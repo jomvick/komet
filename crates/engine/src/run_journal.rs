@@ -229,6 +229,24 @@ impl RunJournal {
         text.filter(|text| !text.is_empty())
     }
 
+    /// Chat ids with a journal file on this host, from the file names alone
+    /// (no parsing). Used to find journals a remote tombstone orphaned.
+    pub fn chat_ids(&self) -> Result<Vec<String>, JournalError> {
+        let mut ids = Vec::new();
+        for entry in std::fs::read_dir(&self.dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            if let Some(chat_id) = path.file_stem().and_then(|s| s.to_str()) {
+                ids.push(chat_id.to_string());
+            }
+        }
+        ids.sort();
+        Ok(ids)
+    }
+
     /// Crash-recovery scan: chat ids whose journal's last event is NOT a `Done` — their
     /// runs died mid-stream and need recovery (stamp `aborted`, close the journal).
     pub fn stale_sessions(&self) -> Result<Vec<String>, JournalError> {

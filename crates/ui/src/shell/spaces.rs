@@ -380,7 +380,7 @@ impl Shell {
                     Some(SpacesMenuPage::Actions) => {
                         let (worktrees_enabled, settings_enabled) =
                             self.project_menu_action_availability(cx);
-                        usize::from(worktrees_enabled) + usize::from(settings_enabled)
+                        1 + usize::from(worktrees_enabled) + usize::from(settings_enabled)
                     }
                     Some(SpacesMenuPage::Settings) => 2,
                     Some(SpacesMenuPage::Worktrees) => self
@@ -416,12 +416,16 @@ impl Shell {
                 let (worktrees_enabled, settings_enabled) =
                     self.project_menu_action_availability(cx);
                 match self.spaces_menu.get().map(|menu| (menu.page, menu.active)) {
-                    Some((SpacesMenuPage::Actions, 0)) if worktrees_enabled => {
+                    Some((SpacesMenuPage::Actions, 0)) => {
+                        self.open_project_menu_page(SpacesMenuPage::Projects, window, cx);
+                        return;
+                    }
+                    Some((SpacesMenuPage::Actions, 1)) if worktrees_enabled => {
                         self.open_project_menu_worktrees(window, cx);
                         return;
                     }
                     Some((SpacesMenuPage::Actions, active))
-                        if settings_enabled && active == usize::from(worktrees_enabled) =>
+                        if settings_enabled && active == 1 + usize::from(worktrees_enabled) =>
                     {
                         self.open_project_menu_page(SpacesMenuPage::Settings, window, cx);
                         return;
@@ -470,12 +474,16 @@ impl Shell {
                     }
                     _ => {}
                 }
-                let row = {
-                    let active = self.spaces_menu.get().map(|m| m.active).unwrap_or(0);
-                    self.spaces_menu_rows(cx).get(active).cloned()
-                };
-                if let Some(row) = row {
-                    self.activate_spaces_menu_row(row, cx);
+                // Only the Projects page renders `spaces_menu_rows`; the other
+                // pages handle their rows above, so an unmatched Enter is a no-op.
+                if self.spaces_menu.get().map(|m| m.page) == Some(SpacesMenuPage::Projects) {
+                    let row = {
+                        let active = self.spaces_menu.get().map(|m| m.active).unwrap_or(0);
+                        self.spaces_menu_rows(cx).get(active).cloned()
+                    };
+                    if let Some(row) = row {
+                        self.activate_spaces_menu_row(row, cx);
+                    }
                 }
             }
             popover::MenuKey::Backspace | popover::MenuKey::Other => {}
@@ -750,6 +758,24 @@ impl Shell {
         let mut actions = popover::popover_card(theme).w(px(220.0)).flex().flex_col();
 
         let (worktrees_enabled, settings_enabled) = self.project_menu_action_availability(cx);
+        actions = actions.child(
+            self.project_menu_action_row(
+                "project-menu-switch",
+                icons::FOLDER,
+                "Switch project",
+                true,
+                active == 0,
+                theme,
+            )
+            .on_hover(cx.listener(|this, hovered: &bool, window, cx| {
+                if *hovered {
+                    this.open_project_menu_page(SpacesMenuPage::Projects, window, cx);
+                }
+            }))
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.open_project_menu_page(SpacesMenuPage::Projects, window, cx);
+            })),
+        );
         actions = actions.when(worktrees_enabled, |menu| {
             menu.child(
                 self.project_menu_action_row(
@@ -757,7 +783,7 @@ impl Shell {
                     icons::GIT_BRANCH,
                     "Switch worktree",
                     true,
-                    active == 0,
+                    active == 1,
                     theme,
                 )
                 .on_hover(cx.listener(|this, hovered: &bool, window, cx| {
@@ -777,7 +803,7 @@ impl Shell {
                     icons::SETTINGS_MINIMALISTIC,
                     "Project settings",
                     true,
-                    active == usize::from(worktrees_enabled),
+                    active == 1 + usize::from(worktrees_enabled),
                     theme,
                 )
                 .on_hover(cx.listener(|this, hovered: &bool, window, cx| {

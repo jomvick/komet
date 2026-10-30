@@ -193,9 +193,16 @@ pub fn all_snapshots() -> Vec<(HarnessId, Vec<(SignalFamily, SignalCounts)>)> {
     let ledger = lock();
     let mut harnesses: Vec<HarnessId> = ledger.counts.keys().map(|(harness, _)| *harness).collect();
     harnesses.sort_by_key(|harness| harness.as_str());
+    harnesses.dedup();
     harnesses
         .into_iter()
-        .map(|harness| (harness, snapshot(harness)))
+        .map(|harness| {
+            let rows = FAMILIES
+                .iter()
+                .filter_map(|family| ledger.counts.get(&(harness, *family)).map(|c| (*family, *c)))
+                .collect();
+            (harness, rows)
+        })
         .collect()
 }
 
@@ -292,6 +299,25 @@ mod tests {
                 SignalFamily::UnknownMethod,
             ]
         );
+    }
+
+    #[test]
+    fn all_snapshots_returns_one_row_per_harness_and_every_family() {
+        let harness = HarnessId::Qoder;
+        record_received(harness, SignalFamily::Questions);
+        record_received(harness, SignalFamily::Plans);
+        let all = all_snapshots();
+        let mut ids: Vec<HarnessId> = all.iter().map(|(h, _)| *h).collect();
+        let total = ids.len();
+        ids.dedup();
+        assert_eq!(ids.len(), total, "one snapshot per harness");
+        let rows: Vec<SignalFamily> = all
+            .iter()
+            .find(|(h, _)| *h == harness)
+            .map(|(_, rows)| rows.iter().map(|(f, _)| *f).collect())
+            .unwrap_or_default();
+        assert!(rows.contains(&SignalFamily::Questions));
+        assert!(rows.contains(&SignalFamily::Plans));
     }
 
     #[test]

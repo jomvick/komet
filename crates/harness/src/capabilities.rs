@@ -41,7 +41,9 @@ pub fn interaction_surface(id: HarnessId) -> HarnessInteractionSurface {
             tool_progress: ProgressSurface::None,
         },
         HarnessId::Codex => HarnessInteractionSurface {
-            questions: QuestionSurface::None,
+            // `item/tool/requestUserInput` round-trips through `request_input`
+            // as a native question; approvals stay on the permission bridge.
+            questions: QuestionSurface::Native,
             compaction: CompactionSurface::BoundaryOnly,
             subagents: SubagentSurface::Tagged,
             plans: PlanSurface::LivePanel,

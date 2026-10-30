@@ -47,11 +47,8 @@ pub struct RailTick {
 fn count_subagents(entries: &[SessionMessageEntry]) -> usize {
     entries
         .iter()
-        .filter(|entry| {
-            entry.parts.iter().any(
-                |part| matches!(part, MessagePart::Tool { call, .. } if call.is_subagent_spawn()),
-            )
-        })
+        .flat_map(|entry| entry.parts.iter())
+        .filter(|part| matches!(part, MessagePart::Tool { call, .. } if call.is_subagent_spawn()))
         .count()
 }
 

@@ -69,8 +69,11 @@ Estimate: 2–3 days. Ships in the next release; immediately cuts new-session gr
 rule is one sentence: **the doc carries the durable facts, the host's run journal
 carries the payload.** Concretely:
 
-- Tool outputs stay journal-only (A2). The doc keeps the ≤160-char failure
-  summary and metadata, never the full text.
+- Tool outputs stay journal-only (A2). The doc keeps metadata plus the failure
+  summary: a failed output of 160 characters or fewer is stored in the synced
+  doc in full (it is not truncated); a longer one keeps a 160-character
+  summary (its first non-empty line, capped). A successful output never enters
+  the doc, however short.
 - Compaction writes `MessagePart::Compaction` (one part per cycle, `id` per
   compaction — a session may compact several times) with `status`, `trigger`,
   `tokens_before`/`tokens_after`, `error` and `summary_bytes`. The summary text

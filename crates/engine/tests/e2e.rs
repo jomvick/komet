@@ -327,7 +327,11 @@ async fn queued_run_command_executes_end_to_end() {
     // The live broadcast delivered the same events.
     let mut broadcast_count = 0usize;
     while let Ok(event) = live.try_recv() {
-        assert!(event.seq >= 1);
+        // `RunPhase` frames are ephemeral: they ride the live feed with seq 0
+        // and never enter the journal, so they have no replay counterpart.
+        if event.seq == 0 {
+            continue;
+        }
         broadcast_count += 1;
     }
     assert_eq!(broadcast_count, mock_script().len());

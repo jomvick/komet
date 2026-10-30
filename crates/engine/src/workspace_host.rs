@@ -20,6 +20,7 @@
 //! serves the full sidebar before any server contact; the old `ws4` rooms are
 //! simply never joined again. The legacy snapshot is kept for rollback.
 
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
 use chrono::Utc;
@@ -375,8 +376,15 @@ impl WorkspaceHost {
                         loop {
                             tokio::select! {
                                 event = events.recv() => match event {
-                                    Ok(komet_sync::RegistryEvent::Applied)
-                                    | Ok(komet_sync::RegistryEvent::Connected) => {
+                                    Ok(komet_sync::RegistryEvent::Applied) => {
+                                        let Some(inner) = weak.upgrade() else { return };
+                                        // A tombstone applied from a server frame never
+                                        // runs `delete_chat` here; this host still owns
+                                        // the journal those chats wrote.
+                                        inner.discard_orphan_journals();
+                                        inner.bump_changed();
+                                    }
+                                    Ok(komet_sync::RegistryEvent::Connected) => {
                                         let Some(inner) = weak.upgrade() else { return };
                                         inner.bump_changed();
                                     }
@@ -806,9 +814,17 @@ impl WorkspaceHost {
 
     /// Hard-delete a space and its chats (registry cascade — one atomic batch).
     /// The caller (rpc layer) tears down live runs / doc-host handles for the
-    /// returned chat ids.
+    /// returned chat ids; the journals those chats wrote die here with them.
     pub fn delete_space(&self, space_id: &str) -> Result<DeletedSpace, EngineError> {
-        Ok(self.mutate(|doc| doc.delete_space(space_id))?)
+        let deleted = self.mutate(|doc| doc.delete_space(space_id))?;
+        if let Some(journal) = lock(&self.inner.journal).clone() {
+            for chat_id in &deleted.chat_ids {
+                if let Err(err) = journal.discard(chat_id) {
+                    tracing::warn!(chat = %chat_id, error = %err, "run journal delete failed");
+                }
+            }
+        }
+        Ok(deleted)
     }
 
     /// Synced seen marker (any device; LWW + monotonic guard in the doc layer).
@@ -926,8 +942,9 @@ impl WorkspaceHost {
     /// On the host that ran the chat it also drops the run journal: a deleted
     /// chat must not keep its transcript (or a subagent's) readable, and its
     /// `.resume` file must not survive to hand a revival budget to a run whose
-    /// chat no longer exists. A device that merely converges the tombstone has
-    /// no journal file here, so the discard is a no-op there.
+    /// chat no longer exists. A device that converges a tombstone does not come
+    /// through here; the registry apply sweep (`discard_orphan_journals`) drops
+    /// any journal it does own.
     pub fn delete_chat(&self, chat_id: &str) -> Result<bool, EngineError> {
         let deleted = self.mutate(|doc| doc.delete_chat(chat_id))?;
         if deleted
@@ -981,6 +998,39 @@ impl WorkspaceHost {
 }
 
 impl WorkspaceHostInner {
+    /// Drop the journal (and its `.resume` budget) of every chat the registry
+    /// no longer holds. Remote chat tombstones and space cascades are applied
+    /// by the registry client, never through this host's delete methods, so a
+    /// delete made on another device would otherwise leave the transcript on
+    /// the machine that ran it.
+    fn discard_orphan_journals(&self) {
+        let Some(journal) = lock(&self.journal).clone() else {
+            return;
+        };
+        let known: HashSet<String> = match lock(&self.reg).read_chats() {
+            Ok(chats) => chats.into_iter().map(|chat| chat.id).collect(),
+            Err(err) => {
+                tracing::warn!(error = %err, "registry chat read failed; journals kept");
+                return;
+            }
+        };
+        let ids = match journal.chat_ids() {
+            Ok(ids) => ids,
+            Err(err) => {
+                tracing::warn!(error = %err, "run journal scan failed");
+                return;
+            }
+        };
+        for chat_id in ids {
+            if known.contains(&chat_id) {
+                continue;
+            }
+            if let Err(err) = journal.discard(&chat_id) {
+                tracing::warn!(chat = %chat_id, error = %err, "orphan journal delete failed");
+            }
+        }
+    }
+
     fn bump_changed(&self) {
         self.changed_tx.send_modify(|v| *v = v.wrapping_add(1));
     }

@@ -450,17 +450,22 @@ fn notice_row(message: SharedString, offline: bool, theme: &Theme) -> gpui::Div 
 /// The outbox line: how many messages are parked, plus why the newest one is
 /// waiting — the reason stored with the entry, so the hint tracks the link.
 /// Pure, so the composer's contract is testable without a window.
-fn queued_sends_notice(queued: &[QueuedSend]) -> Option<SharedString> {
-    let last = queued.last()?;
+fn queued_sends_notice<'a>(
+    queued: impl IntoIterator<Item = &'a QueuedSend>,
+) -> Option<SharedString> {
+    let mut count = 0;
+    let mut last = None;
+    for entry in queued {
+        count += 1;
+        last = Some(entry);
+    }
+    let last = last?;
     let reason = if last.reason.trim().is_empty() {
         "engine unreachable"
     } else {
         last.reason.as_str()
     };
-    Some(SharedString::from(format!(
-        "Queued {} — {reason}",
-        queued.len()
-    )))
+    Some(SharedString::from(format!("Queued {count} — {reason}")))
 }
 
 /// Whether the composer can still act on a request left on `status` in the
@@ -4004,6 +4009,11 @@ pub struct Composer {
     /// Highlighted action on the approval card (Tab/Shift-Tab). `None` = no
     /// explicit pick, so Enter takes the plain Allow.
     permission_cursor: Option<usize>,
+    /// The request `permission_cursor` belongs to. A request resolved elsewhere
+    /// (watchdog auto-deny, another device) never runs `answer_permission`, so
+    /// the cursor is dropped when the pending id changes — a stale highlight
+    /// must not make the next card's Enter deny.
+    permission_cursor_for: Option<String>,
     /// Set by send/answer/decision so the next paint hands the keyboard back to
     /// the prompt (no action can leave focus on a retired surface).
     refocus_input_pending: bool,
@@ -4113,7 +4123,9 @@ impl Composer {
         if self.run_live(cx) {
             self.interrupt(cx);
         }
-        self.send(text, false, cx);
+        // The text was handed in, not typed: a draft in the input is not its
+        // owner, so the send must leave the input and its files alone.
+        self.send(text, false, false, cx);
     }
 
     /// Resubmit the last full-turn prompt verbatim (the error chip's
@@ -4240,6 +4252,7 @@ impl Composer {
             wizard_input,
             permission_focus: cx.focus_handle(),
             permission_cursor: None,
+            permission_cursor_for: None,
             refocus_input_pending: false,
             answered_requests: HashSet::new(),
             advance_task: None,
@@ -5294,7 +5307,14 @@ impl Composer {
         match target {
             RequestTarget::Permission => window.focus(&self.permission_focus, cx),
             RequestTarget::Question => {
-                let focus = self.wizard_input.read(cx).focus_handle.clone();
+                // An options-only question mounts no input; the dock's own
+                // focus handle is what carries digits/Enter/Escape.
+                let free_text = self.wizard.as_ref().is_some_and(Wizard::allows_free_text);
+                let focus = if free_text {
+                    self.wizard_input.read(cx).focus_handle.clone()
+                } else {
+                    self.wizard_focus.clone()
+                };
                 window.focus(&focus, cx);
             }
         }
@@ -5340,6 +5360,12 @@ impl Composer {
             self.last_rendered_height = 0.0;
             self.route_snap_until = Some(Instant::now() + Duration::from_millis(ROUTE_SNAP_MS));
             self.input.update(cx, |input, cx| input.set_text(draft, cx));
+            // Reopening the chat a held send was typed in is the moment it can
+            // leave; the link-flip drain in the shell sees whichever chat is
+            // selected then, so entries for other chats stay parked.
+            if self.send_block(cx).is_none() {
+                self.drain_queued_sends(cx);
+            }
         }
 
         // Question dock lifecycle (wizard state cached per request id).
@@ -5394,9 +5420,15 @@ impl Composer {
             // re-render to fall through to wizard/composer instead of stale gate.
             if let Some(pending) = pending_permission_request(&transcript) {
                 let pending_rid = pending.request_id;
-                // pending exists — keep answered gate; nothing to do
-                let _ = pending_rid;
+                // A different request means the highlight was chosen for one
+                // that is now gone (auto-denied, resolved elsewhere): reset it
+                // so Enter on the new card takes the plain Allow.
+                if self.permission_cursor_for.as_deref() != Some(pending_rid.as_str()) {
+                    self.permission_cursor = None;
+                    self.permission_cursor_for = Some(pending_rid);
+                }
             } else {
+                self.permission_cursor_for = None;
                 // No pending permission — any permission-origin answered id that
                 // isn't an input can be cleared if transcript is non-empty (superseded)
                 let stale: Vec<String> = self
@@ -5476,8 +5508,8 @@ impl Composer {
             _ if text.is_empty() && self.staged().is_empty() => {}
             _ if self.send_blocked(cx) => {}
             SendButtonMode::Queue => self.enqueue_prompt(text, false, cx),
-            SendButtonMode::Send => self.send(text, false, cx),
-            SendButtonMode::Steer => self.send(text, true, cx),
+            SendButtonMode::Send => self.send(text, false, true, cx),
+            SendButtonMode::Steer => self.send(text, true, true, cx),
         }
         // Send is a hand-off, not an exit: the keyboard stays on the prompt.
         self.refocus_input_pending = true;
@@ -5617,19 +5649,24 @@ impl Composer {
                     .or_default()
                     .extend(item.staged);
             }
-            self.send(item.text, item.steer, cx);
+            self.send(item.text, item.steer, false, cx);
         }
     }
 
     /// Hand the offline outbox back to the send path (transparency plan
-    /// Task 10). The shell calls this when the link flips to `Ready`.
-    /// Taking before sending is the dedupe guarantee: the texts are out of the
-    /// state before the first send runs, so a link that dies mid-drain has
-    /// `send()` re-park that one text once — nothing replays, nothing is lost.
+    /// Task 10). The shell calls this when the link flips to `Ready`, and the
+    /// chat-key swap calls it when the user reopens the chat a held send
+    /// belongs to. Only entries parked under the current chat are taken —
+    /// another chat's text would otherwise run in this chat's project and
+    /// sandbox. Taking before sending is the dedupe guarantee: the texts are
+    /// out of the state before the first send runs, so a link that dies
+    /// mid-drain has `send()` re-park that one text once — nothing replays,
+    /// nothing is lost.
     pub fn drain_queued_sends(&mut self, cx: &mut Context<Self>) {
+        let chat_key = self.current_key.clone();
         let queued = self
             .state
-            .update(cx, |state, _| state.take_queued_sends());
+            .update(cx, |state, _| state.take_queued_sends_for(&chat_key));
         if queued.is_empty() {
             return;
         }
@@ -5643,7 +5680,14 @@ impl Composer {
             if sendable {
                 self.submit_text(text, cx);
             } else {
-                self.enqueue_prompt(text, false, cx);
+                // Re-park without the input-clearing path: the text already
+                // left the input when it was queued, and the draft staged
+                // since then is not this message's to take.
+                self.prompt_queue.push_back(QueuedPrompt {
+                    text,
+                    steer: false,
+                    staged: Vec::new(),
+                });
             }
         }
         cx.notify();
@@ -5665,11 +5709,29 @@ impl Composer {
 
     /// Park a send the link cannot carry and show its named reason. The input
     /// clears the way a successful send does — the text now lives in the outbox,
-    /// so leaving it here would deliver it twice. Files are the exception: the
-    /// outbox is text-only, and a text-only copy would silently drop them, so a
-    /// send with staged attachments stays exactly where it is.
-    fn hold_send(&mut self, text: String, reason: String, cx: &mut Context<Self>) {
+    /// so leaving it here would deliver it twice. That only holds when the text
+    /// came from the input: a replayed text (outbox drain, prompt queue) has to
+    /// be put back rather than overwrite or clear an unrelated draft. Files are
+    /// the exception: the outbox is text-only, and a text-only copy would
+    /// silently drop them, so a send with staged attachments stays exactly
+    /// where it is.
+    fn hold_send(
+        &mut self,
+        text: String,
+        reason: String,
+        from_input: bool,
+        cx: &mut Context<Self>,
+    ) {
+        // The outbox is text-only: a text-only copy would silently drop the
+        // files, so a send with staged attachments stays where it is. Only a
+        // text that was typed here is already there; a replayed text (prompt
+        // queue, outbox drain) is put back into an empty input instead of
+        // being lost.
         if !self.staged().is_empty() {
+            if !from_input && self.input.read(cx).text().trim().is_empty() {
+                self.input
+                    .update(cx, |input, cx| input.set_text(text.clone(), cx));
+            }
             self.failure = Some(
                 format!(
                     "{} — send blocked; your files stay in the composer",
@@ -5685,12 +5747,14 @@ impl Composer {
             cx.notify();
             return;
         }
+        let chat_key = self.current_key.clone();
         self.state.update(cx, |state, _| {
-            state.queue_send(text);
+            state.queue_send(chat_key, text);
         });
-        self.input
-            .update(cx, |input, cx| input.set_text("", cx));
-        self.drafts.remove(&self.current_key);
+        if from_input {
+            self.input.update(cx, |input, cx| input.set_text("", cx));
+            self.drafts.remove(&self.current_key);
+        }
         self.failure = None;
         cx.notify();
     }
@@ -5699,7 +5763,11 @@ impl Composer {
     /// thread the picked config in: worktree creation (when the isolated toggle
     /// is on), `Mutate createChat` with the `ChatConfig` + cwd, and the model /
     /// reasoning / options on the Run request itself (§1.7).
-    fn send(&mut self, text: String, steer: bool, cx: &mut Context<Self>) {
+    /// `from_input` says the text was composed in the prompt field right now:
+    /// only then do the input, the draft cache and the staged files follow it
+    /// out. A replayed text (outbox drain, prompt queue) must leave the draft
+    /// the user prepared in the meantime alone.
+    fn send(&mut self, text: String, steer: bool, from_input: bool, cx: &mut Context<Self>) {
         if !steer && !text.trim().is_empty() {
             self.last_sent = Some(text.clone());
         }
@@ -5707,7 +5775,7 @@ impl Composer {
         // and say why (transparency plan Task 10). `send_block` also covers a
         // vanished engine handle, which the status frame reports late.
         if let Some(reason) = self.send_block(cx) {
-            self.hold_send(text, reason, cx);
+            self.hold_send(text, reason, from_input, cx);
             return;
         }
         let Some(engine) = self.state.read(cx).engine().cloned() else {
@@ -5771,12 +5839,16 @@ impl Composer {
             .is_some_and(|s| local_device_id.as_deref() != Some(s.device_id.as_str()));
         // Snapshot-and-clear NOW (use-attachments.ts takeAttachments): the
         // strip empties the instant you hit send; a failure hands the files
-        // back into the chat's stash.
-        let staged = self
-            .attachments
-            .remove(&self.current_key)
-            .unwrap_or_default();
-        self.preview = None;
+        // back into the chat's stash. A replayed text has no files of its own,
+        // so the current draft's stash is left alone.
+        let staged = if from_input {
+            self.preview = None;
+            self.attachments
+                .remove(&self.current_key)
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         let message_id = uuid::Uuid::new_v4().to_string();
         let created_at = chrono::Utc::now().timestamp_millis();
 
@@ -5837,8 +5909,10 @@ impl Composer {
             cx.notify();
         });
 
-        self.input.update(cx, |input, cx| input.set_text("", cx));
-        self.drafts.remove(&self.current_key);
+        if from_input {
+            self.input.update(cx, |input, cx| input.set_text("", cx));
+            self.drafts.remove(&self.current_key);
+        }
         self.failure = None;
         self.sending = true;
         cx.emit(ComposerEvent::Sent {
@@ -6598,7 +6672,14 @@ impl Composer {
         actions: Vec<komet_proto::AgentPermissionAction>,
         cx: &mut Context<Self>,
     ) {
-        let key = event.keystroke.key.as_str();
+        // `keystroke.key` is the unmodified name, so Shift-Tab arrives as
+        // "tab" with the shift flag — spell it the way `permission_key`
+        // matches, or the Prev arm can never fire.
+        let key = if event.keystroke.key == "tab" && event.keystroke.modifiers.shift {
+            "shift-tab"
+        } else {
+            event.keystroke.key.as_str()
+        };
 
         // Build resolved actions (mirroring render_permission_panel logic)
         let mut resolved_actions: Vec<komet_proto::PermissionChoice> = Vec::new();
@@ -6636,15 +6717,20 @@ impl Composer {
             }
             PermissionKey::Next => {
                 if len > 0 {
-                    self.permission_cursor = Some(self.permission_cursor.map_or(0, |current| (current + 1) % len));
+                    self.permission_cursor = Some(
+                        self.permission_cursor
+                            .map_or(0, |current| (current + 1) % len),
+                    );
                     cx.notify();
                     cx.stop_propagation();
                 }
             }
             PermissionKey::Prev => {
                 if len > 0 {
-                    self.permission_cursor =
-                        Some(self.permission_cursor.map_or(len - 1, |current| (current + len - 1) % len));
+                    self.permission_cursor = Some(
+                        self.permission_cursor
+                            .map_or(len - 1, |current| (current + len - 1) % len),
+                    );
                     cx.notify();
                     cx.stop_propagation();
                 }
@@ -6674,12 +6760,16 @@ impl Composer {
         // Codex.
         let updated = match &decision {
             komet_proto::PermissionChoice::AllowAlways { .. } => {
-                let mut opts = komet_proto::SandboxOptions::from_level(self.state.read(cx).access_mode);
+                let mut opts =
+                    komet_proto::SandboxOptions::from_level(self.state.read(cx).access_mode);
                 if let Some(perms) = &mut opts.opencode {
                     if let Some(pos) = perms.bash.patterns.iter().position(|(p, _)| p == "*") {
                         perms.bash.patterns[pos] = ("*".into(), komet_proto::Perm::Allow);
                     } else {
-                        perms.bash.patterns.push(("*".into(), komet_proto::Perm::Allow));
+                        perms
+                            .bash
+                            .patterns
+                            .push(("*".into(), komet_proto::Perm::Allow));
                     }
                 }
                 Some(opts)
@@ -7353,10 +7443,8 @@ impl Composer {
                 // Tab/Shift-Tab highlight: the same list Enter applies to.
                 let cursor = self.permission_cursor;
                 div().flex().flex_row().flex_wrap().gap(px(8.0)).children(
-                    resolved_actions
-                        .into_iter()
-                        .enumerate()
-                        .map(|(index, (action_id, label, is_allow))| {
+                    resolved_actions.into_iter().enumerate().map(
+                        |(index, (action_id, label, is_allow))| {
                             let req = request_id.clone();
                             let decision: komet_proto::PermissionChoice =
                                 if action_id == "allow-always" || label == "Allow always" {
@@ -7432,10 +7520,9 @@ impl Composer {
                                 }))
                                 .child(icon)
                                 .child(label)
-                                .when(cursor == Some(index), |el| {
-                                    el.border_color(theme.text)
-                                })
-                        }),
+                                .when(cursor == Some(index), |el| el.border_color(theme.text))
+                        },
+                    ),
                 )
             });
         card.into_any_element()
@@ -7652,9 +7739,19 @@ impl Render for Composer {
 
         // The offline outbox announces itself (transparency plan Task 10): the
         // parked count plus the reason stored with the newest entry, so a held
-        // Return reads as a deliberate hold instead of a dead button. Not
-        // dismissible — clicking it must never drop a queued message.
-        let queued = queued_sends_notice(self.state.read(cx).queued_sends());
+        // Return reads as a deliberate hold instead of a dead button. Only this
+        // chat's entries — another chat's text is not waiting on this composer.
+        // Not dismissible — clicking it must never drop a queued message.
+        let queued = {
+            let key = self.current_key.as_str();
+            let state = self.state.read(cx);
+            queued_sends_notice(
+                state
+                    .queued_sends()
+                    .iter()
+                    .filter(|entry| entry.chat_key == key),
+            )
+        };
         let container = container.when_some(queued, |el, notice| {
             el.child(notice_row(notice, true, &theme))
         });
@@ -9498,9 +9595,9 @@ mod tests {
             "the reason must name the link state: {reason}"
         );
 
-        let shown = state.queue_send("fix the test".into());
+        let shown = state.queue_send("chat-a".into(), "fix the test".into());
         assert_eq!(shown, reason, "the row shows the reason it stored");
-        state.queue_send("fix the test".into());
+        state.queue_send("chat-a".into(), "fix the test".into());
         assert_eq!(
             state.queued_sends().len(),
             1,
@@ -9512,14 +9609,28 @@ mod tests {
             Some(SharedString::from("Queued 1 — reconnecting (2, 2.5s)"))
         );
 
-        assert_eq!(state.take_queued_sends(), vec!["fix the test".to_string()]);
+        // Another chat's text is not this chat's to send.
+        state.queue_send("chat-b".into(), "elsewhere".into());
+        assert_eq!(
+            state.take_queued_sends_for("chat-a"),
+            vec!["fix the test".to_string()]
+        );
+        assert_eq!(
+            state.queued_sends().len(),
+            1,
+            "draining one chat leaves the other chat's entry parked"
+        );
+        assert!(
+            state.take_queued_sends_for("chat-a").is_empty(),
+            "a second drain cannot replay the text"
+        );
+        assert_eq!(
+            state.take_queued_sends_for("chat-b"),
+            vec!["elsewhere".to_string()]
+        );
         assert!(
             state.queued_sends().is_empty(),
             "taking empties the outbox — the only way out"
-        );
-        assert!(
-            state.take_queued_sends().is_empty(),
-            "a second drain cannot replay the text"
         );
         assert_eq!(queued_sends_notice(state.queued_sends()), None);
     }

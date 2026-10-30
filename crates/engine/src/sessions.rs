@@ -136,6 +136,8 @@ pub(crate) enum FeedHit {
     /// The feed started a tool; the payload is its chip label.
     Tool(&'static str),
     Status(SubagentStatus),
+    /// The parent's spawn chip: opens the feed once, never restarts it.
+    Opened,
 }
 
 /// The feeds one hub event touched, keyed by the parent they belong to. Same
@@ -148,8 +150,10 @@ pub(crate) fn touched_feeds(event: &AgentEvent) -> Vec<(String, FeedHit)> {
         && call.is_subagent_spawn()
     {
         // The spawn itself opens the feed: from here the chip is live, and the
-        // clock starts before the child's first frame arrives.
-        hits.push((id.clone(), FeedHit::Status(SubagentStatus::Running)));
+        // clock starts before the child's first frame arrives. A re-emitted
+        // spawn (title/rawInput refresh) must not reset a settled feed, so this
+        // is an open-only hit, not a `Running` transition.
+        hits.push((id.clone(), FeedHit::Opened));
     }
     if let AgentEvent::Subagent {
         parent_tool_use_id,
@@ -206,6 +210,9 @@ impl SubagentFeeds {
                 last_tool: None,
             });
             match *hit {
+                // `or_insert` above already opened an absent feed at
+                // `seen_at`; an existing one keeps its counters and status.
+                FeedHit::Opened => {}
                 FeedHit::Tool(name) => {
                     feed.tool_count += 1;
                     feed.last_tool = Some(name);
@@ -769,12 +776,7 @@ impl SessionsEngine {
         chat_id: &str,
         after_seq: u64,
     ) -> Result<(Vec<JournaledEvent>, broadcast::Receiver<JournaledEvent>), EngineError> {
-        let rx = {
-            let mut hubs = lock(&self.inner.hubs);
-            hubs.entry(chat_id.to_string())
-                .or_insert_with(|| broadcast::channel(1024).0)
-                .subscribe()
-        };
+        let rx = self.hub_receiver(chat_id);
         let replay = self
             .inner
             .journal
@@ -783,6 +785,15 @@ impl SessionsEngine {
             .map(|(seq, event)| JournaledEvent { seq, event })
             .collect();
         Ok((replay, rx))
+    }
+
+    /// The chat's live receiver, subscribed before any journal projection so a
+    /// frame appended in between lands in the stream (dedupe by `seq`).
+    fn hub_receiver(&self, chat_id: &str) -> broadcast::Receiver<JournaledEvent> {
+        let mut hubs = lock(&self.inner.hubs);
+        hubs.entry(chat_id.to_string())
+            .or_insert_with(|| broadcast::channel(1024).0)
+            .subscribe()
     }
 
     /// Latest journal seq for a chat (0 when the journal is missing/empty).
@@ -855,7 +866,10 @@ impl SessionsEngine {
         ),
         EngineError,
     > {
-        let (_replay, live) = self.subscribe(chat_id, after_seq)?;
+        // Subscribe to the hub directly: `subscribe` would parse the whole
+        // chat journal into a replay that this call discards (the feed's own
+        // projection below reads the file again).
+        let live = self.hub_receiver(chat_id);
         let Some(journal) = self.subagent_events(chat_id, parent_tool_use_id) else {
             return Ok((None, live));
         };

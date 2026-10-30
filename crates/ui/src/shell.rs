@@ -1860,6 +1860,9 @@ impl Shell {
                         cx.background_executor().timer(RECONNECT_TICK).await;
                         let alive = this.update(cx, |shell: &mut Shell, cx| {
                             if !shell.reconnect_countdown_live(cx) {
+                                // The task is exiting; release the slot so the
+                                // next attempt can arm a fresh ticker.
+                                shell.reconnect_ticker = None;
                                 return false;
                             }
                             cx.notify();
@@ -2597,7 +2600,14 @@ impl Shell {
         let id = match self
             .subagent_tabs
             .iter()
-            .find(|(_, panel)| panel.read(cx).open() == &open)
+            .find(|(_, panel)| {
+                // Feed identity only: status/counters/title change while the
+                // tab stays open, and must not spawn a second subscription.
+                let existing = panel.read(cx).open();
+                existing.chat_id == open.chat_id
+                    && existing.target_device_id == open.target_device_id
+                    && existing.spawn.parent_tool_use_id == open.spawn.parent_tool_use_id
+            })
             .map(|(id, _)| *id)
         {
             Some(id) => id,

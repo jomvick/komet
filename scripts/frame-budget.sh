@@ -94,7 +94,7 @@ log_path, csv_path = sys.argv[1], sys.argv[2]
 ansi_re = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 window_re = re.compile(r'window frame budget\b')
 row_re = re.compile(r'row frame budget\b')
-row_field_re = re.compile(r"kind=(\w+) id=(\S+) renders=(\d+)")
+row_field_re = re.compile(r'kind="?(\w+)"? id=(\S+) renders=(\d+)')
 kv_re = re.compile(r"(\w+)=(\d+)")
 
 windows = []

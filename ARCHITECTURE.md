@@ -302,7 +302,7 @@ no-op).
 | Harness | Questions | Compaction | Subagents | Plans | Tool progress |
 | --- | --- | --- | --- | --- | --- |
 | Claude Code | `Native` (`AskUserQuestion`) | `LifecycleWithSummary` | `Tagged` | `ToolChip` (`TodoWrite`) | `None` (the CLI streams no partial tool stdout) |
-| Codex | `None` (approvals only) | `BoundaryOnly` | `Tagged` | `LivePanel` | `Streaming` (`outputDelta`) |
+| Codex | `Native` (`item/tool/requestUserInput`) | `BoundaryOnly` | `Tagged` | `LivePanel` | `Streaming` (`outputDelta`) |
 | Cursor | `None` (`askQuestion` has no answer channel in the SDK) | `BoundaryOnly` | `Tagged` (`taskUpdate`) | `ToolChip` | `Final` (the shim maps no partial content) |
 | Grok / OpenCode | `PermissionShaped` | `None` (Gate B) | `NestedSession` | `ToolChip` | `Streaming` |
 | Devin / GitHub Copilot / Hermes / Pi / Cline / Qoder | `PermissionShaped` | `None` (Gate B) | `TaggedIfEmitted` | `ToolChip` | `Streaming` |

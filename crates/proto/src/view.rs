@@ -101,7 +101,7 @@ pub fn format_ms(ms: u64) -> String {
     if ms < 1_000 {
         format!("{ms} ms")
     } else if ms < 10_000 {
-        format!("{}s", ms as f64 / 1000.0)
+        format!("{:.1}s", ms as f64 / 1000.0)
     } else {
         format!("{}s", ms / 1_000)
     }

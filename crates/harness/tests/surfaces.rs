@@ -41,7 +41,7 @@ const GOLDEN: &[(HarnessId, HarnessInteractionSurface)] = &[
     (
         HarnessId::Codex,
         HarnessInteractionSurface {
-            questions: QuestionSurface::None,
+            questions: QuestionSurface::Native,
             compaction: CompactionSurface::BoundaryOnly,
             subagents: SubagentSurface::Tagged,
             plans: PlanSurface::LivePanel,

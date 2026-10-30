@@ -568,6 +568,10 @@ pub(crate) fn map_update(update: &Value) -> Vec<AgentEvent> {
         }
         "compaction_summary_chunk" => {
             let id = str_field(update, "compactionId");
+            if id.is_empty() {
+                tracing::debug!("dropping an ACP compaction_summary_chunk without a compactionId");
+                return Vec::new();
+            }
             let Some(text) = opt_str(update, &["summaryDelta", "delta", "text"]) else {
                 return Vec::new();
             };
@@ -1530,6 +1534,10 @@ mod tests {
         for update in [
             json!({"sessionUpdate": "something_from_a_future_draft", "value": 1}),
             json!({"sessionUpdate": "compaction_summary_chunk"}),
+            json!({
+                "sessionUpdate": "compaction_summary_chunk",
+                "summaryDelta": "no id to settle",
+            }),
             json!({"sessionUpdate": ""}),
         ] {
             assert!(map_update(&update).is_empty(), "{update:?}");

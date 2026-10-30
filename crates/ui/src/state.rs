@@ -1069,17 +1069,26 @@ pub struct AppState {
     /// the status stays `Reconnecting` across a failure so the countdown never
     /// jumps.
     reconnect_pending: bool,
+    /// The sleeping retry attempt. Kept so a manual Retry (which restarts
+    /// `bootstrap`) can cancel it: dropping a gpui task cancels it, whereas a
+    /// detached one wakes later and forks a second chain.
+    reconnect_task: Option<Task<()>>,
     /// Messages the user fired while the link was down: kept whole here, named
-    /// by the reason the UI showed, handed to the composer once by
-    /// [`Self::take_queued_sends`]. A cut-off send must not be a lost paragraph.
+    /// by the reason the UI showed, and tagged with the chat they were typed
+    /// in so a later drain cannot deliver them to another chat. Handed back
+    /// once by [`Self::take_queued_sends_for`]. A cut-off send must not be a
+    /// lost paragraph.
     queued_sends: Vec<QueuedSend>,
 }
 
 /// One parked message (transparency plan Task 10). The reason is stored with it
 /// because that is what makes the wait legible: "queued — reconnecting (2)"
-/// reads as a deliberate hold, a silent input box reads as a dead button.
+/// reads as a deliberate hold, a silent input box reads as a dead button. The
+/// chat key is the owner: `""` is the new-chat canvas, every other key is the
+/// chat that was selected when the send was held.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueuedSend {
+    pub chat_key: String,
     pub text: String,
     pub reason: String,
 }
@@ -1141,6 +1150,7 @@ impl AppState {
             reconnect_attempt: 0,
             reconnect_deadline: None,
             reconnect_pending: false,
+            reconnect_task: None,
             queued_sends: Vec::new(),
             auto_selected: false,
             chats_synced: false,
@@ -1677,20 +1687,25 @@ impl AppState {
         }
     }
 
-    /// Park a message the link cannot carry. Returns the reason shown on the
-    /// row. Duplicates of the immediately-preceding entry are refused: a user
+    /// Park a message the link cannot carry, under the chat it was typed in.
+    /// Returns the reason shown on the row. Duplicates of the
+    /// immediately-preceding entry for the same chat are refused: a user
     /// pressing Return twice in a row while nothing visibly happened must not
     /// queue the same paragraph twice.
-    pub fn queue_send(&mut self, text: String) -> String {
+    pub fn queue_send(&mut self, chat_key: String, text: String) -> String {
         let reason = self.send_block_reason().unwrap_or_default();
         if self
             .queued_sends
             .last()
-            .is_some_and(|last| last.text == text)
+            .is_some_and(|last| last.chat_key == chat_key && last.text == text)
         {
             return reason;
         }
-        self.queued_sends.push(QueuedSend { text, reason });
+        self.queued_sends.push(QueuedSend {
+            chat_key,
+            text,
+            reason,
+        });
         self.queued_sends.last().unwrap().reason.clone()
     }
 
@@ -1699,14 +1714,17 @@ impl AppState {
         &self.queued_sends
     }
 
-    /// Hand the parked messages to the composer and empty the outbox in the
-    /// same breath — the only way out, so the frame that lands after a
-    /// reconnect cannot replay a message twice.
-    pub fn take_queued_sends(&mut self) -> Vec<String> {
-        std::mem::take(&mut self.queued_sends)
+    /// Hand over the parked messages owned by `chat_key` and leave the other
+    /// chats' entries in the outbox. Taking before sending is the dedupe
+    /// guarantee: the texts are out of the state before the first send runs,
+    /// so a link that dies mid-drain has `send()` re-park that one text once —
+    /// nothing replays, nothing is lost.
+    pub fn take_queued_sends_for(&mut self, chat_key: &str) -> Vec<String> {
+        let (mine, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut self.queued_sends)
             .into_iter()
-            .map(|queued| queued.text)
-            .collect()
+            .partition(|queued| queued.chat_key == chat_key);
+        self.queued_sends = rest;
+        mine.into_iter().map(|queued| queued.text).collect()
     }
 
     /// The status the shell narrates: the engine link, or — while a paired
@@ -2064,6 +2082,7 @@ impl AppState {
         self.echoes.clear();
         self.pending_sends.clear();
         self.queued_sends.clear();
+        self.reconnect_task = None;
         self.reconnect_attempt = 0;
         self.reconnect_pending = false;
         self.reconnect_deadline = None;
@@ -2150,7 +2169,7 @@ impl AppState {
         // via gpui_tokio's `Tokio` handle and then hop back to gpui for the
         // state update, mirroring `bootstrap`.
         let state = cx.entity().clone();
-        cx.spawn(async move |_, cx| {
+        self.reconnect_task = Some(cx.spawn(async move |_, cx| {
             cx.background_executor()
                 .timer(std::time::Duration::from_millis(delay_ms))
                 .await;
@@ -2160,7 +2179,7 @@ impl AppState {
                 Ok(Err(err)) => Err(format!("{err:#}")),
                 Err(join_err) => Err(join_err.to_string()),
             };
-            let _ = state.update(cx, |s, cx| {
+            state.update(cx, |s, cx| {
                 // The attempt is over either way: release the guard before
                 // deciding, or the chain could never advance past attempt 1.
                 s.reconnect_pending = false;
@@ -2175,8 +2194,7 @@ impl AppState {
                     }
                 }
             });
-        })
-        .detach();
+        }));
     }
 
     /// The user pressed Retry: the chain restarts from the top of the schedule
@@ -2194,7 +2212,10 @@ impl AppState {
         state.update(cx, |s, cx| {
             s.connection = ConnectionStatus::Connecting;
             // A manual Retry (and a fresh boot) restarts the chain from the top
-            // of the schedule, not from where the last one gave up.
+            // of the schedule, not from where the last one gave up — and
+            // cancels whatever attempt was still sleeping, so its outcome
+            // cannot replace the new engine or fork a second chain.
+            s.reconnect_task = None;
             s.reconnect_attempt = 0;
             s.reconnect_pending = false;
             s.reconnect_deadline = None;
@@ -4734,7 +4755,11 @@ mod tests {
         assert!(state.transcript_task.is_none());
         assert!(state.workspaces.is_empty());
         assert_eq!(state.transcript.len(), 2, "the last frame survives the gap");
-        assert_eq!(state.pending_echoes().len(), 1, "an unconfirmed echo survives too");
+        assert_eq!(
+            state.pending_echoes().len(),
+            1,
+            "an unconfirmed echo survives too"
+        );
         assert_eq!(state.selected_chat.as_deref(), Some("c1"));
 
         // And the state it lands in keeps the shell up rather than revealing a

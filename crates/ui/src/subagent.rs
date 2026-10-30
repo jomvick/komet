@@ -339,6 +339,12 @@ impl SubagentPanel {
         if self.started {
             return;
         }
+        // `start_feed`/`start_activity` no-op without an engine (still dialing,
+        // or a reconnect took it). Leave `started` unset so a later render
+        // retries instead of leaving the tab waiting forever.
+        if self.state.read(cx).engine().is_none() {
+            return;
+        }
         self.started = true;
         self.start_feed(cx);
         self.start_activity(cx);
@@ -497,10 +503,12 @@ impl SubagentPanel {
         }
         self.entries = entries;
         self.rows = rows;
+        // `offset().y` is zero or negative; the distance to the bottom is the
+        // positive max plus that offset.
         let near_end = {
             let offset = self.scroll.offset().y;
             let max = self.scroll.max_offset().y;
-            f32::from(max) - f32::from(offset) <= FOLLOW_BAND
+            f32::from(max) + f32::from(offset) <= FOLLOW_BAND
         };
         if near_end {
             self.scroll.scroll_to_bottom();
