@@ -337,10 +337,9 @@ async fn restart_roundtrip_restores_chats_transcript_and_resume() {
         "phase frames are ephemeral: {replayed:#?}"
     );
     assert!(
-        replayed.iter().any(|(_, event)| matches!(
-            event,
-            AgentEvent::SessionStarted { .. }
-        )),
+        replayed
+            .iter()
+            .any(|(_, event)| matches!(event, AgentEvent::SessionStarted { .. })),
         "the durable events around them are still journaled: {replayed:#?}"
     );
     core.shutdown().await;
