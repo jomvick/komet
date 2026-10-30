@@ -497,11 +497,7 @@ impl Shell {
             });
         };
 
-        let pr_badge = status
-            .pull_request
-            .as_ref()
-            .map(|pr| (format!("#{}", pr.number), pr_state_color(pr, theme)));
-        let width = trigger_width(pr_badge.as_ref().map(|(label, _)| label.as_str()));
+        let width = trigger_width(None);
         let fade = "github-menu-trigger-fade";
         let open = self.github_menu.get().is_some();
         let mut trigger = div()
@@ -550,26 +546,10 @@ impl Shell {
                 }
             }))
             .child(
-                icon(icons::GITHUB)
-                    .size(px(17.0))
+                icon(icons::DOCUMENT)
+                    .size(px(15.0))
                     .text_color(theme.text.opacity(0.9)),
             )
-            .when_some(pr_badge, |el, (label, color)| {
-                el.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(4.0))
-                        .child(div().size(px(6.0)).rounded_full().bg(color))
-                        .child(
-                            div()
-                                .text_size(px(11.5))
-                                .font_weight(gpui::FontWeight::MEDIUM)
-                                .text_color(theme.text.opacity(0.85))
-                                .child(SharedString::from(label)),
-                        ),
-                )
-            })
             .child(chevron(open, theme));
         if open {
             let closing = self.github_menu.closing_since();
@@ -583,13 +563,45 @@ impl Shell {
                 8.0,
             ));
         }
-        let project_open_control = self.render_project_open_control(theme, cx);
+        let terminal_toggle = div()
+            .id("github-terminal-toggle")
+            .size(px(28.0))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(8.0))
+            .border_1()
+            .border_color(crate::theme::hairline(0.10))
+            .bg(motion::hover_blend(
+                "github-terminal-toggle-fade",
+                crate::theme::wash(0.03),
+                crate::theme::wash(0.11),
+            ))
+            .on_hover(motion::hover_listener(
+                "github-terminal-toggle-fade",
+                cx.entity_id(),
+            ))
+            .cursor_pointer()
+            .occlude()
+            .on_mouse_down(gpui::MouseButton::Left, |_, window, _| {
+                window.prevent_default()
+            })
+            .on_click(cx.listener(|this, _, window, cx| {
+                cx.stop_propagation();
+                this.toggle_terminal(window, cx);
+            }))
+            .child(
+                icon(icons::TERMINAL)
+                    .size(px(15.0))
+                    .text_color(theme.text_muted),
+            );
         let controls = div()
             .flex()
             .items_center()
             .gap(px(6.0))
             .child(trigger)
-            .child(project_open_control);
+            .child(terminal_toggle);
         Some((
             controls.into_any_element(),
             width + 6.0 + OPEN_PROJECT_BUTTON_WIDTH,
@@ -712,6 +724,34 @@ impl Shell {
             ));
 
         let mut body = div().flex().flex_col().child(header).child(divider());
+
+        body = body.child(
+            popover::menu_row(theme, false, "github-open-cursor", cx.entity_id())
+                .id("github-open-cursor")
+                .mx(px(4.0))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.close_github_menu(cx);
+                    this.request_open_project(ProjectOpenChoice::Cursor, cx);
+                }))
+                .child(
+                    div()
+                        .size(px(22.0))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(6.0))
+                        .border_1()
+                        .border_color(crate::theme::hairline(0.14))
+                        .child(
+                            icon(icons::CURSOR_MARK)
+                                .size(px(12.0))
+                                .text_color(theme.text),
+                        ),
+                )
+                .child(SharedString::from("Open in Cursor")),
+        );
 
         if self.github.branch_picker_open {
             body = body.child(self.github_branch_picker(status, theme, cx));

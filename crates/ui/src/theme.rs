@@ -469,12 +469,13 @@ impl Theme {
     pub const GLASS_ALPHA_LIGHT: f32 = if cfg!(target_os = "macos") { 0.80 } else { 1.0 };
     /// Main-panel header height (komet `h-11`) — in-card headers (changes pane).
     pub const HEADER_HEIGHT: f32 = 44.0;
-    /// The unified window titlebar (traffic lights + cluster + tabs). Content
-    /// rides [`Self::TITLEBAR_TOP_PAD`] lower than center so the air above
-    /// matches the perceived gap to the inset card below (border + card body).
-    pub const TITLEBAR_HEIGHT: f32 = 38.0;
-    /// Downward shift of titlebar content within the bar.
-    pub const TITLEBAR_TOP_PAD: f32 = 2.0;
+    /// The unified window titlebar (traffic lights + cluster + tabs). Compact
+    /// enough to give the content more room while keeping the chrome readable.
+    pub const TITLEBAR_HEIGHT: f32 = 42.0;
+    /// Slightly tighter vertical offset keeps the controls visually centered in
+    /// the compact bar while preserving the layout rhythm against the content
+    /// card below.
+    pub const TITLEBAR_TOP_PAD: f32 = 1.0;
     /// Reserved status strip under the content outlet (komet `h-6`) — the
     /// WorkingIndicator row; reserving it keeps the composer from shifting.
     pub const STATUS_STRIP_HEIGHT: f32 = 24.0;

@@ -1002,11 +1002,7 @@ pub fn reconnect_banner(
             attempt, reason, ..
         } => {
             let remaining = deadline
-                .map(|due| {
-                    due.signed_duration_since(now)
-                        .num_milliseconds()
-                        .max(0) as u64
-                })
+                .map(|due| due.signed_duration_since(now).num_milliseconds().max(0) as u64)
                 .unwrap_or(0);
             let mut label = format!(
                 "Reconnecting to the engine — attempt {attempt}/{RECONNECT_MAX_ATTEMPTS}, retrying in {}",
@@ -8583,7 +8579,7 @@ fn window_control_button(
     let fade_key = format!("window-control-{id}");
     div()
         .id(id)
-        .size(px(24.0))
+        .size(px(28.0))
         .flex_none()
         .flex()
         .items_center()
@@ -8615,7 +8611,7 @@ fn window_control_button(
             cx.stop_propagation();
             on_click(event, window, cx)
         })
-        .child(icon(icon_path).size(px(16.0)).text_color(muted))
+        .child(icon(icon_path).size(px(17.0)).text_color(muted))
 }
 
 const WINDOWS_CAPTION_BUTTON_WIDTH: f32 = 36.0;
@@ -9244,7 +9240,6 @@ impl Render for Shell {
         {
             const CLIENT_INSET: f32 = 10.0;
             window.set_client_inset(px(CLIENT_INSET));
-            let bounds_size = window.window_bounds().get_bounds().size;
             let root = root
                 .when(!tiling.top && !tiling.left, |el| {
                     el.rounded_tl(px(Theme::PANEL_RADIUS))
@@ -9259,20 +9254,109 @@ impl Render for Shell {
                     el.rounded_br(px(Theme::PANEL_RADIUS))
                 })
                 .overflow_hidden();
-            div()
-                .size_full()
-                .bg(gpui::transparent_black())
-                .when(!tiling.top, |el| el.pt(px(CLIENT_INSET)))
-                .when(!tiling.bottom, |el| el.pb(px(CLIENT_INSET)))
-                .when(!tiling.left, |el| el.pl(px(CLIENT_INSET)))
-                .when(!tiling.right, |el| el.pr(px(CLIENT_INSET)))
-                .on_mouse_down(MouseButton::Left, move |event, window, _| {
-                    if let Some(edge) =
-                        client_resize_edge(event.position, bounds_size, CLIENT_INSET, tiling)
+            let resize_hitbox = |edge: ResizeEdge, strip: gpui::Div| {
+                strip.on_mouse_down(MouseButton::Left, move |event, window, _| {
+                    let size = window.window_bounds().get_bounds().size;
+                    if client_resize_edge(event.position, size, CLIENT_INSET, tiling) == Some(edge)
                     {
                         window.start_window_resize(edge);
                     }
                 })
+            };
+            let hitboxes = div()
+                .absolute()
+                .inset_0()
+                .when(!tiling.top, |el| {
+                    el.child(resize_hitbox(
+                        ResizeEdge::Top,
+                        div()
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .right_0()
+                            .h(px(CLIENT_INSET)),
+                    ))
+                })
+                .when(!tiling.bottom, |el| {
+                    el.child(resize_hitbox(
+                        ResizeEdge::Bottom,
+                        div()
+                            .absolute()
+                            .bottom_0()
+                            .left_0()
+                            .right_0()
+                            .h(px(CLIENT_INSET)),
+                    ))
+                })
+                .when(!tiling.left, |el| {
+                    el.child(resize_hitbox(
+                        ResizeEdge::Left,
+                        div()
+                            .absolute()
+                            .top_0()
+                            .bottom_0()
+                            .left_0()
+                            .w(px(CLIENT_INSET)),
+                    ))
+                })
+                .when(!tiling.right, |el| {
+                    el.child(resize_hitbox(
+                        ResizeEdge::Right,
+                        div()
+                            .absolute()
+                            .top_0()
+                            .bottom_0()
+                            .right_0()
+                            .w(px(CLIENT_INSET)),
+                    ))
+                })
+                .when(!(tiling.top || tiling.left), |el| {
+                    el.child(resize_hitbox(
+                        ResizeEdge::TopLeft,
+                        div()
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .w(px(CLIENT_INSET))
+                            .h(px(CLIENT_INSET)),
+                    ))
+                })
+                .when(!(tiling.top || tiling.right), |el| {
+                    el.child(resize_hitbox(
+                        ResizeEdge::TopRight,
+                        div()
+                            .absolute()
+                            .top_0()
+                            .right_0()
+                            .w(px(CLIENT_INSET))
+                            .h(px(CLIENT_INSET)),
+                    ))
+                })
+                .when(!(tiling.bottom || tiling.left), |el| {
+                    el.child(resize_hitbox(
+                        ResizeEdge::BottomLeft,
+                        div()
+                            .absolute()
+                            .bottom_0()
+                            .left_0()
+                            .w(px(CLIENT_INSET))
+                            .h(px(CLIENT_INSET)),
+                    ))
+                })
+                .when(!(tiling.bottom || tiling.right), |el| {
+                    el.child(resize_hitbox(
+                        ResizeEdge::BottomRight,
+                        div()
+                            .absolute()
+                            .bottom_0()
+                            .right_0()
+                            .w(px(CLIENT_INSET))
+                            .h(px(CLIENT_INSET)),
+                    ))
+                });
+            div()
+                .size_full()
+                .child(hitboxes)
                 .child(root)
                 .into_any_element()
         } else {
@@ -9299,7 +9383,10 @@ mod tests {
         let (label, retry) = reconnect_banner(&status, now, Some(due)).expect("reconnecting");
         assert!(retry, "{label}");
         assert!(label.contains("Reconnecting"), "{label}");
-        assert!(label.contains(&format!("2/{RECONNECT_MAX_ATTEMPTS}")), "{label}");
+        assert!(
+            label.contains(&format!("2/{RECONNECT_MAX_ATTEMPTS}")),
+            "{label}"
+        );
         assert!(label.contains(&format_ms(1_200)), "{label}");
         assert!(!label.contains(&format_ms(5_000)), "{label}");
         assert!(label.contains("socket closed"), "{label}");
