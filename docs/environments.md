@@ -38,6 +38,22 @@ The link is a secret — it grants shell on that host. Paste it in Komet
 (Settings → Sync → **Add device**) to add the environment; the desktop walks
 through decode, reachability probe, and pairing, and reports which step failed.
 
+### Requirements
+
+`--serve` installs the same `komet` binary as the desktop app. No window is
+opened, but the binary still loads gpui's Linux shared libraries, so a minimal
+server image needs them before `komet` can start (no display server is needed):
+
+```bash
+# Debian/Ubuntu
+sudo apt install libxcb1 libxkbcommon0 libxkbcommon-x11-0 libdbus-1-3
+# Fedora
+sudo dnf install libxcb libxkbcommon libxkbcommon-x11 dbus-libs
+```
+
+On a VPS, also run `loginctl enable-linger $USER` so the `systemd --user` unit
+keeps running after you log out.
+
 Without `--install-service`, the same command runs in the foreground (useful
 under Docker or your own supervisor). Without `--public-url` or `--lan`, no link is
 printed: expose the server behind TLS first, then run

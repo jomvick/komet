@@ -63,9 +63,9 @@ use crate::jsonrpc::{Incoming, RpcClient};
 use crate::{Harness, HarnessError, RunControls, errors::typed_error};
 use catalog::REASONING_LEVELS;
 use normalize::{
-    ChildRoute, Phase, compacted_event, delta_text, item_id, item_type, map_item,
-    notification_thread_id, route_child_notification, turn_error_message, turn_id, usage_events,
-    user_message_text,
+    ChildRoute, Phase, compacted_events, delta_text, item_id, item_type, map_item,
+    notification_thread_id, plan_events, progress_events, route_child_notification,
+    turn_error_message, turn_id, usage_events, user_message_text,
 };
 
 /// Locate the device's installed Codex CLI: `CODEX_EXECUTABLE`, then our own
@@ -1171,9 +1171,32 @@ async fn run_session(session: Session) {
                                 pending_usage = usage_events(&params);
                             }
 
+                            // Live tool stdout: ephemeral by contract, the
+                            // engine coalesces and never journals it.
+                            "item/commandExecution/outputDelta"
+                            | "item/fileChange/outputDelta" => {
+                                for ev in progress_events(&params) {
+                                    if !send(&event_tx, ev).await {
+                                        break 'main;
+                                    }
+                                }
+                            }
+
+                            // Full plan snapshot; the stable live-plan id
+                            // makes the doc fold refresh one plan part.
+                            "turn/plan/updated" => {
+                                for ev in plan_events(&params) {
+                                    if !send(&event_tx, ev).await {
+                                        break 'main;
+                                    }
+                                }
+                            }
+
                             "thread/compacted" => {
-                                if !send(&event_tx, compacted_event()).await {
-                                    break 'main;
+                                for ev in compacted_events(&params) {
+                                    if !send(&event_tx, ev).await {
+                                        break 'main;
+                                    }
                                 }
                             }
 
@@ -1553,7 +1576,10 @@ async fn steer_as_new_turn(
 // ---------------------------------------------------------------------------
 
 type RequestInputFn = Box<
-    dyn Fn(Vec<UserInputQuestion>) -> tokio::sync::oneshot::Receiver<Vec<UserInputAnswer>>
+    dyn Fn(
+            Vec<UserInputQuestion>,
+            komet_proto::QuestionSource,
+        ) -> tokio::sync::oneshot::Receiver<Vec<UserInputAnswer>>
         + Send
         + Sync,
 >;
@@ -1585,7 +1611,9 @@ fn handle_server_request(
         let request_input = Arc::clone(request_input);
         tokio::spawn(async move {
             let asked: Vec<UserInputQuestion> = questions.iter().map(|(_, q)| q.clone()).collect();
-            let answers = (request_input)(asked).await.unwrap_or_default();
+            let answers = (request_input)(asked, komet_proto::QuestionSource::Native)
+                .await
+                .unwrap_or_default();
             let mut by_id = serde_json::Map::new();
             for (wire_id, q) in &questions {
                 let labels: Vec<Value> = answers
@@ -1617,10 +1645,16 @@ fn handle_server_request(
     }
 
     let (kind, summary, choices) = permissions::parse_approval_request(method, params);
+    // Codex approvals are per item (`itemId`), which is also the tool call's
+    // id on the transcript — link the decision to that chip when present.
+    let gated_item = {
+        let id = item_id(params);
+        (!id.is_empty()).then_some(id)
+    };
     let client = client.clone();
     let request_permission = Arc::clone(request_permission);
     tokio::spawn(async move {
-        let decision = (request_permission)(kind, summary, choices)
+        let decision = (request_permission)(kind, summary, choices, gated_item)
             .await
             .unwrap_or(komet_proto::PermissionChoice::Deny);
         let accept = matches!(
@@ -1687,6 +1721,10 @@ fn user_input_questions(params: &Value) -> Vec<(String, UserInputQuestion)> {
                     .iter()
                     .find_map(|k| q.get(*k).and_then(Value::as_bool))
                     .unwrap_or(false),
+                option_descriptions: Vec::new(),
+                allow_free_text: true,
+                secret: false,
+                default: None,
             };
             (wire_id, question)
         })

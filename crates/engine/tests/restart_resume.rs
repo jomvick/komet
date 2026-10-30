@@ -21,13 +21,15 @@ use futures::StreamExt;
 use futures::stream::BoxStream;
 
 use komet_doc::{
-    MessagePart, MessageRole, MessageStatus, SessionCommandPayload, SessionDoc, SessionMessageEntry,
+    CommandBasedOn, InputResponse, MessagePart, MessageRole, MessageStatus, SessionCommandEntry,
+    SessionCommandPayload, SessionCommandStatus, SessionDoc, SessionMessageEntry, SubagentStatus,
 };
 use komet_engine::{EngineCore, HarnessRegistry, RunJournal};
 use komet_harness::{Harness, HarnessError, RunControls};
 use komet_proto::{
-    AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SandboxLevel,
-    SteeringMode,
+    AgentEvent, CompactionStatus, DoneStatus, HarnessId, Model, PermissionChoice,
+    PermissionDecision, PermissionKind, QuestionSource, ReasoningLevel, RunRequest, SandboxLevel,
+    SteeringMode, ToolCall, UserInputAnswer, UserInputQuestion,
 };
 use komet_sync::DocsStore;
 
@@ -319,6 +321,27 @@ async fn restart_roundtrip_restores_chats_transcript_and_resume() {
     assert_eq!(
         stored_harness_session(&core),
         Some(("hs-restart-2".into(), Some("/tmp".into())))
+    );
+
+    // Two turns went through a run that started, waited on the model and
+    // streamed — every one of those phase changes was broadcast, and the
+    // journal on disk must not have grown a line for any of them (plan
+    // Task 10). A replay after a restart that carried a stale "waitingModel"
+    // would name a wait that stopped happening minutes ago.
+    let journal = RunJournal::open(dir.join("orgs/dev-org/dev-user/journals")).unwrap();
+    let replayed = journal.replay(CHAT, 0).unwrap();
+    assert!(
+        replayed
+            .iter()
+            .all(|(_, event)| !matches!(event, AgentEvent::RunPhase { .. })),
+        "phase frames are ephemeral: {replayed:#?}"
+    );
+    assert!(
+        replayed.iter().any(|(_, event)| matches!(
+            event,
+            AgentEvent::SessionStarted { .. }
+        )),
+        "the durable events around them are still journaled: {replayed:#?}"
     );
     core.shutdown().await;
 }
@@ -983,6 +1006,827 @@ async fn steer_after_restart_dispatches_new_turn_with_resume() {
             Some("hs-steer"),
             "steer-turned-run must resume the stored harness session"
         );
+    }
+    core.shutdown().await;
+}
+
+// ── Task 9 (durabilité) : une réponse survit au run qui l'a posée ──────────
+
+/// A crash long enough ago that boot recovery will NOT auto-resume the turn
+/// (the freshness window is 12 h): these tests exercise the durable command
+/// path, not the revival path.
+const NOT_FRESH_MS: i64 = 1;
+
+fn pin_device(dir: &std::path::Path, device: &str) {
+    std::fs::create_dir_all(dir).unwrap();
+    std::fs::write(dir.join("device-id"), device).unwrap();
+}
+
+/// Write the on-disk state a kill -9 mid-turn leaves behind: a chat snapshot
+/// plus a journal whose last event is not `Done`.
+fn write_crash_state(
+    dir: &std::path::Path,
+    entries: Vec<SessionMessageEntry>,
+    events: &[AgentEvent],
+) {
+    std::fs::create_dir_all(dir).unwrap();
+    let store = DocsStore::open(dir.join("orgs/dev-org/dev-user")).unwrap();
+    let doc = SessionDoc::init(CHAT).unwrap();
+    for entry in entries {
+        doc.push_message(&entry).unwrap();
+    }
+    store
+        .save_snapshot(CHAT, &doc.export_snapshot().unwrap())
+        .unwrap();
+    let journal = RunJournal::open(dir.join("orgs/dev-org/dev-user/journals")).unwrap();
+    for event in events {
+        journal.append(CHAT, event).unwrap();
+    }
+}
+
+fn entry_with(
+    id: &str,
+    role: MessageRole,
+    status: MessageStatus,
+    device: &str,
+    parts: Vec<MessagePart>,
+) -> SessionMessageEntry {
+    SessionMessageEntry {
+        id: id.into(),
+        role,
+        parts,
+        created_at: NOT_FRESH_MS,
+        device_id: device.into(),
+        status: Some(status),
+        continuation_of: None,
+    }
+}
+
+fn pick_question() -> UserInputQuestion {
+    UserInputQuestion {
+        id: "q1".into(),
+        header: "Pick".into(),
+        question: "Which option?".into(),
+        options: vec!["Option A".into(), "Option B".into()],
+        multi_select: false,
+        option_descriptions: Vec::new(),
+        allow_free_text: false,
+        secret: false,
+        default: None,
+    }
+}
+
+fn crashed_session(session: &str, assistant_id: &str) -> AgentEvent {
+    AgentEvent::SessionStarted {
+        harness: HarnessId::Mock,
+        model: "mock-1".into(),
+        tools: vec![],
+        cwd: "/tmp".into(),
+        session_id: session.into(),
+        assistant_message_id: assistant_id.into(),
+    }
+}
+
+/// Queue a command under an explicit device id — what a second device's
+/// answer/decision looks like once the doc replicates.
+fn queue_as(core: &EngineCore, id: &str, device: &str, payload: SessionCommandPayload) {
+    let handle = core.doc_host.open(CHAT).expect("open chat");
+    let based_on = handle.doc().read_entries().ok().and_then(|entries| {
+        entries.last().map(|entry| CommandBasedOn {
+            turn_id: Some(entry.id.clone()),
+            frontier: None,
+        })
+    });
+    handle
+        .doc()
+        .queue_command(&SessionCommandEntry {
+            id: id.into(),
+            payload,
+            issued_by: device.into(),
+            issued_at: chrono::Utc::now().timestamp_millis(),
+            based_on,
+            expires_at: None,
+            status: SessionCommandStatus::Pending,
+            resolution: None,
+        })
+        .expect("queue command");
+}
+
+fn command_status(core: &EngineCore, id: &str) -> Option<(SessionCommandStatus, Option<String>)> {
+    core.doc_host
+        .open(CHAT)
+        .expect("open chat")
+        .doc()
+        .read_commands()
+        .expect("read commands")
+        .into_iter()
+        .find(|command| command.id == id)
+        .map(|command| (command.status, command.resolution))
+}
+
+async fn wait_for_command(core: &EngineCore, id: &str) -> (SessionCommandStatus, Option<String>) {
+    wait_for(
+        || {
+            command_status(core, id)
+                .is_some_and(|(status, _)| status != SessionCommandStatus::Pending)
+        },
+        "the command to resolve",
+    )
+    .await;
+    command_status(core, id).expect("command still queued")
+}
+
+fn input_part(
+    core: &EngineCore,
+    request_id: &str,
+) -> Option<(bool, Vec<komet_doc::InputResponse>)> {
+    entries_now(core).into_iter().find_map(|entry| {
+        entry.parts.into_iter().find_map(|part| match part {
+            MessagePart::Input {
+                request_id: rid,
+                resolved,
+                responses,
+                ..
+            } if rid == request_id => Some((resolved, responses)),
+            _ => None,
+        })
+    })
+}
+
+type PermissionPart = (bool, Option<PermissionChoice>, Option<String>, Option<i64>);
+
+fn permission_part(core: &EngineCore, request_id: &str) -> Option<PermissionPart> {
+    entries_now(core).into_iter().find_map(|entry| {
+        entry.parts.into_iter().find_map(|part| match part {
+            MessagePart::Permission {
+                request_id: rid,
+                resolved,
+                decision,
+                decided_by,
+                decided_at,
+                ..
+            } if rid == request_id => Some((resolved, decision, decided_by, decided_at)),
+            _ => None,
+        })
+    })
+}
+
+#[tokio::test]
+async fn answering_after_restart_starts_a_new_turn_and_says_so() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("data");
+    pin_device(&dir, "dev-crash");
+    write_crash_state(
+        &dir,
+        vec![
+            entry_with(
+                "msg-user-1",
+                MessageRole::User,
+                MessageStatus::Complete,
+                "dev-crash",
+                vec![MessagePart::Text {
+                    id: "t0".into(),
+                    text: "long task".into(),
+                }],
+            ),
+            entry_with(
+                "msg-assistant-1",
+                MessageRole::Assistant,
+                MessageStatus::Streaming,
+                "dev-crash",
+                vec![
+                    MessagePart::Text {
+                        id: "t1".into(),
+                        text: "thinking…".into(),
+                    },
+                    MessagePart::Input {
+                        id: "in-q-1".into(),
+                        request_id: "q-1".into(),
+                        questions: vec![pick_question()],
+                        resolved: false,
+                        responses: Vec::new(),
+                        source: QuestionSource::Native,
+                    },
+                ],
+            ),
+        ],
+        &[crashed_session("hs-q", "msg-assistant-1")],
+    );
+
+    let requests: RequestLog = Arc::new(Mutex::new(Vec::new()));
+    let core = assemble(
+        &dir,
+        RecordingHarness {
+            requests: requests.clone(),
+            session_id: "hs-q2".into(),
+            fail_starts: Default::default(),
+        },
+    );
+    assert_eq!(core.device_id, "dev-crash");
+
+    // Boot recovery settles the dead turn but leaves the question ANSWERABLE:
+    // the UI keeps it up until the user answers (user requirement).
+    let entries = entries_now(&core);
+    assert_eq!(entries[1].status, Some(MessageStatus::Aborted));
+    assert!(
+        matches!(
+            &entries[1].parts[1],
+            MessagePart::Input {
+                resolved: false,
+                ..
+            }
+        ),
+        "recovery must not cancel an open question: {:?}",
+        entries[1].parts[1]
+    );
+    assert!(
+        requests.lock().unwrap().is_empty(),
+        "an old crashed turn must not auto-resume"
+    );
+
+    pre_title(&core);
+    let command = core
+        .doc_host
+        .queue_command(
+            CHAT,
+            SessionCommandPayload::RespondInput {
+                request_id: "q-1".into(),
+                answers: vec![UserInputAnswer {
+                    question_id: "q1".into(),
+                    labels: vec!["Option B".into()],
+                    free_text: None,
+                }],
+            },
+        )
+        .expect("queue answer");
+    let (status, reason) = wait_for_command(&core, &command).await;
+    assert_eq!(status, SessionCommandStatus::Applied);
+    assert_eq!(
+        reason.as_deref(),
+        Some("answered as new turn"),
+        "the durable command says what it did"
+    );
+
+    wait_for(
+        || complete_assistant_count(&core) == 1,
+        "the answered turn to complete",
+    )
+    .await;
+    {
+        let log = requests.lock().unwrap();
+        assert_eq!(log.len(), 1, "one run: the orphan answer's new turn");
+        assert!(
+            log[0].prompt.contains("Option B"),
+            "the answer rides the resumed turn: {}",
+            log[0].prompt
+        );
+        assert_eq!(
+            log[0].resume.as_deref(),
+            Some("hs-q"),
+            "the new turn resumes the crashed harness conversation"
+        );
+    }
+    let (resolved, responses) = input_part(&core, "q-1").expect("question part");
+    assert!(resolved);
+    assert_eq!(responses.len(), 1);
+    assert!(responses[0].applied, "the host delivered this answer");
+    assert_eq!(responses[0].device, "dev-crash");
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn permission_after_restart_is_recorded_but_run_is_gone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("data");
+    pin_device(&dir, "dev-crash");
+    write_crash_state(
+        &dir,
+        vec![
+            entry_with(
+                "msg-user-1",
+                MessageRole::User,
+                MessageStatus::Complete,
+                "dev-crash",
+                vec![MessagePart::Text {
+                    id: "t0".into(),
+                    text: "run a command".into(),
+                }],
+            ),
+            entry_with(
+                "msg-assistant-1",
+                MessageRole::Assistant,
+                MessageStatus::Streaming,
+                "dev-crash",
+                vec![MessagePart::Permission {
+                    id: "perm-perm-1".into(),
+                    request_id: "perm-1".into(),
+                    permission_kind: PermissionKind::Command {
+                        cmdline: "cargo test".into(),
+                    },
+                    summary: "Run cargo test".into(),
+                    choices: vec![PermissionChoice::Deny, PermissionChoice::Allow],
+                    actions: Vec::new(),
+                    resolved: false,
+                    decision: None,
+                    tool_call_id: None,
+                    decided_by: None,
+                    decided_at: None,
+                    expires_at: None,
+                }],
+            ),
+        ],
+        &[crashed_session("hs-perm", "msg-assistant-1")],
+    );
+
+    let requests: RequestLog = Arc::new(Mutex::new(Vec::new()));
+    let core = assemble(
+        &dir,
+        RecordingHarness {
+            requests: requests.clone(),
+            session_id: "hs-perm-2".into(),
+            fail_starts: Default::default(),
+        },
+    );
+
+    // The dead approval panel is closed at boot; no decision is invented.
+    let (resolved, decision, decided_by, _) =
+        permission_part(&core, "perm-1").expect("permission part");
+    assert!(resolved);
+    assert_eq!(
+        decision, None,
+        "recovery closes the panel, it decides nothing"
+    );
+    assert_eq!(decided_by, None);
+
+    // A decision queued offline (or from another device) still lands — and it
+    // must not resurrect the run.
+    queue_as(
+        &core,
+        "cmd-permit",
+        "dev-phone",
+        SessionCommandPayload::Permit {
+            request_id: "perm-1".into(),
+            decision: PermissionDecision {
+                request_id: "perm-1".into(),
+                choice: PermissionChoice::Allow,
+                selected_action_id: None,
+                updated_permissions: None,
+            },
+        },
+    );
+    let (status, reason) = wait_for_command(&core, "cmd-permit").await;
+    assert_eq!(status, SessionCommandStatus::Applied, "{reason:?}");
+    let (resolved, decision, decided_by, decided_at) =
+        permission_part(&core, "perm-1").expect("permission part");
+    assert!(resolved);
+    assert_eq!(decision, Some(PermissionChoice::Allow));
+    assert_eq!(decided_by.as_deref(), Some("dev-phone"));
+    assert!(decided_at.is_some(), "the deciding device's clock is kept");
+    assert!(
+        requests.lock().unwrap().is_empty(),
+        "recording a decision never dispatches a run"
+    );
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn concurrent_permission_decisions_keep_deny() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("data");
+    pin_device(&dir, "dev-crash");
+    let permission = |id: &str| MessagePart::Permission {
+        id: format!("perm-{id}"),
+        request_id: id.into(),
+        permission_kind: PermissionKind::Command {
+            cmdline: "cargo test".into(),
+        },
+        summary: "Run cargo test".into(),
+        choices: vec![PermissionChoice::Deny, PermissionChoice::Allow],
+        actions: Vec::new(),
+        resolved: false,
+        decision: None,
+        tool_call_id: None,
+        decided_by: None,
+        decided_at: None,
+        expires_at: None,
+    };
+    write_crash_state(
+        &dir,
+        vec![entry_with(
+            "msg-assistant-1",
+            MessageRole::Assistant,
+            MessageStatus::Streaming,
+            "dev-crash",
+            vec![permission("perm-a"), permission("perm-b")],
+        )],
+        &[crashed_session("hs-perm", "msg-assistant-1")],
+    );
+
+    let requests: RequestLog = Arc::new(Mutex::new(Vec::new()));
+    let core = assemble(
+        &dir,
+        RecordingHarness {
+            requests: requests.clone(),
+            session_id: "hs-perm-2".into(),
+            fail_starts: Default::default(),
+        },
+    );
+
+    let decide = |id: &str, device: &str, choice: PermissionChoice| {
+        queue_as(
+            &core,
+            id,
+            device,
+            SessionCommandPayload::Permit {
+                request_id: "perm-a".into(),
+                decision: PermissionDecision {
+                    request_id: "perm-a".into(),
+                    choice,
+                    selected_action_id: None,
+                    updated_permissions: None,
+                },
+            },
+        );
+    };
+    // Order A: Allow lands first, then a concurrent Deny.
+    decide("cmd-a1", "dev-laptop", PermissionChoice::Allow);
+    assert_eq!(
+        wait_for_command(&core, "cmd-a1").await.0,
+        SessionCommandStatus::Applied
+    );
+    decide("cmd-a2", "dev-phone", PermissionChoice::Deny);
+    assert_eq!(
+        wait_for_command(&core, "cmd-a2").await.0,
+        SessionCommandStatus::Applied
+    );
+    let (_, decision, decided_by, _) = permission_part(&core, "perm-a").expect("perm-a");
+    assert_eq!(
+        decision,
+        Some(PermissionChoice::Deny),
+        "a late Allow must never rewrite what the agent was denied"
+    );
+    assert_eq!(decided_by.as_deref(), Some("dev-phone"));
+
+    // Same rule in the other order (Deny first, Allow second), on a second id.
+    let deny_b = |id: &str, device: &str, choice: PermissionChoice| {
+        queue_as(
+            &core,
+            id,
+            device,
+            SessionCommandPayload::Permit {
+                request_id: "perm-b".into(),
+                decision: PermissionDecision {
+                    request_id: "perm-b".into(),
+                    choice,
+                    selected_action_id: None,
+                    updated_permissions: None,
+                },
+            },
+        );
+    };
+    deny_b("cmd-b1", "dev-phone", PermissionChoice::Deny);
+    assert_eq!(
+        wait_for_command(&core, "cmd-b1").await.0,
+        SessionCommandStatus::Applied
+    );
+    deny_b("cmd-b2", "dev-laptop", PermissionChoice::Allow);
+    assert_eq!(
+        wait_for_command(&core, "cmd-b2").await.0,
+        SessionCommandStatus::Applied
+    );
+    let (_, decision, decided_by, _) = permission_part(&core, "perm-b").expect("perm-b");
+    assert_eq!(decision, Some(PermissionChoice::Deny));
+    assert_eq!(decided_by.as_deref(), Some("dev-phone"));
+    assert!(
+        requests.lock().unwrap().is_empty(),
+        "decisions never dispatch runs"
+    );
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn compaction_metadata_survives_a_viewer_reconnect() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("data");
+    write_crash_state(
+        &dir,
+        vec![entry_with(
+            "msg-assistant-1",
+            MessageRole::Assistant,
+            MessageStatus::Complete,
+            "dev-host",
+            vec![MessagePart::Compaction {
+                id: "cmp-c1".into(),
+                compaction_id: "c1".into(),
+                status: CompactionStatus::Completed,
+                trigger: Some("auto".into()),
+                tokens_before: Some(165_000),
+                tokens_after: None,
+                error: None,
+                // Journal-only policy: metadata in the doc, prose in the
+                // host's journal — never both.
+                summary: None,
+                summary_bytes: Some(9),
+                summary_in_journal: true,
+            }],
+        )],
+        &[
+            crashed_session("hs-cmp", "msg-assistant-1"),
+            AgentEvent::ContextCompaction {
+                id: "c1".into(),
+                status: CompactionStatus::Completed,
+                trigger: Some("auto".into()),
+                tokens_before: Some(165_000),
+                tokens_after: None,
+                summary: Some("the recap".into()),
+                summary_delta: None,
+                error: None,
+            },
+            AgentEvent::Done {
+                status: DoneStatus::Completed,
+                result: None,
+                error: None,
+                session_id: Some("hs-cmp".into()),
+                reason: None,
+            },
+        ],
+    );
+
+    // A viewer reconnecting (fresh core over the persisted state) sees the
+    // cycle's metadata from the doc, on every device.
+    let requests: RequestLog = Arc::new(Mutex::new(Vec::new()));
+    let core = assemble(
+        &dir,
+        RecordingHarness {
+            requests: requests.clone(),
+            session_id: "hs-cmp-2".into(),
+            fail_starts: Default::default(),
+        },
+    );
+    let part = entries_now(&core)
+        .into_iter()
+        .flat_map(|entry| entry.parts)
+        .find_map(|part| match part {
+            MessagePart::Compaction {
+                status,
+                trigger,
+                tokens_before,
+                tokens_after,
+                summary,
+                summary_bytes,
+                summary_in_journal,
+                ..
+            } => Some((
+                status,
+                trigger,
+                tokens_before,
+                tokens_after,
+                summary,
+                summary_bytes,
+                summary_in_journal,
+            )),
+            _ => None,
+        })
+        .expect("compaction part survived the reconnect");
+    assert_eq!(part.0, CompactionStatus::Completed);
+    assert_eq!(part.1.as_deref(), Some("auto"));
+    assert_eq!(part.2, Some(165_000));
+    assert_eq!(part.3, None, "no invented post-compaction reading");
+    assert_eq!(part.4, None, "journal-only: the doc carries no prose");
+    assert_eq!(part.5, Some(9));
+    assert!(part.6);
+
+    // The recap itself is fetched from the host's journal by RPC.
+    use komet_rpc::{RpcReply, RpcService as _, methods};
+    let reply = core
+        .rpc_service()
+        .handle(
+            methods::GET_COMPACTION_SUMMARY,
+            serde_json::json!({ "chatId": CHAT, "compactionId": "c1" }),
+        )
+        .await
+        .expect("compaction summary rpc");
+    let RpcReply::Value(reply) = reply else {
+        panic!("GetCompactionSummary is a unary reply");
+    };
+    assert_eq!(reply["status"], "ok", "{reply}");
+    assert_eq!(reply["text"], "the recap");
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn subagent_duration_is_absent_after_crash() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("data");
+    pin_device(&dir, "dev-crash");
+    write_crash_state(
+        &dir,
+        vec![entry_with(
+            "msg-assistant-1",
+            MessageRole::Assistant,
+            MessageStatus::Streaming,
+            "dev-crash",
+            vec![MessagePart::Tool {
+                id: "spawn-1".into(),
+                call: ToolCall::Unknown {
+                    name: "Agent".into(),
+                    input: Some(serde_json::json!({ "description": "explore" })),
+                },
+                is_error: false,
+                resolved: false,
+                output: None,
+                diff: None,
+                output_ref: None,
+                output_bytes: None,
+                diff_ref: None,
+                diff_stats: None,
+                subagent_ref: None,
+                subagent_status: Some(SubagentStatus::Running),
+                subagent_tail: None,
+                subagent_duration_ms: None,
+                subagent_tool_count: None,
+            }],
+        )],
+        &[crashed_session("hs-sub", "msg-assistant-1")],
+    );
+
+    let requests: RequestLog = Arc::new(Mutex::new(Vec::new()));
+    let core = assemble(
+        &dir,
+        RecordingHarness {
+            requests: requests.clone(),
+            session_id: "hs-sub-2".into(),
+            fail_starts: Default::default(),
+        },
+    );
+    let entries = entries_now(&core);
+    assert_eq!(entries[0].status, Some(MessageStatus::Aborted));
+    let MessagePart::Tool {
+        subagent_status,
+        subagent_duration_ms,
+        subagent_tool_count,
+        ..
+    } = &entries[0].parts[0]
+    else {
+        panic!("spawn chip expected, got {:?}", entries[0].parts[0]);
+    };
+    assert_eq!(
+        *subagent_status,
+        Some(SubagentStatus::Failed),
+        "a child that died with the process is never left 'running'"
+    );
+    assert_eq!(
+        *subagent_duration_ms, None,
+        "the journal has no timestamps to rebuild a duration from"
+    );
+    assert_eq!(*subagent_tool_count, None);
+    assert!(requests.lock().unwrap().is_empty());
+    core.shutdown().await;
+}
+
+/// Task 8/9 boundary: after a restart, an OPEN question on a settled entry is
+/// actionable — answering it starts a new turn (see
+/// `answering_after_restart_starts_a_new_turn_and_says_so`). An already
+/// ANSWERED question is history: a late command for it is recorded as a
+/// concurrent answer and must never dispatch a run.
+#[tokio::test]
+async fn stale_question_is_historical_not_actionable() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("data");
+    pin_device(&dir, "dev-crash");
+    let history = MessagePart::Input {
+        id: "in-q-old".into(),
+        request_id: "q-old".into(),
+        questions: vec![pick_question()],
+        resolved: true,
+        responses: vec![InputResponse {
+            answers: vec![UserInputAnswer {
+                question_id: "q1".into(),
+                labels: vec!["Option A".into()],
+                free_text: None,
+            }],
+            decided_at: NOT_FRESH_MS,
+            device: "dev-crash".into(),
+            applied: true,
+        }],
+        source: QuestionSource::Native,
+    };
+    let open = MessagePart::Input {
+        id: "in-q-1".into(),
+        request_id: "q-1".into(),
+        questions: vec![pick_question()],
+        resolved: false,
+        responses: Vec::new(),
+        source: QuestionSource::Native,
+    };
+    write_crash_state(
+        &dir,
+        vec![
+            entry_with(
+                "msg-assistant-0",
+                MessageRole::Assistant,
+                MessageStatus::Complete,
+                "dev-crash",
+                vec![history],
+            ),
+            entry_with(
+                "msg-user-1",
+                MessageRole::User,
+                MessageStatus::Complete,
+                "dev-crash",
+                vec![MessagePart::Text {
+                    id: "t0".into(),
+                    text: "second task".into(),
+                }],
+            ),
+            entry_with(
+                "msg-assistant-1",
+                MessageRole::Assistant,
+                MessageStatus::Streaming,
+                "dev-crash",
+                vec![open],
+            ),
+        ],
+        &[crashed_session("hs-q", "msg-assistant-1")],
+    );
+
+    let requests: RequestLog = Arc::new(Mutex::new(Vec::new()));
+    let core = assemble(
+        &dir,
+        RecordingHarness {
+            requests: requests.clone(),
+            session_id: "hs-q2".into(),
+            fail_starts: Default::default(),
+        },
+    );
+    pre_title(&core);
+
+    let answer = |label: &str| UserInputAnswer {
+        question_id: "q1".into(),
+        labels: vec![label.into()],
+        free_text: None,
+    };
+
+    // The answered question is history: a late answer from another device is
+    // recorded as a concurrent answer, and nothing runs.
+    queue_as(
+        &core,
+        "cmd-old",
+        "dev-phone",
+        SessionCommandPayload::RespondInput {
+            request_id: "q-old".into(),
+            answers: vec![answer("Option B")],
+        },
+    );
+    let (status, reason) = wait_for_command(&core, "cmd-old").await;
+    assert_eq!(status, SessionCommandStatus::Rejected, "{reason:?}");
+    assert!(
+        reason
+            .as_deref()
+            .is_some_and(|why| why.contains("recorded, not delivered")),
+        "the stale answer is explained, not swallowed: {reason:?}"
+    );
+    let (resolved, responses) = input_part(&core, "q-old").expect("historical question");
+    assert!(resolved);
+    assert_eq!(responses.len(), 2, "the late answer is listed, not dropped");
+    assert!(responses[0].applied, "the delivered answer keeps its mark");
+    assert!(
+        !responses[1].applied,
+        "the late answer is recorded as a conflict, never delivered"
+    );
+    assert!(
+        requests.lock().unwrap().is_empty(),
+        "a historical question must never start a turn"
+    );
+
+    // The open question from the crashed run is actionable: the very same
+    // command type now dispatches a new turn.
+    let command = core
+        .doc_host
+        .queue_command(
+            CHAT,
+            SessionCommandPayload::RespondInput {
+                request_id: "q-1".into(),
+                answers: vec![answer("Option B")],
+            },
+        )
+        .expect("queue answer");
+    let (status, reason) = wait_for_command(&core, &command).await;
+    assert_eq!(status, SessionCommandStatus::Applied);
+    assert_eq!(
+        reason.as_deref(),
+        Some("answered as new turn"),
+        "only an actionable question restarts the agent"
+    );
+    wait_for(
+        || complete_assistant_count(&core) == 2,
+        "the answered turn to complete",
+    )
+    .await;
+    {
+        let log = requests.lock().unwrap();
+        assert_eq!(log.len(), 1, "exactly one run: the open question's turn");
+        assert!(log[0].prompt.contains("Option B"));
     }
     core.shutdown().await;
 }

@@ -365,7 +365,49 @@ impl ChatDocHandle {
                 "resolved permissions abandoned by a dead run"
             );
         }
-        if !stamped.is_empty() || resolved_perms > 0 {
+        // Same reasoning for compaction: a boundary still `inProgress` with no
+        // live run never settled — the squeeze either finished or died with the
+        // process, and the transcript must not keep claiming "compacting…" for
+        // a turn that is gone. This device's parts only: another device's live
+        // run owns its own cycles.
+        let failed_compactions = self
+            .doc
+            .fail_interrupted_compactions(&self.device_id, note)
+            .unwrap_or_else(|err| {
+                tracing::warn!(chat = %self.chat_id, error = %err, "compaction sweep failed");
+                0
+            });
+        if failed_compactions > 0 {
+            tracing::info!(
+                chat = %self.chat_id,
+                failed_compactions,
+                "failed compactions abandoned by a dead run"
+            );
+        }
+        // Same reasoning for a spawned subagent: a chip still `running` with no
+        // live run never settled, and the transcript must not keep claiming
+        // "agent running" for a child that died with the process. Its terminal
+        // numbers stay absent — the journal has no timestamps to rebuild a
+        // duration from, and inventing one would read as a measurement.
+        let failed_subagents = self
+            .doc
+            .fail_running_subagents(&self.device_id)
+            .unwrap_or_else(|err| {
+                tracing::warn!(chat = %self.chat_id, error = %err, "subagent sweep failed");
+                0
+            });
+        if failed_subagents > 0 {
+            tracing::info!(
+                chat = %self.chat_id,
+                failed_subagents,
+                "failed subagents abandoned by a dead run"
+            );
+        }
+        if !stamped.is_empty()
+            || resolved_perms > 0
+            || failed_compactions > 0
+            || failed_subagents > 0
+        {
             self.publish_messages();
         }
         Ok(stamped)
@@ -2286,7 +2328,18 @@ impl DocHost {
                 request_id,
                 answers,
             } => {
+                // The single durable write for an answer, live or orphaned:
+                // recorded here, with the device that issued the command, so a
+                // peer can see whose answer the agent got.
                 if sessions.respond_input(chat_id, request_id, answers.clone())? {
+                    sessions.record_input_response(
+                        chat_id,
+                        request_id,
+                        answers,
+                        true,
+                        &entry.issued_by,
+                        entry.issued_at,
+                    )?;
                     return Ok((SessionCommandStatus::Applied, None));
                 }
                 // No live resolver. Only a request id the doc shows as an
@@ -2313,10 +2366,26 @@ impl DocHost {
                         })
                 });
                 let Some(questions) = questions else {
-                    return Ok((
-                        SessionCommandStatus::Rejected,
-                        Some("no pending input request".into()),
-                    ));
+                    // The id matches no OPEN question on a settled entry. It may
+                    // still match a question another device already answered:
+                    // record this answer as a conflict (never delivered) so
+                    // nothing the user typed is dropped, and never re-dispatch.
+                    let conflict = sessions
+                        .record_input_response(
+                            chat_id,
+                            request_id,
+                            answers,
+                            false,
+                            &entry.issued_by,
+                            entry.issued_at,
+                        )
+                        .unwrap_or(false);
+                    let why = if conflict {
+                        "already answered elsewhere — recorded, not delivered"
+                    } else {
+                        "no pending input request"
+                    };
+                    return Ok((SessionCommandStatus::Rejected, Some(why.into())));
                 };
                 // The run died under the question (engine restart, crash).
                 // The question is still open in the doc and the command is
@@ -2337,9 +2406,18 @@ impl DocHost {
                 request.prompt = respond_input_prompt(&questions, answers);
                 request.resume = None; // dispatch re-derives the harness session
                 request.attachments = Vec::new();
-                if let Err(err) = handle.doc.resolve_input(request_id) {
-                    tracing::warn!(chat = %chat_id, request = %request_id, error = %err,
-                        "orphaned input resolve failed");
+                if !sessions.record_input_response(
+                    chat_id,
+                    request_id,
+                    answers,
+                    true,
+                    &entry.issued_by,
+                    entry.issued_at,
+                )? {
+                    return Ok((
+                        SessionCommandStatus::Rejected,
+                        Some("question part no longer exists".into()),
+                    ));
                 }
                 let harness = self.harness_for_request(chat_id, &request);
                 sessions.dispatch(chat_id, harness, request, None).await?;
@@ -2357,18 +2435,23 @@ impl DocHost {
                 // doc part resolved. A dead/absent run still stamps the doc
                 // (the panel closes; nothing is un-blocked — same fallback
                 // the input path takes).
-                match sessions.respond_permission(chat_id, request_id, decision.choice.clone()) {
-                    Ok(true) => {
-                        tracing::info!(chat=%chat_id, request=%request_id, ?decision, "permit delivered to live run")
-                    }
-                    _ => {
-                        tracing::info!(chat=%chat_id, request=%request_id, ?decision, "permit with no live run (doc stamped only)")
-                    }
-                }
-                let resolved = handle.doc.resolve_permission(request_id).unwrap_or(false)
-                    || handle.doc.resolve_input(request_id).unwrap_or(false);
-                if !resolved {
+                let delivered =
+                    sessions.respond_permission(chat_id, request_id, decision.choice.clone())?;
+                if !sessions.record_permission_decision(
+                    chat_id,
+                    request_id,
+                    &decision.choice,
+                    &entry.issued_by,
+                    entry.issued_at,
+                )? && !delivered
+                {
+                    // Neither a live resolver nor a permission part carried this
+                    // id: the decision belongs to nothing.
                     tracing::warn!(chat=%chat_id, request=%request_id, ?decision, "permit received but no pending permission part found");
+                    return Ok((
+                        SessionCommandStatus::Rejected,
+                        Some("no pending permission request".into()),
+                    ));
                 }
                 Ok((SessionCommandStatus::Applied, None))
             }
@@ -2504,9 +2587,23 @@ pub fn respond_input_prompt(
     questions: &[UserInputQuestion],
     answers: &[UserInputAnswer],
 ) -> String {
+    // No answers is a cancel (Escape in the dock): the resumed turn says so
+    // instead of asking the agent to answer a question with nothing.
+    if answers.is_empty() {
+        return "I cancelled the question you asked.".to_string();
+    }
     let mut lines = vec!["Answering your earlier question:".to_string()];
     for answer in answers {
-        let picked = answer.labels.join(", ");
+        let secret = questions
+            .iter()
+            .any(|q| q.id == answer.question_id && q.secret);
+        // This text becomes a user message (synced, journaled), so a secret
+        // answer is never replayed into it.
+        let picked = if secret {
+            komet_proto::WITHHELD_SECRET_ANSWER.to_owned()
+        } else {
+            answer.labels.join(", ")
+        };
         let question = questions
             .iter()
             .find(|q| q.id == answer.question_id)
@@ -2588,5 +2685,56 @@ mod part_segment_tests {
         assert_eq!(encode_part_segment("m1#c1"), "m1%23c1");
         assert_eq!(encode_part_segment("tool:call_9"), "tool%3Acall_9");
         assert_eq!(encode_part_segment("plain-id_0.diff~"), "plain-id_0.diff~");
+    }
+}
+
+#[cfg(test)]
+mod respond_input_prompt_tests {
+    use super::respond_input_prompt;
+    use komet_proto::{UserInputAnswer, UserInputQuestion};
+
+    fn question(id: &str, secret: bool) -> UserInputQuestion {
+        UserInputQuestion {
+            id: id.into(),
+            header: "Header".into(),
+            question: format!("Question {id}?"),
+            options: vec!["a".into(), "b".into()],
+            multi_select: false,
+            option_descriptions: Vec::new(),
+            allow_free_text: true,
+            secret,
+            default: None,
+        }
+    }
+
+    #[test]
+    fn a_cancelled_question_resumes_as_a_cancel_not_a_blank_answer() {
+        // Escape in the dock sends no answers; the dead-run fallback must say
+        // so instead of dispatching a turn that answers nothing.
+        assert_eq!(
+            respond_input_prompt(&[question("q1", false)], &[]),
+            "I cancelled the question you asked."
+        );
+    }
+
+    #[test]
+    fn answers_pair_with_their_question_and_a_secret_is_withheld() {
+        let questions = [question("q1", false), question("q2", true)];
+        let answers = [
+            UserInputAnswer {
+                question_id: "q1".into(),
+                labels: vec!["a".into()],
+                free_text: None,
+            },
+            UserInputAnswer {
+                question_id: "q2".into(),
+                labels: vec!["hunter2".into()],
+                free_text: None,
+            },
+        ];
+        let prompt = respond_input_prompt(&questions, &answers);
+        assert!(prompt.contains("Question q1? — a"));
+        assert!(prompt.contains(komet_proto::WITHHELD_SECRET_ANSWER));
+        assert!(!prompt.contains("hunter2"));
     }
 }

@@ -5,9 +5,10 @@
 //! `item/delta` appends to one field (`text`, `summary.<n>`, `output`).
 //! Text is emitted as the suffix past what was already sent, so a full
 //! re-send after deltas never duplicates. Items Komet does not show:
-//! `userMessage` (the prompt itself), `reminderChild` (Muse's per-step
-//! housekeeping agents) and `compaction`.
-use komet_proto::{AgentEvent, DoneStatus, TodoItem, ToolCall, ToolDiff};
+//! `userMessage` (the prompt itself) and `reminderChild` (Muse's per-step
+//! housekeeping agents). `compaction` is shown: it is a fact about the thread's
+//! context, not housekeeping.
+use komet_proto::{AgentEvent, CompactionStatus, DoneStatus, TodoItem, ToolCall, ToolDiff};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 
@@ -28,6 +29,10 @@ pub(super) struct Normalizer {
     last_message: Option<String>,
     announced: HashSet<String>,
     finished: HashSet<String>,
+    /// Status already reported for each compaction item, so a recap that
+    /// streams in afterwards re-emits the cycle's real state instead of
+    /// guessing `inProgress`.
+    compaction_status: HashMap<String, CompactionStatus>,
     /// Subagents still running: background work the runtime holds.
     pub running_subagents: HashSet<String>,
 }
@@ -64,6 +69,7 @@ impl Normalizer {
             "toolCall" | "userShell" => self.tool(id, item),
             "subagent" => self.subagent(id, item),
             "workflow" => self.workflow(id, item),
+            "compaction" => self.compaction(id, item),
             _ => vec![],
         }
     }
@@ -77,6 +83,30 @@ impl Normalizer {
             return vec![];
         }
         let field = params["field"].as_str().unwrap_or("text");
+        if kind == Some("compaction") {
+            // A recap streams exactly like message text does — but it belongs
+            // to the compaction, and as assistant text it would put the
+            // thread's own summary in the conversation. `summary` replaces, so
+            // re-sending the accumulated whole stays idempotent.
+            let mut so_far = self.emitted.get(id).cloned().unwrap_or_default();
+            so_far.push_str(delta);
+            self.emitted.insert(id.into(), so_far.clone());
+            let status = self
+                .compaction_status
+                .get(id)
+                .copied()
+                .unwrap_or(CompactionStatus::InProgress);
+            return vec![AgentEvent::ContextCompaction {
+                id: id.into(),
+                status,
+                trigger: None,
+                tokens_before: None,
+                tokens_after: None,
+                summary: Some(so_far),
+                summary_delta: None,
+                error: None,
+            }];
+        }
         let reasoning = match (field, kind) {
             ("text", Some("reasoning")) => true,
             ("text", _) => false,
@@ -144,6 +174,17 @@ impl Normalizer {
                 call,
             });
         }
+        if status == "inProgress"
+            && let Some(text) = item["visibleOutput"].as_str().filter(|t| !t.is_empty())
+        {
+            // Item revisions: `visibleOutput` while the tool runs is the
+            // output so far — a snapshot the open chip shows live.
+            events.push(AgentEvent::ToolProgress {
+                id: id.into(),
+                text: cap(text, 16384),
+                append: false,
+            });
+        }
         if status != "inProgress" && self.announced.contains(id) && self.finished.insert(id.into())
         {
             let output = item["visibleOutput"]
@@ -162,6 +203,47 @@ impl Normalizer {
             });
         }
         events
+    }
+
+    /// A `compaction` item is Muse rewriting its own context. The item is
+    /// re-sent whole at each revision, so everything it reports — status, the
+    /// sizes it traded, the recap, a failure — rides through; what it does not
+    /// report stays unknown rather than derived.
+    fn compaction(&mut self, id: &str, item: &Value) -> Vec<AgentEvent> {
+        let status = match string(item, "status") {
+            "completed" => CompactionStatus::Completed,
+            "failed" => CompactionStatus::Failed,
+            "cancelled" | "canceled" => CompactionStatus::Cancelled,
+            // `inProgress` and any spelling this build does not know: a later
+            // revision settles it.
+            _ => CompactionStatus::InProgress,
+        };
+        self.compaction_status.insert(id.into(), status);
+        let recap = ["text", "summary"]
+            .iter()
+            .map(|key| string(item, key))
+            .find(|text| !text.trim().is_empty())
+            .unwrap_or_default();
+        if !recap.is_empty() {
+            // Seed the delta accumulator: a recap that keeps streaming after a
+            // full re-send must append to what the thread already shows, not
+            // replace it with the tail.
+            self.emitted.insert(id.into(), recap.to_owned());
+        }
+        vec![AgentEvent::ContextCompaction {
+            id: id.into(),
+            status,
+            trigger: reported(string(item, "trigger")).or_else(|| reported(string(item, "reason"))),
+            tokens_before: number(item, &["tokensBefore", "tokens_before", "preTokens"]),
+            tokens_after: number(item, &["tokensAfter", "tokens_after"]),
+            summary: reported(recap),
+            summary_delta: None,
+            error: [item["error"].as_str(), item["error"]["message"].as_str()]
+                .into_iter()
+                .flatten()
+                .find(|text| !text.trim().is_empty())
+                .map(str::to_owned),
+        }]
     }
 
     /// A subagent is shown as its spawn chip, `Agent: <objective>`; its
@@ -378,6 +460,18 @@ pub(super) fn string<'a>(v: &'a Value, key: &str) -> &'a str {
     v[key].as_str().unwrap_or("")
 }
 
+/// A string the wire actually reported: absent, empty and blank all mean the
+/// same thing downstream — unknown.
+fn reported(text: &str) -> Option<String> {
+    (!text.trim().is_empty()).then(|| text.to_owned())
+}
+
+/// First number present under any of `keys` (Muse has shipped both spellings of
+/// its field names across builds).
+fn number(v: &Value, keys: &[&str]) -> Option<u64> {
+    keys.iter().find_map(|key| v[*key].as_u64())
+}
+
 fn cap(text: &str, limit: usize) -> String {
     if text.len() <= limit {
         return text.into();
@@ -581,12 +675,131 @@ mod tests {
     #[test]
     fn housekeeping_items_are_not_shown() {
         let mut n = Normalizer::default();
-        for kind in ["userMessage", "reminderChild", "compaction"] {
+        // `compaction` left this list: it is a fact about the thread's context,
+        // not housekeeping — see `compaction_items_are_shown`.
+        for kind in ["userMessage", "reminderChild"] {
             assert!(
                 n.item(&item(kind, kind, 1, "completed", json!({"text":"x"})))
                     .is_empty()
             );
         }
+    }
+
+    #[test]
+    fn compaction_items_are_shown() {
+        let mut n = Normalizer::default();
+        let events = n.item(&item("c", "compaction", 1, "inProgress", json!({})));
+        assert!(
+            matches!(
+                &events[..],
+                [AgentEvent::ContextCompaction { id, status: CompactionStatus::InProgress, summary: None, .. }]
+                    if id == "c"
+            ),
+            "{events:?}"
+        );
+        // The same revision re-sent is the same fact, not a second row.
+        assert!(
+            n.item(&item("c", "compaction", 1, "inProgress", json!({})))
+                .is_empty()
+        );
+        // A later revision carries the recap and the terminal status.
+        let events = n.item(&item(
+            "c",
+            "compaction",
+            2,
+            "completed",
+            json!({"text":"recap of the thread"}),
+        ));
+        assert!(
+            matches!(
+                &events[..],
+                [AgentEvent::ContextCompaction {
+                    status: CompactionStatus::Completed,
+                    summary: Some(text),
+                    ..
+                }] if text == "recap of the thread"
+            ),
+            "{events:?}"
+        );
+        // A recap may stream as deltas like any text item — and must never read
+        // as assistant text, nor replace the recap with a fragment.
+        let events = n.delta(&json!({"itemId":"c","field":"text","delta":" (more)"}));
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::TextDelta { .. })),
+            "{events:?}"
+        );
+        assert!(
+            matches!(
+                &events[..],
+                [AgentEvent::ContextCompaction { summary: Some(text), .. }]
+                    if text == "recap of the thread (more)"
+            ),
+            "{events:?}"
+        );
+    }
+
+    /// Muse's own failure wording stays visible on the row: a compaction that
+    /// died mid-write is the case the user most needs to see.
+    #[test]
+    fn compaction_item_reports_failure_and_cancellation() {
+        let mut n = Normalizer::default();
+        let events = n.item(&item(
+            "f",
+            "compaction",
+            1,
+            "failed",
+            json!({"error":{"message":"context summarization failed"}}),
+        ));
+        assert!(
+            matches!(
+                &events[..],
+                [AgentEvent::ContextCompaction {
+                    status: CompactionStatus::Failed,
+                    error: Some(message),
+                    ..
+                }] if message == "context summarization failed"
+            ),
+            "{events:?}"
+        );
+        let events = n.item(&item("k", "compaction", 1, "cancelled", json!({})));
+        assert!(
+            matches!(
+                &events[..],
+                [AgentEvent::ContextCompaction {
+                    status: CompactionStatus::Cancelled,
+                    ..
+                }]
+            ),
+            "{events:?}"
+        );
+    }
+
+    /// The item is re-sent whole at each revision, so the sizes Muse reports
+    /// ride through instead of being invented by the engine.
+    #[test]
+    fn compaction_item_carries_what_it_reports() {
+        let mut n = Normalizer::default();
+        let events = n.item(&item(
+            "t",
+            "compaction",
+            1,
+            "completed",
+            json!({"trigger":"auto","tokensBefore":165_000,"tokensAfter":12_000}),
+        ));
+        assert!(
+            matches!(
+                &events[..],
+                [AgentEvent::ContextCompaction {
+                    trigger: Some(trigger),
+                    tokens_before: Some(165_000),
+                    tokens_after: Some(12_000),
+                    ..
+                }] if trigger == "auto"
+            ),
+            "{events:?}"
+        );
     }
 
     #[test]

@@ -58,13 +58,15 @@ use crate::settings::{
 };
 use crate::state::{
     AppState, ConnectionStatus, EngineBootConfig, EngineHandle, EngineMode, GatePhase, Indicator,
-    OrgRow, WorkspaceEntry, WorkspaceStatus, format_time_ago, org_name_valid, parse_orgs,
-    sort_memberships,
+    OrgRow, RECONNECT_MAX_ATTEMPTS, WorkspaceEntry, WorkspaceStatus, format_ms, format_time_ago,
+    org_name_valid, parse_orgs, sort_memberships,
 };
+use crate::subagent::{SubagentEvent, SubagentOpen, SubagentPanel};
 use crate::terminal::panel::{TerminalPanel, ToggleTerminal, clamp_terminal_height};
 use crate::theme::Theme;
 use crate::transcript::{
-    self, ErrorOpenAccounts, ErrorOpenModelPicker, ErrorRetryTurn, Transcript, TranscriptEvent,
+    self, ErrorOpenAccounts, ErrorOpenModelPicker, ErrorRetryTurn, RevealLastCompaction,
+    Transcript, TranscriptEvent,
 };
 
 /// Wider floor for the right pane while it shows the Files+FileEditor split
@@ -980,6 +982,49 @@ fn sync_flow_after_auth(
     }
 }
 
+/// Cadence of the banner countdown — the retry it counts down to is never
+/// sooner than the first schedule step (500 ms), so a quarter-second is finer
+/// than the thing it measures and cheap enough to run only while reconnecting.
+const RECONNECT_TICK: Duration = Duration::from_millis(250);
+
+/// The reconnect banner's label: `None` draws nothing. The countdown comes
+/// from `deadline`, never from the frame's `retry_in_ms` — that number was
+/// snapshotted when the attempt was scheduled, so printing it would freeze the
+/// strip at the schedule delay while the retry was actually closer (or overdue).
+/// Pure so the wording is testable without a window.
+pub fn reconnect_banner(
+    status: &ConnectionStatus,
+    now: chrono::DateTime<Utc>,
+    deadline: Option<chrono::DateTime<Utc>>,
+) -> Option<(String, bool)> {
+    match status {
+        ConnectionStatus::Reconnecting {
+            attempt, reason, ..
+        } => {
+            let remaining = deadline
+                .map(|due| {
+                    due.signed_duration_since(now)
+                        .num_milliseconds()
+                        .max(0) as u64
+                })
+                .unwrap_or(0);
+            let mut label = format!(
+                "Reconnecting to the engine — attempt {attempt}/{RECONNECT_MAX_ATTEMPTS}, retrying in {}",
+                format_ms(remaining)
+            );
+            if !reason.is_empty() {
+                label.push_str(" · ");
+                label.push_str(reason);
+            }
+            Some((label, true))
+        }
+        // Degraded: the link carries the app fine, the run it holds does not —
+        // nothing is queued and no retry is pending, so just say what.
+        ConnectionStatus::Degraded { reason } => Some((reason.clone(), false)),
+        _ => None,
+    }
+}
+
 /// The "Create your workspace" gate (feature-inventory §1.2 OrgGate).
 struct OrgGateUi {
     name_input: Entity<ComposerInput>,
@@ -1038,6 +1083,14 @@ pub struct Shell {
     /// Event hookups for [`Self::diffs`] (History rows opening commit tabs).
     diff_subs: std::collections::HashMap<u64, Subscription>,
     diff_seq: u64,
+    /// Subagent transcript surfaces by id — one per spawn chip clicked. The
+    /// panel owns its own `WatchSubagent`/`WatchActivity` tasks, so closing the
+    /// tab (dropping the entity) is what stops the subscription.
+    subagent_tabs: std::collections::HashMap<u64, Entity<SubagentPanel>>,
+    /// Event hookups for [`Self::subagent_tabs`] (a nested spawn opening its
+    /// own tab, one level deeper).
+    subagent_subs: std::collections::HashMap<u64, Subscription>,
+    subagent_seq: u64,
     /// One workspace browser per chat/panel key. Dropping the entity closes
     /// its file watcher and every in-flight workspace request.
     files: std::collections::HashMap<String, Entity<FilesSurface>>,
@@ -1211,6 +1264,13 @@ pub struct Shell {
     splash: SplashPhase,
     splash_task: Option<Task<()>>,
     save_task: Option<Task<()>>,
+    /// Ticker that keeps the banner countdown moving. Armed only while
+    /// `link_status()` is `Reconnecting` with a deadline still ahead of now —
+    /// an idle app must not pay a notify every quarter-second.
+    reconnect_ticker: Option<Task<()>>,
+    /// Last link status seen by [`Shell::on_state_changed`]: the drain of the
+    /// composer's offline outbox rides the edge into `Ready`, not every notify.
+    last_connection: ConnectionStatus,
     /// Focus fallback (registered on first paint — [`Shell::new`] has no
     /// window): keyboard shortcuts dispatch through the window focus chain, so
     /// with nothing focused they go dead. Initial focus lands on the composer
@@ -1239,6 +1299,18 @@ impl Shell {
                 TranscriptEvent::OpenWorkspaceFile { path, line } => {
                     this.pending_workspace_file = Some((path.clone(), *line));
                     cx.notify();
+                }
+                TranscriptEvent::OpenSubagent {
+                    chat_id,
+                    target_device_id,
+                    spawn,
+                } => {
+                    let open = SubagentOpen {
+                        chat_id: chat_id.clone(),
+                        target_device_id: target_device_id.clone(),
+                        spawn: spawn.clone(),
+                    };
+                    this.add_subagent_surface(open, cx);
                 }
             },
         );
@@ -1350,6 +1422,9 @@ impl Shell {
             diffs: std::collections::HashMap::new(),
             diff_subs: std::collections::HashMap::new(),
             diff_seq: 0,
+            subagent_tabs: std::collections::HashMap::new(),
+            subagent_subs: std::collections::HashMap::new(),
+            subagent_seq: 0,
             files: std::collections::HashMap::new(),
             files_subs: std::collections::HashMap::new(),
             file_surfaces: std::collections::HashMap::new(),
@@ -1450,6 +1525,8 @@ impl Shell {
             splash: SplashPhase::Visible,
             splash_task: None,
             save_task: None,
+            reconnect_ticker: None,
+            last_connection: ConnectionStatus::Connecting,
             focus_sub: None,
             _ticker: ticker,
             _state_observation: observation,
@@ -1738,8 +1815,66 @@ impl Shell {
                 }
             }
             // Reveal the gate card immediately; the splash never returns mid-session.
-            ConnectionStatus::Failed(_) => self.splash = SplashPhase::Gone,
-            ConnectionStatus::Connecting => {}
+            ConnectionStatus::Failed { .. } => self.splash = SplashPhase::Gone,
+            ConnectionStatus::Connecting | ConnectionStatus::Reconnecting { .. } => {}
+            // Attached but degraded keeps the shell up — the banner narrates it.
+            ConnectionStatus::Degraded { .. } => {}
+        }
+        // Task 10: a reconnect keeps the frame up, so the only new surface is
+        // the banner's countdown — and the messages the composer parked while
+        // the link was down go back out on the edge into Ready, once (the drain
+        // is a no-op on an empty outbox, so the first boot costs nothing).
+        let link = state.read(cx).link_status();
+        self.drive_reconnect_ticker(&link, cx);
+        if link == ConnectionStatus::Ready && self.last_connection != ConnectionStatus::Ready {
+            self.composer
+                .update(cx, |composer, cx| composer.drain_queued_sends(cx));
+        }
+        self.last_connection = link;
+    }
+
+    /// Is an automatic retry still due? `Reconnecting` whose deadline has
+    /// passed is a chain waiting on the engine's own frame — there is nothing
+    /// left to count down to, so the ticker must not ride it.
+    fn reconnect_countdown_live(&self, cx: &App) -> bool {
+        let state = self.state.read(cx);
+        match state.link_status() {
+            ConnectionStatus::Reconnecting { .. } => {
+                state.reconnect_deadline.is_some_and(|due| due > Utc::now())
+            }
+            _ => false,
+        }
+    }
+
+    /// Arm/disarm the countdown ticker. It exists only to make the banner's
+    /// "retrying in …" move between engine frames; the moment the link leaves
+    /// `Reconnecting` (or its deadline passes) the task is dropped, so a
+    /// healthy app never polls.
+    fn drive_reconnect_ticker(&mut self, link: &ConnectionStatus, cx: &mut Context<Self>) {
+        let pending = matches!(link, ConnectionStatus::Reconnecting { .. })
+            && self.reconnect_countdown_live(cx);
+        match (pending, self.reconnect_ticker.is_some()) {
+            (true, false) => {
+                self.reconnect_ticker = Some(cx.spawn(async move |this, cx| {
+                    loop {
+                        cx.background_executor().timer(RECONNECT_TICK).await;
+                        let alive = this.update(cx, |shell: &mut Shell, cx| {
+                            if !shell.reconnect_countdown_live(cx) {
+                                return false;
+                            }
+                            cx.notify();
+                            true
+                        });
+                        if !alive.unwrap_or(false) {
+                            break;
+                        }
+                    }
+                }));
+            }
+            (false, true) => {
+                self.reconnect_ticker = None;
+            }
+            _ => {}
         }
     }
 
@@ -1936,7 +2071,10 @@ impl Shell {
                     .find(|(k, _, _)| k == tab)
                     .map(|(_, title, _)| (*surface, title.clone(), false, None)),
                 RightSurface::Picker => None,
-                RightSurface::Subagent(_) => None,
+                RightSurface::Subagent(id) => self
+                    .subagent_tabs
+                    .get(id)
+                    .map(|panel| (*surface, panel.read(cx).tab_title(), false, None)),
             })
             .collect()
     }
@@ -2020,7 +2158,12 @@ impl Shell {
                     changes.update(cx, |changes, cx| changes.ensure_content(cx));
                 }
             }
-            RightSurface::Subagent(_) | RightSurface::Picker => {}
+            RightSurface::Subagent(id) => {
+                if let Some(panel) = self.subagent_tabs.get(&id).cloned() {
+                    panel.update(cx, |panel, cx| panel.ensure_started(cx));
+                }
+            }
+            RightSurface::Picker => {}
         }
         cx.notify();
     }
@@ -2363,7 +2506,13 @@ impl Shell {
                 let panel = self.right_terminal_panel(cx);
                 panel.update(cx, |panel, cx| panel.close_tab_by_key(tab, window, cx));
             }
-            RightSurface::Subagent(_) | RightSurface::Picker => {}
+            RightSurface::Subagent(id) => {
+                // Dropping the entity ends its subscription tasks: a tab that
+                // is closed is a feed nobody is watching.
+                self.subagent_tabs.remove(&id);
+                self.subagent_subs.remove(&id);
+            }
+            RightSurface::Picker => {}
         }
         self.panels.update(&key, |p| {
             if p.right_active == surface {
@@ -2437,6 +2586,47 @@ impl Shell {
             .or_default()
             .push(RightSurface::Diff(id));
         self.set_right_active(RightSurface::Diff(id), cx);
+    }
+
+    /// A spawn chip's badge click: the child's transcript opens as its own
+    /// read-only tab, over the host's run journal (`WatchSubagent`).
+    fn add_subagent_surface(&mut self, open: SubagentOpen, cx: &mut Context<Self>) {
+        // One tab per feed: clicking the same chip again — or a chip whose
+        // child was already opened — focuses the tab it opened rather than
+        // starting a second subscription to the same journal feed.
+        let id = match self
+            .subagent_tabs
+            .iter()
+            .find(|(_, panel)| panel.read(cx).open() == &open)
+            .map(|(id, _)| *id)
+        {
+            Some(id) => id,
+            None => {
+                self.subagent_seq += 1;
+                let id = self.subagent_seq;
+                let panel = cx.new(|_| SubagentPanel::new(self.state.clone(), open));
+                let sub = cx.subscribe(&panel, |this: &mut Self, _, event, cx| match event {
+                    SubagentEvent::OpenNested(nested) => {
+                        this.add_subagent_surface((**nested).clone(), cx);
+                    }
+                });
+                self.subagent_tabs.insert(id, panel);
+                self.subagent_subs.insert(id, sub);
+                id
+            }
+        };
+        let surface = RightSurface::Subagent(id);
+        let key = self.panel_key(cx);
+        push_unique_right_surface(self.right_tabs.entry(key.clone()).or_default(), surface);
+        // A chip is clicked from the conversation, where the pane may well be
+        // closed — opening a tab the user cannot see would read as the click
+        // doing nothing.
+        if !self.right_pane_open(cx) {
+            let from = self.right_target(cx);
+            self.panels.update(&key, |p| p.changes_open = true);
+            self.right_tween = Some(WidthTween::new(from, self.right_target(cx)));
+        }
+        self.set_right_active(surface, cx);
     }
 
     /// The picker's Terminal card / the `+` menu's Terminal row: every click
@@ -3312,9 +3502,9 @@ impl Shell {
             )
         };
         if !ready {
-            if let ConnectionStatus::Failed(error) = &self.state.read(cx).connection {
+            if let ConnectionStatus::Failed { message, .. } = &self.state.read(cx).connection {
                 self.sync_flow = SyncFlow::RestartPending { notice_open: true };
-                self.runtime_change_error = Some(error.clone().into());
+                self.runtime_change_error = Some(message.clone().into());
                 cx.notify();
             }
             return;
@@ -4851,14 +5041,10 @@ impl Shell {
             self.render_user_menu(user_line.clone(), trigger_subline, menu_identity, theme, cx)
         };
         let user_menu = bottom_bar;
-        let pickers = self.composer.read(cx).pickers().clone();
-        let device_selector = pickers.update(cx, |pickers, cx| pickers.render_device_selector(cx));
 
-        // The device switcher sits above the filter and outside the scroll
-        // region: it says which machine everything below belongs to.
+        // Keep the project selector at the top and move the local workspace row
+        // down to the footer, as in the requested sidebar layout.
         let device_row = self.render_workspace_switcher(theme, cx);
-        // The space filter lives ABOVE the scroll region (fixed) so its
-        // dropdown can float without being clipped by the list's overflow.
         let filter_row = self.render_spaces_filter(theme, cx);
 
         div()
@@ -4868,7 +5054,6 @@ impl Shell {
             .flex_col()
             // (No titlebar strip: the unified window titlebar spans the whole
             // window above this column.)
-            .child(device_row)
             .child(filter_row)
             // The (filtered) Sessions list scrolls inside an EdgeFade scope —
             // a true per-glyph gradient at active overflow edges. Glass-safe
@@ -4940,7 +5125,7 @@ impl Shell {
                     .px(px(Theme::SPACE_SM))
                     .pb(px(Theme::SPACE_XS))
                     .flex_none()
-                    .child(device_selector),
+                    .child(device_row),
             )
             .child(div().p(px(Theme::SPACE_SM)).flex_none().child(user_menu))
             .into_any_element()
@@ -5396,6 +5581,64 @@ impl Shell {
                 .cursor_pointer()
                 .hover(move |s| s.bg(chip_bg_hover))
                 .on_click(cx.listener(move |this, _, _, cx| this.on_update_strip_click(cx)));
+        }
+        Some(strip.into_any_element())
+    }
+
+    /// Reconnect banner (transparency plan Task 10): a thin in-flow strip above
+    /// the workspace while the link is `Reconnecting` or `Degraded`. It never
+    /// hides or replaces the frame — the transcript and composer stay exactly
+    /// where they are, the strip just takes its own row — because a lost link
+    /// that blanks the screen is indistinguishable from a crashed app.
+    /// `link_status()` (not `connection`) is what it speaks, so a paired
+    /// environment that went offline reads the same way with no second path.
+    fn render_reconnect_banner(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let theme = Theme::of(cx).clone();
+        let (status, deadline) = {
+            let state = self.state.read(cx);
+            (state.link_status(), state.reconnect_deadline)
+        };
+        let reconnecting = matches!(status, ConnectionStatus::Reconnecting { .. });
+        let (label, show_retry) = reconnect_banner(&status, Utc::now(), deadline)?;
+        let tone = if reconnecting {
+            theme.text_muted
+        } else {
+            theme.warning
+        };
+        let mut strip = div()
+            .id("reconnect-banner")
+            .flex_none()
+            .w_full()
+            .px(px(Theme::SPACE_MD))
+            .py(px(4.0))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(Theme::SPACE_SM))
+            .bg(tone.opacity(0.08))
+            .border_b_1()
+            .border_color(tone.opacity(0.20))
+            .text_size(px(11.0))
+            .text_color(tone)
+            .child(div().flex_1().min_w_0().child(SharedString::from(label)));
+        if show_retry {
+            // Manual retry: `AppState::bootstrap` zeroes the attempt counter and
+            // the deadline, so this skips the rest of the backoff chain.
+            strip = strip.child(
+                div()
+                    .id("reconnect-retry-now")
+                    .flex_none()
+                    .px(px(8.0))
+                    .py(px(2.0))
+                    .rounded(px(6.0))
+                    .border_1()
+                    .border_color(theme.border)
+                    .text_color(theme.text)
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme.glass_hover()))
+                    .on_click(cx.listener(|this, _, _, cx| this.retry_engine(cx)))
+                    .child(SharedString::from("Retry now")),
+            );
         }
         Some(strip.into_any_element())
     }
@@ -6725,7 +6968,8 @@ impl Shell {
                     )
                     .when(has_selection, |el| el.child(status))
                     .when(has_spaces && has_selection, |el| {
-                        el.child(self.composer.clone())
+                        el.when_some(self.render_plan_card(cx), |el, card| el.child(card))
+                            .child(self.composer.clone())
                     })
                     .child(self.render_terminal_container(cx))
             })
@@ -6894,6 +7138,116 @@ impl Shell {
             .into_any_element()
     }
 
+    /// The selected chat's current plan, above the composer. Visible while
+    /// work remains or the run is still live: once every task is done and the
+    /// run has settled, the transcript chips keep the record and the card
+    /// leaves the chrome. Width matches the composer column so the two read as
+    /// one stack; nothing here takes focus or blocks typing.
+    fn render_plan_card(&self, cx: &App) -> Option<AnyElement> {
+        let state = self.state.read(cx);
+        let chat_id = state.selected_chat.as_deref()?;
+        let plan = state.active_plan.as_deref()?;
+        let total = plan.len();
+        let done = plan.iter().filter(|item| item.done).count();
+        let run_live = matches!(
+            state.indicator_for(chat_id, Utc::now()),
+            Indicator::Working | Indicator::AwaitingInput
+        );
+        let (rows, hidden) = plan_card_layout(total, done, run_live)?;
+        let theme = Theme::of(cx).clone();
+        Some(
+            div()
+                .w_full()
+                .max_w(px(768.0))
+                .mx_auto()
+                .px(px(Theme::SPACE_LG))
+                .pb(px(Theme::SPACE_SM))
+                .child(
+                    div()
+                        .id("active-plan")
+                        .w_full()
+                        .rounded(px(Theme::CONTROL_RADIUS))
+                        .border_1()
+                        .border_color(theme.border)
+                        .bg(theme.surface_raised)
+                        .px(px(Theme::SPACE_MD))
+                        .py(px(Theme::SPACE_SM))
+                        .flex()
+                        .flex_col()
+                        .gap(px(4.0))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(6.0))
+                                        .child(
+                                            icon(icons::CHECKLIST)
+                                                .size(px(13.0))
+                                                .text_color(theme.text_muted),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_size(px(12.0))
+                                                .font_weight(gpui::FontWeight::MEDIUM)
+                                                .text_color(theme.text)
+                                                .child("Plan"),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(11.0))
+                                        .text_color(theme.text_muted)
+                                        .child(SharedString::from(format!("{done}/{total}"))),
+                                ),
+                        )
+                        .children(plan.iter().take(rows).map(|item| {
+                            div()
+                                .flex()
+                                .items_start()
+                                .gap(px(6.0))
+                                .text_size(px(12.0))
+                                .child(
+                                    div()
+                                        .w(px(14.0))
+                                        .flex_none()
+                                        .text_color(if item.done {
+                                            theme.success
+                                        } else {
+                                            theme.text_faint
+                                        })
+                                        .child(if item.done { "✓" } else { "○" }),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .text_color(if item.done {
+                                            theme.text_muted.opacity(0.7)
+                                        } else {
+                                            theme.text
+                                        })
+                                        .child(SharedString::from(item.text.clone())),
+                                )
+                        }))
+                        .when(hidden > 0, |el| {
+                            el.child(
+                                div()
+                                    .pl(px(20.0))
+                                    .text_size(px(11.0))
+                                    .text_color(theme.text_faint)
+                                    .child(SharedString::from(format!("+{hidden} more"))),
+                            )
+                        }),
+                )
+                .into_any_element(),
+        )
+    }
+
     /// Working indicator strip: gradient spinner + rotating flavour word (7s,
     /// seeded per chat) + elapsed, staleness-gated via [`Indicator`]; falls back
     /// to a "Sending…" bridge and then the engine mode line.
@@ -7039,6 +7393,16 @@ impl Shell {
                     // the resolved surface (fallbacks can move it).
                     panel.update(cx, |panel, cx| panel.select_tab_by_key(tab, cx));
                     panel.into_any_element()
+                }
+                RightSurface::Subagent(id) => {
+                    if let Some(panel) = self.subagent_tabs.get(&id).cloned() {
+                        // Idempotent, like the diff surface: a persisted-open
+                        // pane on boot starts watching here, not at tab open.
+                        panel.update(cx, |panel, cx| panel.ensure_started(cx));
+                        panel.into_any_element()
+                    } else {
+                        self.render_surface_picker(cx)
+                    }
                 }
                 _ => self.render_surface_picker(cx),
             };
@@ -7727,33 +8091,55 @@ impl Shell {
         let content: AnyElement = match phase {
             // Backend unreachable: quiet centered copy (komet Gate `Failed`),
             // plus a Retry affordance (the native engine doesn't self-redial).
-            GatePhase::Failed(error) => div()
-                .flex()
-                .flex_col()
-                .items_center()
-                .gap(px(Theme::SPACE_MD))
-                .child(
-                    div()
-                        .text_size(px(14.0))
-                        .text_color(theme.text_muted)
-                        .child(SharedString::from(error.clone())),
-                )
-                .child(
-                    div()
-                        .id("retry-engine")
-                        .px(px(12.0))
-                        .py(px(6.0))
-                        .rounded(px(8.0))
-                        .border_1()
-                        .border_color(theme.border)
-                        .text_size(px(13.0))
-                        .text_color(theme.text)
+            GatePhase::Failed(error) => {
+                // ... but only when a redial can actually happen: `retryable:
+                // false` is the end of the chain (nothing to re-run), and a
+                // button that promises a connection it cannot make is the exact
+                // silence this plan set out to remove.
+                let retryable = match self.state.read(cx).connection {
+                    ConnectionStatus::Failed { retryable, .. } => retryable,
+                    // `KOMET_FORCE_GATE=failed` draws this card over a live
+                    // connection for styling passes — Retry is honest there.
+                    _ => true,
+                };
+                let mut action = div()
+                    .id("retry-engine")
+                    .px(px(12.0))
+                    .py(px(6.0))
+                    .rounded(px(8.0))
+                    .border_1()
+                    .border_color(theme.border)
+                    .text_size(px(13.0))
+                    .text_color(if retryable {
+                        theme.text
+                    } else {
+                        theme.text_muted
+                    })
+                    .child(SharedString::from(if retryable {
+                        "Retry"
+                    } else {
+                        "Engine unreachable"
+                    }));
+                if retryable {
+                    action = action
                         .cursor_pointer()
                         .hover(|s| s.bg(theme.glass_hover()))
-                        .on_click(cx.listener(|this, _, _, cx| this.retry_engine(cx)))
-                        .child(SharedString::from("Retry")),
-                )
-                .into_any_element(),
+                        .on_click(cx.listener(|this, _, _, cx| this.retry_engine(cx)));
+                }
+                div()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap(px(Theme::SPACE_MD))
+                    .child(
+                        div()
+                            .text_size(px(14.0))
+                            .text_color(theme.text_muted)
+                            .child(SharedString::from(error.clone())),
+                    )
+                    .child(action)
+                    .into_any_element()
+            }
             // Login card (komet App.tsx Gate): centered card on the grid —
             // logo, "Log in to Komet", copy, full-width white Log in button.
             _ => div()
@@ -8065,6 +8451,24 @@ impl Shell {
             )
             .into_any_element()
     }
+}
+
+/// Row ceiling for the plan card above the composer: the card must stay a
+/// glance, not a second transcript.
+const PLAN_CARD_MAX_ROWS: usize = 6;
+
+/// The plan card's two rules, decided apart from rendering. Visibility: open
+/// work always shows the card, and a fully-done plan leaves once the run
+/// settles (the transcript chips keep the record) — a run still going keeps the
+/// card up so the last tick is never a flicker. Cap: rows past
+/// [`PLAN_CARD_MAX_ROWS`] are counted so the card can announce `+N` instead of
+/// silently cutting the list (transparency invariant I9).
+fn plan_card_layout(total: usize, done: usize, run_live: bool) -> Option<(usize, usize)> {
+    if total == 0 || (done == total && !run_live) {
+        return None;
+    }
+    let rows = total.min(PLAN_CARD_MAX_ROWS);
+    Some((rows, total - rows))
 }
 
 /// The sign-in gate's faint grid backdrop (komet styles.css `.bg-grid`):
@@ -8566,6 +8970,18 @@ impl Render for Shell {
                 composer.update(cx, |composer, cx| {
                     composer.resubmit_last(cx);
                 });
+            }))
+            // The Context popover's « See in thread »: the popover is about the
+            // gauge, the marker is about the history — dismiss, then land on it.
+            .on_action(cx.listener(|this, _: &RevealLastCompaction, _, cx| {
+                let composer = this.composer.clone();
+                composer.update(cx, |composer, cx| {
+                    let pickers = composer.pickers().clone();
+                    pickers.update(cx, |pickers, cx| pickers.close(cx));
+                });
+                this.transcript.update(cx, |transcript, cx| {
+                    transcript.reveal_last_compaction(cx);
+                });
             }));
         let root = if let Some(path) = wallpaper::path(cx).filter(|path| path.is_file()) {
             root.child(
@@ -8663,7 +9079,7 @@ impl Render for Shell {
                 let border_color = Theme::of(cx).border;
                 // The workspace is one inset surface: the transcript and any
                 // open side panel share its rounded boundary.
-                let card: AnyElement = div()
+                let workspace: AnyElement = div()
                     .flex_1()
                     .min_w_0()
                     .mt(px(8.0))
@@ -8680,6 +9096,20 @@ impl Render for Shell {
                     .child(main)
                     .child(right)
                     .into_any_element();
+                // The banner is a row ABOVE the workspace, not an overlay on it:
+                // the frame keeps painting and nothing has to be restored when
+                // the link comes back.
+                let card: AnyElement = match self.render_reconnect_banner(cx) {
+                    Some(banner) => div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .child(banner)
+                        .child(workspace)
+                        .into_any_element(),
+                    None => workspace,
+                };
                 // The whole app page is one keyed `animate-in` entrance (komet
                 // App.tsx `<div key={phase} className="animate-in h-full">`):
                 // arriving from the splash or any gate fades the page in; the
@@ -8845,6 +9275,45 @@ impl Render for Shell {
 mod tests {
     use super::*;
 
+    #[test]
+    fn connection_banner_names_the_attempt_and_the_countdown() {
+        let now = Utc::now();
+        let status = ConnectionStatus::Reconnecting {
+            attempt: 2,
+            retry_in_ms: 5_000,
+            reason: "socket closed".into(),
+        };
+        // The frame's `retry_in_ms` says 5 s but the deadline is 1.2 s out: the
+        // countdown follows the clock, never the snapshot it was scheduled with.
+        let due = now + chrono::Duration::milliseconds(1_200);
+        let (label, retry) = reconnect_banner(&status, now, Some(due)).expect("reconnecting");
+        assert!(retry, "{label}");
+        assert!(label.contains("Reconnecting"), "{label}");
+        assert!(label.contains(&format!("2/{RECONNECT_MAX_ATTEMPTS}")), "{label}");
+        assert!(label.contains(&format_ms(1_200)), "{label}");
+        assert!(!label.contains(&format_ms(5_000)), "{label}");
+        assert!(label.contains("socket closed"), "{label}");
+        // An overdue deadline reads as 0 — a negative wait is a lie about a
+        // retry that is already running.
+        let late = now - chrono::Duration::milliseconds(400);
+        let (label, _) = reconnect_banner(&status, now, Some(late)).expect("reconnecting");
+        assert!(label.contains(&format_ms(0)), "{label}");
+        // Degraded: the reason as a warning, no countdown (nothing is queued).
+        let (label, retry) = reconnect_banner(
+            &ConnectionStatus::Degraded {
+                reason: "no output".into(),
+            },
+            now,
+            None,
+        )
+        .expect("degraded");
+        assert_eq!(label, "no output");
+        assert!(!retry);
+        assert!(!label.contains("retrying in"), "{label}");
+        // Ready draws nothing at all.
+        assert_eq!(reconnect_banner(&ConnectionStatus::Ready, now, None), None);
+    }
+
     fn update_status(version: &str, available: bool) -> komet_update::UpdateStatus {
         komet_update::UpdateStatus {
             current_version: "1.0.0".into(),
@@ -8872,6 +9341,45 @@ mod tests {
         assert_eq!(
             newly_detected_update(Some("1.1.0"), &newer).as_deref(),
             Some("1.2.0")
+        );
+    }
+
+    #[test]
+    fn persistent_plan_card_shows_unfinished_work() {
+        // One open task is enough: the card stays above the composer however
+        // long the transcript gets, because it is derived from the doc, not
+        // from what happens to be on screen.
+        assert_eq!(plan_card_layout(1, 0, true), Some((1, 0)));
+        assert_eq!(
+            plan_card_layout(1, 0, false),
+            Some((1, 0)),
+            "unfinished work keeps the card even after the run settles"
+        );
+        // Past the display cap the extra tasks are announced, never silently cut.
+        assert_eq!(plan_card_layout(9, 2, true), Some((6, 3)));
+        assert_eq!(
+            plan_card_layout(PLAN_CARD_MAX_ROWS, 0, true),
+            Some((6, 0)),
+            "exactly at the cap there is nothing to announce"
+        );
+    }
+
+    #[test]
+    fn persistent_plan_card_leaves_when_the_plan_is_done() {
+        assert_eq!(
+            plan_card_layout(3, 3, false),
+            None,
+            "everything done and the run settled: the chips carry the record"
+        );
+        assert_eq!(
+            plan_card_layout(3, 3, true),
+            Some((3, 0)),
+            "a live run keeps the last plan on screen — no flicker at the tail"
+        );
+        assert_eq!(
+            plan_card_layout(0, 0, true),
+            None,
+            "an empty plan never renders a card"
         );
     }
 

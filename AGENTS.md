@@ -44,9 +44,11 @@ the crate table in `ARCHITECTURE.md` §3 is authoritative.
 
 - `scripts/e2e-smoke.sh` is stale: it still starts the `edge/` Cloudflare Worker via `wrangler`,
   and `edge/` was removed (commit `bc3f8ab`). It will not run as-is — use `scripts/dev-demo.sh`.
-- A new agent harness must declare its sandbox branch in the `ARCHITECTURE.md` §6 matrix and add a
-  surface-declaration test (pattern: `cline_descriptor_surface_matches_registry_expectations` in
-  `crates/harness/tests/acp.rs`); a silent no-op must not ship.
+- A new agent harness must declare its sandbox branch in the `ARCHITECTURE.md` §6 matrix **and** its
+  interaction-surface row in `crates/harness/src/capabilities.rs` (golden-tested by
+  `crates/harness/tests/surfaces.rs`; sandbox test pattern:
+  `cline_descriptor_surface_matches_registry_expectations` in `crates/harness/tests/acp.rs`), plus a
+  fixture per signal family it claims. A silent no-op must not ship.
 - komet sandbox settings constrain the *agent CLI's* own permissions, not an OS boundary — see
   `docs/security.md` before touching sandbox/permission code.
 - Do not run the release packaging scripts for verification; CI (`.github/workflows/release.yml`)

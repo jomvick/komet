@@ -6,8 +6,8 @@
 //! reasoning), natively tailored to the active CLI engine.
 
 use gpui::{
-    AnyElement, IntoElement, ParentElement, PathBuilder, SharedString, Styled, canvas, div, hsla,
-    point, prelude::FluentBuilder, px,
+    AnyElement, App, IntoElement, ParentElement, PathBuilder, SharedString, Styled, Window, canvas,
+    div, hsla, point, prelude::*, px,
 };
 use komet_proto::{ContextUsageSource, ContextUsageStats, HarnessId, format_tokens};
 
@@ -149,6 +149,16 @@ impl HarnessContextProfile {
                 caching_type: None,
                 default_compaction_rule: "Turn boundary prune",
             },
+            Some(HarnessId::Qoder) => Self {
+                display_name: "Qoder",
+                protocol_badge: "ACP",
+                brand_icon: crate::icons::QODER_MARK,
+                brand_color: hsla(154.0 / 360.0, 0.62, 0.48, 1.0),
+                telemetry_title: "Qoder CLI Telemetry",
+                telemetry_description: "Qoder's native ACP runtime: model, mode and tool execution telemetry.",
+                caching_type: None,
+                default_compaction_rule: "Turn boundary prune",
+            },
             Some(HarnessId::Cline) => Self {
                 display_name: "Cline",
                 protocol_badge: "Native ACP",
@@ -253,6 +263,7 @@ pub fn render_context_ring(
     harness: Option<HarnessId>,
     theme: &Theme,
 ) -> AnyElement {
+    let _child = crate::perf::child_frame(crate::perf::ChildView::ContextUsage);
     let ratio = stats.context_ratio();
     let percent = stats.context_percent();
     let show_percent = stats.used() > 0;
@@ -325,6 +336,7 @@ pub fn render_context_ring(
 /// stability.
 pub fn render_context_popover(
     stats: &ContextUsageStats,
+    thread: &crate::state::ThreadCompactions,
     _harness: Option<HarnessId>,
     _model_name: Option<&str>,
     theme: &Theme,
@@ -342,7 +354,16 @@ pub fn render_context_popover(
 
     let has_breakdown =
         total_used > 0 || stats.cached_input_tokens > 0 || stats.reasoning_tokens > 0;
-    let has_compactions = stats.compactions_count > 0 || stats.compactions_reason.is_some();
+    // The counter and the latest reason are the same fact the timeline draws,
+    // seen twice: only some harnesses report the native numbers, and the doc
+    // is never silent once a boundary landed. Reading both keeps the popover
+    // from contradicting the rows below it.
+    let compaction_count = stats.compactions_count.max(thread.count as u32);
+    let compaction_reason = stats
+        .compactions_reason
+        .clone()
+        .or_else(|| thread.last_trigger.clone());
+    let has_compactions = compaction_count > 0 || thread.in_progress || compaction_reason.is_some();
 
     let header = div()
         .flex()
@@ -435,24 +456,42 @@ pub fn render_context_popover(
     }
 
     if has_compactions {
-        let reason = stats
-            .compactions_reason
-            .clone()
-            .unwrap_or_else(|| "cache expiry".to_string());
-        root = root.child(popover::menu_separator()).child(
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(2.0))
-                .px(px(8.0))
-                .pb(px(6.0))
-                .child(section_header(
-                    "Compactions",
-                    stats.compactions_count.to_string(),
-                    theme,
-                ))
-                .child(plain_row("Latest", reason, theme)),
-        );
+        let count = if thread.in_progress {
+            format!("{compaction_count} · in progress")
+        } else {
+            compaction_count.to_string()
+        };
+        let mut section = div()
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .px(px(8.0))
+            .pb(px(6.0))
+            .child(section_header("Compactions", count, theme));
+        // The reason only ever comes from a real report — the agent's stats
+        // frame or the boundary itself — never a default.
+        if let Some(reason) = compaction_reason {
+            section = section.child(plain_row("Latest", reason, theme));
+        }
+        // The gauge and the marker are two views of one event; the link is how
+        // the user finds the thread's own account of it.
+        if compaction_count > 0 || thread.in_progress {
+            section = section.child(
+                div()
+                    .id("context-see-compaction")
+                    .cursor_pointer()
+                    .pt(px(2.0))
+                    .text_size(px(11.0))
+                    .text_color(theme.text_faint)
+                    .hover(|s| s.text_color(theme.text_muted))
+                    .on_click(move |_, window: &mut Window, cx: &mut App| {
+                        window
+                            .dispatch_action(Box::new(crate::transcript::RevealLastCompaction), cx);
+                    })
+                    .child("See in thread"),
+            );
+        }
+        root = root.child(popover::menu_separator()).child(section);
     }
 
     root.child(

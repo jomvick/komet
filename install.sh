@@ -8,9 +8,10 @@
 # .desktop entry + icon into ~/.local/share.
 #
 # On another machine (a VM, a VPS) that should become a Komet *environment* —
-# no UI, just the sync server plus the engine that runs its sessions — add
-# --serve. It installs, registers `komet serve` as the user service so it
-# survives logout and reboot, and prints the pairing link to paste in
+# no window, just the sync server plus the engine that runs its sessions — add
+# --serve. It installs, registers `komet serve` as the user service (run
+# `loginctl enable-linger $USER` on a VPS so it also survives logout), and
+# prints the pairing link to paste in
 # Komet → Settings → Sync → Add device:
 #
 #   sh install.sh --serve --lan
@@ -320,10 +321,10 @@ fi
 
 # --- become an environment ----------------------------------------------------
 # `komet serve --install-service` writes the pairing link, registers the sync
-# server + engine as the user service (so it survives logout and reboot) and
-# starts it. serve.json holds the token, so the unit needs no environment
-# variable. Komet here runs without a UI by design: this machine is the device
-# other devices pair to.
+# server + engine as the user service (started at boot; use `loginctl
+# enable-linger` on a VPS so it also survives logout) and starts it. serve.json
+# holds the token, so the unit needs no environment variable. Komet here runs
+# without a window by design: this machine is the device other devices pair to.
 set -- serve --install-service
 if [ -n "$PUBLIC_URL" ]; then
   set -- "$@" --public-url "$PUBLIC_URL"

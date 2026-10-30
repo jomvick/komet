@@ -252,6 +252,10 @@ impl EngineCore {
             }
         }
         let journal = Arc::new(RunJournal::open(profile.store_root().join("journals"))?);
+        // The workspace needs a handle too: a chat's journal (its transcript and
+        // its auto-resume budget) dies with the chat row, wherever the delete
+        // comes from — RPC, space cascade, or the orphan sweep.
+        let workspace_journal = journal.clone();
         let mcp_registry = Arc::new(crate::mcp::McpRegistry::load(data_dir).unwrap_or_else(|e| {
             tracing::warn!(error = %e, "mcp registry load failed, starting empty");
             crate::mcp::McpRegistry::empty(data_dir)
@@ -281,6 +285,7 @@ impl EngineCore {
         let store_for_import = store.clone();
         let doc_host = runtime.doc_host;
         let workspace = runtime.workspace;
+        workspace.attach_journal(workspace_journal);
         doc_host.set_sessions(sessions.clone());
         sessions.set_doc_host(doc_host.clone());
         match sessions.recover_stale() {

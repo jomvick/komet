@@ -35,6 +35,24 @@ pub struct RailTick {
     pub message_id: String,
     pub prompt: String,
     pub reply: Option<String>,
+    /// Subagent spawns in this prompt's section. A turn that delegated is not
+    /// the same turn: the work happened somewhere the prompt's own reply does
+    /// not show, so the outline marks it rather than let a spawned run read as
+    /// an ordinary answer.
+    pub subagents: usize,
+}
+
+/// Count the spawn chips in one section's entries — the same genus gate the
+/// transcript's chips use, so an ordinary Run/Read never marks a tick.
+fn count_subagents(entries: &[SessionMessageEntry]) -> usize {
+    entries
+        .iter()
+        .filter(|entry| {
+            entry.parts.iter().any(
+                |part| matches!(part, MessagePart::Tool { call, .. } if call.is_subagent_spawn()),
+            )
+        })
+        .count()
 }
 
 fn user_text(entry: &SessionMessageEntry) -> String {
@@ -80,10 +98,17 @@ pub fn rail_ticks(
         if entry.role != MessageRole::User {
             continue;
         }
+        // The tick's own section: this prompt up to the next one. A later
+        // turn's spawns are not this turn's delegation.
+        let end = entries[ix + 1..]
+            .iter()
+            .position(|e| e.role == MessageRole::User)
+            .map_or(entries.len(), |offset| ix + 1 + offset);
         ticks.push(RailTick {
             message_id: entry.id.clone(),
             prompt: user_text(entry),
             reply: first_reply_text(&entries[ix + 1..]),
+            subagents: count_subagents(&entries[ix + 1..end]),
         });
     }
     for echo in echoes {
@@ -92,6 +117,7 @@ pub fn rail_ticks(
                 message_id: echo.id.clone(),
                 prompt: user_text(echo),
                 reply: None,
+                subagents: 0,
             });
         }
     }
@@ -157,6 +183,14 @@ pub fn tick_buckets(n: usize, capacity: usize) -> Vec<(usize, usize)> {
 /// The bucket containing tick `ix` (for active/hover mapping).
 pub fn bucket_of(buckets: &[(usize, usize)], ix: usize) -> Option<usize> {
     buckets.iter().position(|&(s, e)| ix >= s && ix < e)
+}
+
+/// The rail preview's delegation line: how many subagents this turn ran.
+fn format_subagent_count(count: usize) -> String {
+    format!(
+        "{count} {}",
+        if count == 1 { "subagent" } else { "subagents" }
+    )
 }
 
 /// Char-cap a preview with an ellipsis. Whitespace runs (including newlines —
@@ -432,6 +466,7 @@ impl Transcript {
         if pairs.len() < 2 {
             return gpui::Empty.into_any_element();
         }
+        let _child = crate::perf::child_frame(crate::perf::ChildView::Rail);
         let tick_rows: Vec<usize> = pairs.iter().map(|(_, row)| *row).collect();
         // Active detection reads from the READING line, not the raw clip top:
         // the titlebar overlays the list, so a row whose top sits within that
@@ -531,6 +566,18 @@ impl Transcript {
                                     .text_color(theme.text_muted.opacity(0.7))
                                     .child(SharedString::from(format!("{bucket_len} prompts"))),
                             )
+                        })
+                        // A delegated turn says so in the preview too: the mark
+                        // alone does not say whether it ran one child or three.
+                        .when(tick.subagents > 0, |el| {
+                            el.child(
+                                div()
+                                    .text_size(px(10.0))
+                                    .text_color(theme.text_muted)
+                                    .child(SharedString::from(format_subagent_count(
+                                        tick.subagents,
+                                    ))),
+                            )
                         });
                     // Mounted straight through deferred/anchored (not a popover
                     // mount helper), so the frost wrap happens here.
@@ -558,6 +605,18 @@ impl Transcript {
                             .rounded(px(1.0))
                             .bg(bar_color),
                     )
+                    // The delegation mark: a dot beside the bar, sized to stay
+                    // inside the 26px column even at the hovered bar width.
+                    .when(tick.subagents > 0, |el| {
+                        el.child(
+                            div()
+                                .size(px(3.0))
+                                .ml(px(2.0))
+                                .flex_none()
+                                .rounded_full()
+                                .bg(theme.text_muted),
+                        )
+                    })
                     .when_some(card, |el, card| {
                         el.child(gpui::deferred(
                             gpui::anchored()
@@ -589,6 +648,71 @@ mod tests {
             status: Some(MessageStatus::Complete),
             continuation_of: None,
         }
+    }
+
+    /// An assistant entry carrying one tool chip, folded through the doc's own
+    /// fold so the part shape is the real one.
+    fn tool_entry(id: &str, name: &str) -> SessionMessageEntry {
+        let mut parts = Vec::new();
+        komet_doc::fold_event_into_parts(
+            &mut parts,
+            &komet_proto::AgentEvent::ToolCall {
+                id: format!("{id}-tool"),
+                call: komet_proto::ToolCall::Unknown {
+                    name: name.into(),
+                    input: None,
+                },
+            },
+        );
+        SessionMessageEntry {
+            id: id.into(),
+            role: MessageRole::Assistant,
+            parts,
+            created_at: 0,
+            device_id: "d".into(),
+            status: Some(MessageStatus::Complete),
+            continuation_of: None,
+        }
+    }
+
+    /// A turn that delegated is marked in the outline: the child's work is not
+    /// in the reply preview, so a prompt answered by a subagent would otherwise
+    /// read as an ordinary answer. The mark counts the tick's OWN section — a
+    /// later prompt's spawn is not this prompt's delegation.
+    #[test]
+    fn ticks_mark_the_turn_that_spawned_a_subagent() {
+        let entries = vec![
+            entry("u1", MessageRole::User, "scan this"),
+            tool_entry("a1", "Agent: scan"),
+            entry("u2", MessageRole::User, "and now?"),
+            entry("a2", MessageRole::Assistant, "plain answer"),
+        ];
+        let ticks = rail_ticks(&entries, &[]);
+        assert_eq!(ticks.len(), 2);
+        assert_eq!(ticks[0].subagents, 1, "the spawn sits in u1's section");
+        assert_eq!(ticks[1].subagents, 0, "u2 ran nothing");
+        assert_eq!(
+            rail_ticks(&entries, &[entry("u3", MessageRole::User, "echo")])[2].subagents,
+            0,
+            "an echo has no content to mark"
+        );
+        assert_eq!(format_subagent_count(1), "1 subagent");
+        assert_eq!(format_subagent_count(2), "2 subagents");
+    }
+
+    /// The gate is the spawn genus, not "a tool ran": an ordinary chip must not
+    /// mark a tick, or every turn with a `Run` would look delegated.
+    #[test]
+    fn an_ordinary_tool_chip_never_marks_a_tick() {
+        let ticks = rail_ticks(
+            &[
+                entry("u1", MessageRole::User, "build it"),
+                tool_entry("a1", "Run"),
+                tool_entry("a2", "Read"),
+            ],
+            &[],
+        );
+        assert_eq!(ticks.first().map(|t| t.subagents), Some(0));
     }
 
     #[test]

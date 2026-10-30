@@ -290,6 +290,7 @@ fn npm_package(harness: HarnessId) -> Option<&'static str> {
         HarnessId::Pi => Some("@earendil-works/pi-coding-agent"),
         HarnessId::Copilot => Some("@github/copilot"),
         HarnessId::Cline => Some("cline"),
+        HarnessId::Qoder => Some("@qoder-ai/qodercli"),
         _ => None,
     }
 }
@@ -310,6 +311,9 @@ fn install_source(harness: HarnessId) -> Option<InstallSource> {
         HarnessId::Muse => InstallSource::ShellInstaller("https://dev.meta.ai/install.sh"),
         HarnessId::Copilot => InstallSource::Npm("@github/copilot"),
         HarnessId::Cline => InstallSource::Npm("cline"),
+        // The recommended install is Qoder's own script; the CLI's built-in
+        // updater works for both script and npm installs.
+        HarnessId::Qoder => InstallSource::SelfUpdate(&["update"]),
         HarnessId::Mock => return None,
     })
 }
@@ -345,6 +349,7 @@ fn executable(harness: HarnessId) -> &'static str {
         HarnessId::Muse => "muse",
         HarnessId::Copilot => "copilot",
         HarnessId::Cline => "cline",
+        HarnessId::Qoder => "qoder",
         HarnessId::Mock => "mock",
     }
 }
@@ -835,6 +840,10 @@ mod tests {
             install_source(HarnessId::Pi),
             Some(InstallSource::SelfUpdate(&["update", "--self"]))
         );
+        assert_eq!(
+            install_source(HarnessId::Qoder),
+            Some(InstallSource::SelfUpdate(&["update"]))
+        );
         // These have no self-updater, so npm stays the fallback.
         assert_eq!(
             install_source(HarnessId::Grok),
@@ -857,6 +866,7 @@ mod tests {
             HarnessId::Codex,
             HarnessId::Opencode,
             HarnessId::Pi,
+            HarnessId::Qoder,
         ] {
             assert!(matches!(
                 install_source(harness),

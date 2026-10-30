@@ -139,6 +139,33 @@
   adapters for present CLIs at boot. Handshake additionally bounded at 120s
   (a hung agent used to spin "Working" forever).
 
+## Compaction surface (transparency plan Task 3.4)
+`acp/normalize.rs` now maps the draft RFD updates — `compaction_update` (→
+`ContextCompaction` lifecycle: `compactionId`, status, trigger, tokens
+before/after, summary, error) and `compaction_summary_chunk` (→ `summary_delta`,
+no status invented for a lone chunk). An unmapped `sessionUpdate` kind is
+logged at debug and dropped; a `compaction_update` without an id is the same
+honest no-op. Mapping one normalizer means one fixture for all eight agents —
+but a mapping is not evidence, so the surface table keeps every ACP agent at
+`CompactionSurface::None` (Gate B: komet also never announces
+`clientCapabilities.session.compaction`) until each agent is probed live:
+
+| Agent | Launch | Pinned adapter | `compaction_update` observed? |
+| --- | --- | --- | --- |
+| Grok | `grok agent stdio` (`--always-approve` before the subcommand) | `@xai-official/grok@1.0.4` | not observed |
+| Pi | `pi-acp` (community adapter over pi RPC) | `pi-acp@0.0.33` | not observed |
+| OpenCode | `opencode acp` | none (native CLI) | not observed |
+| Cline | `cline --acp` | none (native CLI) | not observed |
+| Hermes | `hermes acp` | none (native CLI) | not observed |
+| Devin | `devin acp` | none (native CLI) | not observed |
+| Copilot | `copilot --acp` | none (native CLI) | not observed |
+| Qoder | `qoder --acp` | none (native CLI) | not observed |
+
+Promoting an agent to `Lifecycle`/`LifecycleWithSummary` requires recording,
+here: the installed binary version, the raw update (kinds and field spellings),
+and whether a summary chunk arrives. One agent's evidence never widens the
+others.
+
 ## Citations
 agentclientprotocol.com (v1 spec + schema), agentclientprotocol org repos
 (claude-agent-acp v0.66.0, codex-acp v1.1.14 — steering wire shape),

@@ -52,9 +52,34 @@ pub mod methods {
     /// Live reasoning stream (issue #31): text deltas of the in-progress
     /// turn, never persisted to the doc. Params `{chatId}`.
     pub const WATCH_REASONING: &str = "WatchReasoning";
+    /// Live activity stream of the in-progress turn, every frame tagged `kind`:
+    /// `toolProgress` (what the CLI prints while a command runs),
+    /// `subagentStatus` (one spawn feed's live tool count, the NAME of the tool
+    /// it is on and its elapsed time, read off the host's own counters — never
+    /// the child's tool arguments — emitted when a feed changes, not per delta),
+    /// and `compaction` (a boundary's progress, sizes only — never its recap).
+    /// Ephemeral by construction — never journaled, never folded, never replayed.
+    /// Params `{chatId}`.
+    pub const WATCH_ACTIVITY: &str = "WatchActivity";
     /// Per-tool request/response detail rebuilt from the run journal
     /// (issue #10, complement of #31). Params `{chatId, partId}`.
     pub const GET_TOOL_DETAIL: &str = "GetToolDetail";
+    /// One subagent's transcript, projected from the host's run journal — there
+    /// is no child doc, the journal is the only copy of a child's content.
+    /// Params `{chatId, parentToolUseId, afterSeq?}`. Replies as a stream of
+    /// `{seq, phase: "replay"|"live", event}` frames (subscribe-then-replay, so
+    /// `seq` dedupes the overlap), ending at the run's `Done`; or, when this
+    /// host never ran the chat, a single `{status: "unavailable", reason}` value
+    /// — never an empty transcript, which would read as "the subagent said
+    /// nothing".
+    pub const WATCH_SUBAGENT: &str = "WatchSubagent";
+    /// A compaction recap rebuilt from the host's run journal — the doc carries
+    /// only its size and whether one exists, so a summary line that opens needs
+    /// this fetch. Params `{chatId, compactionId}`. Answer is `ok` with `text`,
+    /// or `unavailable` with a reason (the journal is host-local: a device
+    /// without it has nothing to offer, and an empty string would read as "the
+    /// agent summarized nothing").
+    pub const GET_COMPACTION_SUMMARY: &str = "GetCompactionSummary";
     /// Nudge every open room client to verify liveness NOW (window focus,
     /// app foregrounded). No params; IPC-only. Each room ignores the hint
     /// unless it has been broadcast-quiet ≥30s, so this is cheap to spam.

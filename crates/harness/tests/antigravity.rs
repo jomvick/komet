@@ -55,7 +55,7 @@ fn controls() -> (RunControls, mpsc::Sender<SteerMessage>, CancellationToken) {
     let (steer_tx, steer_rx) = mpsc::channel(8);
     let token = CancellationToken::new();
     let controls = RunControls {
-        request_input: Box::new(move |_| {
+        request_input: Box::new(move |_, _| {
             let (tx, rx) = oneshot::channel();
             let _ = tx.send(Vec::new());
             rx
@@ -119,6 +119,64 @@ async fn happy_path_streams_deltas_and_completes() {
             ..
         }
     )));
+}
+
+/// `agy -p` is a one-shot NDJSON stream: an in-run `ask_question` can never be
+/// answered back into it. The harness must not put an unanswerable panel on
+/// screen (the old bridge did, then dropped the awaiting receiver); it surfaces
+/// a visible notice and keeps the capability table honest.
+#[tokio::test]
+async fn ask_question_is_a_visible_notice_not_an_unanswerable_panel() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let h = harness();
+    let asked = Arc::new(AtomicUsize::new(0));
+    let asked_in = asked.clone();
+    let (steer_tx, steer_rx) = mpsc::channel(8);
+    let token = CancellationToken::new();
+    let controls = RunControls {
+        request_input: Box::new(move |_, _| {
+            asked_in.fetch_add(1, Ordering::SeqCst);
+            let (tx, rx) = oneshot::channel();
+            let _ = tx.send(Vec::new());
+            rx
+        }),
+        request_permission: RunControls::noop_permission(),
+        steering: steer_rx,
+        interrupt: token.clone(),
+        env: Vec::new(),
+    };
+    let events = collect_events(&h, request("scenario:ask_question"), controls).await;
+
+    assert_eq!(
+        asked.load(Ordering::SeqCst),
+        0,
+        "no answer channel exists, so no question panel may be opened"
+    );
+    let notice = events
+        .iter()
+        .find_map(|e| match e {
+            AgentEvent::Error { message, .. } => Some(message.clone()),
+            _ => None,
+        })
+        .expect("the unanswerable question must surface as a notice");
+    assert!(notice.contains("Which database should I use?"), "{notice}");
+    assert!(notice.contains("one-shot"), "{notice}");
+    // The tool itself is still visible, and the turn completes.
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::ToolCall { .. }))
+    );
+    assert!(events.iter().any(|e| matches!(
+        e,
+        AgentEvent::Done {
+            status: DoneStatus::Completed,
+            ..
+        }
+    )));
+    let _ = steer_tx;
 }
 
 #[tokio::test]

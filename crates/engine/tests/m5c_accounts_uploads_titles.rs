@@ -494,11 +494,47 @@ async fn uploads_chunk_commit_readback_and_jail() {
         .read_chunk(&outside.to_string_lossy(), 0, &[tmp.path().to_path_buf()])
         .expect("cwd-rooted read");
     assert_eq!(BASE64.decode(&ok.data).expect("data"), b"nope");
-    // Non-image extensions are refused even inside the jail (komet parity).
+    // Non-image files are admitted only from the upload cache (a committed
+    // upload is host-staged, so its type is the host's own business); a
+    // non-image reached through a cwd root stays refused (komet parity).
     let text = PathBuf::from(uploads.dir()).join("notes.txt");
     std::fs::create_dir_all(uploads.dir()).expect("uploads dir");
     std::fs::write(&text, b"text").expect("txt");
-    assert!(uploads.read_chunk(&text.to_string_lossy(), 0, &[]).is_err());
+    let cached = uploads
+        .read_chunk(&text.to_string_lossy(), 0, &[])
+        .expect("cache-rooted non-image read");
+    assert_eq!(cached.mime_type, "text/plain");
+    let stray = tmp.path().join("stray.txt");
+    std::fs::write(&stray, b"stray").expect("stray txt");
+    assert!(
+        uploads
+            .read_chunk(&stray.to_string_lossy(), 0, &[tmp.path().to_path_buf()])
+            .is_err(),
+        "non-image outside the upload cache"
+    );
+    // An extension the table does not know is refused outside the cache, and
+    // reads as octet-stream inside it.
+    let odd = PathBuf::from(uploads.dir()).join("payload.weird");
+    std::fs::write(&odd, b"odd").expect("weird");
+    assert_eq!(
+        uploads
+            .read_chunk(&odd.to_string_lossy(), 0, &[])
+            .expect("cache-rooted unknown type")
+            .mime_type,
+        "application/octet-stream"
+    );
+    let odd_outside = tmp.path().join("payload.weird");
+    std::fs::write(&odd_outside, b"odd").expect("outside weird");
+    assert!(
+        uploads
+            .read_chunk(
+                &odd_outside.to_string_lossy(),
+                0,
+                &[tmp.path().to_path_buf()]
+            )
+            .is_err(),
+        "unknown type outside the upload cache"
+    );
 
     // Bogus upload ids never become paths.
     assert!(uploads.append("../evil", "aGk=", None).is_err());

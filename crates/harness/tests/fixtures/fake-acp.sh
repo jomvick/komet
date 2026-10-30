@@ -35,6 +35,9 @@ has "$line" '"method":"initialize"' || exit 1
 has "$line" '"protocolVersion":1' || exit 1
 has "$line" '"name":"komet"' || exit 1
 has "$line" '"readTextFile":false' || exit 1
+# Gate B: the draft elicitation advertisement is opt-in per agent.
+ELICIT_ADVERTISED=0
+has "$line" '"elicitation":{"form":{}}' && ELICIT_ADVERTISED=1
 emit "{\"id\":$(rid "$line"),\"result\":{\"protocolVersion\":1,\"agentCapabilities\":{\"loadSession\":true,\"_meta\":{\"availableCommands\":[{\"name\":\"compact\",\"description\":\"Compact the session\"},{\"name\":\"goal\",\"description\":\"Set a goal\",\"input\":{\"hint\":\"the goal\"}}]}},\"_meta\":{\"steering\":{\"supported\":true}}}}"
 
 # ---- session new / load ----------------------------------------------------
@@ -151,6 +154,11 @@ case "$promptline" in
   update '{"sessionUpdate":"plan","entries":[{"content":"read","priority":"high","status":"completed"},{"content":"fix","priority":"high","status":"in_progress"}]}'
   # Command advertisement mid-run.
   update '{"sessionUpdate":"available_commands_update","availableCommands":[{"name":"deep-research","description":"Research deeply"}]}'
+  # Draft Session Compaction RFD, one cycle: notice → recap chunk → boundary.
+  # Field spellings are not settled upstream; this replays the camelCase shape.
+  update '{"sessionUpdate":"compaction_update","compactionId":"cmp-1","status":"in_progress"}'
+  update '{"sessionUpdate":"compaction_summary_chunk","compactionId":"cmp-1","summaryDelta":"Asked for a fix; wrote resolve.rs. "}'
+  update '{"sessionUpdate":"compaction_update","compactionId":"cmp-1","status":"completed","trigger":"auto","tokensBefore":165000,"summary":"Asked for a fix; wrote resolve.rs."}'
   # Context gauge + unknown kinds are tolerated, another session filtered.
   update '{"sessionUpdate":"usage_update","used":1200,"size":500000}'
   update '{"sessionUpdate":"totally_unknown_kind","x":1}'
@@ -176,6 +184,91 @@ case "$promptline" in
   { has "$ans" '"id":88' && has "$ans" '"outcome":"selected"' && has "$ans" '"optionId":"opt-tokio"'; } ||
     { emit "{\"id\":$pid,\"result\":{\"stopReason\":\"refusal\"}}"; exit 0; }
   update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"answered"}}'
+  emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
+  ;;
+
+# ---- draft elicitation RFD (Gate B: KOMET_ACP_ELICITATION names the slug) --
+# Every elicit-* scenario first checks the advertisement it expects, so a
+# harness that served a form it never announced fails the fixture.
+
+*scenario:elicit-refused*)
+  # Gate off: initialize carried no elicitation capability, so a request that
+  # arrives anyway must be refused with -32601 rather than served.
+  [ "$ELICIT_ADVERTISED" = "0" ] ||
+    { emit "{\"id\":$pid,\"result\":{\"stopReason\":\"refusal\"}}"; exit 0; }
+  emit "{\"id\":90,\"method\":\"elicitation/create\",\"params\":{\"sessionId\":\"$SID\",\"message\":\"Which environment?\",\"requestedSchema\":{\"type\":\"object\",\"properties\":{\"env\":{\"type\":\"string\",\"title\":\"Environment\",\"enum\":[\"staging\",\"prod\"]}},\"required\":[\"env\"]}}}"
+  read_rpc ans || exit 1
+  { has "$ans" '"id":90' && has "$ans" '"error"' && has "$ans" '-32601'; } ||
+    { emit "{\"id\":$pid,\"result\":{\"stopReason\":\"refusal\"}}"; exit 0; }
+  update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"refused"}}'
+  emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
+  ;;
+
+*scenario:elicit-single*)
+  [ "$ELICIT_ADVERTISED" = "1" ] ||
+    { emit "{\"id\":$pid,\"result\":{\"stopReason\":\"refusal\"}}"; exit 0; }
+  emit "{\"id\":88,\"method\":\"elicitation/create\",\"params\":{\"sessionId\":\"$SID\",\"message\":\"Which environment should I deploy to?\",\"requestedSchema\":{\"type\":\"object\",\"properties\":{\"env\":{\"type\":\"string\",\"title\":\"Environment\",\"description\":\"Pick the target\",\"enum\":[\"staging\",\"prod\"],\"enumNames\":[\"Staging\",\"Production\"],\"default\":\"staging\"}},\"required\":[\"env\"]}}}"
+  read_rpc ans || exit 1
+  { has "$ans" '"id":88' && has "$ans" '"action":"accept"' && has "$ans" '"env":"prod"'; } ||
+    { emit "{\"id\":$pid,\"result\":{\"stopReason\":\"refusal\"}}"; exit 0; }
+  update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"answered"}}'
+  emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
+  ;;
+
+*scenario:elicit-multi*)
+  [ "$ELICIT_ADVERTISED" = "1" ] ||
+    { emit "{\"id\":$pid,\"result\":{\"stopReason\":\"refusal\"}}"; exit 0; }
+  emit "{\"id\":89,\"method\":\"elicitation/create\",\"params\":{\"sessionId\":\"$SID\",\"message\":\"Release details\",\"requestedSchema\":{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\",\"title\":\"Name\"},\"channel\":{\"type\":\"string\",\"title\":\"Channel\",\"enum\":[\"stable\",\"beta\"],\"enumNames\":[\"Stable\",\"Beta\"]}},\"required\":[\"name\",\"channel\"]}}}"
+  read_rpc ans || exit 1
+  { has "$ans" '"id":89' && has "$ans" '"action":"accept"' && has "$ans" '"name":"v2.1"' && has "$ans" '"channel":"beta"'; } ||
+    { emit "{\"id\":$pid,\"result\":{\"stopReason\":\"refusal\"}}"; exit 0; }
+  update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"answered"}}'
+  emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
+  ;;
+
+*scenario:elicit-array*)
+  [ "$ELICIT_ADVERTISED" = "1" ] ||
+    { emit "{\"id\":$pid,\"result\":{\"stopReason\":\"refusal\"}}"; exit 0; }
+  emit "{\"id\":91,\"method\":\"elicitation/create\",\"params\":{\"sessionId\":\"$SID\",\"message\":\"Which checks should run?\",\"requestedSchema\":{\"type\":\"object\",\"properties\":{\"checks\":{\"type\":\"array\",\"title\":\"Checks\",\"items\":{\"type\":\"string\",\"enum\":[\"clippy\",\"fmt\",\"test\"],\"enumNames\":[\"Clippy\",\"Format\",\"Tests\"]}}},\"required\":[\"checks\"]}}}"
+  read_rpc ans || exit 1
+  { has "$ans" '"id":91' && has "$ans" '"action":"accept"' && has "$ans" '"checks":["fmt","test"]'; } ||
+    { emit "{\"id\":$pid,\"result\":{\"stopReason\":\"refusal\"}}"; exit 0; }
+  update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"answered"}}'
+  emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
+  ;;
+
+*scenario:elicit-cancel*)
+  [ "$ELICIT_ADVERTISED" = "1" ] ||
+    { emit "{\"id\":$pid,\"result\":{\"stopReason\":\"refusal\"}}"; exit 0; }
+  emit "{\"id\":92,\"method\":\"elicitation/create\",\"params\":{\"sessionId\":\"$SID\",\"message\":\"Proceed?\",\"requestedSchema\":{\"type\":\"object\",\"properties\":{\"confirm\":{\"type\":\"boolean\",\"title\":\"Confirm\"}},\"required\":[\"confirm\"]}}}"
+  read_rpc ans || exit 1
+  { has "$ans" '"id":92' && has "$ans" '"action":"cancel"'; } ||
+    { emit "{\"id\":$pid,\"result\":{\"stopReason\":\"refusal\"}}"; exit 0; }
+  update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"cancelled"}}'
+  emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
+  ;;
+
+*scenario:elicit-decline*)
+  [ "$ELICIT_ADVERTISED" = "1" ] ||
+    { emit "{\"id\":$pid,\"result\":{\"stopReason\":\"refusal\"}}"; exit 0; }
+  emit "{\"id\":93,\"method\":\"elicitation/create\",\"params\":{\"sessionId\":\"$SID\",\"message\":\"Name it\",\"requestedSchema\":{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\",\"title\":\"Name\"}},\"required\":[\"name\"]}}}"
+  read_rpc ans || exit 1
+  { has "$ans" '"id":93' && has "$ans" '"action":"decline"'; } ||
+    { emit "{\"id\":$pid,\"result\":{\"stopReason\":\"refusal\"}}"; exit 0; }
+  update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"declined"}}'
+  emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
+  ;;
+
+*scenario:elicit-url*)
+  # url mode is declared in the RFD but not supported this iteration: explicit
+  # -32602 refusal, never a silent fallback to a form.
+  [ "$ELICIT_ADVERTISED" = "1" ] ||
+    { emit "{\"id\":$pid,\"result\":{\"stopReason\":\"refusal\"}}"; exit 0; }
+  emit "{\"id\":94,\"method\":\"elicitation/create\",\"params\":{\"sessionId\":\"$SID\",\"mode\":\"url\",\"message\":\"Sign in\",\"url\":\"https://example.com/auth\",\"requestedSchema\":{\"type\":\"object\",\"properties\":{}}}}"
+  read_rpc ans || exit 1
+  { has "$ans" '"id":94' && has "$ans" '"error"' && has "$ans" '-32602'; } ||
+    { emit "{\"id\":$pid,\"result\":{\"stopReason\":\"refusal\"}}"; exit 0; }
+  update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"unsupported"}}'
   emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
   ;;
 

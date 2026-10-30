@@ -258,6 +258,10 @@ pub fn extract_questions(params: &Value) -> Option<Vec<UserInputQuestion>> {
             question,
             options,
             multi_select,
+            option_descriptions: Vec::new(),
+            allow_free_text: false,
+            secret: false,
+            default: None,
         });
     }
     if out.is_empty() { None } else { Some(out) }

@@ -15,7 +15,10 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use komet_harness::{Harness, HarnessError, mock::MockHarness};
-use komet_proto::{AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, SteeringMode};
+use komet_proto::{
+    AgentEvent, DoneStatus, HarnessId, HarnessInteractionSurface, Model, ReasoningLevel,
+    SteeringMode,
+};
 
 /// A served cache entry is re-probed in the background at most this often, so
 /// the file stays warm without a probe per picker open. There is no upper
@@ -78,6 +81,12 @@ pub struct HarnessDescriptor {
     /// "unknown": consumers fall back to [`default_enabled`] membership.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
+    /// What this harness's adapter can show (transparency plan Task 0), derived
+    /// from the harness table — the descriptor never declares it a second time.
+    /// `Default` (all-absent) decodes a catalog from an engine predating the
+    /// field as *unknown*, which no live harness declares.
+    #[serde(default)]
+    pub surface: HarnessInteractionSurface,
 }
 
 fn default_installed() -> bool {
@@ -107,6 +116,7 @@ fn describe(harness: &dyn Harness) -> HarnessDescriptor {
         reasoning_levels: harness.reasoning_levels().to_vec(),
         installed: harness.installed(),
         enabled: None,
+        surface: komet_harness::capabilities::interaction_surface(harness.id()),
     }
 }
 
@@ -564,6 +574,22 @@ impl HarnessRegistry {
     }
 }
 
+/// The mock harness's script for a headless/dev run. `KOMET_MOCK_SCENARIO`
+/// selects a transparency scenario (`compaction`, `subagent_nested`) so those
+/// facts are reachable in the offline demo with no live agent and no token;
+/// anything else — unset, empty, or an unknown name — runs the default
+/// streaming demo `fallback` builds.
+fn mock_script(fallback: impl FnOnce() -> Vec<AgentEvent>) -> Vec<AgentEvent> {
+    match std::env::var("KOMET_MOCK_SCENARIO")
+        .unwrap_or_default()
+        .as_str()
+    {
+        "compaction" => komet_harness::mock::compaction_script(),
+        "subagent_nested" => komet_harness::mock::subagent_nested_script(),
+        _ => fallback(),
+    }
+}
+
 /// The production registry: MockHarness (hidden from production pickers) plus a lazy
 /// `claude-code` slot resolved through `komet_harness` on first use (subprocess
 /// discovery only happens when a run/model call actually needs it).
@@ -573,7 +599,7 @@ pub fn default_registry() -> HarnessRegistry {
     komet_harness::shell_env::prewarm();
     let registry = HarnessRegistry::new();
     registry.register(Arc::new(MockHarness {
-        script: vec![
+        script: mock_script(|| vec![
             AgentEvent::TextDelta {
                 text: "## Streaming pipeline\n\nEvery turn flows through the same path:\n\n".into(),
             },
@@ -615,7 +641,7 @@ pub fn default_registry() -> HarnessRegistry {
                 session_id: None,
 reason: None,
             },
-        ],
+        ]),
     }));
     registry.register_lazy(
         HarnessDescriptor {
@@ -634,6 +660,7 @@ reason: None,
             ],
             installed: true,
             enabled: None,
+            surface: komet_harness::capabilities::interaction_surface(HarnessId::ClaudeCode),
         },
         Box::new(|| komet_harness::ClaudeHarness::new().installed()),
         Box::new(|| Ok(Arc::new(komet_harness::ClaudeHarness::new()) as Arc<dyn Harness>)),
@@ -661,6 +688,7 @@ reason: None,
             ],
             installed: true,
             enabled: None,
+            surface: komet_harness::capabilities::interaction_surface(HarnessId::Codex),
         },
         Box::new(|| komet_harness::CodexHarness::new().installed()),
         Box::new(|| Ok(Arc::new(komet_harness::CodexHarness::new()) as Arc<dyn Harness>)),
@@ -678,6 +706,7 @@ reason: None,
             reasoning_levels: Vec::new(),
             installed: true,
             enabled: None,
+            surface: komet_harness::capabilities::interaction_surface(HarnessId::Cursor),
         },
         Box::new(|| komet_harness::CursorHarness::new().installed()),
         Box::new(|| Ok(Arc::new(komet_harness::CursorHarness::new()) as Arc<dyn Harness>)),
@@ -699,6 +728,7 @@ reason: None,
             ],
             installed: true,
             enabled: None,
+            surface: komet_harness::capabilities::interaction_surface(HarnessId::Grok),
         },
         Box::new(|| komet_harness::AcpHarness::grok().installed()),
         Box::new(|| Ok(Arc::new(komet_harness::AcpHarness::grok()) as Arc<dyn Harness>)),
@@ -716,6 +746,7 @@ reason: None,
             reasoning_levels: Vec::new(),
             installed: true,
             enabled: None,
+            surface: komet_harness::capabilities::interaction_surface(HarnessId::Hermes),
         },
         Box::new(|| komet_harness::AcpHarness::hermes().installed()),
         Box::new(|| Ok(Arc::new(komet_harness::AcpHarness::hermes()) as Arc<dyn Harness>)),
@@ -735,6 +766,7 @@ reason: None,
             // determines whether it can be enabled or managed.
             installed: true,
             enabled: None,
+            surface: komet_harness::capabilities::interaction_surface(HarnessId::Opencode),
         },
         Box::new(|| komet_harness::AcpHarness::opencode().installed()),
         Box::new(|| Ok(Arc::new(komet_harness::AcpHarness::opencode()) as Arc<dyn Harness>)),
@@ -758,6 +790,7 @@ reason: None,
             ],
             installed: true,
             enabled: None,
+            surface: komet_harness::capabilities::interaction_surface(HarnessId::Pi),
         },
         Box::new(|| komet_harness::AcpHarness::pi().installed()),
         Box::new(|| Ok(Arc::new(komet_harness::AcpHarness::pi()) as Arc<dyn Harness>)),
@@ -774,6 +807,7 @@ reason: None,
             reasoning_levels: vec![],
             installed: true,
             enabled: None,
+            surface: komet_harness::capabilities::interaction_surface(HarnessId::Antigravity),
         },
         Box::new(|| komet_harness::AntigravityHarness::new().installed()),
         Box::new(|| Ok(Arc::new(komet_harness::AntigravityHarness::new()) as Arc<dyn Harness>)),
@@ -793,9 +827,28 @@ reason: None,
             reasoning_levels: vec![],
             installed: true,
             enabled: None,
+            surface: komet_harness::capabilities::interaction_surface(HarnessId::Cline),
         },
         Box::new(|| komet_harness::AcpHarness::cline().installed()),
         Box::new(|| Ok(Arc::new(komet_harness::AcpHarness::cline()) as Arc<dyn Harness>)),
+    );
+    // Qoder CLI over its native ACP server (`qoder --acp`), same lazy
+    // pattern: turn-boundary steering and no advertised `thought_level`.
+    // `installed` is a real CLI probe — Qoder needs its own login
+    // (`qoder login` or QODER_PERSONAL_ACCESS_TOKEN).
+    registry.register_lazy(
+        HarnessDescriptor {
+            id: HarnessId::Qoder,
+            name: "Qoder".into(),
+            supports_steering: true,
+            steering_mode: SteeringMode::TurnBoundary,
+            reasoning_levels: vec![],
+            installed: true,
+            enabled: None,
+            surface: komet_harness::capabilities::interaction_surface(HarnessId::Qoder),
+        },
+        Box::new(|| komet_harness::AcpHarness::qoder().installed()),
+        Box::new(|| Ok(Arc::new(komet_harness::AcpHarness::qoder()) as Arc<dyn Harness>)),
     );
     // Devin CLI over its native ACP server (`devin acp`).
     registry.register_lazy(
@@ -807,6 +860,7 @@ reason: None,
             reasoning_levels: Vec::new(),
             installed: true,
             enabled: None,
+            surface: komet_harness::capabilities::interaction_surface(HarnessId::Devin),
         },
         Box::new(|| komet_harness::AcpHarness::devin().installed()),
         Box::new(|| Ok(Arc::new(komet_harness::AcpHarness::devin()) as Arc<dyn Harness>)),
@@ -821,6 +875,7 @@ reason: None,
             reasoning_levels: Vec::new(),
             installed: true,
             enabled: None,
+            surface: komet_harness::capabilities::interaction_surface(HarnessId::Copilot),
         },
         Box::new(|| komet_harness::AcpHarness::copilot().installed()),
         Box::new(|| Ok(Arc::new(komet_harness::AcpHarness::copilot()) as Arc<dyn Harness>)),
@@ -835,6 +890,7 @@ reason: None,
             reasoning_levels: Vec::new(),
             installed: true,
             enabled: None,
+            surface: komet_harness::capabilities::interaction_surface(HarnessId::Muse),
         },
         Box::new(|| komet_harness::MuseHarness::new().installed()),
         Box::new(|| Ok(Arc::new(komet_harness::MuseHarness::new()) as Arc<dyn Harness>)),
@@ -861,6 +917,7 @@ mod tests {
                 reasoning_levels: vec![],
                 installed: true,
                 enabled: None,
+                surface: komet_harness::capabilities::interaction_surface(HarnessId::Mock),
             },
             Box::new(|| false),
             Box::new(move || {
@@ -883,6 +940,29 @@ mod tests {
     }
 
     #[test]
+    fn catalog_surfaces_are_the_harness_table_projected_not_recopied() {
+        // Task 0's single source of truth: `ListHarnesses` carries the surface
+        // the harness crate declares, so a descriptor that drifted from the
+        // table (or a lazy slot that forgot it) fails here.
+        let registry = default_registry();
+        let descriptors = registry.descriptors();
+        assert_eq!(descriptors.len(), 14);
+        for descriptor in &descriptors {
+            assert_eq!(
+                descriptor.surface,
+                komet_harness::capabilities::interaction_surface(descriptor.id),
+                "{}'s catalog surface differs from the harness table",
+                descriptor.id.as_str()
+            );
+            assert_ne!(
+                descriptor.surface,
+                komet_proto::HarnessInteractionSurface::default(),
+                "an all-absent surface means the projection did not run"
+            );
+        }
+    }
+
+    #[test]
     fn default_registry_lists_all_supported_agent_slots() {
         let registry = default_registry();
         let ids: Vec<HarnessId> = registry.descriptors().iter().map(|d| d.id).collect();
@@ -899,6 +979,7 @@ mod tests {
                 HarnessId::Pi,
                 HarnessId::Antigravity,
                 HarnessId::Cline,
+                HarnessId::Qoder,
                 HarnessId::Devin,
                 HarnessId::Copilot,
                 HarnessId::Muse,
@@ -979,6 +1060,11 @@ mod tests {
             .find(|d| d.id == HarnessId::Cline)
             .expect("cline descriptor");
         assert!(cline_desc.reasoning_levels.is_empty());
+        let qoder = registry.resolve(HarnessId::Qoder).unwrap();
+        assert_eq!(qoder.id(), HarnessId::Qoder);
+        assert_eq!(qoder.display_name(), "Qoder");
+        assert_eq!(qoder.steering_mode(), SteeringMode::TurnBoundary);
+        assert!(qoder.reasoning_levels().is_empty());
         let devin = registry.resolve(HarnessId::Devin).unwrap();
         assert_eq!(devin.id(), HarnessId::Devin);
         assert_eq!(devin.display_name(), "Devin");
@@ -1039,6 +1125,7 @@ mod tests {
                 reasoning_levels: vec![],
                 installed: true,
                 enabled: None,
+                surface: komet_harness::capabilities::interaction_surface(id),
             },
             Box::new(move || installed),
             Box::new(|| Err(HarnessError::NotInstalled("test slot".into()))),
@@ -1301,6 +1388,7 @@ mod tests {
                 reasoning_levels: vec![],
                 installed: true,
                 enabled: None,
+                surface: komet_harness::capabilities::interaction_surface(HarnessId::Mock),
             },
             Box::new(|| true),
             Box::new(move || {

@@ -1332,7 +1332,10 @@ async fn run_session(session: Session) {
 }
 
 type RequestInputFn = Box<
-    dyn Fn(Vec<UserInputQuestion>) -> tokio::sync::oneshot::Receiver<Vec<UserInputAnswer>>
+    dyn Fn(
+            Vec<UserInputQuestion>,
+            komet_proto::QuestionSource,
+        ) -> tokio::sync::oneshot::Receiver<Vec<UserInputAnswer>>
         + Send
         + Sync,
 >;
@@ -1363,7 +1366,9 @@ fn handle_control_request(
             let request_id = req.request_id;
             let input = req.request.input;
             let questions = parse_questions(&input);
-            let answers = (request_input)(questions.clone()).await.unwrap_or_default();
+            let answers = (request_input)(questions.clone(), komet_proto::QuestionSource::Native)
+                .await
+                .unwrap_or_default();
             let updated = updated_input_with_answers(&input, &questions, &answers);
             let line = control_response_line(&request_id, allow_response(updated));
             let _ = stdin_tx.send(StdinMsg::Line(line));
@@ -1384,7 +1389,7 @@ fn handle_control_request(
         let input = req.request.input;
         let (kind, summary, choices) =
             permissions::parse_tool_permission(&req.request.tool_name, &input);
-        let decision = (request_permission)(kind, summary, choices)
+        let decision = (request_permission)(kind, summary, choices, req.request.tool_use_id)
             .await
             .unwrap_or(komet_proto::PermissionChoice::Deny);
         let resp = match decision {
@@ -1401,7 +1406,10 @@ fn handle_control_request(
 
 /// Parse Claude's `AskUserQuestion` tool input into [`UserInputQuestion`]s
 /// (tolerant of `header`/`title`, `question`/`prompt`, string or object
-/// options — option descriptions are dropped, the wire type carries labels).
+/// options). Object options may carry a `description`; it is mirrored into
+/// `option_descriptions`, aligned one-to-one with `options` (string options
+/// contribute an empty string). When no option has a description the vector
+/// stays empty so it is skipped on the wire.
 fn parse_questions(input: &Value) -> Vec<UserInputQuestion> {
     let raw = input.get("questions").and_then(Value::as_array);
     raw.map(|a| a.as_slice())
@@ -1410,6 +1418,38 @@ fn parse_questions(input: &Value) -> Vec<UserInputQuestion> {
         .map(|q| {
             let field =
                 |keys: [&str; 2]| keys.iter().find_map(|k| q.get(*k).and_then(Value::as_str));
+            let parsed_options: Vec<(String, String)> = q
+                .get("options")
+                .and_then(Value::as_array)
+                .map(|a| a.as_slice())
+                .unwrap_or_default()
+                .iter()
+                .map(|op| match op {
+                    Value::String(s) => (s.clone(), String::new()),
+                    other => (
+                        other
+                            .get("label")
+                            .or_else(|| other.get("value"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .into(),
+                        other
+                            .get("description")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .into(),
+                    ),
+                })
+                .collect();
+            let mut options = Vec::with_capacity(parsed_options.len());
+            let mut option_descriptions = Vec::with_capacity(parsed_options.len());
+            for (label, description) in parsed_options {
+                options.push(label);
+                option_descriptions.push(description);
+            }
+            if option_descriptions.iter().all(String::is_empty) {
+                option_descriptions.clear();
+            }
             UserInputQuestion {
                 id: uuid::Uuid::new_v4().to_string(),
                 header: field(["header", "title"]).unwrap_or("Question").into(),
@@ -1418,22 +1458,11 @@ fn parse_questions(input: &Value) -> Vec<UserInputQuestion> {
                     .iter()
                     .find_map(|k| q.get(*k).and_then(Value::as_bool))
                     .unwrap_or(false),
-                options: q
-                    .get("options")
-                    .and_then(Value::as_array)
-                    .map(|a| a.as_slice())
-                    .unwrap_or_default()
-                    .iter()
-                    .map(|op| match op {
-                        Value::String(s) => s.clone(),
-                        other => other
-                            .get("label")
-                            .or_else(|| other.get("value"))
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .into(),
-                    })
-                    .collect(),
+                options,
+                option_descriptions,
+                allow_free_text: true,
+                secret: false,
+                default: None,
             }
         })
         .collect()
@@ -1497,6 +1526,67 @@ mod tests {
     }
 
     #[test]
+    fn question_option_descriptions_align_with_options() {
+        let input = json!({
+            "questions": [{
+                "header": "Choice",
+                "question": "Pick one",
+                "options": [
+                    {"label": "A", "description": "first"},
+                    {"label": "B", "description": "second"},
+                    {"label": "C", "value": "c", "description": "third"}
+                ]
+            }]
+        });
+        let qs = parse_questions(&input);
+        assert_eq!(
+            qs[0].options,
+            vec!["A".to_string(), "B".to_string(), "C".to_string()]
+        );
+        assert_eq!(
+            qs[0].option_descriptions,
+            vec![
+                "first".to_string(),
+                "second".to_string(),
+                "third".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn question_option_descriptions_empty_without_descriptions() {
+        let input = json!({
+            "questions": [{
+                "header": "Choice",
+                "question": "Pick one",
+                "options": ["A", {"label": "B"}, {"value": "C"}]
+            }]
+        });
+        let qs = parse_questions(&input);
+        assert_eq!(
+            qs[0].options,
+            vec!["A".to_string(), "B".to_string(), "C".to_string()]
+        );
+        assert!(qs[0].option_descriptions.is_empty());
+    }
+
+    #[test]
+    fn question_multi_select_keeps_free_text() {
+        let input = json!({
+            "questions": [{
+                "header": "Choice",
+                "question": "Pick many",
+                "options": ["A", "B"],
+                "multiSelect": true
+            }]
+        });
+        let qs = parse_questions(&input);
+        assert!(qs[0].multi_select);
+        assert!(qs[0].allow_free_text);
+        assert!(qs[0].option_descriptions.is_empty());
+    }
+
+    #[test]
     fn answers_key_by_question_text() {
         let input =
             json!({"questions": [{"header": "H", "question": "Pick one", "options": ["A", "B"]}]});
@@ -1504,6 +1594,7 @@ mod tests {
         let answers = vec![UserInputAnswer {
             question_id: qs[0].id.clone(),
             labels: vec!["B".into()],
+            free_text: None,
         }];
         let updated = updated_input_with_answers(&input, &qs, &answers);
         assert_eq!(updated["answers"]["Pick one"], json!("B"));

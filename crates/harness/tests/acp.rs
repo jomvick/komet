@@ -154,13 +154,14 @@ fn controls() -> (RunControls, mpsc::Sender<SteerMessage>, CancellationToken) {
     let (steer_tx, steer_rx) = mpsc::channel(8);
     let token = CancellationToken::new();
     let controls = RunControls {
-        request_input: Box::new(move |questions| {
+        request_input: Box::new(move |questions, _source| {
             let (tx, rx) = oneshot::channel();
             let answers: Vec<UserInputAnswer> = questions
                 .iter()
                 .map(|q| UserInputAnswer {
                     question_id: q.id.clone(),
                     labels: vec!["Yes".into()],
+                    free_text: None,
                 })
                 .collect();
             let _ = tx.send(answers);
@@ -340,6 +341,43 @@ async fn happy_path_maps_chunks_tools_diffs_plans_and_commands() {
                 && stats.source == komet_proto::ContextUsageSource::Native
     )));
 
+    // The draft compaction cycle arrives as three frames in wire order, all on
+    // one id — the thread shows one row that gets refined, not three rows.
+    let cycle: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::ContextCompaction {
+                id,
+                status,
+                summary_delta,
+                summary,
+                tokens_before,
+                trigger,
+                ..
+            } if id == "cmp-1" => Some((
+                *status,
+                summary_delta.clone(),
+                summary.clone(),
+                *tokens_before,
+                trigger.clone(),
+            )),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(cycle.len(), 3, "{events:?}");
+    assert_eq!(cycle[0].0, komet_proto::CompactionStatus::InProgress);
+    assert_eq!(
+        cycle[1].1.as_deref(),
+        Some("Asked for a fix; wrote resolve.rs. ")
+    );
+    assert_eq!(cycle[2].0, komet_proto::CompactionStatus::Completed);
+    assert_eq!(
+        cycle[2].2.as_deref(),
+        Some("Asked for a fix; wrote resolve.rs.")
+    );
+    assert_eq!(cycle[2].3, Some(165_000));
+    assert_eq!(cycle[2].4.as_deref(), Some("auto"));
+
     assert_eq!(dones(&events), vec![(DoneStatus::Completed, None)]);
 }
 
@@ -367,13 +405,14 @@ async fn question_shaped_requests_bridge_to_the_input_panel() {
     let (steer_tx, steer_rx) = mpsc::channel(8);
     let token = CancellationToken::new();
     let controls = RunControls {
-        request_input: Box::new(move |questions| {
+        request_input: Box::new(move |questions, _source| {
             let (tx, rx) = oneshot::channel();
             let answers: Vec<UserInputAnswer> = questions
                 .iter()
                 .map(|q| UserInputAnswer {
                     question_id: q.id.clone(),
                     labels: vec!["Use tokio".into()],
+                    free_text: None,
                 })
                 .collect();
             let _ = tx.send(answers);
@@ -406,12 +445,12 @@ async fn permission_requests_block_on_the_permission_bridge() {
     let (steer_tx, steer_rx) = mpsc::channel(8);
     let token = CancellationToken::new();
     let controls = RunControls {
-        request_input: Box::new(|_questions| {
+        request_input: Box::new(|_questions, _source| {
             let (tx, rx) = oneshot::channel();
             let _ = tx.send(Vec::new());
             rx
         }),
-        request_permission: Box::new(|_kind, _summary, _choices| {
+        request_permission: Box::new(|_kind, _summary, _choices, _tool_call_id| {
             let (tx, rx) = oneshot::channel();
             let _ = tx.send(komet_proto::PermissionChoice::AllowAlways {
                 scope: komet_proto::Scope::Chat,
@@ -437,12 +476,12 @@ async fn permission_bridge_deny_selects_the_reject_option() {
     let (steer_tx, steer_rx) = mpsc::channel(8);
     let token = CancellationToken::new();
     let controls = RunControls {
-        request_input: Box::new(|_questions| {
+        request_input: Box::new(|_questions, _source| {
             let (tx, rx) = oneshot::channel();
             let _ = tx.send(Vec::new());
             rx
         }),
-        request_permission: Box::new(|_kind, _summary, _choices| {
+        request_permission: Box::new(|_kind, _summary, _choices, _tool_call_id| {
             let (tx, rx) = oneshot::channel();
             let _ = tx.send(komet_proto::PermissionChoice::Deny);
             rx
@@ -466,12 +505,12 @@ async fn full_access_auto_allows_without_the_permission_bridge() {
     let (steer_tx, steer_rx) = mpsc::channel(8);
     let token = CancellationToken::new();
     let controls = RunControls {
-        request_input: Box::new(|_questions| {
+        request_input: Box::new(|_questions, _source| {
             let (tx, rx) = oneshot::channel();
             let _ = tx.send(Vec::new());
             rx
         }),
-        request_permission: Box::new(|_kind, _summary, _choices| {
+        request_permission: Box::new(|_kind, _summary, _choices, _tool_call_id| {
             panic!("full access must auto-allow ACP permissions");
         }),
         steering: steer_rx,
@@ -493,12 +532,12 @@ async fn read_only_auto_denies_shell_without_the_permission_bridge() {
     let (steer_tx, steer_rx) = mpsc::channel(8);
     let token = CancellationToken::new();
     let controls = RunControls {
-        request_input: Box::new(|_questions| {
+        request_input: Box::new(|_questions, _source| {
             let (tx, rx) = oneshot::channel();
             let _ = tx.send(Vec::new());
             rx
         }),
-        request_permission: Box::new(|_kind, _summary, _choices| {
+        request_permission: Box::new(|_kind, _summary, _choices, _tool_call_id| {
             panic!("read-only must auto-deny shell without asking");
         }),
         steering: steer_rx,
@@ -843,6 +882,19 @@ fn cline_descriptor_surface_matches_registry_expectations() {
     let harness = AcpHarness::cline();
     assert_eq!(harness.id(), HarnessId::Cline);
     assert_eq!(harness.display_name(), "Cline");
+    assert!(harness.supports_steering());
+    assert_eq!(harness.steering_mode(), SteeringMode::TurnBoundary);
+    assert!(harness.reasoning_levels().is_empty());
+}
+
+/// Qoder CLI's ACP surface: native `qoder --acp`, turn-boundary steering,
+/// no advertised `thought_level` (Qoder's ACP docs list modes, tools and MCP
+/// but no effort config option).
+#[test]
+fn qoder_descriptor_surface_matches_registry_expectations() {
+    let harness = AcpHarness::qoder();
+    assert_eq!(harness.id(), HarnessId::Qoder);
+    assert_eq!(harness.display_name(), "Qoder");
     assert!(harness.supports_steering());
     assert_eq!(harness.steering_mode(), SteeringMode::TurnBoundary);
     assert!(harness.reasoning_levels().is_empty());
@@ -1376,12 +1428,12 @@ async fn cline_workspace_write_blocks_on_the_permission_bridge() {
     let (steer_tx, steer_rx) = mpsc::channel(8);
     let token = CancellationToken::new();
     let controls = RunControls {
-        request_input: Box::new(|_questions| {
+        request_input: Box::new(|_questions, _source| {
             let (tx, rx) = oneshot::channel();
             let _ = tx.send(Vec::new());
             rx
         }),
-        request_permission: Box::new(|_kind, _summary, _choices| {
+        request_permission: Box::new(|_kind, _summary, _choices, _tool_call_id| {
             let (tx, rx) = oneshot::channel();
             let _ = tx.send(komet_proto::PermissionChoice::AllowAlways {
                 scope: komet_proto::Scope::Chat,
@@ -1480,6 +1532,7 @@ fn sandbox_surface_declares_a_native_first_branch_per_harness() {
         ),
         ("hermes", "bridge-fallback: ACP permission policy"),
         ("pi", "bridge-fallback: ACP permission policy"),
+        ("qoder", "bridge-fallback: ACP permission policy"),
         (
             "unsupported-sandbox-options",
             "rejected: ProviderOptionsRejected",
@@ -1495,6 +1548,7 @@ fn sandbox_surface_declares_a_native_first_branch_per_harness() {
         HarnessId::Cursor,
         HarnessId::Hermes,
         HarnessId::Pi,
+        HarnessId::Qoder,
     ] {
         let prefix = match harness {
             HarnessId::Cline => "cline-",
@@ -1506,6 +1560,7 @@ fn sandbox_surface_declares_a_native_first_branch_per_harness() {
             HarnessId::Cursor => "cursor",
             HarnessId::Hermes => "hermes",
             HarnessId::Pi => "pi",
+            HarnessId::Qoder => "qoder",
             _ => continue,
         };
         assert!(
@@ -1519,6 +1574,7 @@ fn sandbox_surface_declares_a_native_first_branch_per_harness() {
         HarnessId::Grok,
         HarnessId::Hermes,
         HarnessId::Pi,
+        HarnessId::Qoder,
         HarnessId::Antigravity,
     ] {
         let req = RunRequest {

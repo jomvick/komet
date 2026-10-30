@@ -22,6 +22,8 @@ pub enum HarnessId {
     Opencode,
     /// Cline's autonomous coding agent CLI, driven over ACP (`cline --acp`).
     Cline,
+    /// Qoder CLI, driven over ACP (`qoder --acp`).
+    Qoder,
     Antigravity,
     Muse,
     Copilot,
@@ -41,6 +43,7 @@ impl HarnessId {
             HarnessId::Pi => "pi",
             HarnessId::Opencode => "opencode",
             HarnessId::Cline => "cline",
+            HarnessId::Qoder => "qoder",
             HarnessId::Antigravity => "antigravity",
             HarnessId::Muse => "muse",
             HarnessId::Copilot => "copilot",
@@ -59,6 +62,7 @@ impl HarnessId {
             "pi" => Some(HarnessId::Pi),
             "opencode" | "open-code" => Some(HarnessId::Opencode),
             "cline" => Some(HarnessId::Cline),
+            "qoder" => Some(HarnessId::Qoder),
             "antigravity" | "agy" => Some(HarnessId::Antigravity),
             "muse" => Some(HarnessId::Muse),
             "copilot" | "github-copilot" => Some(HarnessId::Copilot),
@@ -78,11 +82,112 @@ impl HarnessId {
             HarnessId::Pi => "Pi",
             HarnessId::Opencode => "OpenCode",
             HarnessId::Cline => "Cline",
+            HarnessId::Qoder => "Qoder",
             HarnessId::Antigravity => "Antigravity CLI",
             HarnessId::Muse => "Muse",
             HarnessId::Copilot => "GitHub Copilot",
             HarnessId::Mock => "Mock",
         }
+    }
+}
+
+/// How a question from the agent reaches the user, and how the answer travels
+/// back. A declared absence, not an omission: `None` means Komet shows nothing
+/// and says so, rather than inventing an affordance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum QuestionSurface {
+    None,
+    /// Questions arrive on the permission/approval wire; answering is deciding.
+    PermissionShaped,
+    /// ACP `elicitation/create` (draft protocol, advertised only when gated on).
+    Elicitation,
+    /// The CLI's own question tool (`AskUserQuestion`, `request_user_input`, …).
+    Native,
+}
+
+/// What the harness reveals about context compaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CompactionSurface {
+    None,
+    /// A boundary marker in the transcript; the summary text is not exposed.
+    BoundaryOnly,
+    /// Start/update/end lifecycle signals, without summary text.
+    Lifecycle,
+    /// Lifecycle plus the summary content itself.
+    LifecycleWithSummary,
+}
+
+/// How a spawned subagent's existence and work are carried.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SubagentSurface {
+    None,
+    /// Events in this session carry a parent link.
+    Tagged,
+    /// Tagged only when this agent's adapter actually emits them — per-agent
+    /// verification decides, the transport contract does not.
+    TaggedIfEmitted,
+    /// The child is its own session/thread, reachable apart from the parent run.
+    NestedSession,
+}
+
+/// Where the agent's current plan lives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PlanSurface {
+    None,
+    /// A `Todo` tool call among the transcript's chips.
+    ToolChip,
+    /// The live plan singleton, which also drives the persistent plan card.
+    LivePanel,
+}
+
+/// What is visible of a tool's execution while it runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProgressSurface {
+    /// The CLI gives no partial output; Komet simulates none.
+    None,
+    /// Only the resolved result appears.
+    Final,
+    /// Ephemeral `ToolProgress` chunks while the tool runs (never journaled).
+    Streaming,
+}
+
+/// The interaction surface one harness declares — the answer to "what can Komet
+/// possibly show for this agent", kept as data so a UI never guesses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HarnessInteractionSurface {
+    pub questions: QuestionSurface,
+    pub compaction: CompactionSurface,
+    pub subagents: SubagentSurface,
+    pub plans: PlanSurface,
+    pub tool_progress: ProgressSurface,
+}
+
+impl HarnessInteractionSurface {
+    /// Nothing declared: the fallback for a harness with no entry in the table,
+    /// which the declaration test makes unreachable rather than tolerated.
+    pub const fn none() -> Self {
+        Self {
+            questions: QuestionSurface::None,
+            compaction: CompactionSurface::None,
+            subagents: SubagentSurface::None,
+            plans: PlanSurface::None,
+            tool_progress: ProgressSurface::None,
+        }
+    }
+}
+
+/// All-absent, which is what a catalog from an engine predating the field
+/// decodes to: no harness *declares* this (the surface test forbids it), so an
+/// all-`None` surface means "unknown", not "unsupported".
+impl Default for HarnessInteractionSurface {
+    fn default() -> Self {
+        Self::none()
     }
 }
 
@@ -948,6 +1053,7 @@ pub fn validate_run_request(request: &RunRequest) -> Result<(), ValidationError>
             | HarnessId::Grok
             | HarnessId::Hermes
             | HarnessId::Pi
+            | HarnessId::Qoder
             | HarnessId::Antigravity => {
                 return Err(ValidationError::ProviderOptionsRejected { provider: harness });
             }
@@ -1462,13 +1568,61 @@ pub struct UserInputQuestion {
     pub options: Vec<String>,
     #[serde(default)]
     pub multi_select: bool,
+    /// Descriptions aligned with `options` (ACP `oneOf` / `anyOf`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub option_descriptions: Vec<String>,
+    /// Whether the agent accepts a free-text answer.
+    #[serde(default)]
+    pub allow_free_text: bool,
+    /// Sensitive answer content must be masked in the transcript and omitted
+    /// from exports.
+    #[serde(default)]
+    pub secret: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UserInputAnswer {
     pub question_id: String,
+    #[serde(default)]
     pub labels: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub free_text: Option<String>,
+}
+
+/// Longest free-text answer the doc keeps, in bytes. The agent still receives
+/// the answer whole; the transcript only ever holds a bounded prefix (4 KiB,
+/// the same bound as a tool output).
+pub const USER_INPUT_TEXT_CAP: usize = 4 * 1024;
+
+/// What a secret answer reads as once it leaves the host's memory. The doc,
+/// the run journal and the export carry this marker, never the value.
+pub const WITHHELD_SECRET_ANSWER: &str = "[withheld: secret answer]";
+
+/// What kind of interaction produced a question, i.e. which wire it came in on.
+/// `Native` is the engine's own `request_input` channel — and the default an
+/// older event or doc deserializes to, so a pre-`source` question is read as
+/// the channel that has always existed rather than as something unknown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum QuestionSource {
+    #[default]
+    Native,
+    /// ACP draft `elicitation/create` (opt-in per agent, see Gate B).
+    Elicitation,
+    /// An agent that has no question channel and asks through a permission
+    /// request; Komet renders it as a question.
+    PermissionShaped,
+}
+
+impl QuestionSource {
+    /// Whether this is the `request_input` channel (the wire's and the doc's
+    /// default) — used to skip serializing a field old readers assume.
+    pub fn is_native(&self) -> bool {
+        *self == Self::Native
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1656,6 +1810,25 @@ impl ErrorKind {
     }
 }
 
+/// The lifecycle phase of a live run, carried by the ephemeral
+/// [`AgentEvent::RunPhase`] frame. It exists to name *what the user is
+/// waiting on* while `Indicator::Working` is up — the harness process
+/// starting, the model thinking, output streaming, a tool running — so no
+/// wait is a silent spinner. Never persisted; a viewport without it keeps the
+/// generic working trailer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RunPhase {
+    /// Dispatched, spawning the harness CLI, before `SessionStarted`.
+    Starting,
+    /// `SessionStarted` received; waiting for the model's first token.
+    WaitingModel,
+    /// Streaming text/reasoning deltas.
+    Streaming,
+    /// Running a tool call.
+    Tool,
+}
+
 /// The normalized streaming event every harness emits.
 ///
 /// Mirrors komet's `AgentEvent` tagged enum.
@@ -1672,6 +1845,15 @@ pub enum AgentEvent {
         /// Harness-native session id (used for resume).
         session_id: String,
         assistant_message_id: String,
+    },
+    /// The live run changed phase. Ephemeral like [`Self::ToolProgress`]:
+    /// broadcast on `WatchActivity`, never journalled, never folded into a
+    /// doc part — the transcript's working trailer is its whole use, so a
+    /// viewport that does not receive these frames falls back to the plain
+    /// `Working` indicator.
+    #[serde(rename_all = "camelCase")]
+    RunPhase {
+        phase: RunPhase,
     },
     TextDelta {
         text: String,
@@ -1701,6 +1883,23 @@ pub enum AgentEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         diff: Option<ToolDiff>,
     },
+    /// Ephemeral tool-output chunk: live stdout the CLI streams but never
+    /// re-emits as a final result (Codex `commandExecution/outputDelta`, ACP
+    /// intermediate tool content). Broadcast-only by contract — the engine
+    /// coalesces it per tool id, never journals it, and the doc fold never
+    /// sees it. The open chip renders it while the run is live; a reconnect
+    /// starts with nothing.
+    #[serde(rename_all = "camelCase")]
+    ToolProgress {
+        id: String,
+        text: String,
+        /// `true` when `text` extends what was already streamed for this tool
+        /// (Codex `outputDelta`); `false` when it is the full content so far
+        /// (ACP `tool_call_update` replaces its content array). The engine's
+        /// coalescer resolves both into one tail snapshot before broadcast.
+        #[serde(default)]
+        append: bool,
+    },
     /// Last-turn token counts (cost / rate-limit probes); never persisted to docs.
     #[serde(rename_all = "camelCase")]
     Usage {
@@ -1719,6 +1918,41 @@ pub enum AgentEvent {
     #[serde(rename_all = "camelCase")]
     ContextWindow {
         stats: ContextUsageStats,
+    },
+    /// A context-compaction BOUNDARY: the agent squeezed its own history, so
+    /// everything before this point is now represented by a summary. Distinct
+    /// from [`AgentEvent::ContextWindow`], which is a gauge reading — a gauge
+    /// says "how full", this says "a compaction happened, here is where".
+    ///
+    /// `id` is the compaction's own identity: the agent's when it has one (ACP
+    /// `compactionId`), otherwise synthesized by the adapter per compaction —
+    /// never a per-run stable id, because one session can compact several times
+    /// and each cycle must land as its own transcript part.
+    #[serde(rename_all = "camelCase")]
+    ContextCompaction {
+        id: String,
+        status: CompactionStatus,
+        /// Why it happened: "auto" | "manual" | a provider's own wording.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        trigger: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tokens_before: Option<u64>,
+        /// The agent's own post-compaction reading when it has one; otherwise
+        /// the engine derives it from the next native `ContextWindow`. `None`
+        /// means unknown — the UI shows no arrow rather than inventing a value.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tokens_after: Option<u64>,
+        /// Complete replacement for the summary accumulated so far.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        summary: Option<String>,
+        /// Append to the accumulated summary (ACP
+        /// `compaction_summary_chunk`): streamed, order matters.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        summary_delta: Option<String>,
+        /// Failure reason on `Failed` (agent error, or a compaction the engine
+        /// found abandoned at restart).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
     },
     /// The agent advertised (or changed) its slash-command set — ACP
     /// `available_commands_update`. The engine caches the latest list per
@@ -1749,6 +1983,17 @@ pub enum AgentEvent {
         actions: Vec<AgentPermissionAction>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         provider: Option<String>,
+        /// The tool call this approval gates, when the harness knows (ACP
+        /// `request_permission` carries it, Codex ties the item to a call id).
+        /// Lets the transcript link a decision to the chip it un-blocked.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_call_id: Option<String>,
+        /// Epoch-ms deadline of the engine watchdog that auto-denies an
+        /// unanswered request (`None` = no watchdog). The doc part carries it
+        /// so the approval card can count down instead of the auto-deny
+        /// happening silently.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expires_at: Option<i64>,
     },
     #[serde(rename_all = "camelCase")]
     PermissionResolved {
@@ -1759,10 +2004,17 @@ pub enum AgentEvent {
     InputRequested {
         request_id: String,
         questions: Vec<UserInputQuestion>,
+        /// Which channel asked. Absent on an older wire means [`QuestionSource::Native`].
+        #[serde(default, skip_serializing_if = "QuestionSource::is_native")]
+        source: QuestionSource,
     },
     #[serde(rename_all = "camelCase")]
     InputResolved {
         request_id: String,
+        /// The answers actually handed to the agent. Empty on an older wire,
+        /// and on a resolution that delivered nothing (auto-declined).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        answers: Vec<UserInputAnswer>,
     },
     #[serde(rename_all = "camelCase")]
     Steered {
@@ -1781,27 +2033,40 @@ pub enum AgentEvent {
     },
     /// A USER-role message injected into a running session — today only seen
     /// wrapped in [`AgentEvent::Subagent`]: the PARENT agent steering its
-    /// subagent mid-run (claude: a tagged user frame's text blocks). The
-    /// engine writes it to the subagent doc as its own user entry, closing
-    /// the streaming assistant segment above it — the subagent transcript
-    /// then reads like any steered chat. Never emitted untagged (the parent
-    /// chat's user messages come from doc commands, not the wire).
+    /// subagent mid-run (claude: a tagged user frame's text blocks). It reopens
+    /// the spawn chip's cycle in the parent doc and lives on in the host's run
+    /// journal, which is what a subagent transcript is projected from — there is
+    /// no subagent doc. Never emitted untagged (the parent chat's user messages
+    /// come from doc commands, not the wire).
     #[serde(rename_all = "camelCase")]
     UserMessage {
         text: String,
     },
     /// An event belonging to a SUBAGENT's nested transcript, attributed to
     /// the spawning tool call (`parent_tool_use_id` = the parent-feed
-    /// `ToolCall::id` that launched it). Never folded into the parent chat
-    /// doc — the engine routes these to the subagent's own doc; the parent
-    /// keeps only the spawn chip. Additive: old consumers that don't match
-    /// this variant drop the nested traffic, which is the pre-subagent-viz
-    /// behavior.
+    /// `ToolCall::id` that launched it). No child content is folded into the
+    /// parent chat doc — the wrapper is journaled as the host received it, and
+    /// `WatchSubagent` projects one feed out of that journal on demand; the
+    /// parent doc keeps the spawn chip alone. Additive: old consumers that
+    /// don't match this variant drop the nested traffic, which is the
+    /// pre-subagent-viz behavior.
     #[serde(rename_all = "camelCase")]
     Subagent {
         parent_tool_use_id: String,
         event: Box<AgentEvent>,
     },
+}
+
+/// Lifecycle of one compaction, carried by
+/// [`AgentEvent::ContextCompaction`] and the doc part it folds into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CompactionStatus {
+    #[default]
+    InProgress,
+    Completed,
+    Failed,
+    Cancelled,
 }
 
 /// How the context-window gauge was produced.
@@ -2917,10 +3182,21 @@ mod tests {
                 },
             ],
             provider: Some("opencode".into()),
+            tool_call_id: None,
+            expires_at: Some(1_700_000_000_000),
         };
         let json = serde_json::to_value(&ev).unwrap();
-        let back: AgentEvent = serde_json::from_value(json).unwrap();
+        let back: AgentEvent = serde_json::from_value(json.clone()).unwrap();
         assert_eq!(ev, back);
+        // Additive field: a wire without it still parses (no watchdog).
+        let mut legacy = json.clone();
+        legacy.as_object_mut().unwrap().remove("expiresAt");
+        let back: AgentEvent = serde_json::from_value(legacy).unwrap();
+        let mut without_deadline = ev;
+        if let AgentEvent::PermissionRequested { expires_at, .. } = &mut without_deadline {
+            *expires_at = None;
+        }
+        assert_eq!(back, without_deadline);
     }
 
     #[test]

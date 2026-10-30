@@ -193,6 +193,42 @@ impl RunJournal {
             .collect()
     }
 
+    /// The compaction summary the journal kept for one cycle (the doc carries
+    /// only its size). Frames are replayed in journal order with the fold's own
+    /// rule: a `summary` replaces whatever earlier chunks accumulated, a
+    /// `summary_delta` extends it — so an interrupted stream that replayed a
+    /// cycle rebuilds the same text the host saw live.
+    ///
+    /// `None` means "there is no summary here" (unknown cycle, a provider that
+    /// compacts without one, or a file rotated away), which the RPC reports as
+    /// an explicit `unavailable` — never an empty string that reads as "the
+    /// agent summarized nothing".
+    pub fn compaction_summary(&self, chat_id: &str, compaction_id: &str) -> Option<String> {
+        let path = self.path_for(chat_id);
+        if !path.exists() {
+            return None;
+        }
+        let mut text: Option<String> = None;
+        for (_, event) in read_lines(&path).ok()? {
+            if let AgentEvent::ContextCompaction {
+                id,
+                summary,
+                summary_delta,
+                ..
+            } = &event
+                && id == compaction_id
+            {
+                if let Some(full) = summary {
+                    text = Some(full.clone());
+                }
+                if let Some(delta) = summary_delta {
+                    text.get_or_insert_with(String::new).push_str(delta);
+                }
+            }
+        }
+        text.filter(|text| !text.is_empty())
+    }
+
     /// Crash-recovery scan: chat ids whose journal's last event is NOT a `Done` — their
     /// runs died mid-stream and need recovery (stamp `aborted`, close the journal).
     pub fn stale_sessions(&self) -> Result<Vec<String>, JournalError> {
@@ -216,14 +252,83 @@ impl RunJournal {
         Ok(stale)
     }
 
-    /// Remove a chat's journal file entirely (tests / future compaction).
+    /// The transcript of one subagent, projected from the chat's journal.
+    ///
+    /// Nested traffic is journaled exactly as it arrived: every
+    /// [`AgentEvent::Subagent`] wrapper carries the tool id of its DIRECT
+    /// parent, so a feed is "the payloads whose wrapper says
+    /// `parent_tool_use_id`, in journal order". Wrapper chains are descended,
+    /// never assumed — a wire that double-wraps (`B` inside `A`'s line)
+    /// attributes `B`'s payload to `B` and shows `A` only the wrapper that
+    /// spawned it. That is what keeps a sub-subagent out of its grandparent's
+    /// transcript while staying reachable from it.
+    ///
+    /// `None` means "this host has nothing to show" (never ran the chat, the
+    /// journal was discarded with the chat, or the file is unreadable);
+    /// `Some(vec![])` means "the journal is here and this feed is empty (yet)".
+    /// The RPC turns the first into an explicit `Unavailable` so a missing
+    /// journal never renders as an empty transcript.
+    pub fn subagent_events(
+        &self,
+        chat_id: &str,
+        parent_tool_use_id: &str,
+    ) -> Option<Vec<(u64, AgentEvent)>> {
+        let path = self.path_for(chat_id);
+        if !path.exists() {
+            return None;
+        }
+        let lines = match read_lines(&path) {
+            Ok(lines) => lines,
+            Err(err) => {
+                tracing::warn!(chat = %chat_id, error = %err, "journal: subagent projection unreadable");
+                return None;
+            }
+        };
+        let mut out = Vec::new();
+        for (seq, event) in lines {
+            project_feed(&event, parent_tool_use_id, seq, &mut out);
+        }
+        Some(out)
+    }
+
+    /// Remove a chat's journal and its resume budget. Deleting a chat must not
+    /// leave a transcript behind, and a stale `.resume` would hand a deleted
+    /// run its revival budget on the next crash scan.
     pub fn discard(&self, chat_id: &str) -> Result<(), JournalError> {
         self.lock().remove(chat_id);
-        let path = self.path_for(chat_id);
-        if path.exists() {
-            std::fs::remove_file(path)?;
+        for path in [self.path_for(chat_id), self.attempts_path(chat_id)] {
+            if path.exists() {
+                std::fs::remove_file(path)?;
+            }
         }
         Ok(())
+    }
+}
+
+/// One journal line into `out`: payloads of the wrapper tagged `target` are
+/// emitted unwrapped, a wrapper for someone else is descended, and a wrapper
+/// nested under our own feed stops there — it belongs to its own parent.
+///
+/// `pub(crate)` because a live subscriber applies the same rule to the frames it
+/// receives: the replay and the live tail must attribute nested traffic
+/// identically, or the two halves of one transcript disagree about who said what.
+pub(crate) fn project_feed(
+    event: &AgentEvent,
+    target: &str,
+    seq: u64,
+    out: &mut Vec<(u64, AgentEvent)>,
+) {
+    let AgentEvent::Subagent {
+        parent_tool_use_id,
+        event: inner,
+    } = event
+    else {
+        return;
+    };
+    if parent_tool_use_id == target {
+        out.push((seq, (**inner).clone()));
+    } else {
+        project_feed(inner, target, seq, out);
     }
 }
 
@@ -414,5 +519,192 @@ mod tests {
         journal.append("chat-1", &tool_call("t1")).unwrap();
         assert!(journal.events_for_part("chat-1", "nope").is_empty());
         assert!(journal.events_for_part("missing-chat", "t1").is_empty());
+    }
+
+    fn compaction(id: &str, summary: Option<&str>, summary_delta: Option<&str>) -> AgentEvent {
+        AgentEvent::ContextCompaction {
+            id: id.into(),
+            status: komet_proto::CompactionStatus::Completed,
+            trigger: Some("auto".into()),
+            tokens_before: Some(165_000),
+            tokens_after: None,
+            summary: summary.map(str::to_owned),
+            summary_delta: summary_delta.map(str::to_owned),
+            error: None,
+        }
+    }
+
+    #[test]
+    fn summary_deltas_are_concatenated_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = RunJournal::open(dir.path()).unwrap();
+        // Interleaved noise + a second cycle: the fetch must read only its own.
+        journal.append("chat-1", &text("warming up")).unwrap();
+        journal
+            .append("chat-1", &compaction("c1", None, Some("They met ")))
+            .unwrap();
+        journal
+            .append("chat-1", &compaction("c2", None, Some("other cycle")))
+            .unwrap();
+        journal
+            .append("chat-1", &compaction("c1", None, Some("in Paris, then ")))
+            .unwrap();
+        journal
+            .append("chat-1", &compaction("c1", None, Some("parted")))
+            .unwrap();
+
+        assert_eq!(
+            journal.compaction_summary("chat-1", "c1").as_deref(),
+            Some("They met in Paris, then parted"),
+            "chunks rebuild in journal order, across a reopen-free read"
+        );
+        assert_eq!(
+            journal.compaction_summary("chat-1", "c2").as_deref(),
+            Some("other cycle")
+        );
+        assert!(journal.compaction_summary("chat-1", "nope").is_none());
+        assert!(journal.compaction_summary("missing-chat", "c1").is_none());
+    }
+
+    #[test]
+    fn a_full_summary_replaces_the_chunks_it_follows() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = RunJournal::open(dir.path()).unwrap();
+        journal
+            .append("chat-1", &compaction("c1", None, Some("partial ")))
+            .unwrap();
+        // The provider then emits the whole text: the fold (and so the fetch)
+        // replaces, it does not append the recap twice.
+        journal
+            .append("chat-1", &compaction("c1", Some("the recap"), None))
+            .unwrap();
+        assert_eq!(
+            journal.compaction_summary("chat-1", "c1").as_deref(),
+            Some("the recap")
+        );
+    }
+
+    #[test]
+    fn a_cycle_without_summary_is_absent_not_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = RunJournal::open(dir.path()).unwrap();
+        // Codex-style: the boundary arrives with no recap at all.
+        journal
+            .append("chat-1", &compaction("c1", None, None))
+            .unwrap();
+        assert!(
+            journal.compaction_summary("chat-1", "c1").is_none(),
+            "no summary must read as unavailable, not as an empty recap"
+        );
+    }
+
+    fn subagent(parent: &str, event: AgentEvent) -> AgentEvent {
+        AgentEvent::Subagent {
+            parent_tool_use_id: parent.into(),
+            event: Box::new(event),
+        }
+    }
+
+    #[test]
+    fn subagent_feed_is_projected_in_journal_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = RunJournal::open(dir.path()).unwrap();
+        // The parent's own feed interleaves with the child's — the projection
+        // must pick out the child's lines and keep their order.
+        journal.append("chat-1", &text("parent says")).unwrap();
+        journal
+            .append("chat-1", &subagent("spawn-a", text("a thinks")))
+            .unwrap();
+        journal
+            .append("chat-1", &subagent("spawn-a", tool_call("a-tool")))
+            .unwrap();
+        journal
+            .append("chat-1", &subagent("spawn-b", text("b thinks")))
+            .unwrap();
+        journal
+            .append("chat-1", &subagent("spawn-a", tool_result("a-tool")))
+            .unwrap();
+        journal.append("chat-1", &done()).unwrap();
+
+        let a = journal.subagent_events("chat-1", "spawn-a").unwrap();
+        assert_eq!(a.len(), 3, "only A's payloads, in journal order");
+        assert_eq!(a[0].0, 2);
+        assert!(matches!(&a[0].1, AgentEvent::TextDelta { text } if text == "a thinks"));
+        assert!(matches!(&a[1].1, AgentEvent::ToolCall { id, .. } if id == "a-tool"));
+        assert!(
+            matches!(&a[2].1, AgentEvent::ToolResult { id, .. } if id == "a-tool"),
+            "the child's tool settles on the child's feed"
+        );
+        let b = journal.subagent_events("chat-1", "spawn-b").unwrap();
+        assert_eq!(b.len(), 1);
+        assert!(matches!(&b[0].1, AgentEvent::TextDelta { text } if text == "b thinks"));
+        // A tool id is not a spawn id: the parent's chips have no feed.
+        assert!(journal.subagent_events("chat-1", "t1").unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_nested_wrapper_stays_under_its_own_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = RunJournal::open(dir.path()).unwrap();
+        // A wire that double-wraps: B's content arrives INSIDE A's line. It is
+        // B's content, so it must not read as A's — A sees the wrapper (the
+        // spawn chip), and B's feed is reached by B's id.
+        journal
+            .append(
+                "chat-1",
+                &subagent("spawn-a", subagent("spawn-b", text("deep"))),
+            )
+            .unwrap();
+
+        let a = journal.subagent_events("chat-1", "spawn-a").unwrap();
+        assert_eq!(a.len(), 1);
+        assert!(
+            matches!(&a[0].1, AgentEvent::Subagent { parent_tool_use_id, .. }
+                if parent_tool_use_id == "spawn-b"),
+            "A's feed carries B's wrapper, not B's prose: {:?}",
+            a[0].1
+        );
+        let b = journal.subagent_events("chat-1", "spawn-b").unwrap();
+        assert_eq!(b.len(), 1, "the chain is descended, not flattened away");
+        assert!(matches!(&b[0].1, AgentEvent::TextDelta { text } if text == "deep"));
+        assert_eq!(b[0].0, 1, "the deep event keeps its journal seq");
+    }
+
+    #[test]
+    fn a_missing_journal_is_absent_not_an_empty_feed() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = RunJournal::open(dir.path()).unwrap();
+        journal.append("chat-1", &text("no children here")).unwrap();
+        assert!(
+            journal.subagent_events("chat-1", "spawn-a").is_some(),
+            "a journal with no nested traffic is an empty feed, not an error"
+        );
+        assert!(
+            journal.subagent_events("never-ran", "spawn-a").is_none(),
+            "no journal on this host must read as unavailable"
+        );
+    }
+
+    #[test]
+    fn discard_removes_the_resume_budget_with_the_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = RunJournal::open(dir.path()).unwrap();
+        journal.append("chat-1", &text("half a turn")).unwrap();
+        journal.note_resume_attempt("chat-1");
+        assert!(
+            journal
+                .stale_sessions()
+                .unwrap()
+                .contains(&"chat-1".to_string())
+        );
+
+        journal.discard("chat-1").unwrap();
+
+        // No resurrection: the crash scan has nothing to flag, and the revival
+        // budget restarts rather than carrying over a deleted run's counts.
+        assert!(journal.stale_sessions().unwrap().is_empty());
+        assert_eq!(journal.resume_attempts("chat-1"), 0);
+        assert!(journal.subagent_events("chat-1", "spawn-a").is_none());
+        assert!(journal.replay("chat-1", 0).unwrap().is_empty());
     }
 }

@@ -64,13 +64,14 @@ fn controls() -> (RunControls, mpsc::Sender<SteerMessage>, CancellationToken) {
     let (steer_tx, steer_rx) = mpsc::channel(8);
     let token = CancellationToken::new();
     let controls = RunControls {
-        request_input: Box::new(move |questions: Vec<UserInputQuestion>| {
+        request_input: Box::new(move |questions: Vec<UserInputQuestion>, _source| {
             let (tx, rx) = oneshot::channel();
             let answers: Vec<UserInputAnswer> = questions
                 .iter()
                 .map(|q| UserInputAnswer {
                     question_id: q.id.clone(),
                     labels: vec!["Yes".into()],
+                    free_text: None,
                 })
                 .collect();
             let _ = tx.send(answers);

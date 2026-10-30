@@ -99,6 +99,20 @@ pub enum WorkspaceStatus {
     Offline,
 }
 
+/// What the Context popover needs from the thread to agree with the timeline:
+/// the compaction boundaries the doc actually carries.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ThreadCompactions {
+    /// Settled boundaries (completed, failed, cancelled).
+    pub count: usize,
+    /// A cycle is mid-flight — the thread says so even when the agent's usage
+    /// stats never mention compaction at all.
+    pub in_progress: bool,
+    /// Why the newest boundary happened, as the agent worded it (`None` = the
+    /// agent never said; the UI shows no reason rather than a guess).
+    pub last_trigger: Option<String>,
+}
+
 /// One row of the sidebar switcher: the local machine plus every paired device.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WorkspaceEntry {
@@ -847,9 +861,11 @@ async fn query_engine_info(client: &RpcClient) -> Result<EngineInfo, RpcError> {
 // and with their own test suite. Re-exported here because every call site in
 // this crate reads them as `state::…`.
 pub use komet_proto::view::{
-    ChatGroup, ConnectionStatus, GatePhase, Indicator, SESSION_STALE_MS, attention_rank,
-    chat_location, display_status, effective_indicator, format_time_ago, gate_phase, group_chats,
-    parse_auth_state, project_label, sort_active, sort_chats, sort_spaces, sort_tabs,
+    ChatGroup, ConnectionStatus, GatePhase, Indicator, RECONNECT_MAX_ATTEMPTS, SESSION_STALE_MS,
+    attention_rank, chat_location, display_status, effective_indicator, format_ms, format_time_ago,
+    gate_phase, group_chats, next_reconnect_step, parse_auth_state, project_label,
+    reconnect_base_delay_ms, reconnect_jittered_delay_ms, reconnect_should_retry, sort_active,
+    sort_chats, sort_spaces, sort_tabs,
 };
 
 // ---------------------------------------------------------------------------
@@ -953,6 +969,10 @@ pub struct AppState {
     pub spaces_synced: bool,
     /// Joined transcript of the selected chat (continuations folded engine-side).
     pub transcript: Vec<SessionMessageEntry>,
+    /// The selected chat's current plan: latest `ToolCall::Todo` in doc order,
+    /// cached so the persistent plan card never rescans a long transcript on
+    /// every streaming frame.
+    pub active_plan: Option<Vec<komet_proto::TodoItem>>,
     /// Optimistic user echoes per chat id, shown until the doc frame carrying
     /// the same message id arrives (client-minted ids make dedup exact).
     echoes: HashMap<String, Vec<SessionMessageEntry>>,
@@ -1037,6 +1057,31 @@ pub struct AppState {
     /// displayed, so its frames can't repaint another workspace's lists.
     data_tasks: Vec<Task<()>>,
     transcript_task: Option<Task<()>>,
+    /// Ordinal of the auto-retry attempt in flight, 0 when the chain is idle
+    /// (see [`Self::schedule_reconnect`] and the bounded schedule in
+    /// `komet_proto::view`).
+    pub reconnect_attempt: u32,
+    /// Wall clock the pending retry is due at — what the banner counts down
+    /// against. `None` whenever no attempt is queued.
+    pub reconnect_deadline: Option<DateTime<Utc>>,
+    /// A chain attempt is queued or dialing right now. This, and not the status
+    /// label, is what keeps two dying watches from forking two retry chains —
+    /// the status stays `Reconnecting` across a failure so the countdown never
+    /// jumps.
+    reconnect_pending: bool,
+    /// Messages the user fired while the link was down: kept whole here, named
+    /// by the reason the UI showed, handed to the composer once by
+    /// [`Self::take_queued_sends`]. A cut-off send must not be a lost paragraph.
+    queued_sends: Vec<QueuedSend>,
+}
+
+/// One parked message (transparency plan Task 10). The reason is stored with it
+/// because that is what makes the wait legible: "queued — reconnecting (2)"
+/// reads as a deliberate hold, a silent input box reads as a dead button.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueuedSend {
+    pub text: String,
+    pub reason: String,
 }
 
 impl Default for AppState {
@@ -1060,6 +1105,7 @@ impl AppState {
             selected_device: None,
             selected_chat: None,
             transcript: Vec::new(),
+            active_plan: None,
             echoes: HashMap::new(),
             pending_sends: HashMap::new(),
             upload_progress: None,
@@ -1092,6 +1138,10 @@ impl AppState {
             watch_tasks: Vec::new(),
             data_tasks: Vec::new(),
             transcript_task: None,
+            reconnect_attempt: 0,
+            reconnect_deadline: None,
+            reconnect_pending: false,
+            queued_sends: Vec::new(),
             auto_selected: false,
             chats_synced: false,
             spaces_synced: false,
@@ -1205,6 +1255,7 @@ impl AppState {
             self.selected_chat = None;
             self.pending_access = None;
             self.transcript.clear();
+            self.active_plan = None;
             self.transcript_task = None;
         }
         // The update may change the open chat's level from another device, or
@@ -1395,6 +1446,34 @@ impl AppState {
         (total_chars / 4) as u64
     }
 
+    /// What the thread itself carries about compaction: the boundaries the doc
+    /// holds, and why the newest one happened. Harnesses are inconsistent —
+    /// some report a count in their usage stats, some report nothing — so the
+    /// Context popover reads the doc too: a boundary in the transcript is a
+    /// fact, while a missing stat is only silence.
+    pub fn thread_compactions(&self) -> ThreadCompactions {
+        let mut out = ThreadCompactions::default();
+        for entry in &self.transcript {
+            for part in &entry.parts {
+                if let komet_doc::MessagePart::Compaction {
+                    status, trigger, ..
+                } = part
+                {
+                    match status {
+                        komet_proto::CompactionStatus::InProgress => out.in_progress = true,
+                        _ => out.count += 1,
+                    }
+                    // Newest wins: entries arrive in order, so the last
+                    // settled boundary's trigger is the one the popover shows.
+                    if let Some(trigger) = trigger {
+                        out.last_trigger = Some(trigger.clone());
+                    }
+                }
+            }
+        }
+        out
+    }
+
     pub fn apply_auth(&mut self, auth: AuthState) {
         self.auth = Some(auth);
     }
@@ -1423,7 +1502,14 @@ impl AppState {
             echoes.retain(|echo| !entries.iter().any(|e| e.id == echo.id));
         }
         self.transcript = entries;
+        self.refresh_active_plan();
         self.ack_pending_send_from_transcript();
+    }
+
+    /// Recompute [`Self::active_plan`] from the transcript. Pure backward scan
+    /// (last `Todo` wins), so it is cheap while the plan sits near the tail.
+    fn refresh_active_plan(&mut self) {
+        self.active_plan = komet_doc::latest_plan(&self.transcript);
     }
 
     /// Apply a `WatchDocMessages` delta frame in place. `Err` = this copy has
@@ -1432,7 +1518,25 @@ impl AppState {
         &mut self,
         frame: TranscriptFrame,
     ) -> Result<(), TranscriptDesync> {
+        let had_entries = self.transcript.len();
         komet_doc::apply_transcript_frame(&mut self.transcript, frame)?;
+        // Plans update in place on the streaming tail; only that case (or a
+        // new/removed entry) can change the answer. Skipping the scan keeps
+        // frame-time cost flat for long chats.
+        let tail_has_plan = self.transcript.last().is_some_and(|entry| {
+            entry.parts.iter().any(|part| {
+                matches!(
+                    part,
+                    komet_doc::MessagePart::Tool {
+                        call: komet_proto::ToolCall::Todo { .. },
+                        ..
+                    }
+                )
+            })
+        });
+        if tail_has_plan || self.transcript.len() != had_entries {
+            self.refresh_active_plan();
+        }
         if let Some(chat_id) = self.selected_chat.as_deref()
             && let Some(echoes) = self.echoes.get_mut(chat_id)
         {
@@ -1468,6 +1572,7 @@ impl AppState {
         {
             self.transcript.truncate(idx);
         }
+        self.refresh_active_plan();
         if let Some(echoes) = self.echoes.get_mut(chat_id) {
             echoes.clear();
         }
@@ -1542,6 +1647,91 @@ impl AppState {
             .and_then(|id| self.echoes.get(id))
             .map(|v| v.as_slice())
             .unwrap_or(&[])
+    }
+
+    // ---- offline outbox (transparency plan Task 10) ----
+
+    /// Why a send cannot leave right now, in words — `None` when the link is
+    /// Ready. The composer queues against this string instead of showing a
+    /// button that does nothing; naming the reason is the whole point. Reads
+    /// [`Self::link_status`], so a paired environment that is offline blocks
+    /// exactly like a dead engine.
+    pub fn send_block_reason(&self) -> Option<String> {
+        match self.link_status() {
+            ConnectionStatus::Ready => None,
+            ConnectionStatus::Connecting => Some("connecting".to_string()),
+            ConnectionStatus::Reconnecting {
+                attempt,
+                retry_in_ms,
+                ..
+            } => Some(format!(
+                "reconnecting ({attempt}, {})",
+                format_ms(retry_in_ms)
+            )),
+            ConnectionStatus::Degraded { reason } => Some(format!("link degraded: {reason}")),
+            ConnectionStatus::Failed { retryable, .. } => Some(if retryable {
+                "engine unreachable — press Retry".to_string()
+            } else {
+                "engine unreachable".to_string()
+            }),
+        }
+    }
+
+    /// Park a message the link cannot carry. Returns the reason shown on the
+    /// row. Duplicates of the immediately-preceding entry are refused: a user
+    /// pressing Return twice in a row while nothing visibly happened must not
+    /// queue the same paragraph twice.
+    pub fn queue_send(&mut self, text: String) -> String {
+        let reason = self.send_block_reason().unwrap_or_default();
+        if self
+            .queued_sends
+            .last()
+            .is_some_and(|last| last.text == text)
+        {
+            return reason;
+        }
+        self.queued_sends.push(QueuedSend { text, reason });
+        self.queued_sends.last().unwrap().reason.clone()
+    }
+
+    /// The parked messages, oldest first.
+    pub fn queued_sends(&self) -> &[QueuedSend] {
+        &self.queued_sends
+    }
+
+    /// Hand the parked messages to the composer and empty the outbox in the
+    /// same breath — the only way out, so the frame that lands after a
+    /// reconnect cannot replay a message twice.
+    pub fn take_queued_sends(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.queued_sends)
+            .into_iter()
+            .map(|queued| queued.text)
+            .collect()
+    }
+
+    /// The status the shell narrates: the engine link, or — while a paired
+    /// environment is displayed — that environment's reachability spoken in the
+    /// SAME vocabulary. A paired env that is offline is `Degraded` (this app
+    /// works, the thing you are looking at does not), never a dead gate card, and
+    /// its rows stay hidden: only the env's own pump can fill them. Pure.
+    pub fn link_status(&self) -> ConnectionStatus {
+        if self.is_local_workspace() {
+            return self.connection.clone();
+        }
+        match self.active_workspace_status() {
+            WorkspaceStatus::Connecting => ConnectionStatus::Connecting,
+            WorkspaceStatus::Offline => ConnectionStatus::Degraded {
+                reason: format!(
+                    "{} is offline",
+                    self.workspace_row(&self.active_workspace)
+                        .map(|row| row.label.clone())
+                        .unwrap_or_else(|| "Environment".to_string())
+                ),
+            },
+            // Reachable environment: the app-level link still decides — a
+            // reconnecting engine takes its relay with it.
+            WorkspaceStatus::Online => self.connection.clone(),
+        }
     }
 
     /// Attachment upload starting: expose its progress to the working label.
@@ -1812,17 +2002,15 @@ impl AppState {
         rows
     }
 
-    /// "This computer · fedora" once the registry row carries a hostname.
+    /// Keep the local workspace label aligned with the device name itself, without
+    /// the "This computer" prefix that duplicates the paired-device row below it.
     pub fn local_workspace_label(&self) -> String {
-        let name = self
-            .home_device_id
+        self.home_device_id
             .as_deref()
             .and_then(|id| self.local_devices.iter().find(|d| d.id == id))
-            .map(|d| d.name.clone());
-        match name {
-            Some(name) => format!("This computer · {name}"),
-            None => "This computer".to_string(),
-        }
+            .map(|d| d.name.clone())
+            .or_else(|| self.local_devices.first().map(|d| d.name.clone()))
+            .unwrap_or_else(|| "This computer".to_string())
     }
 
     /// The switcher trigger's label: the workspace being displayed.
@@ -1872,8 +2060,13 @@ impl AppState {
         self.chats_synced = false;
         self.spaces_synced = false;
         self.transcript.clear();
+        self.active_plan = None;
         self.echoes.clear();
         self.pending_sends.clear();
+        self.queued_sends.clear();
+        self.reconnect_attempt = 0;
+        self.reconnect_pending = false;
+        self.reconnect_deadline = None;
         self.local_device_id = None;
         self.home_device_id = None;
         self.update = None;
@@ -1882,25 +2075,69 @@ impl AppState {
 
     // ---- gpui glue ----
 
-    /// Schedule a reconnect using the stored boot config (daemon died or was
-    /// replaced). Guarded: only one reconnect runs at a time, and only from a
-    /// previously-Remote or Failed state — InProcess engines are already local.
-    fn schedule_reconnect(&mut self, cx: &mut Context<Self>) {
-        if self.connection == ConnectionStatus::Connecting {
-            return;
-        }
-        let Some(config) = self.boot_config.clone() else {
-            return;
-        };
-        // Tear down stale remote watches before re-probing; `attach_engine`
-        // will recreate them. Paired-device connections ride the same daemon, so
-        // they go too and re-attach from the next environment frame.
+    /// What a dropped link is allowed to throw away: the pumps, and the
+    /// workspace relays that rode on them — `attach_engine` re-makes both, and
+    /// the transcript of the selected chat is re-subscribed there. What this
+    /// does NOT touch is what the user is looking at: the transcript, the
+    /// echoes and the outbox survive the gap, so a reconnect never blinks
+    /// (transparency plan Task 10).
+    fn drop_engine_subscriptions(&mut self) {
         self.watch_tasks.clear();
         self.data_tasks.clear();
+        // Paired-device connections ride the same daemon, so they go too and
+        // re-attach from the next environment frame.
         self.clear_workspaces();
         self.transcript_task = None;
-        // Keep transcript etc. until new engine attaches — avoid flash.
-        self.connection = ConnectionStatus::Connecting;
+    }
+
+    /// Re-dial the engine after the link dropped, on the BOUNDED backoff chain:
+    /// attempt `n` waits `reconnect_base_delay_ms(n)` ±20 % jitter, the ordinal
+    /// and the deadline ride on `ConnectionStatus::Reconnecting` so the wait is
+    /// countable, and after `RECONNECT_MAX_ATTEMPTS` the chain stops with
+    /// `Failed { retryable: true }` — an endless silent redial reads as an app
+    /// that answers nothing. Guarded: one attempt runs at a time, and only from
+    /// a previously-Remote or Failed state (InProcess engines are already local).
+    /// The transcript, the echoes and the outbox survive: only subscriptions
+    /// die, and `attach_engine` re-makes them.
+    fn schedule_reconnect(&mut self, reason: String, cx: &mut Context<Self>) {
+        if self.reconnect_pending || self.connection == ConnectionStatus::Connecting {
+            return; // a chain attempt is already queued or dialing
+        }
+        self.reconnect_pending = true;
+        let Some(config) = self.boot_config.clone() else {
+            self.reconnect_pending = false;
+            self.connection = ConnectionStatus::Failed {
+                message: reason,
+                retryable: false,
+            };
+            cx.notify();
+            return;
+        };
+        // Draw the jitter from the clock: two viewports reconnecting into the
+        // same daemon must not peak on it at the same millisecond.
+        let unit = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| (since.subsec_micros() % 1_000) as f64 / 1_000.0)
+            .unwrap_or(0.5);
+        let Some((attempt, delay_ms)) = next_reconnect_step(self.reconnect_attempt, unit) else {
+            tracing::error!(attempt = self.reconnect_attempt, %reason, "engine reconnect chain exhausted");
+            self.reconnect_deadline = None;
+            self.connection = ConnectionStatus::Failed {
+                message: reason,
+                retryable: true,
+            };
+            cx.notify();
+            return;
+        };
+        self.reconnect_attempt = attempt;
+        self.drop_engine_subscriptions();
+        self.reconnect_deadline =
+            Some(Utc::now() + chrono::Duration::milliseconds(delay_ms as i64));
+        self.connection = ConnectionStatus::Reconnecting {
+            attempt,
+            retry_in_ms: delay_ms,
+            reason,
+        };
         // Drop the dead engine handle so `attach_engine` can replace it cleanly.
         // Shutdown is best-effort (remote daemon is already gone).
         if let Some(old) = self.engine.take() {
@@ -1914,9 +2151,8 @@ impl AppState {
         // state update, mirroring `bootstrap`.
         let state = cx.entity().clone();
         cx.spawn(async move |_, cx| {
-            // Small delay to let a restarting daemon bind the port.
             cx.background_executor()
-                .timer(std::time::Duration::from_millis(500))
+                .timer(std::time::Duration::from_millis(delay_ms))
                 .await;
             let boot = Tokio::spawn(cx, EngineHandle::bootstrap(config));
             let outcome = match boot.await {
@@ -1924,16 +2160,30 @@ impl AppState {
                 Ok(Err(err)) => Err(format!("{err:#}")),
                 Err(join_err) => Err(join_err.to_string()),
             };
-            state.update(cx, |s, cx| match outcome {
-                Ok(handle) => s.attach_engine(handle, cx),
-                Err(message) => {
-                    tracing::error!(%message, "engine reconnect failed");
-                    s.connection = ConnectionStatus::Failed(message);
-                    cx.notify();
+            let _ = state.update(cx, |s, cx| {
+                // The attempt is over either way: release the guard before
+                // deciding, or the chain could never advance past attempt 1.
+                s.reconnect_pending = false;
+                s.reconnect_deadline = None;
+                match outcome {
+                    Ok(handle) => s.attach_engine(handle, cx),
+                    Err(message) => {
+                        tracing::warn!(%message, "engine reconnect attempt failed");
+                        // Fall through the chain: this attempt is the one that
+                        // just failed, so the next call schedules attempt + 1.
+                        s.schedule_reconnect(message, cx);
+                    }
                 }
             });
         })
         .detach();
+    }
+
+    /// The user pressed Retry: the chain restarts from the top of the schedule
+    /// (attempt 0 → 500 ms) rather than continuing where it gave up.
+    pub fn reset_reconnect_chain(&mut self) {
+        self.reconnect_attempt = 0;
+        self.reconnect_deadline = None;
     }
 
     /// Kick off (or retry) the engine bootstrap: probe → connect-or-embed on
@@ -1943,6 +2193,11 @@ impl AppState {
         let boot_config = config.clone();
         state.update(cx, |s, cx| {
             s.connection = ConnectionStatus::Connecting;
+            // A manual Retry (and a fresh boot) restarts the chain from the top
+            // of the schedule, not from where the last one gave up.
+            s.reconnect_attempt = 0;
+            s.reconnect_pending = false;
+            s.reconnect_deadline = None;
             s.workspace_scope = None;
             s.auth = None;
             s.data_dir = Some(data_dir.clone());
@@ -1967,7 +2222,12 @@ impl AppState {
                 Ok(handle) => s.attach_engine(handle, cx),
                 Err(message) => {
                     tracing::error!(%message, "engine bootstrap failed");
-                    s.connection = ConnectionStatus::Failed(message);
+                    // A cold boot gets no auto-retry chain (the user is looking
+                    // at the gate card), but it must never be a dead end.
+                    s.connection = ConnectionStatus::Failed {
+                        message,
+                        retryable: true,
+                    };
                     cx.notify();
                 }
             });
@@ -2018,6 +2278,11 @@ impl AppState {
         // EngineInfo is part of the attachment boundary: views must know which
         // data profile they reached before they are allowed to render Ready.
         self.connection = ConnectionStatus::Ready;
+        // The chain succeeded (or this is the first boot): the counter restarts
+        // from the top of the schedule, and the deadline goes with the banner.
+        self.reconnect_attempt = 0;
+        self.reconnect_pending = false;
+        self.reconnect_deadline = None;
         // Re-subscribe the transcript if a chat was already selected (reconnect path).
         if let Some(chat_id) = self.selected_chat.clone() {
             self.transcript_task = Some(spawn_transcript_watch(
@@ -2372,6 +2637,7 @@ impl AppState {
         self.devices.clear();
         self.sessions.clear();
         self.transcript.clear();
+        self.active_plan = None;
         self.context_usage.clear();
         self.echoes.clear();
         self.pending_sends.clear();
@@ -2457,6 +2723,7 @@ impl AppState {
         self.pending_access = None;
         self.sync_access_mode();
         self.transcript.clear();
+        self.active_plan = None;
         self.transcript_task = None;
         if let Some(id) = chat_id.as_deref() {
             // A chat implies its project (or the lack of one); `select_chat(None)`
@@ -2584,7 +2851,13 @@ fn spawn_deferred_engine_watch(
         // remote handles stop their completed readiness probe.
         handle.shutdown().await;
         this.update(cx, |state, cx| {
-            state.connection = ConnectionStatus::Failed(failure);
+            // The runtime died after attaching: say so and hand Retry to the
+            // user — re-embedding a half-assembled engine automatically would
+            // hide a real startup failure behind a spinner.
+            state.connection = ConnectionStatus::Failed {
+                message: failure,
+                retryable: true,
+            };
             cx.notify();
         })
         .ok();
@@ -2684,7 +2957,7 @@ fn pump_lost(this: &gpui::WeakEntity<AppState>, owner: &WatchOwner, cx: &mut gpu
         WatchOwner::Engine => {
             let _ = this.update(cx, |state, cx| {
                 tracing::warn!("engine connection lost; reconnecting");
-                state.schedule_reconnect(cx);
+                state.schedule_reconnect("engine connection lost".to_string(), cx);
             });
         }
         WatchOwner::Workspace(env_id) => {
@@ -4150,6 +4423,180 @@ mod tests {
         assert!(state.pending_echoes().is_empty());
     }
 
+    /// Fold a cycle's frames the way the pipeline does: `inProgress` then
+    /// `completed` land on ONE part (refined in place by compaction id), so a
+    /// thread never holds two parts for one boundary.
+    fn compaction_parts(
+        compaction_id: &str,
+        frames: &[(komet_proto::CompactionStatus, Option<&str>)],
+    ) -> Vec<komet_doc::MessagePart> {
+        let mut parts = Vec::new();
+        for (status, trigger) in frames {
+            komet_doc::fold_event_into_parts(
+                &mut parts,
+                &komet_proto::AgentEvent::ContextCompaction {
+                    id: compaction_id.into(),
+                    status: *status,
+                    trigger: trigger.map(str::to_owned),
+                    tokens_before: Some(165_000),
+                    tokens_after: None,
+                    summary: None,
+                    summary_delta: None,
+                    error: None,
+                },
+            );
+        }
+        parts
+    }
+
+    fn compaction_entry(
+        id: &str,
+        frames: &[(komet_proto::CompactionStatus, Option<&str>)],
+    ) -> SessionMessageEntry {
+        SessionMessageEntry {
+            id: format!("sys-{id}"),
+            role: komet_doc::MessageRole::System,
+            parts: compaction_parts(id, frames),
+            created_at: 0,
+            device_id: "local".into(),
+            status: None,
+            continuation_of: None,
+        }
+    }
+
+    #[test]
+    fn thread_compactions_reads_the_doc_when_the_agent_says_nothing() {
+        use komet_proto::CompactionStatus::{Completed, InProgress};
+        let mut state = AppState::new();
+        assert_eq!(state.thread_compactions(), ThreadCompactions::default());
+        // A cycle in flight is not a boundary yet — the popover must not count
+        // it, only mark it live.
+        state.transcript = vec![compaction_entry("c1", &[(InProgress, None)])];
+        let mid = state.thread_compactions();
+        assert_eq!((mid.count, mid.in_progress), (0, true));
+        assert_eq!(mid.last_trigger, None, "no reason was ever reported");
+        // The same cycle settling refines its part (it is not a second
+        // boundary), and a second cycle adds one — with the newest reported
+        // reason winning.
+        state.transcript = vec![
+            compaction_entry("c1", &[(InProgress, None), (Completed, Some("auto"))]),
+            compaction_entry("c2", &[(Completed, Some("manual"))]),
+        ];
+        let done = state.thread_compactions();
+        assert_eq!(done.count, 2, "two cycles, two parts");
+        assert!(!done.in_progress, "the refined part is no longer in flight");
+        assert_eq!(done.last_trigger.as_deref(), Some("manual"));
+    }
+
+    fn plan_entry(id: &str, items: Vec<komet_proto::TodoItem>) -> SessionMessageEntry {
+        let mut parts = Vec::new();
+        komet_doc::fold_event_into_parts(
+            &mut parts,
+            &komet_proto::AgentEvent::ToolCall {
+                id: "acp-plan".into(),
+                call: komet_proto::ToolCall::Todo { items },
+            },
+        );
+        SessionMessageEntry {
+            id: id.into(),
+            role: komet_doc::MessageRole::Assistant,
+            parts,
+            created_at: 0,
+            device_id: "local".into(),
+            status: None,
+            continuation_of: None,
+        }
+    }
+
+    #[test]
+    fn active_plan_tracks_the_latest_todo_call() {
+        let mut state = AppState::new();
+        state.selected_chat = Some("c1".into());
+        let first = vec![komet_proto::TodoItem {
+            text: "a".into(),
+            done: false,
+        }];
+        let last = vec![komet_proto::TodoItem {
+            text: "a".into(),
+            done: true,
+        }];
+        state.apply_transcript(vec![
+            plan_entry("m1", first),
+            plan_entry("m2", last.clone()),
+        ]);
+        assert_eq!(state.active_plan, Some(last));
+    }
+
+    #[test]
+    fn active_plan_follows_in_place_delta_frames() {
+        let mut state = AppState::new();
+        state.selected_chat = Some("c1".into());
+        let first = vec![komet_proto::TodoItem {
+            text: "a".into(),
+            done: false,
+        }];
+        state.apply_transcript(vec![plan_entry("m1", first.clone())]);
+        assert_eq!(state.active_plan, Some(first));
+
+        // The streaming case: the live entry is replaced in place, so the
+        // transcript keeps one entry and the scan must still run — the plan
+        // card is driven by exactly this frame.
+        let last = vec![komet_proto::TodoItem {
+            text: "a".into(),
+            done: true,
+        }];
+        state
+            .apply_transcript_frame(TranscriptFrame::Delta {
+                upsert: vec![komet_doc::TranscriptUpsert {
+                    after: None,
+                    entry: plan_entry("m1", last.clone()),
+                }],
+                append: vec![],
+                remove: vec![],
+                count: 1,
+            })
+            .expect("in-place plan frame");
+        assert_eq!(state.active_plan, Some(last));
+
+        // Removing the plan entry changes the length, which is the other
+        // trigger: the cache must not stay on a snapshot no entry carries.
+        state
+            .apply_transcript_frame(TranscriptFrame::Delta {
+                upsert: vec![],
+                append: vec![],
+                remove: vec!["m1".into()],
+                count: 0,
+            })
+            .expect("plan entry removed");
+        assert_eq!(state.active_plan, None);
+    }
+
+    #[test]
+    fn active_plan_clears_when_its_entry_is_truncated() {
+        let mut state = AppState::new();
+        state.selected_chat = Some("c1".into());
+        state.apply_transcript(vec![plan_entry(
+            "m1",
+            vec![komet_proto::TodoItem {
+                text: "a".into(),
+                done: false,
+            }],
+        )]);
+        assert!(state.active_plan.is_some());
+        state.truncate_transcript_from("c1", "m1");
+        assert_eq!(state.active_plan, None);
+        // A later full snapshot without a plan also clears it.
+        state.apply_transcript(vec![plan_entry(
+            "m2",
+            vec![komet_proto::TodoItem {
+                text: "a".into(),
+                done: true,
+            }],
+        )]);
+        state.apply_transcript(vec![]);
+        assert_eq!(state.active_plan, None);
+    }
+
     #[test]
     fn gate_phases() {
         assert_eq!(
@@ -4157,7 +4604,14 @@ mod tests {
             GatePhase::Loading
         );
         assert_eq!(
-            gate_phase(&ConnectionStatus::Failed("boom".into()), None, None),
+            gate_phase(
+                &ConnectionStatus::Failed {
+                    message: "boom".into(),
+                    retryable: false
+                },
+                None,
+                None
+            ),
             GatePhase::Failed("boom".into())
         );
         assert_eq!(
@@ -4188,6 +4642,167 @@ mod tests {
             ),
             GatePhase::Ready
         );
+    }
+
+    #[test]
+    fn connection_backoff_is_bounded_and_visible() {
+        // The whole chain, driven with jitter switched off (unit 0.5 → no
+        // displacement): 500 ms → 1 s → 2 s → 5 s → 10 s, saturating, and it
+        // STOPS. An unbounded redial loop is the "spinner that answers nothing"
+        // this task exists to remove.
+        let mut attempt = 0u32;
+        let mut chain = Vec::new();
+        while let Some((next, delay)) = next_reconnect_step(attempt, 0.5) {
+            chain.push((next, delay));
+            attempt = next;
+        }
+        assert_eq!(
+            chain,
+            vec![
+                (1, 500),
+                (2, 1_000),
+                (3, 2_000),
+                (4, 5_000),
+                (5, 10_000),
+                (6, 10_000),
+            ],
+            "six attempts, the last two at the ceiling"
+        );
+        assert_eq!(attempt, RECONNECT_MAX_ATTEMPTS);
+
+        // ±20 %, clamped: a bad jitter source cannot leave the band.
+        assert_eq!(reconnect_jittered_delay_ms(1_000, 0.0), 800);
+        assert_eq!(reconnect_jittered_delay_ms(1_000, 1.0), 1_200);
+        assert_eq!(reconnect_jittered_delay_ms(1_000, 7.0), 1_200);
+
+        // The wait is EXPOSED while it runs, not just scheduled: the ordinal and
+        // the deadline are what the banner counts down against, and the gate
+        // stays open (no white screen) for as long as the chain has links left.
+        let mut state = AppState::new();
+        state.connection = ConnectionStatus::Reconnecting {
+            attempt: 3,
+            retry_in_ms: 2_000,
+            reason: "engine connection lost".into(),
+        };
+        state.reconnect_attempt = 3;
+        state.reconnect_deadline = Some(Utc::now() + chrono::Duration::milliseconds(2_000));
+        assert_eq!(state.reconnect_attempt, 3);
+        assert!(state.reconnect_deadline.is_some());
+        assert_eq!(gate_phase(&state.connection, None, None), GatePhase::Ready);
+
+        // Ceiling reached: the chain hands the Retry button to the user, and
+        // `retryable: true` is what keeps that button from being a lie.
+        assert_eq!(next_reconnect_step(RECONNECT_MAX_ATTEMPTS, 0.5), None);
+        state.connection = ConnectionStatus::Failed {
+            message: "engine connection lost".into(),
+            retryable: true,
+        };
+        assert!(matches!(
+            state.connection,
+            ConnectionStatus::Failed {
+                retryable: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn reconnect_keeps_the_last_frame_and_the_echoes() {
+        let mut state = AppState::new();
+        state.selected_chat = Some("c1".into());
+        state.connection = ConnectionStatus::Ready;
+        state.transcript = vec![user_entry("m1"), user_entry("m2")];
+        state.push_echo("c1", user_entry("m3"));
+        state.watch_tasks.push(Task::ready(()));
+        state.data_tasks.push(Task::ready(()));
+        state.transcript_task = Some(Task::ready(()));
+        state.workspaces = vec![WorkspaceEntry {
+            id: "env-1".into(),
+            label: "Work".into(),
+            host: "sync.example".into(),
+            status: WorkspaceStatus::Online,
+            device_count: 1,
+            version: None,
+        }];
+
+        // What the dropped link throws away is the pumps — nothing the user is
+        // reading. (`attach_engine` re-makes them and re-subscribes the
+        // transcript of the still-selected chat.)
+        state.drop_engine_subscriptions();
+        assert!(state.watch_tasks.is_empty());
+        assert!(state.data_tasks.is_empty());
+        assert!(state.transcript_task.is_none());
+        assert!(state.workspaces.is_empty());
+        assert_eq!(state.transcript.len(), 2, "the last frame survives the gap");
+        assert_eq!(state.pending_echoes().len(), 1, "an unconfirmed echo survives too");
+        assert_eq!(state.selected_chat.as_deref(), Some("c1"));
+
+        // And the state it lands in keeps the shell up rather than revealing a
+        // gate card over an empty canvas.
+        state.connection = ConnectionStatus::Reconnecting {
+            attempt: 1,
+            retry_in_ms: 500,
+            reason: "engine connection lost".into(),
+        };
+        assert_eq!(gate_phase(&state.connection, None, None), GatePhase::Ready);
+    }
+
+    #[test]
+    fn paired_environment_reconnect_uses_the_same_states() {
+        let mut state = AppState::new();
+        state.connection = ConnectionStatus::Ready;
+        let work = WorkspaceEntry {
+            id: "env-1".into(),
+            label: "Work".into(),
+            host: "sync.example".into(),
+            status: WorkspaceStatus::Online,
+            device_count: 1,
+            version: None,
+        };
+
+        // Local workspace: the engine link IS the status.
+        assert_eq!(state.link_status(), ConnectionStatus::Ready);
+        state.connection = ConnectionStatus::Reconnecting {
+            attempt: 2,
+            retry_in_ms: 1_000,
+            reason: "engine connection lost".into(),
+        };
+        assert!(matches!(
+            state.link_status(),
+            ConnectionStatus::Reconnecting { attempt: 2, .. }
+        ));
+
+        // A paired environment speaks the SAME vocabulary — the banner needs no
+        // second code path — and never borrows the local engine's health to
+        // look alive: that is how one environment's rows could show up as
+        // another's.
+        state.active_workspace = "env-1".into();
+        state.workspaces = vec![work.clone()];
+        state.connection = ConnectionStatus::Ready;
+        state.workspaces[0].status = WorkspaceStatus::Connecting;
+        assert_eq!(state.link_status(), ConnectionStatus::Connecting);
+        state.workspaces[0].status = WorkspaceStatus::Offline;
+        assert_eq!(
+            state.link_status(),
+            ConnectionStatus::Degraded {
+                reason: "Work is offline".into()
+            }
+        );
+        // Reachable environment: the engine's own state shows through again.
+        // Keep the reconnect banner alive until the runtime has actually
+        // recovered, then drop back to Ready as soon as the engine reports it.
+        state.workspaces[0].status = WorkspaceStatus::Online;
+        state.connection = ConnectionStatus::Reconnecting {
+            attempt: 2,
+            retry_in_ms: 1_000,
+            reason: "engine connection lost".into(),
+        };
+        assert!(matches!(
+            state.link_status(),
+            ConnectionStatus::Reconnecting { .. }
+        ));
+        state.connection = ConnectionStatus::Ready;
+        assert_eq!(state.link_status(), ConnectionStatus::Ready);
     }
 
     #[test]

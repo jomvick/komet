@@ -166,6 +166,12 @@ struct WorkspaceHostInner {
     peer_alive: Mutex<Option<PeerAliveHook>>,
     /// Deaf-socket tripwire state — see `check_presence_deafness`.
     presence_watch: Mutex<PresenceWatch>,
+    /// This host's run journal, attached after assembly by the engine that owns
+    /// it. The journal is not registry state — it lives on the machine that ran
+    /// the chat — so `delete_chat` needs the handle to take a chat's transcript
+    /// (and its revival budget) down with the row. `None` for a workspace with
+    /// no journal of its own (a remote environment, seen only as a registry).
+    journal: Mutex<Option<Arc<crate::run_journal::RunJournal>>>,
 }
 
 /// "This peer is alive" callback (device id) — see `WorkspaceHost::set_peer_alive_hook`.
@@ -281,6 +287,7 @@ impl WorkspaceHost {
                 presence_seen: Mutex::new(std::collections::HashMap::new()),
                 peer_alive: Mutex::new(None),
                 presence_watch: Mutex::new(PresenceWatch::default()),
+                journal: Mutex::new(None),
             }),
         };
         // Persist immediately: after this boot the migration source is never
@@ -428,6 +435,12 @@ impl WorkspaceHost {
     /// the engine points this at `LinkCache::reset_cooldown`.
     pub fn set_peer_alive_hook(&self, hook: PeerAliveHook) {
         *lock(&self.inner.peer_alive) = Some(hook);
+    }
+
+    /// Attach this host's run journal so deleting a chat deletes what the
+    /// journal holds for it. Idempotent; the engine calls it once at assembly.
+    pub fn attach_journal(&self, journal: Arc<crate::run_journal::RunJournal>) {
+        *lock(&self.inner.journal) = Some(journal);
     }
 
     pub fn device_id(&self) -> &str {
@@ -909,8 +922,21 @@ impl WorkspaceHost {
 
     /// Tombstone: removes the chats (and session-status) row; the per-chat session
     /// doc remains untouched.
+    ///
+    /// On the host that ran the chat it also drops the run journal: a deleted
+    /// chat must not keep its transcript (or a subagent's) readable, and its
+    /// `.resume` file must not survive to hand a revival budget to a run whose
+    /// chat no longer exists. A device that merely converges the tombstone has
+    /// no journal file here, so the discard is a no-op there.
     pub fn delete_chat(&self, chat_id: &str) -> Result<bool, EngineError> {
-        Ok(self.mutate(|doc| doc.delete_chat(chat_id))?)
+        let deleted = self.mutate(|doc| doc.delete_chat(chat_id))?;
+        if deleted
+            && let Some(journal) = lock(&self.inner.journal).as_ref()
+            && let Err(err) = journal.discard(chat_id)
+        {
+            tracing::warn!(chat = %chat_id, error = %err, "run journal delete failed");
+        }
+        Ok(deleted)
     }
 
     pub fn rename_device(&self, device_id: &str, name: &str) -> Result<bool, EngineError> {

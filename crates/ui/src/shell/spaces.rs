@@ -380,7 +380,7 @@ impl Shell {
                     Some(SpacesMenuPage::Actions) => {
                         let (worktrees_enabled, settings_enabled) =
                             self.project_menu_action_availability(cx);
-                        1 + usize::from(worktrees_enabled) + usize::from(settings_enabled)
+                        usize::from(worktrees_enabled) + usize::from(settings_enabled)
                     }
                     Some(SpacesMenuPage::Settings) => 2,
                     Some(SpacesMenuPage::Worktrees) => self
@@ -421,13 +421,7 @@ impl Shell {
                         return;
                     }
                     Some((SpacesMenuPage::Actions, active))
-                        if active == usize::from(worktrees_enabled) =>
-                    {
-                        self.open_project_menu_page(SpacesMenuPage::Projects, window, cx);
-                        return;
-                    }
-                    Some((SpacesMenuPage::Actions, active))
-                        if settings_enabled && active == usize::from(worktrees_enabled) + 1 =>
+                        if settings_enabled && active == usize::from(worktrees_enabled) =>
                     {
                         self.open_project_menu_page(SpacesMenuPage::Settings, window, cx);
                         return;
@@ -616,49 +610,6 @@ impl Shell {
             trigger
         };
         let trigger = if filter.is_none() {
-            let menu_open = self.spaces_menu.is_open();
-            let project_menu = div()
-                .id("project-tree-menu")
-                .size(px(24.0))
-                .flex_none()
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded(px(6.0))
-                .cursor_pointer()
-                .bg(if menu_open {
-                    theme.glass_hover()
-                } else {
-                    motion::hover_blend(
-                        "project-tree-menu",
-                        crate::theme::wash(0.0),
-                        crate::theme::wash(0.14),
-                    )
-                })
-                .on_hover(motion::hover_listener("project-tree-menu", cx.entity_id()))
-                .on_click(cx.listener(|this, _, window, cx| {
-                    if !this.spaces_menu.is_open() {
-                        this.open_spaces_menu(window, cx);
-                    }
-                }))
-                .child(
-                    icon(icons::FOLDER)
-                        .size(px(14.0))
-                        .text_color(theme.text_muted.opacity(0.7)),
-                );
-            let project_menu = if self.spaces_menu.get().is_some() {
-                let closing = self.spaces_menu.closing_since();
-                let menu = self.render_spaces_menu(theme, cx);
-                project_menu
-                    .relative()
-                    .child(popover::anchored_menu_below_unfrosted(
-                        "spaces-filter-menu",
-                        menu,
-                        closing,
-                    ))
-            } else {
-                project_menu
-            };
             let expanded = self.settings.project_tree_expanded;
             let project_count = self.state.read(cx).spaces.len();
             let project_header = div()
@@ -731,7 +682,6 @@ impl Shell {
                 .items_center()
                 .gap(px(4.0))
                 .child(project_header)
-                .child(project_menu)
                 .into_any_element()
         } else {
             trigger.into_any_element()
@@ -820,24 +770,6 @@ impl Shell {
                 })),
             )
         });
-        actions = actions.child(
-            self.project_menu_action_row(
-                "project-menu-switch",
-                icons::FOLDER,
-                "Switch project",
-                true,
-                active == usize::from(worktrees_enabled),
-                theme,
-            )
-            .on_hover(cx.listener(|this, hovered: &bool, window, cx| {
-                if *hovered {
-                    this.open_project_menu_page(SpacesMenuPage::Projects, window, cx);
-                }
-            }))
-            .on_click(cx.listener(|this, _, window, cx| {
-                this.open_project_menu_page(SpacesMenuPage::Projects, window, cx);
-            })),
-        );
         actions = actions.when(settings_enabled, |menu| {
             menu.child(
                 self.project_menu_action_row(
@@ -845,7 +777,7 @@ impl Shell {
                     icons::SETTINGS_MINIMALISTIC,
                     "Project settings",
                     true,
-                    active == usize::from(worktrees_enabled) + 1,
+                    active == usize::from(worktrees_enabled),
                     theme,
                 )
                 .on_hover(cx.listener(|this, hovered: &bool, window, cx| {

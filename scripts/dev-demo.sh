@@ -4,6 +4,8 @@
 #
 #   scripts/dev-demo.sh              # build, seed demo data, open the app
 #   scripts/dev-demo.sh --slow       # pace mock streams (~10s) to watch streaming
+#   scripts/dev-demo.sh --questions  # mock runs ask the two-page `question_multi`
+#                                    # scenario (multi-select + « Autre » field)
 #   scripts/dev-demo.sh --daemon-only  # seeded daemon only, for release captures
 #                                      # (scripts/frame-budget.sh in another shell)
 #
@@ -15,10 +17,12 @@ DAEMON_DIR=/tmp/komet-demo-daemon
 UI_DIR=/tmp/komet-demo-ui
 IPC=27921
 DELAY=""
+QUESTIONS=""
 MODE=gui
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --slow) DELAY=350; shift ;;
+    --questions) QUESTIONS=multi; shift ;;
     --daemon-only) MODE=daemon; shift ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
@@ -29,7 +33,8 @@ cargo build -p komet -q
 
 echo "▸ starting engine daemon on :$IPC"
 env KOMET_DATA_DIR="$DAEMON_DIR" KOMET_IPC_PORT=$IPC KOMET_HARNESS=mock \
-  ${DELAY:+KOMET_MOCK_DELAY_MS=$DELAY} RUST_LOG=warn \
+  ${DELAY:+KOMET_MOCK_DELAY_MS=$DELAY} ${QUESTIONS:+KOMET_MOCK_QUESTION=$QUESTIONS} \
+  RUST_LOG=warn \
   ./target/debug/komet headless &
 DAEMON_PID=$!
 trap 'kill $DAEMON_PID 2>/dev/null || true' EXIT
@@ -79,5 +84,6 @@ if [[ "$MODE" == daemon ]]; then
   wait "$DAEMON_PID"
 else
   echo "▸ opening komet (composer is live — type into it; --slow shows streaming)"
+  [[ -n "$QUESTIONS" ]] && echo "  mock runs ask question_multi — answer in the dock above the composer"
   KOMET_DATA_DIR="$UI_DIR" KOMET_IPC_PORT=$IPC RUST_LOG=warn ./target/debug/komet
 fi

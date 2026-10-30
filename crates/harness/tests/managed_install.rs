@@ -29,7 +29,7 @@ async fn managed_install_reaches_session_started() {
     let (_steer_tx, steering) = mpsc::channel(1);
     let interrupt = CancellationToken::new();
     let controls = RunControls {
-        request_input: Box::new(|_| tokio::sync::oneshot::channel().1),
+        request_input: Box::new(|_, _| tokio::sync::oneshot::channel().1),
         request_permission: RunControls::noop_permission(),
         steering,
         interrupt: interrupt.clone(),

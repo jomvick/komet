@@ -44,14 +44,31 @@ pub struct SteerMessage {
     pub message_id: Option<String>,
 }
 
-pub type RequestInputFn =
-    Box<dyn Fn(Vec<UserInputQuestion>) -> oneshot::Receiver<Vec<UserInputAnswer>> + Send + Sync>;
+/// Ask the user questions and await the answers (blocks the agent). The second
+/// argument says which wire the question came in on: the agent's own question
+/// channel (`Native`), or a channel Komet reads as a question because the agent
+/// has no other way to ask (`PermissionShaped`, ACP's option-list
+/// `request_permission`) — the transcript shows the reader where an answer
+/// actually went.
+pub type RequestInputFn = Box<
+    dyn Fn(
+            Vec<UserInputQuestion>,
+            komet_proto::QuestionSource,
+        ) -> oneshot::Receiver<Vec<UserInputAnswer>>
+        + Send
+        + Sync,
+>;
 
+/// Ask the user to approve something. The fourth argument is the id of the
+/// tool call the approval gates, when the agent's wire names one (ACP
+/// `toolCall.toolCallId`, Claude's `tool_use_id`) — `None` when it doesn't, so
+/// the transcript chip stays unlinked rather than guessed.
 pub type RequestPermissionFn = Box<
     dyn Fn(
             komet_proto::PermissionKind,
             String,
             Vec<komet_proto::PermissionChoice>,
+            Option<String>,
         ) -> oneshot::Receiver<komet_proto::PermissionChoice>
         + Send
         + Sync,
@@ -78,16 +95,8 @@ pub struct RunControls {
 }
 
 impl RunControls {
-    pub fn noop_permission() -> Box<
-        dyn Fn(
-                komet_proto::PermissionKind,
-                String,
-                Vec<komet_proto::PermissionChoice>,
-            ) -> oneshot::Receiver<komet_proto::PermissionChoice>
-            + Send
-            + Sync,
-    > {
-        Box::new(|_kind, _summary, _choices| {
+    pub fn noop_permission() -> RequestPermissionFn {
+        Box::new(|_kind, _summary, _choices, _tool_call_id| {
             let (tx, rx) = oneshot::channel();
             let _ = tx.send(komet_proto::PermissionChoice::Deny);
             rx

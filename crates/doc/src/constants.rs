@@ -25,3 +25,34 @@ pub const TERMINAL_OUTPUT_BATCH_MS: u64 = 12;
 pub const COMMAND_DEFAULT_TTL_MS: i64 = 24 * 60 * 60 * 1000;
 /// Current session doc schema version (`meta.schemaVersion`).
 pub const SESSION_SCHEMA_VERSION: u32 = 1;
+/// Byte cap for a compaction summary carried INSIDE the doc — reached only
+/// through the opt-in [`CompactionSummaryPolicy::SummaryInDoc`]. Truncation
+/// happens on a UTF-8 boundary and `MessagePart::Compaction::summary_bytes`
+/// keeps the ORIGINAL size, so the UI can say how much it dropped.
+pub const COMPACTION_SUMMARY_MAX_BYTES: usize = 8 * 1024;
+
+/// Where the TEXT of a compaction summary lives. The default keeps the doc
+/// (and therefore every sync peer, every export, every retained snapshot) free
+/// of a blob the agent produced for itself: the metadata lands in the doc, the
+/// text stays in the host's local run journal and is fetched on demand.
+///
+/// A summary is model prose about the whole conversation — it can carry
+/// whatever the transcript contained, so shipping it to every device by default
+/// is not a transparency win, it is an unbounded copy of the session in
+/// everyone's oplog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CompactionSummaryPolicy {
+    /// Metadata only in the doc (`summary_bytes`, `summary_in_journal`); text
+    /// through `GetCompactionSummary` from the host's run journal.
+    #[default]
+    JournalOnly,
+    /// Text in the doc too, capped at [`COMPACTION_SUMMARY_MAX_BYTES`].
+    SummaryInDoc,
+}
+
+impl CompactionSummaryPolicy {
+    /// Whether summary TEXT may be written into a doc part.
+    pub fn summary_in_doc(self) -> bool {
+        matches!(self, Self::SummaryInDoc)
+    }
+}
