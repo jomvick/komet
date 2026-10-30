@@ -543,6 +543,17 @@ async fn checkpoint_post_validates_seq_frontier_and_floor() {
     assert_eq!(bad_frontier.0, StatusCode::BAD_REQUEST);
     assert_eq!(json_body(&bad_frontier.2)["error"], "bad_frontier");
 
+    // An empty frontier is valid when the checkpoint covers nothing.
+    let empty_uncovered = http(
+        &app,
+        Method::POST,
+        "/chat2/chat-1/checkpoint?seqCovered=0",
+        &[("x-chat2-frontier", String::new())],
+        b"snap".to_vec(),
+    )
+    .await;
+    assert_eq!(empty_uncovered.0, StatusCode::OK);
+
     let empty = http(
         &app,
         Method::POST,
@@ -579,6 +590,17 @@ async fn checkpoint_post_validates_seq_frontier_and_floor() {
         .await;
         assert_kind(&recv_frame(&mut ws).await, frame_type::ACK);
     }
+    // Covering rows requires a frontier: an empty one is rejected.
+    let empty_covered = http(
+        &app,
+        Method::POST,
+        "/chat2/chat-1/checkpoint?seqCovered=1",
+        &[("x-chat2-frontier", String::new())],
+        b"snap".to_vec(),
+    )
+    .await;
+    assert_eq!(empty_covered.0, StatusCode::BAD_REQUEST);
+    assert_eq!(json_body(&empty_covered.2)["error"], "bad_frontier");
     let committed = http(
         &app,
         Method::POST,

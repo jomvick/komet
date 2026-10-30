@@ -7,10 +7,11 @@
 //! clients; this module owns no doc interpretation.
 //!
 //! Wire frames are the client codec ([`komet_sync::chat_frames`]), so the two
-//! ends cannot drift apart. Own replies (STATE/ACK/ROWS_DONE/PROBE_OK/ERROR)
-//! are written straight to the requesting socket; ROW/PRESENCE fan-out travels
-//! over a per-room broadcast and each socket drops events it originated (the
-//! sender must never see its own row echoed).
+//! ends cannot drift apart. Own replies (STATE/ROWS_DONE/PROBE_OK/ERROR) are
+//! written straight to the requesting socket; ROW/PRESENCE fan-out and the push
+//! ACK travel over the per-room broadcast (the ack is addressed to its origin),
+//! so an ack cannot overtake rows appended before it. Each socket drops events
+//! it originated, so the sender never sees its own row echoed.
 //!
 //! Quota windows and presence beats are memory-only and reset on restart,
 //! exactly like the DO's in-memory maps: they contain runaway-client loops and
@@ -97,6 +98,7 @@ impl ChatHub {
         let room = Arc::new(ChatRoom {
             log: Arc::new(log),
             tx,
+            publish: Mutex::new(()),
             presence: Mutex::new(HashMap::new()),
             quotas: Mutex::new(HashMap::new()),
         });
@@ -140,6 +142,9 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 struct ChatRoom {
     log: Arc<ChatLog>,
     tx: broadcast::Sender<Arc<RoomEvent>>,
+    /// Serializes append and fan-out: concurrent pushes must publish in seq
+    /// order, and an ack must follow the rows appended before it.
+    publish: Mutex<()>,
     presence: Mutex<HashMap<String, i64>>,
     quotas: Mutex<HashMap<String, QuotaWindow>>,
 }
@@ -154,6 +159,14 @@ enum RoomEvent {
         batch_id: String,
         payload: Vec<u8>,
     },
+    /// A push acknowledgement travels with the rows so it cannot overtake an
+    /// earlier append; only the originating socket emits it.
+    Ack {
+        origin: u64,
+        batch_id: String,
+        seq: u64,
+        dup: bool,
+    },
     Presence {
         origin: u64,
         device: String,
@@ -166,7 +179,9 @@ impl RoomEvent {
     /// The socket that emitted this event (its own receive loop drops it).
     fn origin(&self) -> u64 {
         match self {
-            RoomEvent::Row { origin, .. } | RoomEvent::Presence { origin, .. } => *origin,
+            RoomEvent::Row { origin, .. }
+            | RoomEvent::Ack { origin, .. }
+            | RoomEvent::Presence { origin, .. } => *origin,
         }
     }
 }
@@ -234,6 +249,13 @@ fn encode_event(event: &RoomEvent) -> Vec<u8> {
             &serde_json::json!({"device": device, "at": at}),
             payload,
         ),
+        RoomEvent::Ack {
+            batch_id, seq, dup, ..
+        } => wire::encode(
+            frame_type::ACK,
+            &serde_json::json!({"batchId": batch_id, "seq": seq, "dup": dup}),
+            &[],
+        ),
     }
 }
 
@@ -271,9 +293,15 @@ async fn serve(room: Arc<ChatRoom>, initial_device: String, socket: WebSocket) {
             biased;
             event = events.recv() => match event {
                 Ok(event) => {
-                    // Own events never echo; a socket that has not said hello
-                    // yet has no business receiving relayed traffic.
-                    if event.origin() == origin || !ready {
+                    // An ack is delivered through the same stream, so it cannot
+                    // overtake rows appended before it; only its own socket
+                    // receives it. Other events never echo to their origin, and
+                    // a socket that has not said hello yet gets no relayed traffic.
+                    let deliver = match event.as_ref() {
+                        RoomEvent::Ack { origin: ack_origin, .. } => *ack_origin == origin,
+                        _ => event.origin() != origin && ready,
+                    };
+                    if !deliver {
                         continue;
                     }
                     if sender
@@ -451,8 +479,14 @@ async fn handle_frame(
                 )
                 .await;
             }
-            match room.log.append(device, batch_id, payload, now_ms()) {
-                Ok(AppendOutcome::Appended { seq, dup }) => {
+            // Append and fan-out under one lock: two concurrent pushes cannot
+            // broadcast out of seq order, and the ack (also on the stream) is
+            // queued behind the rows appended before it.
+            let appended = {
+                let _publish = lock(&room.publish);
+                let appended = room.log.append(device, batch_id, payload, now_ms());
+                if let Ok(AppendOutcome::Appended { seq, dup }) = &appended {
+                    let (seq, dup) = (*seq, *dup);
                     if !dup {
                         // Live relay to every other ready socket; the sender
                         // holds its own bytes and only gets the ack.
@@ -464,14 +498,17 @@ async fn handle_frame(
                             payload: payload.clone(),
                         }));
                     }
-                    send_wire(
-                        sender,
-                        frame_type::ACK,
-                        serde_json::json!({"batchId": batch_id, "seq": seq, "dup": dup}),
-                        &[],
-                    )
-                    .await
+                    let _ = room.tx.send(Arc::new(RoomEvent::Ack {
+                        origin,
+                        batch_id: batch_id.to_string(),
+                        seq,
+                        dup,
+                    }));
                 }
+                appended
+            };
+            match appended {
+                Ok(AppendOutcome::Appended { .. }) => true,
                 Ok(AppendOutcome::Empty) => {
                     send_error(sender, "empty", "push payload is empty", Some(batch_id)).await
                 }
@@ -687,10 +724,16 @@ pub(crate) async fn checkpoint_post(
     else {
         return json_error(StatusCode::BAD_REQUEST, "bad_frontier");
     };
-    // Empty is a valid (empty) frontier; only undecodable base64 is rejected.
+    // Undecodable base64 is rejected here; emptiness is checked against the
+    // coverage below.
     let Ok(frontier) = base64::engine::general_purpose::STANDARD.decode(frontier) else {
         return json_error(StatusCode::BAD_REQUEST, "bad_frontier");
     };
+    // A checkpoint that covers rows must carry a frontier; only a zero-coverage
+    // checkpoint may serialize an empty one.
+    if seq_covered > 0 && frontier.is_empty() {
+        return json_error(StatusCode::BAD_REQUEST, "bad_frontier");
+    }
     if body.len() > MAX_CHECKPOINT_BYTES {
         return json_error(StatusCode::PAYLOAD_TOO_LARGE, "too_large");
     }
