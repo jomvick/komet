@@ -66,24 +66,31 @@ they constrain the agent CLI, not the machine.
 - Holding the link is equivalent to shell on that host: adding the environment opens
   its RPC surface through the relay — sessions, terminals, workspace file reads and
   writes, repo and harness management — as the user running `komet serve`.
-- Treat it as a password. Do not paste it into chat, tickets, screenshots, or shared
-  terminals; Komet does not log the link or its token, but clipboard managers and shell
-  scrollback are outside Komet's control.
-- `komet serve` prints it only on the run that creates or changes it, with
-  `--print-link`, or with `--install-service`; a plain restart stays silent.
-  **Copy link** in Settings re-encodes the stored record with the same token, so it
+- Treat it as a password. Komet's own logs never contain the link or its token, but
+  `komet serve` writes it to **stdout** on first run, when the token, address, or
+  label changes, with `--print-link`, and with `--install-service`; a plain restart
+  stays silent. Before a public URL is configured it prints the raw token and proxy
+  steps instead of a link. Service managers and containers commonly capture stdout
+  into their own logs, so protect that output like the link itself. Do not paste the
+  link into chat, tickets, screenshots, or shared terminals; clipboard managers and
+  shell scrollback are outside Komet's control.
+- **Copy link** in Settings re-encodes the stored record with the same token, so it
   produces the same secret, not a fresh one.
 - There is no revoke or rotate command, endpoint, or per-link expiry, and removing an
   environment deletes only this controller's copy: the remote token stays valid and
   anyone still holding the link can keep pairing. To invalidate a leaked token you
-  must replace `token` in `~/.komet/serve.json`, restart the service
+  must replace `token` in `{data_dir}/serve.json` (`~/.komet/serve.json` is only the
+  default; `KOMET_DATA_DIR` selects another directory), restart the service
   (`komet daemon restart`), and re-pair every controller with the reprinted link —
   the server then accepts only the new value, but all existing pairings break at once.
 
 ### One shared bearer per server
 
-- Each environment has exactly one static bearer, generated into `serve.json` (0600)
-  or supplied as `KOMET_SYNC_TOKEN`. Every client of that server uses the same value;
+- Each environment has exactly one static bearer. `komet serve` keeps it in
+  `{data_dir}/serve.json` (0600); a standalone `komet-sync-server` reads
+  `KOMET_SYNC_TOKEN`. Setting `KOMET_SYNC_TOKEN` does not configure or rotate the token
+  of an environment paired through `komet serve` — that token lives in the paired host's
+  `serve.json` and changes only there. Every client of a server uses the same value;
   there are no per-device or per-environment tokens, scopes, or revocation. That is a
   named non-goal of the environments design (per-environment tokens are deferred).
 - The server compares that one value in constant time, from
@@ -93,7 +100,8 @@ they constrain the agent CLI, not the machine.
   temp-file + rename). Listings and every environment reply are redacted to an empty
   token; the one deliberate exception is the local-only `EnvironmentLink` call that
   backs **Copy link**, which is never logged or embedded in an error message.
-- Rotating the token means editing `serve.json` and restarting: it affects every
+- Rotating the token means editing `serve.json` and restarting (or changing
+  `KOMET_SYNC_TOKEN` and restarting a standalone sync-server): it affects every
   client of that server. If `environments.json` cannot be read, Komet boots with no
   environments and refuses writes rather than overwriting the stored tokens.
 
