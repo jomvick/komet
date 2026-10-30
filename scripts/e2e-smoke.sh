@@ -22,9 +22,12 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 command -v cargo >/dev/null 2>&1 || PATH="$HOME/.cargo/bin:$PATH"
+# Cargo may be configured with a target directory other than $ROOT/target.
+TARGET_DIR="$(cd "$ROOT" && cargo metadata --format-version 1 --no-deps --quiet \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')"
 SYNC_PORT="${KOMET_E2E_SYNC_PORT:-27640}"
 SYNC_URL="http://127.0.0.1:${SYNC_PORT}"
-SYNC_TOKEN="e2e-smoke-token"
+SYNC_TOKEN="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
 TOKEN="alice@org1"
 ORG="org1"
 A_PORT=27801
@@ -87,19 +90,19 @@ if [[ -n "${KOMET_E2E_KOMET_BIN:-}" ]]; then
   KOMET="$KOMET_E2E_KOMET_BIN"
 else
   (cd "$ROOT" && cargo build -q -p komet)
-  KOMET="$ROOT/target/debug/komet"
+  KOMET="$TARGET_DIR/debug/komet"
 fi
 if [[ -n "${KOMET_E2E_SYNC_BIN:-}" ]]; then
   SYNC="$KOMET_E2E_SYNC_BIN"
 else
   (cd "$ROOT" && cargo build -q -p komet-sync-server)
-  SYNC="$ROOT/target/debug/komet-sync-server"
+  SYNC="$TARGET_DIR/debug/komet-sync-server"
 fi
 if [[ -n "${KOMET_E2E_DRIVER_BIN:-}" ]]; then
   DRIVER="$KOMET_E2E_DRIVER_BIN"
 else
   (cd "$ROOT" && cargo build -q -p komet-rpc --example e2e_driver)
-  DRIVER="$ROOT/target/debug/examples/e2e_driver"
+  DRIVER="$TARGET_DIR/debug/examples/e2e_driver"
 fi
 
 # ── 2. Local self-hosted sync server (one static bearer) ───────────────────────
@@ -115,6 +118,7 @@ KOMET_SYNC_TOKEN="$SYNC_TOKEN" KOMET_SYNC_PORT="$SYNC_PORT" KOMET_DATA_DIR="$SYN
   RUST_LOG=info "$SYNC" >"$LOG_DIR/sync-server.log" 2>&1 &
 SYNC_PID=$!
 wait_for "sync server /health :$SYNC_PORT" 30 curl -sf -m 3 "$SYNC_URL/health"
+curl -sf -m 3 -H "Authorization: Bearer $SYNC_TOKEN" "$SYNC_URL/env" >/dev/null
 
 # ── 3. Two headless engines, one user, two devices ─────────────────────────────
 start_engine() { # start_engine <data_dir> <ipc_port> <name> <log>
