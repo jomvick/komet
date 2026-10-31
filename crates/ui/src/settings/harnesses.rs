@@ -148,8 +148,8 @@ impl From<AgentAccountsSnapshot> for AgentConnectionStatus {
 }
 
 fn show_connect_button(harness: HarnessId, status: Option<&AgentConnectionStatus>) -> bool {
-    crate::settings::accounts::cli_login_command(harness).is_none()
-        && crate::settings::accounts::requires_login(harness)
+    crate::settings::providers::cli_login_command(harness).is_none()
+        && crate::settings::providers::requires_login(harness)
         && status.is_some_and(|status| {
             !status.connected.contains(&harness) && !status.unknown.contains(&harness)
         })

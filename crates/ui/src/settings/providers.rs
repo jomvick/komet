@@ -1,4 +1,4 @@
-//! Settings → Agents / accounts (feature-inventory §1.9): provider cards
+//! Settings → Providers (feature-inventory §1.9): provider cards
 //! (Claude Code, Codex) with account rows — email, plan badge, Active,
 //! Switch / Forget — plus the add-account dialogs (paste-code and browser-poll
 //! flows) and account-shaped loading skeletons. Komet retargets devices from the settings
@@ -49,11 +49,11 @@ pub const PROVIDERS: [(HarnessId, &str, &str); 13] = [
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AccountsEvent {
+pub enum ProvidersEvent {
     FocusProvider(HarnessId),
 }
 
-impl EventEmitter<AccountsEvent> for AccountsPage {}
+impl EventEmitter<ProvidersEvent> for ProvidersPage {}
 
 pub fn requires_login(harness: HarnessId) -> bool {
     PROVIDERS
@@ -188,7 +188,7 @@ fn codex_on_path() -> bool {
     false
 }
 
-pub struct AccountsPage {
+pub struct ProvidersPage {
     state: Entity<AppState>,
     /// Which device's logins are shown; `None` = this device (no passthrough).
     /// Retargeted by the page-header device switcher (komet parity: the
@@ -217,7 +217,7 @@ pub struct AccountsPage {
     _code_events: Subscription,
 }
 
-impl AccountsPage {
+impl ProvidersPage {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let observe = cx.observe(&state, |_, _, cx| cx.notify());
         let code_input = cx.new(|cx| ComposerInput::new("Paste the authorization code", cx));
@@ -1262,7 +1262,7 @@ impl AccountsPage {
     }
 }
 
-impl Render for AccountsPage {
+impl Render for ProvidersPage {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         use crate::settings::widgets;
         let theme = Theme::of(cx).clone();

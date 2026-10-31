@@ -39,7 +39,6 @@ use crate::loaders;
 use crate::motion::{self, AnimationExt as _, MotionSpec, RESIZE, SPLASH_OUT, TAB_SLIDE};
 use crate::popover::{self, Loadable};
 use crate::rail;
-use crate::settings::accounts::AccountsPage;
 use crate::settings::appearance::AppearancePage;
 use crate::settings::archived::ArchivedPage;
 use crate::settings::devices::DevicesPage;
@@ -47,6 +46,7 @@ use crate::settings::files::FilesSettingsPage;
 use crate::settings::harnesses::HarnessesPage;
 use crate::settings::integrations::IntegrationsPage;
 use crate::settings::notifications::{NotificationsEvent, NotificationsPage};
+use crate::settings::providers::ProvidersPage;
 use crate::settings::security::{SecurityDefaults, SecurityEvent, SecurityPage};
 use crate::settings::shortcuts::{ShortcutsEvent, ShortcutsPage};
 use crate::settings::sync::{SyncEvent, SyncPage};
@@ -1118,7 +1118,7 @@ pub struct Shell {
     files_settings_page: Option<Entity<FilesSettingsPage>>,
     notifications_page: Option<Entity<NotificationsPage>>,
     shortcuts_page: Option<Entity<ShortcutsPage>>,
-    accounts_page: Option<Entity<AccountsPage>>,
+    providers_page: Option<Entity<ProvidersPage>>,
     harnesses_page: Option<Entity<HarnessesPage>>,
     security_page: Option<Entity<SecurityPage>>,
     sync_page: Option<Entity<SyncPage>>,
@@ -1441,7 +1441,7 @@ impl Shell {
             files_settings_page: None,
             notifications_page: None,
             shortcuts_page: None,
-            accounts_page: None,
+            providers_page: None,
             harnesses_page: None,
             security_page: None,
             sync_page: None,
@@ -1981,7 +1981,7 @@ impl Shell {
         self.harnesses_page = None;
         self.harnesses_sub = None;
         self.open_settings(SettingsSection::Agents, cx);
-        if let Some(page) = self.accounts_page.clone() {
+        if let Some(page) = self.providers_page.clone() {
             page.update(cx, |page, cx| page.focus_harness(harness, cx));
             self.pending_account_harness = None;
         }
@@ -2960,15 +2960,15 @@ impl Shell {
                 }
             }
             SettingsSection::Agents => {
-                if self.accounts_page.is_none() {
+                if self.providers_page.is_none() {
                     let state = self.state.clone();
-                    let page = cx.new(|cx| AccountsPage::new(state, cx));
+                    let page = cx.new(|cx| ProvidersPage::new(state, cx));
                     if let Some(harness) = self.pending_account_harness.take() {
                         page.update(cx, |page, cx| page.focus_harness(harness, cx));
                     }
-                    self.accounts_page = Some(page);
+                    self.providers_page = Some(page);
                 }
-                match &self.accounts_page {
+                match &self.providers_page {
                     Some(page) => page.clone().into_any_element(),
                     None => Empty.into_any_element(),
                 }
