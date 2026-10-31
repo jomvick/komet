@@ -395,6 +395,20 @@ impl EngineBackend for WorkspaceEngine {
     }
 }
 
+/// Whether anything accepts a TCP connection on the IPC port. A refused
+/// connection (or a probe timeout) means the port is free for an engine to
+/// claim.
+async fn port_is_listening(ipc_port: u16) -> bool {
+    matches!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(750),
+            tokio::net::TcpStream::connect(("127.0.0.1", ipc_port)),
+        )
+        .await,
+        Ok(Ok(_))
+    )
+}
+
 /// Cheaply clonable handle to whichever backend won the probe.
 #[derive(Clone)]
 pub struct EngineHandle {
@@ -425,7 +439,11 @@ impl EngineHandle {
             return Ok(handle);
         }
 
-        tracing::info!(data_dir = %config.data_dir.display(), "no daemon on port; embedding engine");
+        tracing::info!(
+            data_dir = %config.data_dir.display(),
+            port = config.ipc_port,
+            "embedding engine (no attachable komet daemon)"
+        );
         let engine_config = EngineConfig {
             data_dir: config.data_dir,
             edge_url: config.edge_url,
@@ -588,6 +606,18 @@ impl EngineHandle {
     /// Launch this app's engine as a detached sibling process and attach over
     /// the same authenticated IPC used by explicitly installed daemons.
     async fn start_managed_engine(config: &EngineBootConfig) -> Option<EngineHandle> {
+        // A listener that did not attach above is not ours (another app on the
+        // same port, or an engine of another user). Spawning a managed engine
+        // is then guaranteed to lose the bind, and probing it would repeat the
+        // token warning every 150ms — embed once instead.
+        if port_is_listening(config.ipc_port).await {
+            tracing::warn!(
+                port = config.ipc_port,
+                "IPC port is held by a listener that is not this komet's engine; \
+                 embedding this window instead of starting a managed engine"
+            );
+            return None;
+        }
         let executable = match std::env::current_exe() {
             Ok(executable) => executable,
             Err(err) => {
@@ -661,7 +691,11 @@ impl EngineHandle {
         };
         tracing::info!(pid = child.id(), "started detached managed engine");
 
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+        // The engine assembles auth, stores and model catalogs before it binds
+        // IPC (a cold boot has been observed taking 30-50s when provider probes
+        // time out). Too short a deadline killed a healthy child and fell back
+        // to embedding, losing multi-viewport IPC for no reason.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
         loop {
             if let Some(handle) = Self::attach_to_daemon(config.ipc_port).await {
                 reap_child(child);
@@ -704,14 +738,22 @@ impl EngineHandle {
             return None;
         }
 
-        tracing::info!(%url, "engine daemon detected; connecting");
+        // Read the identity BEFORE claiming a daemon: the port may be held by
+        // a different app. This runs every 150ms while a managed engine boots,
+        // so the diagnostic stays at debug level and the wait loop above
+        // reports the foreign-listener case exactly once.
         let token = match komet_rpc::ipc_token::read_default(ipc_port) {
             Ok(token) => token,
             Err(err) => {
-                tracing::warn!(error = %err, "engine port is in use but its token is unreadable");
+                tracing::debug!(
+                    port = ipc_port,
+                    error = %err,
+                    "port is in use but is not this komet's engine"
+                );
                 return None;
             }
         };
+        tracing::info!(%url, "engine daemon detected; connecting");
         match connect_ws(&url, &token).await {
             Ok(client) => match query_engine_info(&client).await {
                 Ok(engine_info) => {
