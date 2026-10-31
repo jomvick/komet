@@ -1685,4 +1685,45 @@ mod tests {
         assert_eq!(provider_accounts(&snapshot, HarnessId::Codex).len(), 1);
         assert!(provider_accounts(&snapshot, HarnessId::Cursor).is_empty());
     }
+
+    #[test]
+    fn switching_moves_the_active_account() {
+        let account = |id: &str, active: bool| AgentAccount {
+            id: id.into(),
+            harness: HarnessId::Codex,
+            email: None,
+            plan_label: None,
+            active,
+            usage_windows: vec![],
+            display_name: None,
+            organization: None,
+            auth_kind: None,
+            switchable: true,
+            saved_at: None,
+        };
+        let baseline = AgentAccountsSnapshot {
+            accounts: vec![account("old", true), account("selected", false)],
+            warnings: vec![],
+        };
+        let flags = |s: &AgentAccountsSnapshot| -> Vec<bool> {
+            s.accounts.iter().map(|a| a.active).collect()
+        };
+
+        let mut snapshot = baseline.clone();
+        select_active_account(&mut snapshot, HarnessId::Codex, "selected");
+        assert_eq!(
+            flags(&snapshot),
+            [false, true],
+            "selected activated, previous released"
+        );
+
+        // Unknown id: the function early-returns, no flags move.
+        let mut snapshot = baseline.clone();
+        select_active_account(&mut snapshot, HarnessId::Codex, "missing");
+        assert_eq!(flags(&snapshot), flags(&baseline));
+
+        // Foreign harness: matches no account either, flags stay put.
+        select_active_account(&mut snapshot, HarnessId::ClaudeCode, "selected");
+        assert_eq!(flags(&snapshot), flags(&baseline));
+    }
 }
