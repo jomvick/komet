@@ -6,7 +6,6 @@
 //! - `fade-quick` 0.15s
 //! - `menu-in`   0.14s scale 0.96 + translateY −2 (popovers)
 //! - `dialog-in` 0.18s scale 0.96→1
-//! - `splash-out` 0.5s opacity + translateY −6, 0.15s delay
 //! - `komet-pulse` 2.4s staggered cell opacity 0.08→1, scale 0.9→1 (loaders)
 //! - `gradient-spin-pulse` 750ms per-cell phase wave (working indicator)
 //! - 200ms ease-out width/height transitions (sidebar/panes)
@@ -302,8 +301,6 @@ pub const MENU_IN: MotionSpec = MotionSpec::new(140, EASE);
 pub const MENU_OUT: MotionSpec = MotionSpec::new(100, EASE);
 /// Dialog-in: 0.18s (scale 0.96→1 approximated).
 pub const DIALOG_IN: MotionSpec = MotionSpec::new(180, EASE);
-/// Boot splash exit: 0.5s fade + 6px lift after a 0.15s hold.
-pub const SPLASH_OUT: MotionSpec = MotionSpec::new(500, EASE).with_delay(150);
 /// Sidebar / pane width+height transitions: 200ms ease-out.
 pub const RESIZE: MotionSpec = MotionSpec::new(200, EASE_OUT);
 /// Terminal tab drag-reorder sliding transforms: 150ms (§1.10).
@@ -386,16 +383,6 @@ where
 {
     element.with_animation(id, DIALOG_IN.animation(), |el, t| {
         el.relative().opacity(t).top(px(2.0 * (1.0 - t)))
-    })
-}
-
-/// Boot-splash exit: hold 150ms, then fade out + lift 6px over 500ms.
-pub fn splash_out<E>(id: impl Into<ElementId>, element: E) -> AnimationElement<E>
-where
-    E: Styled + IntoElement + 'static,
-{
-    element.with_animation(id, SPLASH_OUT.animation(), |el, t| {
-        el.opacity(1.0 - t).top(px(-6.0 * t))
     })
 }
 
@@ -830,16 +817,17 @@ mod tests {
 
     #[test]
     fn spec_delay_holds_then_runs() {
-        // SPLASH_OUT: 150ms delay + 500ms run = 650ms total.
-        assert_eq!(SPLASH_OUT.total(), Duration::from_millis(650));
-        assert_eq!(SPLASH_OUT.progress(0.0), 0.0);
+        // 150ms delay + 500ms run = 650ms total.
+        const DELAYED: MotionSpec = MotionSpec::new(500, EASE).with_delay(150);
+        assert_eq!(DELAYED.total(), Duration::from_millis(650));
+        assert_eq!(DELAYED.progress(0.0), 0.0);
         // Still inside the delay window at raw 0.2 (130ms < 150ms).
-        assert_eq!(SPLASH_OUT.progress(0.2), 0.0);
+        assert_eq!(DELAYED.progress(0.2), 0.0);
         // Fully done at the end; clamped beyond.
-        assert_eq!(SPLASH_OUT.progress(1.0), 1.0);
-        assert_eq!(SPLASH_OUT.progress(2.0), 1.0);
+        assert_eq!(DELAYED.progress(1.0), 1.0);
+        assert_eq!(DELAYED.progress(2.0), 1.0);
         // Midway through the run: raw 0.65 → 272.5ms into the 500ms run.
-        let mid = SPLASH_OUT.progress(0.65);
+        let mid = DELAYED.progress(0.65);
         assert!(mid > 0.0 && mid < 1.0);
         // No-delay specs pass straight through the curve.
         assert_close(
@@ -856,7 +844,6 @@ mod tests {
         assert_eq!(FADE_QUICK.duration_ms, 150);
         assert_eq!(MENU_IN.duration_ms, 140);
         assert_eq!(DIALOG_IN.duration_ms, 180);
-        assert_eq!((SPLASH_OUT.duration_ms, SPLASH_OUT.delay_ms), (500, 150));
         assert_eq!(RESIZE.duration_ms, 200);
         assert_eq!(TAB_SLIDE.duration_ms, 150);
         assert_eq!(COLLAPSE.duration_ms, 180);

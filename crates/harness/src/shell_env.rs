@@ -59,6 +59,7 @@ mod unix {
     use std::ffi::OsString;
     use std::io::Read;
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    use std::os::unix::process::CommandExt as _;
     use std::path::{Path, PathBuf};
     use std::process::Stdio;
     use std::sync::{Arc, Mutex};
@@ -164,6 +165,19 @@ mod unix {
             // VSCODE_RESOLVING_ENVIRONMENT; TERM=dumb quiets fancy prompts.
             .env("KOMET_RESOLVING_ENVIRONMENT", "1")
             .env("TERM", "dumb");
+        // An interactive shell opens `/dev/tty` and calls `tcsetpgrp`. When the
+        // daemon was started from a terminal, it sits in a background process
+        // group there, so the kernel stops the *whole group* with SIGTTOU —
+        // including the thread that would enforce ATTEMPT_TIMEOUT. A new
+        // session gives the probe no controlling terminal to fight over.
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
         let Ok(mut child) = cmd.spawn() else {
             return Vec::new();
         };

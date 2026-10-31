@@ -1,6 +1,6 @@
-//! Loaders: the komet pulse loader, the gradient matrix spinner, and the boot
-//! splash content. All motion routes through `crate::motion` pure helpers, so
-//! the math is unit-tested and these elements are testable-by-compile.
+//! Loaders: the komet pulse loader and the gradient matrix spinner. All motion
+//! routes through `crate::motion` pure helpers, so the math is unit-tested and
+//! these elements are testable-by-compile.
 //!
 //! Rendering pattern: each cell is its own `with_animation` repeating element
 //! sharing one period; per-cell offsets come from [`motion::staggered_phase`],
@@ -10,12 +10,11 @@
 //! cell to its rest state automatically (gpui `reduce_motion`).
 
 use gpui::{
-    AnyElement, App, EntityId, Image, ImageFormat, IntoElement, ObjectFit, ParentElement,
-    PathBuilder, SharedString, Styled, StyledImage as _, Window, canvas, div, img, point, px,
+    AnyElement, App, EntityId, IntoElement, ParentElement, PathBuilder, SharedString, Styled,
+    Window, canvas, div, point, px,
 };
-use std::sync::{Arc, OnceLock};
 
-use crate::motion::{self, GRADIENT_SPIN, KOMET_PULSE, PULSE_STAGGER, SPLASH_OUT};
+use crate::motion::{self, GRADIENT_SPIN, KOMET_PULSE, PULSE_STAGGER};
 use crate::theme::Theme;
 
 // Shared with the terminal viewport (`komet_proto::motion`) so both animate the
@@ -265,39 +264,8 @@ pub fn upload_progress_ring(percent: u8, diameter: f32) -> AnyElement {
         .into_any_element()
 }
 
-/// Full-window boot splash using the monochrome hands artwork.
-/// While `fading` it plays `splash-out` (150ms hold, then 0.5s fade + 6px
-/// lift); the shell removes it once [`SPLASH_OUT`] has run its course.
-pub fn splash_overlay(_theme: &Theme, fading: bool) -> AnyElement {
-    let content = div().absolute().inset_0().bg(gpui::rgb(0x000000)).child(
-        img(splash_image())
-            .absolute()
-            .inset_0()
-            .size_full()
-            .object_fit(ObjectFit::Cover),
-    );
-    if fading {
-        motion::splash_out("boot-splash-out", content).into_any_element()
-    } else {
-        content.into_any_element()
-    }
-}
-
-fn splash_image() -> Arc<Image> {
-    static IMAGE: OnceLock<Arc<Image>> = OnceLock::new();
-    IMAGE
-        .get_or_init(|| {
-            Arc::new(Image::from_bytes(
-                ImageFormat::Png,
-                include_bytes!("../assets/splash-hands.png").to_vec(),
-            ))
-        })
-        .clone()
-}
-
 // Compile-time proof the specs referenced here stay wired to the catalog.
 const _: () = {
-    assert!(SPLASH_OUT.delay_ms == 150);
     assert!(KOMET_PULSE.duration_ms == 2400);
     assert!(GRADIENT_SPIN.duration_ms == 750);
 };

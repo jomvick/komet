@@ -681,7 +681,20 @@ impl EngineHandle {
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt as _;
-            command.process_group(0);
+            // A new session, not just a new process group: the child must not
+            // keep the launching terminal as its controlling tty. Otherwise its
+            // login-shell PATH probe (`bash -lic`) touches `/dev/tty`, the
+            // background group is stopped by SIGTTOU, and the engine never
+            // reaches assembly. It also makes "detached" true: closing the
+            // terminal that launched the app no longer hangs up the engine.
+            unsafe {
+                command.pre_exec(|| {
+                    if libc::setsid() == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
         }
         #[cfg(windows)]
         {

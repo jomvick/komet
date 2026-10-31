@@ -212,8 +212,8 @@ feature spec `docs/research/feature-inventory.md` §1.
 - **Diff pane**: unified-patch parser → virtualized file/hunk/line rows, per-file collapse
   (180ms height tween), time-sliced highlight, 200ms width transition on the pane itself.
 - **Animation kit** (`komet-ui::motion`): small helpers over gpui `Animation` reproducing the
-  komet catalog — `fade-in` (0.5s, cubic-bezier(0.16,1,0.3,1), translateY 4→0), `splash-out`,
-  `komet-pulse` staggered cell wave (boot splash + loaders), `gradient-spin-pulse` matrix
+  komet catalog — `fade-in` (0.5s, cubic-bezier(0.16,1,0.3,1), translateY 4→0),
+  `komet-pulse` staggered cell wave (loaders), `gradient-spin-pulse` matrix
   spinner (WorkingIndicator + rotating flavour word), `menu-in`/`dialog-in` scale-fades, 200ms
   ease-out width/height transitions for sidebar/panes, sidebar-resort **slide animation**
   (we own the list, so animate row positions directly — the View Transitions equivalent, 260ms

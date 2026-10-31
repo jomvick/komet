@@ -221,6 +221,12 @@ impl EngineCore {
         // Boot refresh: revalidate the persisted models for every offered
         // harness with an installed CLI (except Mock) in the background, two
         // at a time. Never blocks boot; a failed probe keeps the prior cache.
+        // Held back by the same grace as on-demand refreshes (registry):
+        // the probes spawn agent CLIs (Node, Rust) and on a small machine
+        // they starve the UI's GPU/window init when launched the instant the
+        // engine comes up. The picker already has the persisted cache; fresh
+        // catalogs can land once the window is on screen.
+        const BOOT_WARM_GRACE: std::time::Duration = crate::registry::BOOT_MODEL_GRACE;
         {
             let reg = registry.clone();
             let ids: Vec<HarnessId> = reg
@@ -233,7 +239,10 @@ impl EngineCore {
                 .collect();
             match tokio::runtime::Handle::try_current() {
                 Ok(handle) => {
-                    std::mem::drop(handle.spawn(async move { reg.warm_models_cache(ids).await }));
+                    std::mem::drop(handle.spawn(async move {
+                        tokio::time::sleep(BOOT_WARM_GRACE).await;
+                        reg.warm_models_cache(ids).await;
+                    }));
                 }
                 Err(_) => {
                     // No ambient runtime (tests, one-shot tools): an isolated
@@ -245,7 +254,10 @@ impl EngineCore {
                                 .enable_all()
                                 .build()
                             {
-                                rt.block_on(reg.warm_models_cache(ids));
+                                rt.block_on(async move {
+                                    tokio::time::sleep(BOOT_WARM_GRACE).await;
+                                    reg.warm_models_cache(ids).await;
+                                });
                             }
                         });
                 }

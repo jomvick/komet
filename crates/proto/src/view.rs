@@ -26,7 +26,7 @@ use crate::{AuthState, Chat, ChatIndicator, Session, SessionStatus, Space, Works
 /// view-model only (never serialized), so its shape can evolve freely.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectionStatus {
-    /// First boot / probe — the splash covers this.
+    /// First boot / probe — the shell paints, rows fill in as the engine attaches.
     Connecting,
     /// The link dropped after a working session and the bounded auto-retry
     /// chain is running: `attempt` is the ordinal of the retry in flight
@@ -234,7 +234,8 @@ pub fn sort_chats(chats: &mut [Chat]) {
 /// The app gate (komet's App.tsx phases). Pure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GatePhase {
-    /// Booting / probing — splash covers this.
+    /// Booting / probing. A normal boot renders the Ready frame instead (the
+    /// shell maps it there), so this is the pre-ready state left by a sign-out.
     Loading,
     /// Engine unreachable and embedding failed.
     Failed(String),

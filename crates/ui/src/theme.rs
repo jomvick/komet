@@ -773,7 +773,12 @@ impl Theme {
     pub fn install(appearance: Appearance, cx: &mut App) {
         set_current_appearance(appearance);
         let mut theme = Self::for_appearance(appearance);
-        if crate::settings::wallpaper::is_enabled(cx) {
+        // Only the whole-window scope lets the image show through the shell
+        // surfaces; the in-card scopes keep the chrome opaque.
+        if crate::settings::wallpaper::is_enabled(cx)
+            && crate::settings::wallpaper::scope(cx)
+                == crate::settings::wallpaper::WallpaperScope::Window
+        {
             theme = theme.with_wallpaper();
         }
         let (normal, hover, active) = scrollbar_thumb_colors(&theme);

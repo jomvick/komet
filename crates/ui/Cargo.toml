@@ -38,5 +38,8 @@ nucleo-matcher.workspace = true
 [target.'cfg(target_os = "macos")'.dependencies]
 objc = "0.2"
 
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
 [dev-dependencies]
 tempfile.workspace = true

@@ -3877,6 +3877,7 @@ dependencies = [
  "komet-rpc",
  "komet-syntax",
  "komet-update",
+ "libc",
  "nucleo-matcher",
  "objc",
  "pulldown-cmark",

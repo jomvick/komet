@@ -268,6 +268,70 @@ impl Render for AppearancePage {
                 }))
         });
 
+        // Where the image is painted. Only offered once an image is chosen.
+        let scope_row = has_wallpaper.then(|| {
+            let current_scope = wallpaper::scope(cx);
+            let buttons: Vec<_> = wallpaper::WallpaperScope::ALL
+                .into_iter()
+                .map(|scope| {
+                    let selected = scope == current_scope;
+                    div()
+                        .id(SharedString::from(format!(
+                            "wallpaper-scope-{}",
+                            scope.label()
+                        )))
+                        .px(px(12.0))
+                        .py(px(8.0))
+                        .rounded(px(10.0))
+                        .border_1()
+                        .border_color(if selected {
+                            theme.border_strong
+                        } else {
+                            theme.border
+                        })
+                        .bg(if selected {
+                            crate::theme::card_selected_bg()
+                        } else {
+                            theme.surface_raised.opacity(0.5)
+                        })
+                        .text_size(px(12.5))
+                        .text_color(theme.text)
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.wallpaper_error =
+                                wallpaper::set_scope(scope, cx).err().map(|err| {
+                                    tracing::warn!(error = %err, "could not save wallpaper scope");
+                                    format!("Could not save wallpaper area: {err}")
+                                });
+                            cx.notify();
+                        }))
+                        .child(scope.label())
+                })
+                .collect();
+            let caption = match current_scope {
+                wallpaper::WallpaperScope::Window => "Behind the whole window.",
+                wallpaper::WallpaperScope::Panel => "Behind the main panel only.",
+            };
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(6.0))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(8.0))
+                        .children(buttons),
+                )
+                .child(
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(theme.text_muted)
+                        .child(caption),
+                )
+        });
+
         let wallpaper_preview = wallpaper_path
             .as_ref()
             .filter(|path| path.is_file())
@@ -442,6 +506,7 @@ impl Render for AppearancePage {
                                         )
                                 }
                             )
+                            .children(scope_row)
                             .when_some(self.wallpaper_error.clone(), |el, error| {
                                 el.child(
                                     div()

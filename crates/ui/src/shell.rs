@@ -1,5 +1,5 @@
 //! The app shell (komet `__root.tsx`): sidebar column + main panel + optional
-//! right "Changes" pane, plus the boot splash and the connection gate.
+//! right "Changes" pane, plus the connection gate.
 //!
 //! Layout is komet's: collapsible drag-resizable sidebar (208–400px, default
 //! 256) with a 200ms ease-out width transition; main panel with an h-11 header,
@@ -35,8 +35,7 @@ use crate::changes::{Changes, ChangesEvent};
 use crate::composer::{Composer, ComposerEvent, ComposerInput, ComposerInputEvent};
 use crate::files::{FilesCloseDisposition, FilesEvent, FilesSurface, WorkspacePathDrag};
 use crate::icons::{self, icon};
-use crate::loaders;
-use crate::motion::{self, AnimationExt as _, MotionSpec, RESIZE, SPLASH_OUT, TAB_SLIDE};
+use crate::motion::{self, AnimationExt as _, MotionSpec, RESIZE, TAB_SLIDE};
 use crate::popover::{self, Loadable};
 use crate::rail;
 use crate::settings::appearance::AppearancePage;
@@ -544,13 +543,6 @@ impl WidthTween {
             started: std::time::Instant::now(),
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SplashPhase {
-    Visible,
-    FadingOut,
-    Gone,
 }
 
 /// The chat-row Rename dialog.
@@ -1248,8 +1240,6 @@ pub struct Shell {
     /// Set by [`Shell::eval_tween`] when any tween is mid-flight this frame;
     /// render schedules the next animation frame off it.
     motion_active: std::cell::Cell<bool>,
-    splash: SplashPhase,
-    splash_task: Option<Task<()>>,
     save_task: Option<Task<()>>,
     /// Ticker that keeps the banner countdown moving. Armed only while
     /// `link_status()` is `Reconnecting` with a deadline still ahead of now —
@@ -1507,8 +1497,6 @@ impl Shell {
             terminal_drag_anchor: None,
             reduced_motion: false,
             motion_active: std::cell::Cell::new(false),
-            splash: SplashPhase::Visible,
-            splash_task: None,
             save_task: None,
             reconnect_ticker: None,
             last_connection: ConnectionStatus::Connecting,
@@ -1521,7 +1509,7 @@ impl Shell {
         }
     }
 
-    // ---- splash ----
+    // ---- observation ----
 
     fn on_state_changed(&mut self, state: &Entity<AppState>, cx: &mut Context<Self>) {
         let update_status = state.read(cx).update.clone();
@@ -1782,28 +1770,6 @@ impl Shell {
                 changes.update(cx, |changes, cx| changes.ensure_content(cx));
             }
             self.remember_current_navigation(cx);
-        }
-        match state.read(cx).connection {
-            ConnectionStatus::Ready => {
-                if self.splash == SplashPhase::Visible {
-                    self.splash = SplashPhase::FadingOut;
-                    self.splash_task = Some(cx.spawn(async move |this, cx| {
-                        cx.background_executor()
-                            .timer(SPLASH_OUT.total() + Duration::from_millis(30))
-                            .await;
-                        this.update(cx, |shell, cx| {
-                            shell.splash = SplashPhase::Gone;
-                            cx.notify();
-                        })
-                        .ok();
-                    }));
-                }
-            }
-            // Reveal the gate card immediately; the splash never returns mid-session.
-            ConnectionStatus::Failed { .. } => self.splash = SplashPhase::Gone,
-            ConnectionStatus::Connecting | ConnectionStatus::Reconnecting { .. } => {}
-            // Attached but degraded keeps the shell up — the banner narrates it.
-            ConnectionStatus::Degraded { .. } => {}
         }
         // Task 10: a reconnect keeps the frame up, so the only new surface is
         // the banner's countdown — and the messages the composer parked while
@@ -6605,6 +6571,10 @@ impl Shell {
             composer.set_home_canvas(home_canvas, cx);
         });
         let no_project = self.state.read(cx).no_project;
+        // While the engine is still connecting the space list is simply empty —
+        // show the new-session canvas, not "Add a project", which would read as
+        // a wrong state rather than a pending one.
+        let booting = matches!(self.state.read(cx).gate(), GatePhase::Loading);
 
         // Content outlet: selected chat → transcript; nothing selected → the
         // centered new-session canvas; no spaces at all → the onboarding card.
@@ -6620,7 +6590,7 @@ impl Shell {
                 .clone()
                 .cached(StyleRefinement::default().size_full())
                 .into_any_element()
-        } else if !has_spaces && !no_project {
+        } else if !has_spaces && !no_project && !booting {
             // Onboarding (first boot / after the destructive wipe): no folders
             // to work in yet — one clear affordance.
             let _ = faint;
@@ -6703,18 +6673,24 @@ impl Shell {
                         .child(
                             div()
                                 .w_full()
-                                .px(px(Theme::SPACE_LG))
                                 .flex()
-                                .flex_row()
-                                .items_center()
-                                .gap(px(Theme::SPACE_MD))
-                                .child(div().flex_none().child(target_selectors))
-                                .when_some(checkout_selectors, |el, controls| {
-                                    el.child(div().flex_1().min_w_0().child(controls))
-                                }),
-                        )
-                        .child(div().h(px(12.0)).flex_none())
-                        .child(self.composer.clone()),
+                                .flex_col()
+                                .child(
+                                    div()
+                                        .w_full()
+                                        .px(px(Theme::SPACE_LG))
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap(px(Theme::SPACE_MD))
+                                        .child(div().flex_none().child(target_selectors))
+                                        .when_some(checkout_selectors, |el, controls| {
+                                            el.child(div().flex_1().min_w_0().child(controls))
+                                        }),
+                                )
+                                .child(div().h(px(12.0)).flex_none())
+                                .child(self.composer.clone()),
+                        ),
                 ))
                 .into_any_element()
         };
@@ -8930,7 +8906,12 @@ impl Render for Shell {
                     transcript.reveal_last_compaction(cx);
                 });
             }));
-        let root = if let Some(path) = wallpaper::path(cx).filter(|path| path.is_file()) {
+        // Whole-window scope paints behind everything; the in-card scopes
+        // paint inside the main card instead (see `panel_wallpaper` below).
+        let wallpaper_scope = wallpaper::scope(cx);
+        let root = if let Some(path) = wallpaper::path(cx)
+            .filter(|path| path.is_file() && wallpaper_scope == wallpaper::WallpaperScope::Window)
+        {
             root.child(
                 div()
                     .absolute()
@@ -8946,6 +8927,11 @@ impl Render for Shell {
 
         let render_gate = if restart_required {
             GatePhase::Loading
+        } else if matches!(&gate, GatePhase::Loading) {
+            // Connecting paints the normal frame: the window opens straight
+            // into the shell and rows fill in as the engine attaches, instead
+            // of a boot splash covering an empty window.
+            GatePhase::Ready
         } else {
             gate.clone()
         };
@@ -9026,6 +9012,9 @@ impl Render for Shell {
                 let border_color = Theme::of(cx).border;
                 // The workspace is one inset surface: the transcript and any
                 // open side panel share its rounded boundary.
+                let panel_wallpaper = wallpaper::path(cx)
+                    .filter(|path| path.is_file())
+                    .and_then(|path| wallpaper::card_layer(path, wallpaper_scope, workspace_bg));
                 let workspace: AnyElement = div()
                     .flex_1()
                     .min_w_0()
@@ -9040,6 +9029,7 @@ impl Render for Shell {
                     .border_1()
                     .border_color(border_color)
                     .bg(workspace_bg)
+                    .children(panel_wallpaper)
                     .child(main)
                     .child(right)
                     .into_any_element();
@@ -9059,8 +9049,7 @@ impl Render for Shell {
                 };
                 // The whole app page is one keyed `animate-in` entrance (komet
                 // App.tsx `<div key={phase} className="animate-in h-full">`):
-                // arriving from the splash or any gate fades the page in; the
-                // splash-out crossfades over it on boot.
+                // arriving from any gate fades the page in.
                 // The sidebar resize handle FLOATS over the sidebar/card seam
                 // (zero layout width, same idiom as the changes-pane grabber)
                 // so the sidebar's right gutter stays exactly as wide as its
@@ -9117,7 +9106,9 @@ impl Render for Shell {
                     .child(titlebar_tone)
                     .child(motion::fade_in("phase-app", page))
             }
-            GatePhase::Loading => root, // splash overlay covers boot
+            // Only the sign-out restart lands here; a normal Connecting boot
+            // renders the Ready page above.
+            GatePhase::Loading => root,
             GatePhase::OrgGate => {
                 let card = self.render_org_gate(window, cx);
                 root.child(card)
@@ -9141,22 +9132,9 @@ impl Render for Shell {
             window.request_animation_frame();
         }
 
-        // Boot splash overlay: visible → crossfades out on Ready → removed.
-        let root = match self.splash {
-            SplashPhase::Visible => {
-                let theme = Theme::of(cx).clone();
-                root.child(loaders::splash_overlay(&theme, false))
-            }
-            SplashPhase::FadingOut => {
-                let theme = Theme::of(cx).clone();
-                root.child(loaders::splash_overlay(&theme, true))
-            }
-            SplashPhase::Gone => root,
-        };
-
         // Caption controls are shell-level chrome, not Ready-page content:
-        // keep them above the splash and every auth/org/error gate as well as
-        // the full application. Gate pages also need a native drag surface
+        // keep them above every auth/org/error gate as well as the full
+        // application. Gate pages also need a native drag surface
         // because they do not render the unified tabs/settings titlebar.
         let root = if (!restart_required && matches!(gate, GatePhase::Ready))
             || !cfg!(target_os = "windows")
@@ -9179,8 +9157,12 @@ impl Render for Shell {
         if cfg!(target_os = "linux")
             && let Decorations::Client { tiling } = window.window_decorations()
         {
-            const CLIENT_INSET: f32 = 10.0;
-            window.set_client_inset(px(CLIENT_INSET));
+            // Komet paints its opaque surface edge-to-edge: there is no
+            // transparent shadow margin for the platform to inset. The 10px
+            // client inset only shrank the interactive area, so keep it at
+            // zero and let the strips below own the resize edges.
+            const RESIZE_STRIP: f32 = 6.0;
+            window.set_client_inset(px(0.));
             let root = root
                 .when(!tiling.top && !tiling.left, |el| {
                     el.rounded_tl(px(Theme::PANEL_RADIUS))
@@ -9196,13 +9178,25 @@ impl Render for Shell {
                 })
                 .overflow_hidden();
             let resize_hitbox = |edge: ResizeEdge, strip: gpui::Div| {
-                strip.on_mouse_down(MouseButton::Left, move |event, window, _| {
-                    let size = window.window_bounds().get_bounds().size;
-                    if client_resize_edge(event.position, size, CLIENT_INSET, tiling) == Some(edge)
-                    {
-                        window.start_window_resize(edge);
-                    }
-                })
+                let strip = match edge {
+                    ResizeEdge::Top => strip.cursor_n_resize(),
+                    ResizeEdge::Bottom => strip.cursor_s_resize(),
+                    ResizeEdge::Left => strip.cursor_w_resize(),
+                    ResizeEdge::Right => strip.cursor_e_resize(),
+                    ResizeEdge::TopLeft | ResizeEdge::BottomRight => strip.cursor_nwse_resize(),
+                    ResizeEdge::TopRight | ResizeEdge::BottomLeft => strip.cursor_nesw_resize(),
+                };
+                strip.block_mouse_except_scroll().on_mouse_down(
+                    MouseButton::Left,
+                    move |event, window, _| {
+                        let size = window.window_bounds().get_bounds().size;
+                        if client_resize_edge(event.position, size, RESIZE_STRIP, tiling)
+                            == Some(edge)
+                        {
+                            window.start_window_resize(edge);
+                        }
+                    },
+                )
             };
             let hitboxes = div()
                 .absolute()
@@ -9215,7 +9209,7 @@ impl Render for Shell {
                             .top_0()
                             .left_0()
                             .right_0()
-                            .h(px(CLIENT_INSET)),
+                            .h(px(RESIZE_STRIP)),
                     ))
                 })
                 .when(!tiling.bottom, |el| {
@@ -9226,7 +9220,7 @@ impl Render for Shell {
                             .bottom_0()
                             .left_0()
                             .right_0()
-                            .h(px(CLIENT_INSET)),
+                            .h(px(RESIZE_STRIP)),
                     ))
                 })
                 .when(!tiling.left, |el| {
@@ -9237,7 +9231,7 @@ impl Render for Shell {
                             .top_0()
                             .bottom_0()
                             .left_0()
-                            .w(px(CLIENT_INSET)),
+                            .w(px(RESIZE_STRIP)),
                     ))
                 })
                 .when(!tiling.right, |el| {
@@ -9248,7 +9242,7 @@ impl Render for Shell {
                             .top_0()
                             .bottom_0()
                             .right_0()
-                            .w(px(CLIENT_INSET)),
+                            .w(px(RESIZE_STRIP)),
                     ))
                 })
                 .when(!(tiling.top || tiling.left), |el| {
@@ -9258,8 +9252,8 @@ impl Render for Shell {
                             .absolute()
                             .top_0()
                             .left_0()
-                            .w(px(CLIENT_INSET))
-                            .h(px(CLIENT_INSET)),
+                            .w(px(RESIZE_STRIP))
+                            .h(px(RESIZE_STRIP)),
                     ))
                 })
                 .when(!(tiling.top || tiling.right), |el| {
@@ -9269,8 +9263,8 @@ impl Render for Shell {
                             .absolute()
                             .top_0()
                             .right_0()
-                            .w(px(CLIENT_INSET))
-                            .h(px(CLIENT_INSET)),
+                            .w(px(RESIZE_STRIP))
+                            .h(px(RESIZE_STRIP)),
                     ))
                 })
                 .when(!(tiling.bottom || tiling.left), |el| {
@@ -9280,8 +9274,8 @@ impl Render for Shell {
                             .absolute()
                             .bottom_0()
                             .left_0()
-                            .w(px(CLIENT_INSET))
-                            .h(px(CLIENT_INSET)),
+                            .w(px(RESIZE_STRIP))
+                            .h(px(RESIZE_STRIP)),
                     ))
                 })
                 .when(!(tiling.bottom || tiling.right), |el| {
@@ -9291,14 +9285,16 @@ impl Render for Shell {
                             .absolute()
                             .bottom_0()
                             .right_0()
-                            .w(px(CLIENT_INSET))
-                            .h(px(CLIENT_INSET)),
+                            .w(px(RESIZE_STRIP))
+                            .h(px(RESIZE_STRIP)),
                     ))
                 });
+            // Content first, strips last: the strips must be hit-tested above
+            // the sidebar/titlebar/cards, which `.occlude()` their own area.
             div()
                 .size_full()
-                .child(hitboxes)
                 .child(root)
+                .child(hitboxes)
                 .into_any_element()
         } else {
             root.into_any_element()

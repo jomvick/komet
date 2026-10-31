@@ -468,8 +468,6 @@ pub struct Pickers {
     /// A live refresh requested while the initial cached load was still in
     /// flight; run it as soon as that load completes.
     pending_live_refresh: HashSet<HarnessId>,
-    /// Harnesses already scheduled for this UI startup's live catalog sync.
-    startup_refresh_requested: HashSet<HarnessId>,
     refs: Loadable<Vec<RepoRef>>,
     /// Space id the `refs` slot belongs to (invalidated on space change).
     refs_space: Option<String>,
@@ -578,7 +576,6 @@ impl Pickers {
                 this.harnesses = Loadable::Idle;
                 this.models.clear();
                 this.pending_live_refresh.clear();
-                this.startup_refresh_requested.clear();
             }
             cx.notify();
         });
@@ -644,7 +641,6 @@ impl Pickers {
             harnesses: Loadable::Idle,
             models: HashMap::new(),
             pending_live_refresh: HashSet::new(),
-            startup_refresh_requested: HashSet::new(),
             refs: Loadable::Idle,
             refs_space: None,
             worktrees_only: false,
@@ -1099,15 +1095,11 @@ impl Pickers {
             targets.push(effective);
         }
         for harness in targets {
-            let refresh_at_startup = !self.models.contains_key(&harness)
-                && self.startup_refresh_requested.insert(harness);
+            // Cache-first only: a startup live refresh would duplicate the
+            // engine's own background boot probe and compete with window
+            // init. Opening the picker (or switching rail) still forces a
+            // live probe, so the list cannot stay stale once it is seen.
             self.ensure_models(harness, ModelsLoad::Fill, cx);
-            // The engine may outlive this UI process. Refresh once per UI
-            // startup even when its persistent cache is still marked fresh;
-            // Fill leaves any cached list visible while this runs.
-            if refresh_at_startup {
-                self.ensure_models(harness, ModelsLoad::LiveRefresh, cx);
-            }
         }
     }
 

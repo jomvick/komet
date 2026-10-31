@@ -27,6 +27,12 @@ use komet_proto::{
 /// them.
 const MODELS_CACHE_REFRESH_AFTER: Duration = Duration::from_secs(60 * 60);
 
+/// Startup grace before any background model discovery runs. The probe CLIs
+/// are heavy (Node/Rust boots); on a small machine they starve the UI's
+/// GPU/window init when launched the instant the engine comes up. The picker
+/// already has the persisted cache, so nothing is lost by waiting a little.
+pub(crate) const BOOT_MODEL_GRACE: Duration = Duration::from_secs(30);
+
 /// One harness's persisted model discovery (`{data_dir}/model-cache.json`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -158,6 +164,9 @@ pub struct HarnessRegistry {
     /// Harnesses currently being warmed — `warm_models_cache` claims an id
     /// here so concurrent warms never probe the same harness twice.
     warm_inflight: Mutex<HashSet<HarnessId>>,
+    /// When this registry was built — background probes wait for
+    /// [`BOOT_MODEL_GRACE`] so window init is not starved by agent CLIs.
+    booted_at: std::time::Instant,
 }
 
 impl Default for HarnessRegistry {
@@ -176,6 +185,7 @@ impl HarnessRegistry {
             models_cache: Arc::new(Mutex::new(HashMap::new())),
             models_cache_path: Mutex::new(None),
             warm_inflight: Mutex::new(HashSet::new()),
+            booted_at: std::time::Instant::now(),
         }
     }
 
@@ -250,9 +260,10 @@ impl HarnessRegistry {
     /// `force == false` is the picker's normal path and is CACHE-FIRST: any
     /// known list is served instantly however old it is, and a stale one is
     /// re-probed in the background — so opening the picker, or switching back
-    /// to an agent, never re-runs a cold CLI probe. With nothing cached yet,
-    /// one live probe runs; if the CLI is installed but failing (crash,
-    /// timeout, signed out), the harness's curated
+    /// to an agent, never re-runs a cold CLI probe. Background work is held
+    /// back for [`BOOT_MODEL_GRACE`] after the engine starts. With nothing
+    /// cached yet, one live probe runs; if the CLI is installed but failing
+    /// (crash, timeout, signed out), the harness's curated
     /// [`Harness::fallback_models`] stands in for the display while the probe
     /// is retried in the background. The send path still refuses ids the CLI
     /// does not advertise, so a fallback row can never start a dead run.
@@ -274,7 +285,13 @@ impl HarnessRegistry {
         if let Some(cached) = self.models_cache_entries().get(&id).cloned()
             && !cached.models.is_empty()
         {
-            if now - cached.discovered_at_ms >= refresh_after_ms {
+            // Stale-entry revalidation also waits out the startup grace: this
+            // path is hit by the UI's boot-time prefetch, and probing there
+            // would reintroduce the very contention the grace exists to avoid.
+            // The boot warm pass revalidates every harness once the grace ends.
+            if now - cached.discovered_at_ms >= refresh_after_ms
+                && self.booted_at.elapsed() >= BOOT_MODEL_GRACE
+            {
                 self.spawn_background_refresh(id);
             }
             return Ok(cached.models);
@@ -1443,6 +1460,74 @@ mod tests {
         assert_ne!(
             forced[0].id, "from-cache",
             "force=true must probe the harness instead of serving the cache"
+        );
+    }
+
+    /// The boot grace must suppress stale-entry background refreshes: the UI
+    /// prefetches models while the window is still initializing, and probing
+    /// there would starve GPU/window init with agent CLI spawns. Once the
+    /// grace has passed, the same call revalidates in the background.
+    #[tokio::test]
+    async fn stale_cache_refresh_waits_for_boot_grace() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let mut registry = HarnessRegistry::new();
+        let resolves = Arc::new(AtomicUsize::new(0));
+        let counted = resolves.clone();
+        registry.register_lazy(
+            HarnessDescriptor {
+                id: HarnessId::Mock,
+                name: "Mock".into(),
+                supports_steering: true,
+                steering_mode: SteeringMode::StepBoundary,
+                reasoning_levels: vec![],
+                installed: true,
+                enabled: None,
+                surface: komet_harness::capabilities::interaction_surface(HarnessId::Mock),
+            },
+            Box::new(|| true),
+            Box::new(move || {
+                counted.fetch_add(1, Ordering::SeqCst);
+                Ok(
+                    Arc::new(komet_harness::mock::MockHarness { script: vec![] })
+                        as Arc<dyn Harness>,
+                )
+            }),
+        );
+        registry.models_cache_entries().insert(
+            HarnessId::Mock,
+            CachedModels {
+                discovered_at_ms: crate::now_ms()
+                    - MODELS_CACHE_REFRESH_AFTER.as_millis() as i64
+                    - 1,
+                models: vec![Model {
+                    id: "stale".into(),
+                    label: "Stale".into(),
+                    description: None,
+                    reasoning_levels: vec![],
+                    options: vec![],
+                }],
+            },
+        );
+
+        let served = registry.models(HarnessId::Mock, false).await.unwrap();
+        assert_eq!(served[0].id, "stale", "a stale entry is still served");
+        assert_eq!(
+            resolves.load(Ordering::SeqCst),
+            0,
+            "during the boot grace the stale entry must not be re-probed"
+        );
+
+        registry.booted_at =
+            std::time::Instant::now() - BOOT_MODEL_GRACE - std::time::Duration::from_secs(1);
+        let served = registry.models(HarnessId::Mock, false).await.unwrap();
+        assert_eq!(
+            served[0].id, "stale",
+            "stale rows stay visible while refreshing"
+        );
+        assert_eq!(
+            resolves.load(Ordering::SeqCst),
+            1,
+            "past the grace the stale entry revalidates in the background"
         );
     }
 

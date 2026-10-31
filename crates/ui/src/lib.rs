@@ -10,7 +10,7 @@
 //! - [`state`] — `AppState` entity + `EngineHandle` (connect-or-embed engine);
 //! - [`settings`] — persisted pane widths/collapse flags;
 //! - [`shell`] — sidebar + main panel + right-pane scaffold + gate;
-//! - [`loaders`] — komet pulse loader, gradient spinner, boot splash.
+//! - [`loaders`] — komet pulse loader and gradient spinner.
 
 pub mod app_menus;
 pub mod appearance;
@@ -134,7 +134,8 @@ impl gpui::Global for ReopenState {}
 
 /// Run the headed app: tokio bridge up, engine bootstrap kicked off (probe →
 /// connect-or-embed), 1320×880 window (min 900×600) with [`shell::Shell`] as the
-/// root view, boot splash overlaid until the engine reports ready.
+/// root view. The shell paints immediately; rows fill in when the engine
+/// attaches.
 pub fn run_app(config: UiConfig) {
     let app = gpui_platform::application().with_assets(icons::Assets);
     // Dock-icon click with no window (⌘W closed it): rebuild the main window

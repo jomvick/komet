@@ -148,6 +148,8 @@ pub struct UiSettings {
     /// Local image painted behind translucent app surfaces.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wallpaper_path: Option<String>,
+    /// Where the wallpaper is painted: whole window or main panel.
+    pub wallpaper_scope: wallpaper::WallpaperScope,
     /// Idle time before an edited workspace file is saved automatically.
     pub files_autosave_delay_ms: u64,
     /// Wrap long lines in workspace file editors and previews.
@@ -183,6 +185,7 @@ impl Default for UiSettings {
             keymap: KeymapConfig::default(),
             appearance: crate::appearance::AppearanceMode::default(),
             wallpaper_path: None,
+            wallpaper_scope: wallpaper::WallpaperScope::default(),
             files_autosave_delay_ms: FILES_AUTOSAVE_DELAY_DEFAULT_MS,
             files_word_wrap: false,
             files_editor_font_size: FILES_EDITOR_FONT_SIZE_DEFAULT,
@@ -501,6 +504,7 @@ mod tests {
             },
             appearance: crate::appearance::AppearanceMode::Light,
             wallpaper_path: Some("/wallpapers/aurora.webp".into()),
+            wallpaper_scope: wallpaper::WallpaperScope::Panel,
             files_autosave_delay_ms: 1000,
             files_word_wrap: true,
             files_editor_font_size: 13.0,
