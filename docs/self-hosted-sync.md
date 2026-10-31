@@ -85,7 +85,7 @@ déjà. Sur Internet, passez par TLS et par `--serve
 Le lien `komet://pair/…` se colle dans **Komet → Settings → Sync → Add device**.
 La machine apparaît ensuite dans le sélecteur **Devices** en haut de la sidebar :
 en la sélectionnant, on obtient un workspace vide dont les sessions tournent sur
-elle, et ses agents se règlent dans Settings → Agents.
+elle, et ses agents se règlent dans Settings → Providers.
 
 ## Variables
 - `KOMET_EDGE_URL` : URL du sync server (aucun défaut — non configuré = 100% local)

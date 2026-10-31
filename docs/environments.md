@@ -9,7 +9,7 @@ Status: shipped — the server, the engine runtime, `komet serve`, and the deskt
 side that pastes the link (Settings → Sync → **Add device**) and switches to the
 environment from the **Devices** picker at the top of the sidebar. In an
 environment's workspace you can also enable and manage that machine's agents
-(Settings → Agents targets the device you are looking at).
+(Settings → Providers targets the device you are looking at).
 
 ## One command on the VPS
 

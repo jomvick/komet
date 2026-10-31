@@ -3863,7 +3863,7 @@ fn with_komet_commands(
     }
     for (prompt_name, prompt_harness) in prompts {
         if let Some(tag) = prompt_harness
-            && !tag.eq_ignore_ascii_case(crate::settings::harnesses::cli_name(harness))
+            && !tag.eq_ignore_ascii_case(crate::settings::providers::cli_name(harness))
         {
             continue;
         }

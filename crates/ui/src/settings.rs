@@ -29,16 +29,15 @@ pub enum RememberedNavigation {
     },
 }
 
-pub mod accounts;
 pub mod appearance;
 pub mod archived;
 pub mod composer;
 pub mod devices;
 pub mod files;
-pub mod harnesses;
 pub mod integrations;
 pub mod notifications;
 pub mod prompts;
+pub mod providers;
 pub mod security;
 pub mod shortcuts;
 pub mod sync;

@@ -39,14 +39,13 @@ use crate::loaders;
 use crate::motion::{self, AnimationExt as _, MotionSpec, RESIZE, SPLASH_OUT, TAB_SLIDE};
 use crate::popover::{self, Loadable};
 use crate::rail;
-use crate::settings::accounts::AccountsPage;
 use crate::settings::appearance::AppearancePage;
 use crate::settings::archived::ArchivedPage;
 use crate::settings::devices::DevicesPage;
 use crate::settings::files::FilesSettingsPage;
-use crate::settings::harnesses::HarnessesPage;
 use crate::settings::integrations::IntegrationsPage;
 use crate::settings::notifications::{NotificationsEvent, NotificationsPage};
+use crate::settings::providers::ProvidersPage;
 use crate::settings::security::{SecurityDefaults, SecurityEvent, SecurityPage};
 use crate::settings::shortcuts::{ShortcutsEvent, ShortcutsPage};
 use crate::settings::sync::{SyncEvent, SyncPage};
@@ -183,10 +182,8 @@ pub fn apply_keymap(cx: &mut App, keymap: &KeymapConfig) {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsSection {
     Devices,
-    /// Which harnesses the composer offers (enable/disable toggles).
-    Harnesses,
-    /// Per-provider CLI accounts (login, usage) — labeled "Accounts".
-    Agents,
+    /// One card per agent: enablement, CLI install state and its logins.
+    Providers,
     Appearance,
     Files,
     Notifications,
@@ -198,10 +195,9 @@ pub enum SettingsSection {
 }
 
 impl SettingsSection {
-    pub const ALL: [SettingsSection; 11] = [
+    pub const ALL: [SettingsSection; 10] = [
         SettingsSection::Devices,
-        SettingsSection::Harnesses,
-        SettingsSection::Agents,
+        SettingsSection::Providers,
         SettingsSection::Appearance,
         SettingsSection::Files,
         SettingsSection::Notifications,
@@ -217,8 +213,7 @@ impl SettingsSection {
     pub fn label(self) -> &'static str {
         match self {
             SettingsSection::Devices => "Devices",
-            SettingsSection::Harnesses => "Agents",
-            SettingsSection::Agents => "Accounts",
+            SettingsSection::Providers => "Providers",
             SettingsSection::Appearance => "Appearance",
             SettingsSection::Files => "Files",
             SettingsSection::Notifications => "Notifications",
@@ -236,8 +231,7 @@ impl SettingsSection {
     pub const fn nav_icon(self) -> &'static str {
         match self {
             SettingsSection::Devices => icons::MONITOR,
-            SettingsSection::Harnesses => icons::WIDGET,
-            SettingsSection::Agents => icons::KEY_MINIMALISTIC,
+            SettingsSection::Providers => icons::WIDGET,
             SettingsSection::Appearance => icons::TUNING,
             SettingsSection::Files => icons::FOLDER_WITH_FILES,
             SettingsSection::Notifications => icons::BELL,
@@ -1118,8 +1112,7 @@ pub struct Shell {
     files_settings_page: Option<Entity<FilesSettingsPage>>,
     notifications_page: Option<Entity<NotificationsPage>>,
     shortcuts_page: Option<Entity<ShortcutsPage>>,
-    accounts_page: Option<Entity<AccountsPage>>,
-    harnesses_page: Option<Entity<HarnessesPage>>,
+    providers_page: Option<Entity<ProvidersPage>>,
     security_page: Option<Entity<SecurityPage>>,
     sync_page: Option<Entity<SyncPage>>,
     integrations_page: Option<Entity<IntegrationsPage>>,
@@ -1127,8 +1120,6 @@ pub struct Shell {
     notifications_sub: Option<Subscription>,
     security_sub: Option<Subscription>,
     sync_sub: Option<Subscription>,
-    harnesses_sub: Option<Subscription>,
-    pending_account_harness: Option<HarnessId>,
     /// Session-row context menu: (chat id, window position).
     chat_menu: popover::Popup<(String, Point<Pixels>)>,
     rename_dialog: Option<RenameChatDialog>,
@@ -1359,8 +1350,9 @@ impl Shell {
             Some("settings") | Some("settings/devices") => {
                 Route::Settings(SettingsSection::Devices)
             }
-            Some("settings/agents") => Route::Settings(SettingsSection::Agents),
-            Some("settings/harnesses") => Route::Settings(SettingsSection::Harnesses),
+            Some("settings/providers") | Some("settings/agents") | Some("settings/harnesses") => {
+                Route::Settings(SettingsSection::Providers)
+            }
             Some("settings/appearance") => Route::Settings(SettingsSection::Appearance),
             Some("settings/notifications") => Route::Settings(SettingsSection::Notifications),
             Some("settings/shortcuts") => Route::Settings(SettingsSection::Shortcuts),
@@ -1441,8 +1433,7 @@ impl Shell {
             files_settings_page: None,
             notifications_page: None,
             shortcuts_page: None,
-            accounts_page: None,
-            harnesses_page: None,
+            providers_page: None,
             security_page: None,
             sync_page: None,
             integrations_page: None,
@@ -1450,8 +1441,6 @@ impl Shell {
             notifications_sub: None,
             security_sub: None,
             sync_sub: None,
-            harnesses_sub: None,
-            pending_account_harness: None,
             chat_menu: popover::Popup::default(),
             rename_dialog: None,
             delete_confirm: None,
@@ -1974,17 +1963,6 @@ impl Shell {
         self.sidebar_tween = Some(WidthTween::new(from, self.sidebar_target()));
         self.schedule_save(cx);
         cx.notify();
-    }
-
-    fn open_accounts_for_harness(&mut self, harness: HarnessId, cx: &mut Context<Self>) {
-        self.pending_account_harness = Some(harness);
-        self.harnesses_page = None;
-        self.harnesses_sub = None;
-        self.open_settings(SettingsSection::Agents, cx);
-        if let Some(page) = self.accounts_page.clone() {
-            page.update(cx, |page, cx| page.focus_harness(harness, cx));
-            self.pending_account_harness = None;
-        }
     }
 
     fn toggle_right_pane(&mut self, cx: &mut Context<Self>) {
@@ -2874,8 +2852,8 @@ impl Shell {
     fn open_settings(&mut self, section: SettingsSection, cx: &mut Context<Self>) {
         // Recreate per visit: the page's ListHarnesses load re-probes which
         // CLIs are installed, so installing one shows up on the next open.
-        if section == SettingsSection::Harnesses {
-            self.harnesses_page = None;
+        if section == SettingsSection::Providers {
+            self.providers_page = None;
         }
         self.route = Route::Settings(section);
         self.nav.push(NavEntry::Settings(section));
@@ -2938,37 +2916,12 @@ impl Shell {
                     None => Empty.into_any_element(),
                 }
             }
-            SettingsSection::Harnesses => {
-                if self.harnesses_page.is_none() {
+            SettingsSection::Providers => {
+                if self.providers_page.is_none() {
                     let state = self.state.clone();
-                    let page = cx.new(|cx| HarnessesPage::new(state, cx));
-                    self.harnesses_sub = Some(cx.subscribe(
-                        &page,
-                        |this, _, event: &crate::settings::harnesses::HarnessesEvent, cx| {
-                            match *event {
-                                crate::settings::harnesses::HarnessesEvent::Connect(harness) => {
-                                    this.open_accounts_for_harness(harness, cx);
-                                }
-                            }
-                        },
-                    ));
-                    self.harnesses_page = Some(page);
+                    self.providers_page = Some(cx.new(|cx| ProvidersPage::new(state, cx)));
                 }
-                match &self.harnesses_page {
-                    Some(page) => page.clone().into_any_element(),
-                    None => Empty.into_any_element(),
-                }
-            }
-            SettingsSection::Agents => {
-                if self.accounts_page.is_none() {
-                    let state = self.state.clone();
-                    let page = cx.new(|cx| AccountsPage::new(state, cx));
-                    if let Some(harness) = self.pending_account_harness.take() {
-                        page.update(cx, |page, cx| page.focus_harness(harness, cx));
-                    }
-                    self.accounts_page = Some(page);
-                }
-                match &self.accounts_page {
+                match &self.providers_page {
                     Some(page) => page.clone().into_any_element(),
                     None => Empty.into_any_element(),
                 }
@@ -8944,11 +8897,11 @@ impl Render for Shell {
                     this.open_add_space(cx);
                 }
             }))
-            // Error-chip actions (transcript rows): Auth opens the Accounts
+            // Error-chip actions (transcript rows): Auth opens the Providers
             // settings section, Billing/ModelUnavailable opens the model
             // picker, and Réessayer resubmits the last prompt verbatim.
             .on_action(cx.listener(|this, _: &ErrorOpenAccounts, _, cx| {
-                this.open_settings(SettingsSection::Agents, cx);
+                this.open_settings(SettingsSection::Providers, cx);
             }))
             .on_action(cx.listener(|this, _: &ErrorOpenModelPicker, window, cx| {
                 let composer = this.composer.clone();
@@ -10092,8 +10045,8 @@ mod tests {
         nav.push(chat("a"));
         nav.push(chat("a"));
         assert_eq!(nav.len(), 1, "re-selecting the current route never stacks");
-        nav.push(NavEntry::Settings(SettingsSection::Agents));
-        nav.push(NavEntry::Settings(SettingsSection::Agents));
+        nav.push(NavEntry::Settings(SettingsSection::Providers));
+        nav.push(NavEntry::Settings(SettingsSection::Providers));
         assert_eq!(nav.len(), 2);
     }
 
@@ -10141,7 +10094,9 @@ mod tests {
 
     #[test]
     fn settings_sections_include_security() {
-        assert_eq!(SettingsSection::ALL.len(), 11);
+        assert_eq!(SettingsSection::ALL.len(), 10);
+        assert!(SettingsSection::ALL.contains(&SettingsSection::Providers));
+        assert_eq!(SettingsSection::Providers.label(), "Providers");
         assert!(SettingsSection::ALL.contains(&SettingsSection::Security));
         assert_eq!(SettingsSection::Security.label(), "Security");
         assert!(SettingsSection::ALL.contains(&SettingsSection::Integrations));
