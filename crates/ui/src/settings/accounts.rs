@@ -1,25 +1,22 @@
 //! Settings → Agents / accounts (feature-inventory §1.9): provider cards
-//! (Claude Code, Codex) with account rows — email, plan badge, Active, usage
-//! meters (indigo → amber ≥80% → red ≥95%, reset time), Switch / Forget — plus
-//! the add-account dialogs (paste-code and browser-poll flows) and
-//! account-shaped loading skeletons. Komet retargets devices from the settings
+//! (Claude Code, Codex) with account rows — email, plan badge, Active,
+//! Switch / Forget — plus the add-account dialogs (paste-code and browser-poll
+//! flows) and account-shaped loading skeletons. Komet retargets devices from the settings
 //! sidebar (`targetDeviceId` passthrough kept plumbed, unused single-device).
 //!
 //! The accounts RPC surface is being implemented engine-side in parallel —
 //! every call here surfaces failures as inline UI states rather than assuming
 //! the methods exist.
 
-use chrono::{DateTime, Utc};
 use gpui::{
-    AnyElement, ClipboardItem, Context, Entity, EventEmitter, Hsla, ScrollHandle, SharedString,
+    AnyElement, ClipboardItem, Context, Entity, EventEmitter, ScrollHandle, SharedString,
     Subscription, Task, Window, div, prelude::*, px,
 };
 use std::time::Duration;
 
-use komet_engine::UsageMode;
 use komet_proto::{
     AgentAccount, AgentAccountsSnapshot, AgentLoginMode, AgentLoginPoll, AgentLoginStart,
-    AgentLoginStatus, AgentUsageWindow, HarnessId,
+    AgentLoginStatus, HarnessId,
 };
 use komet_rpc::methods;
 
@@ -29,108 +26,8 @@ use crate::state::AppState;
 use crate::theme::Theme;
 
 // ---------------------------------------------------------------------------
-// Pure: usage meters + labels
+// Pure helpers
 // ---------------------------------------------------------------------------
-
-pub const USAGE_WARN_FRACTION: f32 = 0.80;
-pub const USAGE_CRITICAL_FRACTION: f32 = 0.95;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UsageLevel {
-    /// < 80% — indigo.
-    Normal,
-    /// ≥ 80% — amber.
-    Warn,
-    /// ≥ 95% — red.
-    Critical,
-}
-
-/// Threshold classification of a usage fraction. Pure.
-pub fn usage_level(fraction: f32) -> UsageLevel {
-    if fraction >= USAGE_CRITICAL_FRACTION {
-        UsageLevel::Critical
-    } else if fraction >= USAGE_WARN_FRACTION {
-        UsageLevel::Warn
-    } else {
-        UsageLevel::Normal
-    }
-}
-
-pub fn usage_color(level: UsageLevel, theme: &Theme) -> Hsla {
-    match level {
-        UsageLevel::Normal => theme.accent,
-        UsageLevel::Warn => theme.warning,
-        UsageLevel::Critical => theme.danger,
-    }
-}
-
-/// Why a `ListAgentAccounts` load is happening. Pure input to
-/// [`usage_mode_for`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LoadTrigger {
-    /// Page construction — the visit's first list.
-    Mount,
-    /// "Click to retry" after a failed load — still the visit's first
-    /// successful list.
-    Retry,
-    /// The explicit Refresh button.
-    Refresh,
-    /// After a completed add-account login flow.
-    PostLogin,
-    /// After Switch/Forget succeeds.
-    PostAction,
-}
-
-/// How aggressively a load should resolve usage, sent to the engine as
-/// `usageMode`. Replaces the old `forceUsage` boolean, which could not express
-/// the distinction that mattered: a forced list still served the 60s cache, so
-/// a Refresh inside the TTL returned the previous numbers without a probe.
-///
-/// - `Cached` — the visit's first list (mount, or retry after a failure), and
-///   post-Switch/Forget lists. A cold cache probes, so a first open never
-///   renders "Usage unavailable"; a warm entry is still trustworthy, so we do
-///   not stampede the provider on every nav. Post-Switch/Forget uses it because
-///   the switch moved the LIVE login — the active account is probed through a
-///   different path (live keyring / local language_server) than the saved-slot
-///   copy, and that live entry was just invalidated by the switch itself.
-/// - `Fresh` — the explicit Refresh button and a just-completed login. Both are
-///   an explicit user request for current numbers, so the cache is bypassed
-///   outright.
-pub fn usage_mode_for(trigger: LoadTrigger) -> UsageMode {
-    match trigger {
-        LoadTrigger::Mount | LoadTrigger::Retry | LoadTrigger::PostAction => UsageMode::Cached,
-        LoadTrigger::Refresh | LoadTrigger::PostLogin => UsageMode::Fresh,
-    }
-}
-
-/// Compact absolute reset moment (komet settings.agents.tsx `formatReset`):
-/// a local clock time ("3:45 PM") when it lands within ~22h,
-/// a short weekday + time ("Sun 11:50 AM") within 7 days,
-/// else month + day + time; the caller prefixes "resets ". Pure given `now`.
-pub fn format_reset(resets_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> Option<String> {
-    use chrono::Local;
-    let at = resets_at?;
-    let local = at.with_timezone(&Local);
-    let diff = at.signed_duration_since(now);
-    if diff.num_seconds() <= 0 {
-        return Some("resets soon".into());
-    }
-    Some(if diff.num_hours() < 22 {
-        format!("resets {}", local.format("%-I:%M %p"))
-    } else if diff.num_days() < 7 {
-        format!(
-            "resets {} {}",
-            local.format("%a"),
-            local.format("%-I:%M %p")
-        )
-    } else {
-        format!(
-            "resets {} {}",
-            local.format("%b %-d"),
-            local.format("%-I:%M %p")
-        )
-    })
-}
 
 /// Agents whose CLI login or provider credentials are required before runs.
 /// The first four have native account management; the rest authenticate in
@@ -211,42 +108,6 @@ pub fn provider_accounts(
         .collect();
     accounts.sort_by_key(|a| !a.active);
     accounts
-}
-
-/// Only the selected account's quota is meaningful for the live CLI session.
-fn displayed_usage(account: &AgentAccount) -> Option<&[AgentUsageWindow]> {
-    account.active.then_some(account.usage_windows.as_slice())
-}
-
-/// Providers whose quota the engine can actually probe. The CLI-managed
-/// sign-in providers expose no usage endpoint here, so an empty reading says
-/// nothing about their credentials.
-fn supports_usage_probe(harness: HarnessId) -> bool {
-    matches!(
-        harness,
-        HarnessId::ClaudeCode
-            | HarnessId::Codex
-            | HarnessId::Antigravity
-            | HarnessId::Cursor
-            | HarnessId::Copilot
-    )
-}
-
-fn retain_previous_usage(
-    snapshot: &mut AgentAccountsSnapshot,
-    previous: Option<&AgentAccountsSnapshot>,
-) {
-    let Some(previous) = previous else { return };
-    for account in &mut snapshot.accounts {
-        if account.usage_windows.is_empty()
-            && let Some(old) = previous
-                .accounts
-                .iter()
-                .find(|old| old.id == account.id && !old.usage_windows.is_empty())
-        {
-            account.usage_windows = old.usage_windows.clone();
-        }
-    }
 }
 
 fn select_active_account(snapshot: &mut AgentAccountsSnapshot, harness: HarnessId, id: &str) {
@@ -336,8 +197,8 @@ pub struct AccountsPage {
     device_menu: popover::Popup<()>,
     snapshot: Loadable<AgentAccountsSnapshot>,
     /// A `ListAgentAccounts` is in flight. Kept separate from the `Loadable`
-    /// state so a refresh dims the button and leaves the cards (and their last
-    /// known gauges) on screen instead of collapsing them to skeletons.
+    /// state so a refresh dims the button and leaves the cards on screen
+    /// instead of collapsing them to skeletons.
     refreshing: bool,
     /// Account id with an in-flight Switch/Forget.
     busy_account: Option<String>,
@@ -387,12 +248,7 @@ impl AccountsPage {
             _observe: observe,
             _code_events: code_events,
         };
-        // Force the usage probe on the visit's first list — a plain list
-        // returns no usage windows on a cold engine cache, which rendered
-        // every account as "Usage unavailable" until a manual Refresh. The
-        // Loading skeleton (meter ghosts) covers the probe latency, so
-        // "Usage unavailable" is reserved for a probe that genuinely failed.
-        page.load(usage_mode_for(LoadTrigger::Mount), cx);
+        page.load(cx);
         page
     }
 
@@ -411,8 +267,8 @@ impl AccountsPage {
     }
 
     /// Retarget the page at another device's logins: every accounts RPC is
-    /// relay-forwardable, so the whole page — list, usage probes, switch,
-    /// forget, login flows — follows the passthrough.
+    /// relay-forwardable, so the whole page — list, switch, forget, login
+    /// flows — follows the passthrough.
     fn close_device_menu(&mut self, cx: &mut Context<Self>) {
         if self.device_menu.begin_close() {
             popover::reap_popup(cx, |page: &mut Self| &mut page.device_menu);
@@ -428,12 +284,11 @@ impl AccountsPage {
         }
         self.target_device = target;
         // A different device = a different accounts world: drop in-flight
-        // login/action state and reload with a forced usage probe (the new
-        // device's cache is cold).
+        // login/action state and reload.
         self.login = None;
         self.busy_account = None;
         self.error = None;
-        self.load(usage_mode_for(LoadTrigger::Mount), cx);
+        self.load(cx);
     }
 
     /// Params with the `targetDeviceId` passthrough merged in.
@@ -613,13 +468,13 @@ impl AccountsPage {
         trigger.into_any_element()
     }
 
-    fn load(&mut self, mode: UsageMode, cx: &mut Context<Self>) {
+    fn load(&mut self, cx: &mut Context<Self>) {
         self.load_generation = self.load_generation.wrapping_add(1);
         let generation = self.load_generation;
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             self.refreshing = false;
             if matches!(self.snapshot, Loadable::Ready(_)) {
-                self.error = Some("Usage refresh failed: engine not connected".into());
+                self.error = Some("Refresh failed: engine not connected".into());
             } else {
                 self.snapshot = Loadable::Error("Engine not connected".into());
             }
@@ -635,7 +490,7 @@ impl AccountsPage {
             self.snapshot = Loadable::Loading;
         }
         self.refreshing = true;
-        let params = self.params(serde_json::json!({ "usageMode": mode.as_wire() }));
+        let params = self.params(serde_json::json!({ "usageMode": "none" }));
         self.load_task = Some(cx.spawn(async move |this, cx| {
             let result = engine
                 .client()
@@ -652,15 +507,14 @@ impl AccountsPage {
                         .map_err(|err| err.to_string())
                 });
                 page.snapshot = match parsed {
-                    Ok(mut snapshot) => {
-                        retain_previous_usage(&mut snapshot, previous.as_ref());
+                    Ok(snapshot) => {
                         page.error = None;
                         Loadable::Ready(snapshot)
                     }
                     Err(message) if previous.is_some() => {
-                        // Keep the last successful account and quota snapshot
-                        // visible when a background refresh fails transiently.
-                        page.error = Some(format!("Usage refresh failed: {message}").into());
+                        // Keep the last successful account snapshot visible
+                        // when a background refresh fails transiently.
+                        page.error = Some(format!("Refresh failed: {message}").into());
                         Loadable::Ready(previous.expect("checked above"))
                     }
                     Err(message) => Loadable::Error(message),
@@ -713,7 +567,7 @@ impl AccountsPage {
                         if is_switch && let Loadable::Ready(snapshot) = &mut page.snapshot {
                             select_active_account(snapshot, account_harness, &account_id);
                         }
-                        page.load(usage_mode_for(LoadTrigger::PostAction), cx);
+                        page.load(cx);
                     }
                     Err(err) => page.error = Some(format!("{err}").into()),
                 }
@@ -828,7 +682,7 @@ impl AccountsPage {
                 match result {
                     Ok(_) => {
                         page.login = None;
-                        page.load(usage_mode_for(LoadTrigger::PostLogin), cx);
+                        page.load(cx);
                     }
                     Err(err) => {
                         if let Some(LoginFlow::PasteCode {
@@ -876,7 +730,7 @@ impl AccountsPage {
                         Some(poll) => match poll.status {
                             AgentLoginStatus::Done => {
                                 page.login = None;
-                                page.load(usage_mode_for(LoadTrigger::PostLogin), cx);
+                                page.load(cx);
                                 cx.notify();
                                 true
                             }
@@ -942,108 +796,9 @@ impl AccountsPage {
 
     // ---- render pieces ----
 
-    /// One usage window (komet settings.agents.tsx `UsageMeter`): label ·
-    /// 5px rounded-full bar (indigo → amber ≥80% → red ≥95%) · "NN% used (MM% left)" ·
-    /// reset time with prominence when exhausted.
-    fn render_usage_meter(
-        &self,
-        window: &komet_proto::AgentUsageWindow,
-        theme: &Theme,
-        now: DateTime<Utc>,
-    ) -> AnyElement {
-        let fraction = window.used_fraction.clamp(0.0, 1.0);
-        let remaining_fraction = (1.0 - fraction).clamp(0.0, 1.0);
-        let level = usage_level(fraction);
-        let fill = usage_color(level, theme).opacity(match level {
-            UsageLevel::Normal => 0.8,
-            _ => 0.85,
-        });
-        let reset = format_reset(window.resets_at, now);
-        let used_pct = (fraction * 100.0).round() as u32;
-        let left_pct = (remaining_fraction * 100.0).round() as u32;
-        let value = window.display_value.clone().unwrap_or_else(|| {
-            if used_pct >= 100 {
-                "100% used (0% left)".to_string()
-            } else {
-                format!("{}% used ({}% left)", used_pct, left_pct)
-            }
-        });
-
-        div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(8.0))
-            .text_size(px(11.5))
-            .text_color(theme.text_muted.opacity(0.7))
-            .child(
-                div()
-                    .w(px(72.0))
-                    .flex_none()
-                    .truncate()
-                    .font_weight(gpui::FontWeight::MEDIUM)
-                    .child(SharedString::from(window.label.clone())),
-            )
-            .when(window.display_value.is_none(), |el| {
-                el.child(
-                    // Absolute track so `relative()` fill has a definite parent
-                    // width (`flex_1` + content-sized fill used to collapse).
-                    // Always paint the track: unused windows are 0% fill, and
-                    // hiding that child made Gemini/Session look like "no gauge".
-                    div()
-                        .flex_1()
-                        .min_w(px(56.0))
-                        .max_w(px(220.0))
-                        .h(px(5.0))
-                        .relative()
-                        .child(
-                            div()
-                                .absolute()
-                                .inset_0()
-                                .rounded_full()
-                                .overflow_hidden()
-                                .bg(theme.border)
-                                .child(
-                                    div()
-                                        .h_full()
-                                        // A 1.5% floor keeps tiny non-zero usage
-                                        // visible (komet `max(used, 1.5)%`).
-                                        .w(gpui::relative(if fraction > 0.0 {
-                                            fraction.max(0.015)
-                                        } else {
-                                            0.0
-                                        }))
-                                        .rounded_full()
-                                        .bg(fill),
-                                ),
-                        ),
-                )
-            })
-            .child(
-                div()
-                    .flex_none()
-                    .text_right()
-                    .child(SharedString::from(value)),
-            )
-            .when_some(reset, |el, reset| {
-                el.child(
-                    div()
-                        .flex_none()
-                        .truncate()
-                        .text_color(if level == UsageLevel::Critical {
-                            theme.danger_muted.opacity(0.9)
-                        } else {
-                            theme.text_muted.opacity(0.45)
-                        })
-                        .child(SharedString::from(reset)),
-                )
-            })
-            .into_any_element()
-    }
-
     /// One account row (komet settings.agents.tsx `AccountRow`): initial
-    /// avatar, email + usage meters left; badges over the Switch/Forget
-    /// actions right-anchored.
+    /// avatar and email left; badges over the Switch/Forget actions
+    /// right-anchored.
     ///
     /// The Switch/Forget element ids embed the account id, not the row index:
     /// gpui keys interactive element state by the id path, and row indices
@@ -1056,7 +811,6 @@ impl AccountsPage {
         account: &AgentAccount,
         first: bool,
         theme: &Theme,
-        now: DateTime<Utc>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         use crate::settings::widgets;
@@ -1174,53 +928,7 @@ impl AccountsPage {
                     .min_w_0()
                     .flex()
                     .flex_col()
-                    .child(widgets::row_title(theme, email))
-                    .map(|el| {
-                        // Meters XOR the quiet fallback line — never both
-                        // (komet: `usage ? meters : "Usage unavailable"…`).
-                        if let Some(usage_windows) = displayed_usage(account) {
-                            if usage_windows.is_empty() {
-                                el.child(
-                                    div()
-                                        .mt(px(6.0))
-                                        .truncate()
-                                        .text_size(px(11.5))
-                                        .text_color(theme.text_muted.opacity(0.6))
-                                        .child(SharedString::from(
-                                            if account.switchable
-                                                || !supports_usage_probe(account.harness)
-                                            {
-                                                // Cursor is probed too (its usage DB is
-                                                // read for the ACTIVE login only), so an
-                                                // empty reading here is a real miss, not
-                                                // a coverage gap. "Credentials
-                                                // unavailable" stays reserved for a
-                                                // live login we could not read.
-                                                "Usage unavailable"
-                                            } else {
-                                                "Credentials unavailable"
-                                            },
-                                        )),
-                                )
-                            } else {
-                                el.child(
-                                    div()
-                                        .mt(px(6.0))
-                                        .w_full()
-                                        .flex()
-                                        .flex_col()
-                                        .gap(px(4.0))
-                                        .children(
-                                            usage_windows
-                                                .iter()
-                                                .map(|w| self.render_usage_meter(w, theme, now)),
-                                        ),
-                                )
-                            }
-                        } else {
-                            el
-                        }
-                    }),
+                    .child(widgets::row_title(theme, email)),
             )
             .child(
                 div()
@@ -1493,8 +1201,8 @@ impl AccountsPage {
     }
 
     /// A ghost account row (komet settings.agents.tsx `SkeletonRow`): avatar,
-    /// email line, two usage-meter ghosts, a badge — same geometry as the real
-    /// row so loaded data lands without a layout jump. `dim` fades row two.
+    /// email line, a badge — same geometry as the real row so loaded data
+    /// lands without a layout jump. `dim` fades row two.
     fn render_skeleton_row(
         &self,
         _id: (&'static str, usize),
@@ -1520,29 +1228,6 @@ impl AccountsPage {
                 })
                 .bg(crate::theme::ink(0.05))
         };
-        let meters = div()
-            .mt(px(8.0))
-            .flex()
-            .flex_col()
-            .gap(px(7.0))
-            .children((0..2).map(|_| {
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(8.0))
-                    .child(ghost(px(48.0).into(), 9.0, false))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(56.0))
-                            .max_w(px(230.0))
-                            .h(px(5.0))
-                            .rounded_full()
-                            .bg(crate::theme::ink(0.04)),
-                    )
-                    .child(ghost(px(64.0).into(), 9.0, false))
-            }));
         let inner = div()
             .flex()
             .flex_row()
@@ -1560,8 +1245,7 @@ impl AccountsPage {
                 div()
                     .flex_1()
                     .min_w_0()
-                    .child(ghost(px(176.0).into(), 13.0, false).max_w(gpui::relative(0.6)))
-                    .child(meters),
+                    .child(ghost(px(176.0).into(), 13.0, false).max_w(gpui::relative(0.6))),
             )
             .child(div().flex_none().flex().flex_col().items_end().child(ghost(
                 px(64.0).into(),
@@ -1582,7 +1266,6 @@ impl Render for AccountsPage {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         use crate::settings::widgets;
         let theme = Theme::of(cx).clone();
-        let now = Utc::now();
         let dialog = self.render_login_dialog(window.viewport_size(), window, cx);
         // Driven by the load flag, not the `Loadable` state: a reload keeps the
         // previous snapshot on screen, so `Loading` no longer marks "in flight".
@@ -1688,10 +1371,7 @@ impl Render for AccountsPage {
                     widgets::error_strip(&theme, message)
                         .id("accounts-load-error")
                         .cursor_pointer()
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            // Retry IS the visit's first successful list — force usage.
-                            this.load(usage_mode_for(LoadTrigger::Retry), cx)
-                        }))
+                        .on_click(cx.listener(|this, _, _, cx| this.load(cx)))
                         .child(
                             div()
                                 .mt(px(4.0))
@@ -1720,7 +1400,7 @@ impl Render for AccountsPage {
                             .iter()
                             .enumerate()
                             .map(|(ix, account)| {
-                                self.render_account_row(account, ix == 0, &theme, now, cx)
+                                self.render_account_row(account, ix == 0, &theme, cx)
                             })
                             .collect();
                         let add_id: SharedString = format!("add-account-{name}").into();
@@ -1897,9 +1577,7 @@ impl Render for AccountsPage {
                             .text_size(px(12.5))
                             .hover(|s| widgets::ghost_hover(&theme, s))
                             .when(refreshing, |el| el.opacity(0.5))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.load(usage_mode_for(LoadTrigger::Refresh), cx)
-                            }))
+                            .on_click(cx.listener(|this, _, _, cx| this.load(cx)))
                             .child(
                                 crate::icons::icon(crate::icons::REFRESH)
                                     .size(px(16.0))
@@ -1949,30 +1627,6 @@ impl Render for AccountsPage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeDelta;
-
-    #[test]
-    fn first_load_of_a_visit_probes_on_a_cold_cache() {
-        // The visit's first list must be able to hit the provider, or the open
-        // renders "Usage unavailable" until a manual Refresh. `Cached` still
-        // probes whenever the entry is missing or stale — which is the normal
-        // case for a freshly opened page — without re-fetching a warm entry.
-        assert_eq!(usage_mode_for(LoadTrigger::Mount), UsageMode::Cached);
-        // A retry after a failed load is still the visit's first list.
-        assert_eq!(usage_mode_for(LoadTrigger::Retry), UsageMode::Cached);
-    }
-
-    #[test]
-    fn explicit_refresh_bypasses_the_cache() {
-        // THE regression this guards: a Refresh clicked inside the 60s TTL used
-        // to be served the previous numbers without a probe. `Fresh` ignores
-        // the cache outright, so the click always reaches the engine network
-        // path.
-        assert_eq!(usage_mode_for(LoadTrigger::Refresh), UsageMode::Fresh);
-        // A just-completed login must show the new account's real numbers, not
-        // whatever the previous list cached for that slot id.
-        assert_eq!(usage_mode_for(LoadTrigger::PostLogin), UsageMode::Fresh);
-    }
 
     #[test]
     fn accounts_lists_every_login_required_agent() {
@@ -2003,73 +1657,6 @@ mod tests {
     }
 
     #[test]
-    fn switch_and_forget_re_probe() {
-        // The switch moved the LIVE login, so the cached entry describes the
-        // account that is no longer active. `Cached` re-probes because the
-        // engine invalidates the live entry on a switch.
-        assert_eq!(usage_mode_for(LoadTrigger::PostAction), UsageMode::Cached);
-    }
-
-    #[test]
-    fn no_trigger_stays_offline() {
-        // Every visit-shaped load must be able to hit the network; only the
-        // engine's internal bookkeeping lists are offline.
-        for trigger in [
-            LoadTrigger::Mount,
-            LoadTrigger::Retry,
-            LoadTrigger::Refresh,
-            LoadTrigger::PostLogin,
-            LoadTrigger::PostAction,
-        ] {
-            assert_ne!(usage_mode_for(trigger), UsageMode::Offline, "{trigger:?}");
-        }
-    }
-
-    #[test]
-    fn usage_thresholds_match_komet() {
-        assert_eq!(usage_level(0.0), UsageLevel::Normal);
-        assert_eq!(usage_level(0.79), UsageLevel::Normal);
-        assert_eq!(usage_level(0.80), UsageLevel::Warn);
-        assert_eq!(usage_level(0.94), UsageLevel::Warn);
-        assert_eq!(usage_level(0.95), UsageLevel::Critical);
-        assert_eq!(usage_level(1.0), UsageLevel::Critical);
-    }
-
-    #[test]
-    fn usage_colors_map_to_theme_accents() {
-        let theme = Theme::dark();
-        assert_eq!(usage_color(UsageLevel::Normal, &theme), theme.accent);
-        assert_eq!(usage_color(UsageLevel::Warn, &theme), theme.warning);
-        assert_eq!(usage_color(UsageLevel::Critical, &theme), theme.danger);
-    }
-
-    #[test]
-    fn reset_formatting_is_absolute() {
-        use chrono::Local;
-        let now = Utc::now();
-        assert_eq!(format_reset(None, now), None);
-        // Within ~22h: a local clock time ("resets 3:45 PM").
-        let soon = now + TimeDelta::minutes(125);
-        assert_eq!(
-            format_reset(Some(soon), now),
-            Some(format!(
-                "resets {}",
-                soon.with_timezone(&Local).format("%-I:%M %p")
-            ))
-        );
-        // Beyond: a short weekday + time ("resets Mon 3:45 PM").
-        let later = now + TimeDelta::days(3);
-        assert_eq!(
-            format_reset(Some(later), now),
-            Some(format!(
-                "resets {} {}",
-                later.with_timezone(&Local).format("%a"),
-                later.with_timezone(&Local).format("%-I:%M %p")
-            ))
-        );
-    }
-
-    #[test]
     fn provider_grouping_puts_active_first() {
         let account = |id: &str, harness: HarnessId, active: bool| AgentAccount {
             id: id.into(),
@@ -2097,94 +1684,5 @@ mod tests {
         assert_eq!(ids, ["c2", "c1"], "active account leads");
         assert_eq!(provider_accounts(&snapshot, HarnessId::Codex).len(), 1);
         assert!(provider_accounts(&snapshot, HarnessId::Cursor).is_empty());
-    }
-
-    #[test]
-    fn usage_is_only_displayed_for_the_active_account() {
-        let mut account = AgentAccount {
-            id: "codex-1".into(),
-            harness: HarnessId::Codex,
-            email: None,
-            plan_label: None,
-            active: false,
-            usage_windows: vec![AgentUsageWindow {
-                label: "Week".into(),
-                used_fraction: 0.42,
-                resets_at: None,
-                display_value: None,
-            }],
-            display_name: None,
-            organization: None,
-            auth_kind: None,
-            switchable: true,
-            saved_at: None,
-        };
-
-        assert!(displayed_usage(&account).is_none());
-        account.active = true;
-        assert_eq!(displayed_usage(&account).unwrap()[0].label, "Week");
-    }
-
-    #[test]
-    fn switching_moves_the_active_usage_to_the_selected_account() {
-        let account = |id: &str, active: bool| AgentAccount {
-            id: id.into(),
-            harness: HarnessId::Codex,
-            email: None,
-            plan_label: None,
-            active,
-            usage_windows: vec![],
-            display_name: None,
-            organization: None,
-            auth_kind: None,
-            switchable: true,
-            saved_at: None,
-        };
-        let mut snapshot = AgentAccountsSnapshot {
-            accounts: vec![account("old", true), account("selected", false)],
-            warnings: vec![],
-        };
-
-        select_active_account(&mut snapshot, HarnessId::Codex, "selected");
-
-        assert!(!snapshot.accounts[0].active);
-        assert!(snapshot.accounts[1].active);
-    }
-
-    #[test]
-    fn empty_refresh_keeps_the_last_known_usage_for_each_account() {
-        let account = |usage_windows| AgentAccount {
-            id: "codex-1".into(),
-            harness: HarnessId::Codex,
-            email: None,
-            plan_label: None,
-            active: true,
-            usage_windows,
-            display_name: None,
-            organization: None,
-            auth_kind: None,
-            switchable: true,
-            saved_at: None,
-        };
-        let previous = AgentAccountsSnapshot {
-            accounts: vec![account(vec![AgentUsageWindow {
-                label: "Week".into(),
-                used_fraction: 0.42,
-                resets_at: None,
-                display_value: None,
-            }])],
-            warnings: vec![],
-        };
-        let mut refreshed = AgentAccountsSnapshot {
-            accounts: vec![account(vec![])],
-            warnings: vec![],
-        };
-
-        retain_previous_usage(&mut refreshed, Some(&previous));
-
-        assert_eq!(
-            refreshed.accounts[0].usage_windows,
-            previous.accounts[0].usage_windows
-        );
     }
 }
