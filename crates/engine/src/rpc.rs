@@ -1826,9 +1826,17 @@ impl RpcService for EngineRpc {
             methods::LIST_HARNESSES => RpcReply::value(&self.registry.descriptors()),
             methods::GET_HARNESS_CLI_STATUS => {
                 let params: crate::harness_cli::HarnessCliStatusParams = parse_params(params)?;
-                let statuses = match &self.harness_cli_checker {
-                    Some(checker) => checker.statuses(params.check_latest, params.force).await,
-                    None => {
+                let statuses = match (&self.harness_cli_checker, params.harnesses.as_deref()) {
+                    (Some(checker), Some(harnesses)) => {
+                        checker.statuses_for(harnesses, params.check_latest).await
+                    }
+                    (Some(checker), None) => {
+                        checker.statuses(params.check_latest, params.force).await
+                    }
+                    (None, Some(harnesses)) => {
+                        crate::harness_cli::statuses(harnesses, params.check_latest).await
+                    }
+                    (None, None) => {
                         let harnesses = self
                             .registry
                             .descriptors()

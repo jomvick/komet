@@ -20,7 +20,7 @@ use komet_engine::harness_cli::HarnessCliStatus;
 use komet_engine::registry::{HarnessDescriptor, descriptor_enabled};
 use komet_proto::{
     AgentAccount, AgentAccountsSnapshot, AgentLoginMode, AgentLoginPoll, AgentLoginStart,
-    AgentLoginStatus, HarnessId,
+    AgentLoginStatus, HarnessId, SteeringMode,
 };
 use komet_rpc::methods;
 
@@ -182,6 +182,26 @@ fn harness_display_name(harness: HarnessId) -> &'static str {
     }
 }
 
+/// The card list to paint before `ListHarnesses` lands: a cold engine spends
+/// ~37s assembling stores and model catalogs, and the page must not be a
+/// skeleton for that whole window. Real install/enabled state replaces these
+/// as soon as the reply arrives.
+fn placeholder_descriptors() -> Vec<HarnessDescriptor> {
+    PROVIDERS
+        .iter()
+        .map(|(id, name, _)| HarnessDescriptor {
+            id: *id,
+            name: (*name).to_string(),
+            supports_steering: true,
+            steering_mode: SteeringMode::StepBoundary,
+            reasoning_levels: Vec::new(),
+            installed: true,
+            enabled: None,
+            surface: Default::default(),
+        })
+        .collect()
+}
+
 /// Connected/unknown harnesses, derived from the accounts snapshot.
 #[derive(Default)]
 struct AgentConnectionStatus {
@@ -258,9 +278,10 @@ fn account_summary(accounts: &[&AgentAccount]) -> SharedString {
 }
 
 /// The last enabled agent cannot be switched off — the composer needs
-/// something to run (mirrors the engine guard).
+/// something to run (mirrors the engine guard). Disabling stays available even
+/// when the CLI has since been uninstalled: only *enabling* needs the CLI.
 fn toggle_interactive(installed: bool, enabled: bool, enabled_count: usize) -> bool {
-    installed && !(enabled && enabled_count == 1)
+    (enabled || installed) && !(enabled && enabled_count == 1)
 }
 
 /// Several cards may be open at once; clicking a header flips just that one.
@@ -348,10 +369,14 @@ pub struct ProvidersPage {
     /// One card per entry; the authoritative list of agents.
     harnesses: Loadable<Vec<HarnessDescriptor>>,
     accounts: Loadable<AgentAccountsSnapshot>,
-    /// A `ListHarnesses`/`ListAgentAccounts` is in flight. Kept separate from
-    /// the `Loadable` states so a refresh dims the button and leaves the cards
-    /// on screen instead of collapsing them to skeletons.
-    refreshing: bool,
+    /// The two loads run concurrently and report their own progress: a shared
+    /// `Task` slot meant starting one cancelled the other, so the card list
+    /// never reached `Ready` on a visit that also asked for accounts.
+    harnesses_loading: bool,
+    accounts_loading: bool,
+    /// Last observed engine availability, so the page can retry by itself when
+    /// a cold engine finishes booting after the visit started.
+    engine_connected: bool,
     cli_status: HashMap<HarnessId, HarnessCliStatus>,
     cli_update_prompt: Option<HarnessCliStatus>,
     announced_cli_updates: HashSet<(HarnessId, String)>,
@@ -368,12 +393,16 @@ pub struct ProvidersPage {
     accounts_error: Option<SharedString>,
     copied_login_command: Option<HarnessId>,
     code_input: Entity<ComposerInput>,
-    load_task: Option<Task<()>>,
+    harnesses_task: Option<Task<()>>,
+    accounts_task: Option<Task<()>>,
     load_generation: u64,
     action_task: Option<Task<()>>,
     poll_task: Option<Task<()>>,
     toggle_task: Option<Task<()>>,
     cli_status_task: Option<Task<()>>,
+    /// Per-card CLI status fetches. A map, not one slot: opening a second card
+    /// used to cancel the first card's probe, which then never got a version.
+    card_status_tasks: HashMap<HarnessId, Task<()>>,
     manage_cli_task: Option<Task<()>>,
     _observe: Subscription,
     _code_events: Subscription,
@@ -381,7 +410,20 @@ pub struct ProvidersPage {
 
 impl ProvidersPage {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
-        let observe = cx.observe(&state, |_, _, cx| cx.notify());
+        let observe = cx.observe(&state, |page: &mut Self, state, cx| {
+            let connected = state.read(cx).engine().is_some();
+            if connected && !page.engine_connected {
+                // A visit that started during a cold engine boot saw no handle;
+                // now that it is up, retry instead of leaving the error strip
+                // until the user finds Refresh.
+                page.engine_connected = true;
+                page.load_harnesses(cx);
+                page.load_accounts(cx);
+            } else if !connected {
+                page.engine_connected = false;
+            }
+            cx.notify();
+        });
         let code_input = cx.new(|cx| ComposerInput::new("Paste the authorization code", cx));
         let code_events = cx.subscribe(&code_input, |this: &mut Self, _, event, cx| {
             if matches!(event, ComposerInputEvent::Submitted) {
@@ -389,6 +431,7 @@ impl ProvidersPage {
             }
         });
         let target_device = state.read(cx).harness_target_device();
+        let engine_connected = state.read(cx).engine().is_some();
         let mut page = Self {
             state,
             target_device,
@@ -396,7 +439,9 @@ impl ProvidersPage {
             device_menu: popover::Popup::default(),
             harnesses: Loadable::Idle,
             accounts: Loadable::Idle,
-            refreshing: false,
+            harnesses_loading: false,
+            accounts_loading: false,
+            engine_connected,
             cli_status: HashMap::new(),
             cli_update_prompt: None,
             announced_cli_updates: HashSet::new(),
@@ -409,12 +454,14 @@ impl ProvidersPage {
             accounts_error: None,
             copied_login_command: None,
             code_input,
-            load_task: None,
+            harnesses_task: None,
+            accounts_task: None,
             load_generation: 0,
             action_task: None,
             poll_task: None,
             toggle_task: None,
             cli_status_task: None,
+            card_status_tasks: HashMap::new(),
             manage_cli_task: None,
             _observe: observe,
             _code_events: code_events,
@@ -462,6 +509,9 @@ impl ProvidersPage {
         self.managing_cli = None;
         self.harnesses = Loadable::Idle;
         self.accounts = Loadable::Idle;
+        self.harnesses_loading = false;
+        self.accounts_loading = false;
+        self.card_status_tasks.clear();
         self.load_harnesses(cx);
         self.load_accounts(cx);
     }
@@ -655,6 +705,7 @@ impl ProvidersPage {
     fn load_harnesses(&mut self, cx: &mut Context<Self>) {
         self.error = None;
         let Some(engine) = self.state.read(cx).engine().cloned() else {
+            self.harnesses_loading = false;
             if matches!(self.harnesses, Loadable::Idle) {
                 self.harnesses = Loadable::Error("Engine not connected".into());
             }
@@ -665,26 +716,29 @@ impl ProvidersPage {
         if matches!(self.harnesses, Loadable::Idle) {
             self.harnesses = Loadable::Loading;
         }
-        self.refreshing = true;
-        self.load_task = Some(cx.spawn(async move |this, cx| {
+        self.harnesses_loading = true;
+        self.harnesses_task = Some(cx.spawn(async move |this, cx| {
             let result = engine.client().call(methods::LIST_HARNESSES, params).await;
             this.update(cx, |page, cx| {
                 if page.target_generation != generation {
                     return;
                 }
-                page.refreshing = false;
-                page.harnesses = match result {
-                    Ok(value) => match serde_json::from_value::<Vec<HarnessDescriptor>>(value) {
-                        Ok(list) => {
-                            page.error = None;
-                            Loadable::Ready(list)
-                        }
-                        Err(err) => Loadable::Error(err.to_string()),
-                    },
-                    Err(err) => Loadable::Error(err.to_string()),
-                };
-                if matches!(page.harnesses, Loadable::Ready(_)) {
-                    page.load_cli_status(cx, false, false);
+                page.harnesses_loading = false;
+                let parsed = result.map_err(|err| err.to_string()).and_then(|value| {
+                    serde_json::from_value::<Vec<HarnessDescriptor>>(value)
+                        .map_err(|err| err.to_string())
+                });
+                match parsed {
+                    Ok(list) => {
+                        page.error = None;
+                        page.harnesses = Loadable::Ready(list);
+                    }
+                    // A failed refresh keeps the cards the user can already
+                    // act on; only the very first read has nothing to show.
+                    Err(message) if matches!(page.harnesses, Loadable::Ready(_)) => {
+                        page.error = Some(format!("Refresh failed: {message}").into());
+                    }
+                    Err(message) => page.harnesses = Loadable::Error(message),
                 }
                 cx.notify();
             })
@@ -745,6 +799,46 @@ impl ProvidersPage {
             })
             .ok();
         }));
+    }
+
+    /// One card's version line, fetched when the card is opened. The page used
+    /// to probe every installed CLI as soon as the catalog landed; only the
+    /// expanded card needs its own status.
+    fn load_card_cli_status(&mut self, harness: HarnessId, cx: &mut Context<Self>) {
+        if self.cli_status.contains_key(&harness) {
+            return;
+        }
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        let params = self.with_target(
+            serde_json::json!({ "harnesses": [harness], "checkLatest": false, "force": false }),
+            cx,
+        );
+        let generation = self.target_generation;
+        let task = cx.spawn(async move |this, cx| {
+            let Ok(value) = engine
+                .client()
+                .call(methods::GET_HARNESS_CLI_STATUS, params)
+                .await
+            else {
+                return;
+            };
+            let Ok(statuses) = serde_json::from_value::<Vec<HarnessCliStatus>>(value) else {
+                return;
+            };
+            this.update(cx, |page, cx| {
+                if page.target_generation != generation {
+                    return;
+                }
+                for status in statuses {
+                    page.cli_status.insert(status.harness, status);
+                }
+                cx.notify();
+            })
+            .ok();
+        });
+        self.card_status_tasks.insert(harness, task);
     }
 
     fn check_updates(&mut self, cx: &mut Context<Self>) {
@@ -822,6 +916,8 @@ impl ProvidersPage {
     /// round trip; refusals (engine guards) land in the error strip.
     fn toggle(&mut self, harness: HarnessId, enabled: bool, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
+            self.error = Some("Engine is not running — wait for it to connect, then retry.".into());
+            cx.notify();
             return;
         };
         let params = self.with_target(
@@ -878,7 +974,10 @@ impl ProvidersPage {
                     Ok(value) => match serde_json::from_value::<Vec<HarnessDescriptor>>(value) {
                         Ok(list) => {
                             page.harnesses = Loadable::Ready(list);
-                            page.load_cli_status(cx, false, false);
+                            // Only the harness whose CLI just changed needs a
+                            // new probe — not every installed CLI.
+                            page.cli_status.remove(&harness);
+                            page.load_card_cli_status(harness, cx);
                             crate::pickers::bump_harness_catalog(cx);
                         }
                         Err(err) => page.error = Some(err.to_string().into()),
@@ -898,7 +997,7 @@ impl ProvidersPage {
         self.load_generation = self.load_generation.wrapping_add(1);
         let generation = self.load_generation;
         let Some(engine) = self.state.read(cx).engine().cloned() else {
-            self.refreshing = false;
+            self.accounts_loading = false;
             if matches!(self.accounts, Loadable::Ready(_)) {
                 self.accounts_error = Some("Refresh failed: engine not connected".into());
             } else {
@@ -912,9 +1011,9 @@ impl ProvidersPage {
         if matches!(self.accounts, Loadable::Idle) {
             self.accounts = Loadable::Loading;
         }
-        self.refreshing = true;
+        self.accounts_loading = true;
         let params = self.with_target(serde_json::json!({ "usageMode": "none" }), cx);
-        self.load_task = Some(cx.spawn(async move |this, cx| {
+        self.accounts_task = Some(cx.spawn(async move |this, cx| {
             let result = engine
                 .client()
                 .call(methods::LIST_AGENT_ACCOUNTS, params)
@@ -923,7 +1022,7 @@ impl ProvidersPage {
                 if page.load_generation != generation {
                     return;
                 }
-                page.refreshing = false;
+                page.accounts_loading = false;
                 let previous = page.accounts.ready().cloned();
                 let parsed = result.map_err(|err| err.to_string()).and_then(|value| {
                     serde_json::from_value::<AgentAccountsSnapshot>(value)
@@ -1012,6 +1111,15 @@ impl ProvidersPage {
                                 "Install the {} CLI to enable",
                                 cli_name(harness)
                             )))
+                            .into_any_element(),
+                    );
+                } else if !matches!(self.harnesses, Loadable::Ready(_)) {
+                    meta.push(
+                        div()
+                            .text_color(theme.text_muted.opacity(0.65))
+                            .child(SharedString::from(
+                                "Checking this device\u{2019}s install state\u{2026}",
+                            ))
                             .into_any_element(),
                     );
                 }
@@ -1304,6 +1412,9 @@ impl ProvidersPage {
                             .hover(|s| s.bg(crate::theme::ink(0.03)))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 toggle_expanded(&mut this.expanded, harness);
+                                if is_expanded(&this.expanded, harness) {
+                                    this.load_card_cli_status(harness, cx);
+                                }
                                 cx.notify();
                             }))
                             .child(tile)
@@ -1363,7 +1474,7 @@ impl ProvidersPage {
             // Surface a dead engine handle instead of silently no-oping; the
             // headed log default is `warn`, so this stays visible there too.
             tracing::warn!(method, account = %account.id, "account_action dropped: no engine handle");
-            self.error = Some("Engine is not running — reopen the Accounts page.".into());
+            self.error = Some("Engine is not running — wait for it to connect, then retry.".into());
             cx.notify();
             return;
         };
@@ -1411,7 +1522,7 @@ impl ProvidersPage {
 
     fn start_login(&mut self, harness: HarnessId, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
-            self.error = Some("Engine is not running — reopen the Accounts page.".into());
+            self.error = Some("Engine is not running — wait for it to connect, then retry.".into());
             cx.notify();
             return;
         };
@@ -2038,44 +2149,41 @@ impl Render for ProvidersPage {
         let update_dialog = self.render_cli_update_dialog(window.viewport_size(), cx);
         // Driven by the load flags, not the `Loadable` states: a reload keeps
         // the previous cards on screen, so `Loading` no longer means in flight.
-        let refreshing = self.refreshing;
+        let refreshing = self.harnesses_loading || self.accounts_loading;
 
-        let body: AnyElement = match &self.harnesses {
-            Loadable::Idle | Loadable::Loading => widgets::section_card(&theme)
-                .p(px(16.0))
-                .child(popover::skeleton_rows(
-                    "providers-skeleton",
-                    &theme,
-                    4,
-                    cx.entity_id(),
-                    window,
-                    cx,
-                ))
-                .into_any_element(),
-            Loadable::Error(message) => div()
-                .child(widgets::error_strip(&theme, message.clone()))
-                .child(
-                    widgets::ghost_action(&theme)
-                        .id("providers-retry")
-                        .mt(px(8.0))
-                        .hover(|s| widgets::ghost_hover(&theme, s))
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.load_harnesses(cx);
-                            this.load_accounts(cx);
-                        }))
-                        .child(SharedString::from("Retry")),
-                )
-                .into_any_element(),
-            Loadable::Ready(list) => {
-                let cards = self.cards(&visible_harnesses(list), &theme, cx);
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(12.0))
-                    .children(cards)
-                    .into_any_element()
-            }
+        // Cards paint from the static agent table first and reconcile with the
+        // engine's catalog when it lands, so Providers is usable — names,
+        // toggles, Connect — during a slow engine boot or after a failed read.
+        let list_error = match &self.harnesses {
+            Loadable::Error(message) => Some(message.clone()),
+            _ => None,
         };
+        let descriptors = match &self.harnesses {
+            Loadable::Ready(list) => visible_harnesses(list),
+            _ => placeholder_descriptors(),
+        };
+        let cards = self.cards(&descriptors, &theme, cx);
+        let body: AnyElement = div()
+            .flex()
+            .flex_col()
+            .gap(px(12.0))
+            .when_some(list_error, |el, message| {
+                el.child(
+                    div().child(widgets::error_strip(&theme, message)).child(
+                        widgets::ghost_action(&theme)
+                            .id("providers-retry")
+                            .mt(px(8.0))
+                            .hover(|s| widgets::ghost_hover(&theme, s))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.load_harnesses(cx);
+                                this.load_accounts(cx);
+                            }))
+                            .child(SharedString::from("Retry")),
+                    ),
+                )
+            })
+            .children(cards)
+            .into_any_element();
 
         div()
             .id("providers-page")
@@ -2215,6 +2323,23 @@ mod tests {
         assert!(!requires_login(HarnessId::Mock));
     }
 
+    /// The page must paint every card before the engine answers `ListHarnesses`
+    /// (a cold assembly takes tens of seconds) and after a failed read.
+    #[test]
+    fn placeholders_list_every_agent_with_an_optimistic_toggle() {
+        let placeholders = placeholder_descriptors();
+        assert_eq!(placeholders.len(), PROVIDERS.len());
+        for ((id, name, _), descriptor) in PROVIDERS.iter().zip(&placeholders) {
+            assert_eq!(descriptor.id, *id);
+            assert_eq!(&descriptor.name, name);
+            // Unknown yet: the toggle stays clickable and the engine's reply
+            // (or refusal) reconciles it.
+            assert!(descriptor.installed);
+            assert_eq!(descriptor.enabled, None);
+        }
+        assert!(!placeholders.iter().any(|d| d.id == HarnessId::Mock));
+    }
+
     #[test]
     fn provider_grouping_puts_active_first() {
         let account = |id: &str, harness: HarnessId, active: bool| AgentAccount {
@@ -2279,6 +2404,9 @@ mod tests {
         assert!(toggle_interactive(true, true, 2));
         assert!(toggle_interactive(true, false, 1));
         assert!(!toggle_interactive(false, false, 3));
+        // An enabled agent whose CLI disappeared can still be turned off.
+        assert!(toggle_interactive(false, true, 2));
+        assert!(!toggle_interactive(false, true, 1));
     }
 
     #[test]

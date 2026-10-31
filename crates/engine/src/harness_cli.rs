@@ -52,6 +52,11 @@ pub struct HarnessCliStatusParams {
     /// manual "Check for updates" action wants a live answer.
     #[serde(default)]
     pub force: bool,
+    /// Scope the probe to these harnesses. The Providers page asks for the one
+    /// card the user opened instead of every installed CLI at once; absent
+    /// means the whole catalog (the update check).
+    #[serde(default)]
+    pub harnesses: Option<Vec<HarnessId>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -173,6 +178,35 @@ impl HarnessCliChecker {
                 self.refresh(false, force).await
             }
         }
+    }
+
+    /// Statuses for a subset: cached entries answer instantly, anything else is
+    /// probed for just those harnesses and merged into the shared cache.
+    pub async fn statuses_for(
+        &self,
+        harnesses: &[HarnessId],
+        check_latest: bool,
+    ) -> Vec<HarnessCliStatus> {
+        if !check_latest {
+            let cached: Vec<HarnessCliStatus> = {
+                let statuses = lock(&self.inner.statuses);
+                harnesses
+                    .iter()
+                    .filter_map(|harness| statuses.get(harness).cloned())
+                    .collect()
+            };
+            if cached.len() == harnesses.len() {
+                return cached;
+            }
+        }
+        let statuses = super::harness_cli::statuses(harnesses, check_latest).await;
+        {
+            let mut cached = lock(&self.inner.statuses);
+            for status in &statuses {
+                cached.insert(status.harness, status.clone());
+            }
+        }
+        statuses
     }
 
     pub async fn shutdown(&self) {
@@ -958,6 +992,16 @@ mod tests {
                 .unwrap();
         assert!(explicit_params.check_latest);
         assert!(explicit_params.force);
+    }
+
+    #[test]
+    fn status_params_can_scope_to_the_opened_card() {
+        let all: HarnessCliStatusParams = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(all.harnesses, None);
+
+        let one: HarnessCliStatusParams =
+            serde_json::from_value(serde_json::json!({ "harnesses": ["codex"] })).unwrap();
+        assert_eq!(one.harnesses, Some(vec![HarnessId::Codex]));
     }
 
     #[test]
