@@ -2562,6 +2562,20 @@ fn flush_tool_progress(
     *flush_at = None;
 }
 
+/// Default turn-quiesce window per adapter. Most harnesses acknowledge tool
+/// work on the wire, so 120s of total silence with completed output is a fair
+/// missing-Done signal. Qoder exposes no tool/update frames while its CLI runs
+/// a tool loop: the generic window parked routine work every couple of minutes
+/// (2026-10-30: a 12-minute tool loop was parked at 2 minutes, repeatedly).
+/// Its bound stays long enough to catch a genuinely lost Done without firing
+/// during normal operation.
+fn default_turn_quiesce(harness_id: HarnessId) -> std::time::Duration {
+    match harness_id {
+        HarnessId::Qoder => std::time::Duration::from_secs(20 * 60),
+        _ => std::time::Duration::from_secs(120),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn drive_run(
     inner: Arc<Inner>,
@@ -2699,7 +2713,7 @@ async fn drive_run(
     {
         Some(0) => None,
         Some(ms) => Some(std::time::Duration::from_millis(ms)),
-        None => Some(std::time::Duration::from_secs(120)),
+        None => Some(default_turn_quiesce(harness_id)),
     };
     let mut last_stream_activity = tokio::time::Instant::now();
     // SELF-CONTINUED turns get a much SHORTER quiesce window. A turn the
@@ -3516,6 +3530,20 @@ async fn drive_run(
 mod tests {
     use super::*;
     use komet_proto::{ContextUsageSource, ContextUsageStats, ToolCall};
+
+    #[test]
+    fn qoder_gets_a_longer_turn_quiesce_window() {
+        // Qoder's CLI can run 12+ minutes of tool loops with no ACP traffic;
+        // the generic 120s window parked it repeatedly mid-run (2026-10-30).
+        assert_eq!(
+            default_turn_quiesce(HarnessId::Qoder),
+            std::time::Duration::from_secs(20 * 60)
+        );
+        assert_eq!(
+            default_turn_quiesce(HarnessId::ClaudeCode),
+            std::time::Duration::from_secs(120)
+        );
+    }
 
     #[test]
     fn secret_answers_are_redacted_only_in_the_persisted_copy() {
