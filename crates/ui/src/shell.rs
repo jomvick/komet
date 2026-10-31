@@ -4416,7 +4416,7 @@ impl Shell {
         archived: bool,
         pinned: bool,
         theme: &Theme,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         // Activity, not position (t3code Sidebar): status is a small colored
@@ -4679,18 +4679,6 @@ impl Shell {
                                 .line_height(px(14.0))
                                 .text_color(subline)
                                 .child(branch),
-                        )
-                    })
-                    // Working rows animate the orb at the row's
-                    // bottom-right (the status word keeps its dot up top).
-                    .when(status == komet_proto::ChatIndicator::Working, |el| {
-                        el.child(div().flex_1()).child(
-                            crate::thinking_orbs::ThinkingOrb::new(
-                                crate::thinking_orbs::OrbState::Working,
-                                14.0,
-                            )
-                            .speed(1.25)
-                            .driven(cx.entity_id(), window, cx),
                         )
                     }),
             )

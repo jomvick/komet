@@ -227,7 +227,20 @@ impl Shell {
             Some((button, width)) => (Some(button), width + 8.0),
             None => (None, 0.0),
         };
-        let trailing: Option<gpui::AnyElement> = if self.right_pane_open(cx) {
+        let panel_toggle = header_icon_button(
+            "toggle-changes",
+            icons::SIDEBAR_MINIMALISTIC,
+            &theme,
+            cx.entity_id(),
+            cx.listener(|this, _, _, cx| this.toggle_right_pane(cx)),
+        );
+        let pane_open = self.right_pane_open(cx);
+        // With the pane open, the GitHub controls and the pane toggle live
+        // INSIDE the pane-header zone below (taken out of these Options), so
+        // the zone is one block exactly as wide as the pane.
+        let mut github = github;
+        let mut panel_toggle = Some(panel_toggle);
+        let trailing: Option<gpui::AnyElement> = if pane_open {
             let right_now = self.eval_tween(self.right_tween, self.right_target(cx));
             let pr = titlebar_right_padding(
                 cfg!(target_os = "windows"),
@@ -241,8 +254,20 @@ impl Shell {
             // the strip in takeover, two with the title row present): without
             // budgeting them the capped strip overflows by exactly one gap and
             // the buttons slide right on expand (user report).
-            let gap_budget = (if takeover { 8.0 } else { 16.0 }) + github_slot + 36.0;
-            let avail = self.viewport_width - row_left - pr - gap_budget;
+            // The GitHub controls and the pane toggle follow the strip (one
+            // 8px gap each), so its right edge sits `strip_tail` left of
+            // viewport − pr — the band's edge. The width must subtract that
+            // too, or the whole strip (tabs included) overhangs the
+            // conversation by the width of those controls (user report: the
+            // surface tab straddled the pane's left border).
+            // The pane header is ONE zone anchored to the window's right
+            // edge and exactly `right_now` wide, so its left edge IS the
+            // pane's left border whatever the buttons' widths are (no more
+            // hand-budgeted `strip_tail`): the tabs and the `+` take the
+            // space left after the buttons and scroll if there are too many.
+            let _ = github_slot;
+            let gap_budget = if takeover { 8.0 } else { 16.0 };
+            let avail = self.viewport_width - row_left - gap_budget;
             // The right pane's SURFACE TABS (t3 RightPanelTabs) — the diff
             // options that used to live here moved into the pane's own
             // second row; expand stays in this band.
@@ -256,10 +281,12 @@ impl Shell {
                     .items_center()
                     .gap(px(4.0))
                     .overflow_hidden()
-                    // Right edge already sits at viewport − pr (the row's own
-                    // padding), so this width starts the strip exactly at the
-                    // pane's left border — and rides the open/close tween.
-                    .w(px((right_now - pr).min(avail).max(0.0)))
+                    // Right edge sits at viewport − pr − strip_tail; this
+                    // width starts the strip exactly at the pane's left
+                    // border — and rides the open/close tween.
+                    .w(px(right_now.min(avail).max(0.0)))
+                    // Window-control clearance lives inside the zone now.
+                    .pr(px(pr))
                     // 8 + the trigger's own 8px pad = the pane's 16px text
                     // gutter, so the scope label sits flush over the stats
                     // strip below.
@@ -281,19 +308,21 @@ impl Shell {
                         cx.entity_id(),
                         cx.listener(|this, _, _, cx| this.toggle_right_pane_expand(cx)),
                     ))
+                    .children(
+                        github
+                            .take()
+                            .map(|g| div().flex_none().ml(px(4.0)).child(g)),
+                    )
+                    .children(
+                        panel_toggle
+                            .take()
+                            .map(|t| div().flex_none().ml(px(4.0)).child(t)),
+                    )
                     .into_any_element(),
             )
         } else {
             None
         };
-        let panel_toggle = header_icon_button(
-            "toggle-changes",
-            icons::SIDEBAR_MINIMALISTIC,
-            &theme,
-            cx.entity_id(),
-            cx.listener(|this, _, _, cx| this.toggle_right_pane(cx)),
-        );
-
         let inner = div()
             .size_full()
             .flex()
@@ -301,11 +330,17 @@ impl Shell {
             .pt(px(Theme::TITLEBAR_TOP_PAD))
             .gap(px(8.0))
             .pl(px(row_left))
-            .pr(px(titlebar_right_padding(
-                cfg!(target_os = "windows"),
-                linux_right_controls,
-                Theme::SPACE_LG,
-            )))
+            // Pane open: the zone owns the right padding (it must touch the
+            // window edge so its width equals the pane's).
+            .pr(px(if pane_open {
+                0.0
+            } else {
+                titlebar_right_padding(
+                    cfg!(target_os = "windows"),
+                    linux_right_controls,
+                    Theme::SPACE_LG,
+                )
+            }))
             // In panel takeover the header strip spans the whole band — the
             // title would sit UNDER it (both flex_none, the row overflows and
             // paint order stacks them), so it hides for the duration.
@@ -355,7 +390,7 @@ impl Shell {
             .child(div().flex_1())
             .children(trailing)
             .children(github)
-            .child(panel_toggle);
+            .children(panel_toggle);
 
         // The unified window titlebar: full-width on the glass shell, ABOVE
         // the inset card. No bottom border — the card's own hairline is the
