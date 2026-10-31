@@ -5283,7 +5283,6 @@ fn bucket_used_fraction(bucket: &serde_json::Value) -> Option<f32> {
 /// instead of a generic timeout. Lines carrying ANSI/control sequences are
 /// skipped (they are TUI repaints, not messages) while still serving as a
 /// last-resort fallback.
-#[cfg(target_os = "linux")]
 fn last_output_line(output: &str) -> Option<String> {
     let mut fallback: Option<String> = None;
     for line in output.lines().rev() {
@@ -6376,7 +6375,6 @@ mod tests {
         assert!(parse_cursor_session_token("  ").is_none());
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn last_output_line_skips_tui_repaints() {
         assert_eq!(last_output_line(""), None);
