@@ -263,6 +263,17 @@ fn toggle_interactive(installed: bool, enabled: bool, enabled_count: usize) -> b
     installed && !(enabled && enabled_count == 1)
 }
 
+/// Several cards may be open at once; clicking a header flips just that one.
+fn toggle_expanded(expanded: &mut HashSet<HarnessId>, harness: HarnessId) {
+    if !expanded.remove(&harness) {
+        expanded.insert(harness);
+    }
+}
+
+fn is_expanded(expanded: &HashSet<HarnessId>, harness: HarnessId) -> bool {
+    expanded.contains(&harness)
+}
+
 // ---------------------------------------------------------------------------
 // Entity
 // ---------------------------------------------------------------------------
@@ -346,6 +357,8 @@ pub struct ProvidersPage {
     announced_cli_updates: HashSet<(HarnessId, String)>,
     checking_updates: bool,
     managing_cli: Option<HarnessId>,
+    /// Cards whose accounts are revealed; the page opens fully collapsed.
+    expanded: HashSet<HarnessId>,
     /// Account id with an in-flight Switch/Forget.
     busy_account: Option<String>,
     login: Option<LoginFlow>,
@@ -389,6 +402,7 @@ impl ProvidersPage {
             announced_cli_updates: HashSet::new(),
             checking_updates: false,
             managing_cli: None,
+            expanded: HashSet::new(),
             busy_account: None,
             login: None,
             error: None,
@@ -1278,12 +1292,19 @@ impl ProvidersPage {
                     .id(("provider-card", ix))
                     .child(
                         div()
+                            .id(("provider-card-header", ix))
                             .px(px(20.0))
                             .py(px(14.0))
                             .flex()
                             .flex_row()
                             .items_center()
                             .gap(px(14.0))
+                            .cursor_pointer()
+                            .hover(|s| s.bg(crate::theme::ink(0.03)))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                toggle_expanded(&mut this.expanded, harness);
+                                cx.notify();
+                            }))
                             .child(tile)
                             .child(
                                 div()
@@ -1317,9 +1338,17 @@ impl ProvidersPage {
                                             },
                                         ))
                                     }),
+                            )
+                            .child(
+                                crate::icons::icon(crate::icons::SORT_VERTICAL)
+                                    .flex_none()
+                                    .size(px(14.0))
+                                    .text_color(theme.text_muted.opacity(0.6)),
                             ),
                     )
-                    .child(body)
+                    .when(is_expanded(&self.expanded, harness), |card| {
+                        card.child(body)
+                    })
                     .into_any_element()
             })
             .collect()
@@ -2295,6 +2324,18 @@ mod tests {
         );
         // A disabled harness never prompts, even with a newer release.
         assert!(newly_available_cli_update(&[status], &HashSet::new(), &HashSet::new()).is_none());
+    }
+
+    #[test]
+    fn expanding_one_card_leaves_the_others_alone() {
+        let mut expanded = HashSet::new();
+        toggle_expanded(&mut expanded, HarnessId::ClaudeCode);
+        toggle_expanded(&mut expanded, HarnessId::Codex);
+        assert!(is_expanded(&expanded, HarnessId::ClaudeCode));
+        assert!(is_expanded(&expanded, HarnessId::Codex));
+        toggle_expanded(&mut expanded, HarnessId::ClaudeCode);
+        assert!(!is_expanded(&expanded, HarnessId::ClaudeCode));
+        assert!(is_expanded(&expanded, HarnessId::Codex));
     }
 
     #[test]
