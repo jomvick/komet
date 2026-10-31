@@ -1350,9 +1350,9 @@ impl Shell {
             Some("settings") | Some("settings/devices") => {
                 Route::Settings(SettingsSection::Devices)
             }
-            Some("settings/providers")
-            | Some("settings/agents")
-            | Some("settings/harnesses") => Route::Settings(SettingsSection::Providers),
+            Some("settings/providers") | Some("settings/agents") | Some("settings/harnesses") => {
+                Route::Settings(SettingsSection::Providers)
+            }
             Some("settings/appearance") => Route::Settings(SettingsSection::Appearance),
             Some("settings/notifications") => Route::Settings(SettingsSection::Notifications),
             Some("settings/shortcuts") => Route::Settings(SettingsSection::Shortcuts),
@@ -10106,7 +10106,9 @@ mod tests {
 
     #[test]
     fn settings_sections_include_security() {
-        assert_eq!(SettingsSection::ALL.len(), 11);
+        assert_eq!(SettingsSection::ALL.len(), 10);
+        assert!(SettingsSection::ALL.contains(&SettingsSection::Providers));
+        assert_eq!(SettingsSection::Providers.label(), "Providers");
         assert!(SettingsSection::ALL.contains(&SettingsSection::Security));
         assert_eq!(SettingsSection::Security.label(), "Security");
         assert!(SettingsSection::ALL.contains(&SettingsSection::Integrations));

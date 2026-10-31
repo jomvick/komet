@@ -38,7 +38,7 @@ use crate::state::{AppState, EngineHandle};
 use crate::theme::Theme;
 
 // ---------------------------------------------------------------------------
-// Catalog invalidation (Settings → Agents toggles)
+// Catalog invalidation (Settings → Providers toggles)
 // ---------------------------------------------------------------------------
 
 /// Marker global: [`bump_harness_catalog`] pokes it whenever a Settings →
@@ -582,7 +582,7 @@ impl Pickers {
             }
             cx.notify();
         });
-        // A Settings → Agents toggle changed some device's enabled set:
+        // A Settings → Providers toggle changed some device's enabled set:
         // force-refresh the cached catalog so the rail/chips follow without a
         // restart (stale rows stay visible while the reload runs).
         let catalog_observe = cx.observe_global::<HarnessCatalogChanged>(|this: &mut Self, cx| {
@@ -722,7 +722,7 @@ impl Pickers {
         }
         // New-chat canvas: the remembered last-used harness (sticky defaults),
         // when the loaded catalog still offers it (the device may have
-        // disabled it in Settings → Agents since).
+        // disabled it in Settings → Providers since).
         if let Some(harness) = self.defaults.harness {
             let offered = match self.harnesses.ready() {
                 Some(list) => offered_harnesses(list).iter().any(|d| d.id == harness),
@@ -1010,7 +1010,7 @@ impl Pickers {
             // revalidates, keeping stale rows visible until fresh ones land.
             PickerKind::Branch | PickerKind::Checkout => self.ensure_refs(true, cx),
             PickerKind::HarnessModel | PickerKind::Traits => {
-                // Force: the enabled set moves under us (Settings → Agents,
+                // Force: the enabled set moves under us (Settings → Providers,
                 // possibly from another viewer) — every open revalidates,
                 // keeping current rows visible until the fresh catalog lands.
                 self.ensure_harnesses(true, cx);
@@ -1034,7 +1034,7 @@ impl Pickers {
         // Non-forced (the render loop's eager kick) only loads from Idle: an
         // Error that could re-trigger a load would flip back to Loading
         // before the retry row ever painted (and spam the engine); Retry
-        // resets to Idle. FORCED refreshes (a Settings → Agents toggle, a
+        // resets to Idle. FORCED refreshes (a Settings → Providers toggle, a
         // picker open) reload through Ready/Error too — the enabled set just
         // changed under the cache, which otherwise served the boot-time
         // catalog until restart (user report). Stale-while-revalidate: loaded
@@ -3983,7 +3983,7 @@ fn visible_harnesses_impl(list: &[HarnessDescriptor], allow_mock: bool) -> Vec<H
 }
 
 /// What the composer actually offers: [`visible_harnesses`] narrowed to the
-/// catalog device's enabled set (Settings → Agents — per-device state, so a
+/// catalog device's enabled set (Settings → Providers — per-device state, so a
 /// space on another device follows THAT device's toggles). The dev-rig mock
 /// opt-in survives the filter, and a catalog where nothing is enabled (or
 /// that predates the flag entirely and defaults empty) falls back to

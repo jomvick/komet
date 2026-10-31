@@ -42,7 +42,7 @@
 
 - [ ] **Step 1: Supprimer les helpers et leurs tests**
 
-Retirer du fichier : `USAGE_WARN_FRACTION`, `USAGE_CRITICAL_FRACTION`, `enum UsageLevel`, `usage_level`, `usage_color`, `enum LoadTrigger`, `usage_mode_for`, `format_reset`, `displayed_usage`, `supports_usage_probe`, `retain_previous_usage`, `render_usage_meter`, les imports `chrono::{DateTime, Utc}` (s'ils ne servent plus qu'à ça), `komet_engine::UsageMode`, `AgentUsageWindow`. Retirer les tests `usage_thresholds_match_komet`, `usage_colors_map_to_theme_accents`, `usage_is_only_displayed_for_the_active_account`, `switching_moves_the_active_usage_to_the_selected_account`, `empty_refresh_keeps_the_last_known_usage_for_each_account`, et les tests de `usage_mode_for`.
+Retirer du fichier : `USAGE_WARN_FRACTION`, `USAGE_CRITICAL_FRACTION`, `enum UsageLevel`, `usage_level`, `usage_color`, `enum LoadTrigger`, `usage_mode_for`, `format_reset`, `displayed_usage`, `supports_usage_probe`, `retain_previous_usage`, `render_usage_meter`, les imports `chrono::{DateTime, Utc}` et le paramètre `now: DateTime<Utc>` de `render_account_row` (plus de reset time à formater), `komet_engine::UsageMode`, `AgentUsageWindow`. Retirer les tests `usage_thresholds_match_komet`, `usage_colors_map_to_theme_accents`, `usage_is_only_displayed_for_the_active_account`, `switching_moves_the_active_usage_to_the_selected_account`, `empty_refresh_keeps_the_last_known_usage_for_each_account`, et les tests de `usage_mode_for`.
 
 - [ ] **Step 2: Remplacer les appels de chargement**
 
@@ -75,7 +75,6 @@ git commit -m "refactor(settings): drop usage meters from the accounts page"
 - Rename: `crates/ui/src/settings/accounts.rs` → `crates/ui/src/settings/providers.rs`
 - Modify: `crates/ui/src/settings.rs:32,38` (liste `pub mod`)
 - Modify: `crates/ui/src/shell.rs` (import, champ, `settings_outlet`, `settings_sub`)
-- Modify: `crates/ui/src/composer.rs:3866` (`settings::harnesses::cli_name` → `settings::providers::cli_name`)
 
 **Interfaces:**
 - Consumes: `accounts.rs` de la Task 1.
@@ -110,6 +109,7 @@ git commit -m "refactor(settings): rename accounts module to providers"
 - Delete: `crates/ui/src/settings/harnesses.rs`
 - Modify: `crates/ui/src/settings.rs` (retirer `pub mod harnesses;`)
 - Modify: `crates/ui/src/shell.rs` (imports, champs, `SettingsSection`, `settings_outlet`, routes)
+- Modify: `crates/ui/src/composer.rs:3866` (`settings::harnesses::cli_name` → `settings::providers::cli_name`)
 - Test: `crates/ui/src/settings/providers.rs`
 
 **Interfaces:**
@@ -268,7 +268,7 @@ Expected: FAIL — `toggle_expanded` non définie.
 
 `toggle_expanded` : `if !expanded.remove(&harness) { expanded.insert(harness); }`. `is_expanded` : `expanded.contains(&harness)`.
 
-Dans `rows` : l'en-tête devient `.cursor_pointer()` + `.hover(|s| s.bg(crate::theme::ink(0.03)))` + `.on_click(cx.listener(move |this, _, _, cx| { toggle_expanded(&mut this.expanded, harness); cx.notify(); }))`. Ajouter un chevron (`icons::SORT_VERTICAL` pivoté n'existe pas : utiliser `icons::CHEVRON_DOWN` s'il existe, sinon `icons::SORT_VERTICAL` en dernier recours) qui indique l'état. Chaque handler enfant (Connect, Install/Update, toggle, Switch, Forget, Add account, Copy sign-in command) commence par `cx.stop_propagation()`.
+Dans `rows` : l'en-tête devient `.cursor_pointer()` + `.hover(|s| s.bg(crate::theme::ink(0.03)))` + `.on_click(cx.listener(move |this, _, _, cx| { toggle_expanded(&mut this.expanded, harness); cx.notify(); }))`. Ajouter le glyphe `icons::SORT_VERTICAL` en bout d'en-tête comme indicateur de dépliage (seul glyphe disponible ; pas de rotation). Chaque handler enfant (Connect, Install/Update, toggle, Switch, Forget, Add account, Copy sign-in command) commence par `cx.stop_propagation()`.
 
 Le corps n'est rendu que si `is_expanded(&self.expanded, harness)`. La ligne `account_summary` reste toujours visible dans l'en-tête.
 

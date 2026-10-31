@@ -653,6 +653,7 @@ impl ProvidersPage {
     /// set both come from where the CLIs actually live). The reply is the
     /// card list; CLI versions and accounts follow once it lands.
     fn load_harnesses(&mut self, cx: &mut Context<Self>) {
+        self.error = None;
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             if matches!(self.harnesses, Loadable::Idle) {
                 self.harnesses = Loadable::Error("Engine not connected".into());
@@ -784,14 +785,10 @@ impl ProvidersPage {
                 &theme,
                 &format!("{name} update available"),
             ))
-            .child(
-                div()
-                    .mt(px(8.0))
-                    .child(popover::dialog_body(
-                        &theme,
-                        format!("{version_copy} New models often need the latest version."),
-                    )),
-            )
+            .child(div().mt(px(8.0)).child(popover::dialog_body(
+                &theme,
+                format!("{version_copy} New models often need the latest version."),
+            )))
             .child(
                 div()
                     .mt(px(16.0))
@@ -1002,8 +999,11 @@ impl ProvidersPage {
                     .unwrap_or_default();
                 let summary = account_summary(&accounts);
 
-                let mut meta: Vec<AnyElement> =
-                    vec![div().child(SharedString::from(blurb(harness))).into_any_element()];
+                let mut meta: Vec<AnyElement> = vec![
+                    div()
+                        .child(SharedString::from(blurb(harness)))
+                        .into_any_element(),
+                ];
                 if !installed {
                     meta.push(
                         div()
@@ -1290,6 +1290,7 @@ impl ProvidersPage {
 
                 widgets::section_card(theme)
                     .id(("provider-card", ix))
+                    .mt(px(0.0))
                     .child(
                         div()
                             .id(("provider-card-header", ix))
@@ -1318,11 +1319,9 @@ impl ProvidersPage {
                                             .flex_row()
                                             .items_center()
                                             .gap(px(8.0))
-                                            .child(
-                                                div().flex_1().min_w_0().child(
-                                                    widgets::row_title(theme, descriptor.name.clone()),
-                                                ),
-                                            )
+                                            .child(div().flex_1().min_w_0().child(
+                                                widgets::row_title(theme, descriptor.name.clone()),
+                                            ))
                                             .child(actions),
                                     )
                                     .child(widgets::meta_line(theme, meta)),
@@ -2029,7 +2028,6 @@ impl ProvidersPage {
             .into_any_element();
         Some(popover::modal("add-account-dialog", viewport, card))
     }
-
 }
 
 impl Render for ProvidersPage {
