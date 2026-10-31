@@ -173,6 +173,13 @@ struct AcpAgentSpec {
     /// a dead update check) — surface a visible error chip instead of
     /// indefinite Working.
     prompt_stall: Option<Duration>,
+    /// Blanket dropped-reply settle window (see `run_session`): a turn that
+    /// streamed content, has no open tool, and then goes quiet past this
+    /// window is settled with a synthesized Done. `None` disables it for
+    /// agents whose wire goes LEGITIMATELY silent mid-turn (Qoder runs tool
+    /// loops without emitting `session/update`; a 30s window closed its
+    /// turns minutes early). `KOMET_ACP_QUIET_SETTLE_MS` overrides; 0 disables.
+    quiet_settle: Option<Duration>,
     /// Agent-specific advice appended to the stall error chip: what a wedge
     /// usually means for THIS agent and what the user can check.
     stall_hint: &'static str,
@@ -413,6 +420,7 @@ fn grok_spec() -> AcpAgentSpec {
         // `_meta.promptId`, just ahead of the RPC response.
         prompt_complete_extension: true,
         prompt_stall: Some(Duration::from_secs(30)),
+        quiet_settle: Some(Duration::from_secs(30)),
         stall_hint: "The agent process is likely wedged — a stale shared leader \
              process or a hung startup check; komet launches it with --no-leader \
              and --no-auto-update to avoid both.",
@@ -481,6 +489,7 @@ fn hermes_spec() -> AcpAgentSpec {
         ladder_extras: &[],
         prompt_complete_extension: false,
         prompt_stall: Some(Duration::from_secs(45)),
+        quiet_settle: Some(Duration::from_secs(30)),
         stall_hint: "The agent process is likely wedged \\
              - a stale Python/uv environment or a hung provider auth check. \\
              Try running `hermes acp` once in a terminal to see the raw error.",
@@ -540,6 +549,7 @@ fn pi_spec() -> AcpAgentSpec {
         ladder_extras: &[],
         prompt_complete_extension: false,
         prompt_stall: Some(Duration::from_secs(45)),
+        quiet_settle: Some(Duration::from_secs(30)),
         stall_hint: "The agent process is likely wedged \
              \u{2014} a stale pi-acp adapter process or a hung provider call in \
              pi's own config (~/.pi). Try running `pi` once in a terminal to \
@@ -608,6 +618,7 @@ fn devin_spec() -> AcpAgentSpec {
         ladder_extras: &[],
         prompt_complete_extension: false,
         prompt_stall: Some(Duration::from_secs(60)),
+        quiet_settle: Some(Duration::from_secs(30)),
         stall_hint: "Check Devin CLI authentication with `devin auth login`.",
         http_sidecar: false,
     }
@@ -653,6 +664,7 @@ fn copilot_spec() -> AcpAgentSpec {
         ladder_extras: &[],
         prompt_complete_extension: false,
         prompt_stall: Some(Duration::from_secs(60)),
+        quiet_settle: Some(Duration::from_secs(30)),
         stall_hint: "Check Copilot CLI authentication with `copilot login`.",
         http_sidecar: false,
     }
@@ -719,6 +731,7 @@ fn cline_spec() -> AcpAgentSpec {
         // wire activity. Total silence past this is a wedge (a dead provider
         // auth check) — surface a visible error chip instead of Working.
         prompt_stall: Some(Duration::from_secs(60)),
+        quiet_settle: Some(Duration::from_secs(30)),
         stall_hint: "The agent process is likely wedged — a stale provider auth \
              check in Cline's own config (~/.cline) or a hung model call. Try \
              running `cline --acp` once in a terminal to see the raw error.",
@@ -787,6 +800,13 @@ fn qoder_spec() -> AcpAgentSpec {
         // A native CLI with a login check before the ACP handshake; total
         // silence past this is a wedge (expired token, hung update check).
         prompt_stall: Some(Duration::from_secs(45)),
+        // OFF for Qoder: its ACP wire goes legitimately silent while the CLI
+        // runs a tool loop (no `session/update` until the loop yields), so a
+        // blanket silence window synthesized Done minutes before the CLI
+        // finished (2026-10-30: closed at 2.5 min, Qoder still working at
+        // 12 min). The real `session/prompt` response settles the turn; the
+        // engine's turn-quiesce watchdog stays as the missing-Done backstop.
+        quiet_settle: None,
         stall_hint: "Check Qoder CLI authentication with `qoder login` (or set \
              QODER_PERSONAL_ACCESS_TOKEN), then run `qoder --acp` once in a \
              terminal to see the raw error.",
@@ -874,6 +894,7 @@ fn opencode_spec() -> AcpAgentSpec {
         // silence past the bound means the retry loop, so the watchdog is
         // the only way the user ever learns.
         prompt_stall: Some(Duration::from_secs(60)),
+        quiet_settle: Some(Duration::from_secs(30)),
         stall_hint: "The model provider is likely unreachable or rejecting \
              requests — opencode retries these silently and never reports the \
              failure. Check the model/provider setup (`opencode auth list`, \
@@ -2162,6 +2183,7 @@ impl Harness for AcpHarness {
             effort_values: self.spec.effort_values,
             prompt_complete_extension: self.spec.prompt_complete_extension,
             prompt_stall: self.spec.prompt_stall,
+            quiet_settle: self.spec.quiet_settle,
             stall_hint: self.spec.stall_hint,
             sessions_root: self.sessions_root.clone(),
             sidecar_port,
@@ -2196,6 +2218,7 @@ struct Session {
     agent_name: &'static str,
     prompt_complete_extension: bool,
     prompt_stall: Option<Duration>,
+    quiet_settle: Option<Duration>,
     stall_hint: &'static str,
     /// Sessions-root override for the subagent transcript tail (tests).
     sessions_root: Option<PathBuf>,
@@ -3738,6 +3761,7 @@ async fn run_session(session: Session) {
         agent_name,
         prompt_complete_extension,
         prompt_stall,
+        quiet_settle: spec_quiet_settle,
         stall_hint,
         sessions_root,
         sidecar_port,
@@ -4191,14 +4215,17 @@ async fn run_session(session: Session) {
     // Done ever comes, and the session strands Working until the engine's
     // quiesce watchdog parks it.
     //
-    // `KOMET_ACP_QUIET_SETTLE_MS` overrides; 0 disables.
+    // `KOMET_ACP_QUIET_SETTLE_MS` overrides the adapter's default; 0 disables.
+    // The default is per-spec because silence means different things per
+    // adapter: most agents acknowledge tool work on the wire, but Qoder's
+    // tool loops leave it silent for minutes (`quiet_settle: None` there).
     let quiet_settle: Option<Duration> = match std::env::var("KOMET_ACP_QUIET_SETTLE_MS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
     {
         Some(0) => None,
         Some(ms) => Some(Duration::from_millis(ms)),
-        None => Some(Duration::from_secs(30)),
+        None => spec_quiet_settle,
     };
     let mut last_update_at = tokio::time::Instant::now();
     let mut turn_content_seen = false;
@@ -5243,6 +5270,31 @@ mod tests {
                 },
             })
         );
+    }
+
+    #[test]
+    fn qoder_disables_the_blanket_quiet_settle() {
+        // Qoder runs tool loops without emitting `session/update`, so a
+        // silence window closed its turns minutes before the CLI finished
+        // (2026-10-30). Every other ACP agent keeps the dropped-reply
+        // backstop.
+        assert_eq!(qoder_spec().quiet_settle, None);
+        for spec in [
+            grok_spec(),
+            hermes_spec(),
+            pi_spec(),
+            devin_spec(),
+            copilot_spec(),
+            cline_spec(),
+            opencode_spec(),
+        ] {
+            assert_eq!(
+                spec.quiet_settle,
+                Some(Duration::from_secs(30)),
+                "{:?} dropped the quiet-settle backstop",
+                spec.id
+            );
+        }
     }
 
     #[test]
