@@ -439,10 +439,13 @@ impl EngineHandle {
             return Ok(handle);
         }
 
+        // Reached when nothing attached: no daemon, a foreign listener, a
+        // managed engine that failed or timed out, or managed engines are off.
+        // The reason was already logged by whichever probe failed.
         tracing::info!(
             data_dir = %config.data_dir.display(),
             port = config.ipc_port,
-            "embedding engine (no attachable komet daemon)"
+            "embedding engine"
         );
         let engine_config = EngineConfig {
             data_dir: config.data_dir,
@@ -633,8 +636,23 @@ impl EngineHandle {
             .env("KOMET_EDGE_URL", &config.edge_url)
             .env("KOMET_HARNESS", config.default_harness.as_str())
             .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
+            .stdout(std::process::Stdio::null());
+        // The engine logs through its own file; stderr only carries panics and
+        // failures before logging is up. Discarding it made a dead managed
+        // engine undiagnosable, so append it next to the other logs.
+        let child_log = config.data_dir.join("logs").join("komet-engine-child.log");
+        let stderr = std::fs::create_dir_all(config.data_dir.join("logs"))
+            .ok()
+            .and_then(|()| {
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&child_log)
+                    .ok()
+            })
+            .map(std::process::Stdio::from)
+            .unwrap_or_else(std::process::Stdio::null);
+        command.stderr(stderr);
         match &config.edge_token {
             Some(token) => {
                 command.env("KOMET_EDGE_TOKEN", token);
@@ -691,11 +709,17 @@ impl EngineHandle {
         };
         tracing::info!(pid = child.id(), "started detached managed engine");
 
-        // The engine assembles auth, stores and model catalogs before it binds
-        // IPC (a cold boot has been observed taking 30-50s when provider probes
-        // time out). Too short a deadline killed a healthy child and fell back
-        // to embedding, losing multi-viewport IPC for no reason.
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+        // The engine assembles stores and live model catalogs before it binds
+        // IPC: 37s measured warm, longer when the machine is loaded (a 7-minute
+        // build or shader compile leaves the disk cold). A 60s cap killed
+        // healthy children and forced the slower embedded path. Wait for the
+        // real condition instead — IPC attach or child exit — with a generous
+        // cap and a heartbeat so a slow boot is visible in the log.
+        const START_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+        const PROGRESS_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
+        let started = tokio::time::Instant::now();
+        let deadline = started + START_TIMEOUT;
+        let mut next_progress = started + PROGRESS_EVERY;
         loop {
             if let Some(handle) = Self::attach_to_daemon(config.ipc_port).await {
                 reap_child(child);
@@ -714,11 +738,22 @@ impl EngineHandle {
                 }
                 Ok(None) => {}
             }
-            if tokio::time::Instant::now() >= deadline {
-                tracing::warn!("managed engine did not become ready; embedding instead");
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                tracing::warn!(
+                    waited_s = started.elapsed().as_secs(),
+                    "managed engine did not become ready; killing it and embedding instead"
+                );
                 let _ = child.kill();
                 let _ = child.wait();
                 return None;
+            }
+            if now >= next_progress {
+                tracing::info!(
+                    elapsed_s = started.elapsed().as_secs(),
+                    "managed engine still starting (it binds IPC after assembling stores and model catalogs)"
+                );
+                next_progress += PROGRESS_EVERY;
             }
             tokio::time::sleep(std::time::Duration::from_millis(150)).await;
         }

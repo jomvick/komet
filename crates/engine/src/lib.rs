@@ -824,6 +824,7 @@ impl Engine {
         profile: EngineProfile,
         lock: Option<InstanceLock>,
     ) -> anyhow::Result<EngineRuntime> {
+        tracing::info!("assembling engine core");
         let edge_enabled = match profile.scope() {
             WorkspaceScope::Local => false,
             WorkspaceScope::Synced => {
@@ -933,6 +934,13 @@ impl Engine {
         }
         let profile = profile
             .ok_or_else(|| EngineError::Other("synced workspace profile is not ready".into()))?;
+        // Assembly (stores + provider probes) is the long, silent part of a cold
+        // boot; bracket it so a slow start is attributable in the log.
+        tracing::info!(
+            scope = ?profile.scope(),
+            device_root = %profile.device_root().display(),
+            "engine profile resolved"
+        );
 
         let runtime = Self::assemble_runtime(&config, auth, profile).await?;
 
