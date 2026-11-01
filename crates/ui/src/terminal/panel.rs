@@ -10,10 +10,7 @@
 //! new tab, mod+shift+W close, mod+shift+] / [ cycle, F2 rename, mod+= / - /
 //! 0 font zoom, mod+shift+Up / Down walk the OSC 133 command prompts and
 //! mod+shift+O jumps to the output of the command under the viewport top. Tab
-//! labels prefer a rename, then the OSC title, then `cwd · shell`; a BEL flashes
-//! the tab, dots the grid, and optionally chimes. An eye on the tab says the
-//! terminal's text is currently readable by agents
-//! (the tab's `agent_visible` flag), toggled from the right-click menu).
+//! labels prefer a rename, then the OSC title, then `cwd · shell`.
 //!
 //! Data path per tab: `OpenTerminal` → `SubscribeTerminal` stream; Data frames
 //! (base64) feed the [`Emulator`]; query responses write back; the stream
@@ -57,9 +54,6 @@ use super::view::{
 /// Fixed tab width — drag-reorder math stays analytic.
 pub const TAB_WIDTH: f32 = 118.0;
 pub const TAB_BAR_HEIGHT: f32 = 40.0;
-
-/// How long a BEL keeps the tab flashing / the grid dotted.
-pub const BELL_FLASH: Duration = Duration::from_millis(900);
 
 actions!(
     terminal,
@@ -277,24 +271,6 @@ pub fn tab_title(
     }
 }
 
-/// Consume a pending BEL from the emulator and stamp the flash. Returns
-/// `true` exactly when a NEW bell arrived — the caller rings (flash +
-/// optional chime) on that edge only. Every frame that touches a tab must
-/// call this; an unconsumed bell would otherwise re-fire forever.
-pub fn consume_bell(emu: &mut Emulator, flash: &mut Option<Instant>, now: Instant) -> bool {
-    if emu.take_bell() {
-        *flash = Some(now);
-        true
-    } else {
-        false
-    }
-}
-
-/// Whether a tab's BEL is still visibly ringing at `now`.
-pub fn bell_ringing(flash: Option<Instant>, now: Instant) -> bool {
-    flash.is_some_and(|fired| now.saturating_duration_since(fired) < BELL_FLASH)
-}
-
 fn decode_base64(data: &str) -> Vec<u8> {
     base64::engine::general_purpose::STANDARD
         .decode(data)
@@ -368,14 +344,6 @@ struct TerminalTab {
     session_shell: Option<String>,
     /// Rename applied by the user (F2 / context menu); wins over everything.
     custom_title: Option<SharedString>,
-    /// When a BEL last rang on this tab; drives the flash + grid dot.
-    bell_flash: Option<Instant>,
-    /// The human's grant that agents may read this terminal's text — the
-    /// engine's `agent_visible` flag, mirrored here for the tab badge. It only
-    /// ever moves when `SetTerminalAgentVisible` answers `ok`, or when
-    /// `ListTerminals` reports the engine's truth after a (re)open: a badge
-    /// that lies about exposure is worse than no badge.
-    agent_visible: bool,
 }
 
 /// Settings the panel renders from (kept in sync by the shell, which owns
@@ -385,7 +353,6 @@ struct TerminalTab {
 pub struct TerminalPrefs {
     pub font_size: f32,
     pub scrollback_lines: u32,
-    pub bell_audible: bool,
 }
 
 impl Default for TerminalPrefs {
@@ -393,18 +360,16 @@ impl Default for TerminalPrefs {
         Self {
             font_size: TERMINAL_FONT_SIZE_DEFAULT,
             scrollback_lines: TERMINAL_SCROLLBACK_DEFAULT,
-            bell_audible: false,
         }
     }
 }
 
-/// Panel → shell communication. Font/bell events carry the new value so the
+/// Panel → shell communication. Font events carry the new value so the
 /// shell can persist it and mirror it onto the other panel instance (drawer
 /// vs embedded); `TabClosed` lets the embedded surface strip drop its tab.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TerminalPanelEvent {
     FontSizeChanged(f32),
-    BellAudibleChanged(bool),
     TabActivated(u64),
     TabClosed(u64),
 }
@@ -542,42 +507,6 @@ pub fn jump_delta(
     (target != display_offset).then(|| target as i32 - display_offset as i32)
 }
 
-/// The right-click label for the agent-exposure switch. `None` means the tab
-/// has no session yet, so there is nothing to grant — the row shows the state
-/// it cannot change instead of pretending to be actionable.
-pub fn agent_menu_label(agent_visible: Option<bool>) -> String {
-    match agent_visible {
-        Some(true) => "Visible to agents: on".to_string(),
-        Some(false) => "Visible to agents: off".to_string(),
-        None => "Visible to agents: no session".to_string(),
-    }
-}
-
-/// Whether the right-click row can act: a row is only offered when the engine
-/// has a terminal to address.
-pub fn agent_menu_enabled(agent_visible: Option<bool>) -> bool {
-    agent_visible.is_some()
-}
-
-/// The `SetTerminalAgentVisible` payload: the engine's params are camelCase and
-/// it answers `Failed` on anything it cannot parse, so the field names are part
-/// of the contract and tested rather than typed at the call site.
-pub fn agent_grant_params(terminal_id: &str, visible: bool) -> serde_json::Value {
-    serde_json::json!({ "terminalId": terminal_id, "visible": visible })
-}
-
-/// Tab label for surfaces that only carry text (the shell's embedded strip):
-/// the badge spelled out, because "an agent can read this scrollback" is a
-/// security state the human has to see without opening a menu. The drawer's
-/// tab bar renders the eye glyph instead.
-pub fn tab_title_with_agent_badge(title: &str, agent_visible: bool) -> String {
-    if agent_visible {
-        format!("{title} · agents")
-    } else {
-        title.to_string()
-    }
-}
-
 /// One keystroke while a tab rename is in flight. Pure so the editing
 /// behaviour is testable without a window: returns what the panel should do.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -639,9 +568,6 @@ struct TerminalMenuAvailability {
     paste: bool,
     /// A tab is open: gates Select All / Rename / Close Tab.
     tab: bool,
-    /// The PRIMARY buffer holds text (Linux/FreeBSD only — the row hides
-    /// itself elsewhere, this just gates it where it shows).
-    primary: bool,
 }
 
 impl TerminalMenuAvailability {
@@ -650,18 +576,12 @@ impl TerminalMenuAvailability {
             copy: has_selection,
             paste: clipboard_has_text,
             tab: true,
-            primary: false,
         }
     }
 
     fn with_tab(mut self, tab: bool) -> Self {
         self.tab = tab;
         self.copy &= tab;
-        self
-    }
-
-    fn with_primary(mut self, primary: bool) -> Self {
-        self.primary = primary;
         self
     }
 }
@@ -671,9 +591,6 @@ impl TerminalMenuAvailability {
 struct TerminalContextMenu {
     position: gpui::Point<Pixels>,
     availability: TerminalMenuAvailability,
-    /// The session the row would address: `Some(visible)` when the tab has a
-    /// terminal id at the engine, `None` when there is nothing to grant.
-    agent: Option<bool>,
 }
 
 impl Render for TabGhost {
@@ -720,13 +637,11 @@ pub struct TerminalPanel {
     pointer_relay: Option<ReportButton>,
     /// Open right-click Copy/Paste menu, if any.
     context_menu: crate::popover::Popup<TerminalContextMenu>,
-    /// Live chrome settings (font size, scrollback for new tabs, bell).
+    /// Live chrome settings (font size, scrollback for new tabs).
     prefs: TerminalPrefs,
     /// `(tab key, buffer)` while a rename is being typed; the grid swallows
     /// keystrokes into the buffer until Enter/Esc.
     renaming: Option<(u64, String)>,
-    /// Repaint once the current BEL flash has expired.
-    bell_clear_task: Option<Task<()>>,
     _observe: Subscription,
 }
 
@@ -750,7 +665,6 @@ impl TerminalPanel {
             context_menu: crate::popover::Popup::default(),
             prefs: TerminalPrefs::default(),
             renaming: None,
-            bell_clear_task: None,
             _observe: observe,
         }
     }
@@ -791,7 +705,7 @@ impl TerminalPanel {
         .into()
     }
 
-    // ---- chrome settings (font zoom, scrollback, bell) ----
+    // ---- chrome settings (font zoom, scrollback) ----
 
     /// Push the persisted prefs down from the shell. Font size applies live
     /// (the next prepaint re-measures the grid, which resizes the PTY);
@@ -831,44 +745,10 @@ impl TerminalPanel {
         cx.notify();
     }
 
-    fn toggle_bell_audible(&mut self, cx: &mut Context<Self>) {
-        self.prefs.bell_audible = !self.prefs.bell_audible;
-        cx.emit(TerminalPanelEvent::BellAudibleChanged(
-            self.prefs.bell_audible,
-        ));
-        cx.notify();
-    }
-
-    /// Whether the visual-bell dot should show on the active tab (read by
-    /// the paint element per frame).
-    pub fn bell_indicator_active(&self, cx: &App) -> bool {
-        let now = Instant::now();
-        self.active_tab(cx)
-            .is_some_and(|tab| bell_ringing(tab.bell_flash, now))
-    }
-
-    /// A BEL landed: stamp the tab's flash, optionally chime, and repaint at
-    /// the end of the flash so the highlight visibly stops.
-    fn ring_bell(&mut self, cx: &mut Context<Self>) {
-        if self.prefs.bell_audible {
-            // Reuses the request chime — a short, non-alarming blip. The
-            // KOMET_DISABLE_SOUND kill-switch is honored inside `play`.
-            crate::sound::play(crate::sound::Sound::Request);
-        }
-        let task = cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(BELL_FLASH).await;
-            let _ = this.update(cx, |_, cx| cx.notify());
-        });
-        self.bell_clear_task = Some(task);
-        cx.notify();
-    }
-
     // ---- embedded (right-pane surface) API — the shell's tab strip drives
     // ---- these; keys are stable across reorders/closes.
 
-    /// `(key, title, exited)` for the selected chat's tabs, in tab order. The
-    /// strip the shell draws has no room for a glyph, so an exposed terminal
-    /// says so in its label instead ([`tab_title_with_agent_badge`]).
+    /// `(key, title, exited)` for the selected chat's tabs, in tab order.
     pub fn tab_summaries(&self, cx: &App) -> Vec<(u64, SharedString, bool)> {
         let chat = self.session_key(cx);
         self.chats
@@ -877,12 +757,7 @@ impl TerminalPanel {
                 tabs.tabs
                     .iter()
                     .map(|t| {
-                        let title = Self::display_title(t);
-                        (
-                            t.key,
-                            tab_title_with_agent_badge(title.as_ref(), t.agent_visible).into(),
-                            t.exited.is_some(),
-                        )
+                        (t.key, Self::display_title(t), t.exited.is_some())
                     })
                     .collect()
             })
@@ -1027,8 +902,6 @@ impl TerminalPanel {
             session_cwd: None,
             session_shell: None,
             custom_title: None,
-            bell_flash: None,
-            agent_visible: false,
         });
         entry.active = entry.tabs.len() - 1;
 
@@ -1123,42 +996,6 @@ impl TerminalPanel {
                 return;
             }
 
-            // Read the engine's grant before pumping output. The PTY and its
-            // `agent_visible` flag outlive this UI process (detach is not
-            // close), so a fresh tab must not assume the `false` default: an
-            // unbadged tab an agent can already read is exactly the state this
-            // badge exists to make visible. A failed read leaves it `false`,
-            // and the switch still works — it just starts from the safe side.
-            #[derive(serde::Deserialize)]
-            #[serde(rename_all = "camelCase")]
-            struct ListTerminalsReply {
-                terminals: Vec<TerminalInfo>,
-            }
-            let exposed = engine
-                .client()
-                .call_as::<ListTerminalsReply>(
-                    methods::LIST_TERMINALS,
-                    with_target(serde_json::json!({}), &target),
-                )
-                .await
-                .ok()
-                .and_then(|reply| {
-                    reply
-                        .terminals
-                        .into_iter()
-                        .find(|info| info.terminal_id == terminal_id)
-                        .map(|info| info.agent_visible)
-                })
-                .unwrap_or(false);
-            if exposed {
-                let _ = this.update(cx, |panel, cx| {
-                    if let Some(tab) = panel.tab_mut(&chat, key) {
-                        tab.agent_visible = true;
-                        cx.notify();
-                    }
-                });
-            }
-
             let mut attempt: u32 = 0;
             loop {
                 let Ok(after_seq) = this.update(cx, |panel, _| {
@@ -1235,7 +1072,6 @@ impl TerminalPanel {
         cx: &mut Context<Self>,
     ) -> StreamDisposition {
         let target = self.chat_target(chat, cx);
-        let mut bell_rang = false;
         let disposition = {
             let Some(tab) = self.tab_mut(chat, key) else {
                 return StreamDisposition::Stop;
@@ -1244,10 +1080,6 @@ impl TerminalPanel {
                 TerminalEvent::Data { seq, data } => {
                     tab.last_seq = seq;
                     let responses = tab.emulator.feed(&decode_base64(&data));
-                    // The BEL the stream just carried is consumed HERE, on the
-                    // data edge — unconsumed it would re-fire on every frame.
-                    bell_rang =
-                        consume_bell(&mut tab.emulator, &mut tab.bell_flash, Instant::now());
                     if !responses.is_empty()
                         && let Some(id) = tab.terminal_id.clone()
                     {
@@ -1280,11 +1112,6 @@ impl TerminalPanel {
                 }
             }
         };
-        if bell_rang {
-            // Flash bookkeeping needs `&mut self`, so it runs once the tab
-            // borrow above is gone.
-            self.ring_bell(cx);
-        }
         disposition
     }
 
@@ -1414,21 +1241,6 @@ impl TerminalPanel {
         // mapping needs the placement even on frames where nothing resized,
         // which is almost all of them.
         self.geometry = Some(geometry);
-        // Frame hook #2 for the visual bell: every prepaint consumes any BEL
-        // the active tab is holding, so a feed path that bypassed the stream
-        // handler still lands (and an unconsumed bell can never re-fire on
-        // later frames).
-        let bell_chat = self.session_key(cx);
-        let bell_rang = self
-            .chats
-            .get_mut(&bell_chat)
-            .and_then(|tabs| tabs.tabs.get_mut(tabs.active))
-            .is_some_and(|tab| {
-                consume_bell(&mut tab.emulator, &mut tab.bell_flash, Instant::now())
-            });
-        if bell_rang {
-            self.ring_bell(cx);
-        }
         let (cols, rows) = (geometry.cols, geometry.rows);
         let chat = self.session_key(cx);
         let Some(tabs) = self.chats.get_mut(&chat) else {
@@ -1652,9 +1464,8 @@ impl TerminalPanel {
         }
     }
 
-    /// Middle-click on the text grid: paste the PRIMARY selection (Linux X11
-    /// convention) into the PTY. With a mouse protocol active the app owns the
-    /// middle button, so this relays a report instead. The tab strip's own
+    /// Middle-click on the text grid: with a mouse protocol active the app
+    /// owns the button, so this relays a report. The tab strip's own
     /// middle-click (close tab) is a different element and is untouched.
     fn on_middle_click(
         &mut self,
@@ -1663,31 +1474,7 @@ impl TerminalPanel {
         cx: &mut Context<Self>,
     ) {
         window.focus(&self.focus_handle, cx);
-        if self.relay_press(MouseButton::Middle, event.position, &event.modifiers, cx) {
-            return;
-        }
-        self.paste_primary_selection(cx);
-    }
-
-    /// Paste the primary selection, falling back to the clipboard where the
-    /// platform has no primary buffer (macOS/Windows).
-    fn paste_primary_selection(&mut self, cx: &mut Context<Self>) {
-        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-        let text = cx
-            .read_from_primary()
-            .and_then(|item| item.text())
-            .or_else(|| cx.read_from_clipboard().and_then(|item| item.text()));
-        #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
-        let text = cx.read_from_clipboard().and_then(|item| item.text());
-        let Some(text) = text.filter(|t| !t.is_empty()) else {
-            return;
-        };
-        let bracketed = self
-            .active_tab(cx)
-            .map(|tab| tab.emulator.bracketed_paste_mode())
-            .unwrap_or(false);
-        let bytes = paste_bytes(&text, bracketed);
-        self.queue_input(&bytes, cx);
+        self.relay_press(MouseButton::Middle, event.position, &event.modifiers, cx);
     }
 
     fn on_mouse_down(
@@ -1815,13 +1602,6 @@ impl TerminalPanel {
             return;
         }
         self.selection_drag = None;
-        // Copy-on-select (X11): finishing a selection fills the PRIMARY buffer,
-        // so a middle-click can paste it without an explicit Copy. A bare click
-        // selects nothing, so this is a no-op and never clobbers PRIMARY. Only
-        // the left button drives a selection.
-        if event.button == MouseButton::Left {
-            self.copy_selection_to_primary(cx);
-        }
     }
 
     /// Right-click opens the Copy/Paste context menu at the click point.
@@ -1849,22 +1629,10 @@ impl TerminalPanel {
         let clipboard_has_text = cx
             .read_from_clipboard()
             .is_some_and(|item| item.text().is_some());
-        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-        let primary_has_text = cx
-            .read_from_primary()
-            .is_some_and(|item| item.text().is_some_and(|t| !t.is_empty()));
-        #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
-        let primary_has_text = false;
         self.context_menu.open(TerminalContextMenu {
             position: event.position,
             availability: TerminalMenuAvailability::new(has_selection, clipboard_has_text)
-                .with_tab(has_tab)
-                .with_primary(primary_has_text),
-            // The grant needs a session id to address; mirror the tab's current
-            // state so the row can say "on"/"off" instead of "toggle".
-            agent: self
-                .active_tab(cx)
-                .and_then(|tab| tab.terminal_id.as_ref().map(|_| tab.agent_visible)),
+                .with_tab(has_tab),
         });
         cx.notify();
     }
@@ -1902,30 +1670,6 @@ impl TerminalPanel {
         self.select_all(cx);
     }
 
-    /// Paste the PRIMARY buffer from the menu — the keyboard/mouse equivalent
-    /// of the middle-click, for trackpads where middle-click is awkward.
-    fn paste_primary_from_menu(&mut self, cx: &mut Context<Self>) {
-        self.paste_primary_selection(cx);
-    }
-
-    /// "Visible to agents" menu row: flip the grant on the tab the menu was
-    /// opened over. `set_agent_visible` is the only path that moves the badge,
-    /// and it moves it on the engine's answer, never optimistically.
-    fn toggle_agent_from_menu(&mut self, cx: &mut Context<Self>) {
-        let Some(key) = self.active_tab_key(cx) else {
-            return;
-        };
-        self.toggle_agent_visible(key, cx);
-    }
-
-    fn bell_menu_label(prefs: &TerminalPrefs) -> String {
-        if prefs.bell_audible {
-            "Audible bell: on".to_string()
-        } else {
-            "Audible bell: off".to_string()
-        }
-    }
-
     fn context_menu_row(
         theme: &Theme,
         id: &'static str,
@@ -1955,9 +1699,7 @@ impl TerminalPanel {
         let menu = self.context_menu.get()?;
         let position = menu.position;
         let availability = menu.availability;
-        let agent = menu.agent;
         let closing = self.context_menu.closing_since();
-        let bell_label = Self::bell_menu_label(&self.prefs).into();
 
         // `cx` is a parameter, not a capture: the closure must not hold the
         // mutable context while `.child(row(...))` chains re-borrow it.
@@ -2016,38 +1758,6 @@ impl TerminalPanel {
                 },
                 cx,
             ));
-        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-        {
-            card = card.child(row(
-                "terminal-context-paste-primary",
-                "Paste primary".into(),
-                availability.primary,
-                |this, _, cx| {
-                    this.paste_primary_from_menu(cx);
-                },
-                cx,
-            ));
-        }
-        card = card.child(row(
-            "terminal-context-agent-visible",
-            // The label states the current grant (same shape as the bell row):
-            // clicking flips it, and the eye badge follows the engine's answer.
-            agent_menu_label(agent).into(),
-            agent_menu_enabled(agent),
-            |this, _, cx| {
-                this.toggle_agent_from_menu(cx);
-            },
-            cx,
-        ));
-        card = card.child(row(
-            "terminal-context-bell",
-            bell_label,
-            true,
-            |this, _, cx| {
-                this.toggle_bell_audible(cx);
-            },
-            cx,
-        ));
 
         Some(crate::popover::menu_at(
             "terminal-context-menu",
@@ -2069,23 +1779,6 @@ impl TerminalPanel {
         cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
         true
     }
-
-    /// Fill the PRIMARY selection from the current selection (X11 copy-on-
-    /// select). A no-op when nothing is selected, so it never clobbers PRIMARY
-    /// on a bare click. Only Linux/FreeBSD has a primary buffer; elsewhere this
-    /// is compiled out — middle-click paste then falls back to the clipboard.
-    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-    fn copy_selection_to_primary(&mut self, cx: &mut Context<Self>) {
-        if let Some(text) = self
-            .with_active_emulator(cx, |emu| emu.selection_text())
-            .flatten()
-        {
-            cx.write_to_primary(gpui::ClipboardItem::new_string(text));
-        }
-    }
-
-    #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
-    fn copy_selection_to_primary(&mut self, _cx: &mut Context<Self>) {}
 
     /// Route a wheel gesture to the PTY when an app owns the pointer: mouse-
     /// reporting wheel buttons (protocol active) or AltScroll arrows (alt
