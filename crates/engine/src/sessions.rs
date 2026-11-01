@@ -475,6 +475,8 @@ struct Inner {
     harness_sessions: Mutex<HashMap<String, HarnessSessionRef>>,
     /// Latest context-window snapshot per chat (replaced, not summed).
     usage_stats: Mutex<HashMap<String, komet_proto::ContextUsageStats>>,
+    /// Chats whose journal is currently failing (error logged once per streak).
+    journal_failing: Mutex<std::collections::HashSet<String>>,
     /// Auto-titler for untitled chats (wired at engine assembly; absent in bare tests).
     titles: OnceLock<crate::titles::TitleGenerator>,
     /// Fired with `(chat_id, cwd)` when a user prompt starts a turn (fresh
@@ -535,6 +537,7 @@ impl SessionsEngine {
                 last_requests: Mutex::new(HashMap::new()),
                 harness_sessions: Mutex::new(HashMap::new()),
                 usage_stats: Mutex::new(HashMap::new()),
+                journal_failing: Mutex::new(std::collections::HashSet::new()),
                 titles: OnceLock::new(),
                 turn_listener: OnceLock::new(),
                 permission_timeout: Mutex::new(Some(std::time::Duration::from_secs(10 * 60))),
@@ -1977,18 +1980,42 @@ impl Inner {
 
     /// Journal + broadcast one event (the two unconditional legs of the pipeline).
     fn publish(&self, chat_id: &str, event: &AgentEvent) -> u64 {
+        if !self.pre_publish(chat_id, event) {
+            return 0;
+        }
+        let seq = self.append_journal(chat_id, event);
+        self.broadcast_journaled(chat_id, event, seq)
+    }
+
+    /// [`Inner::publish`] for the async event pump: the journal write (serialize,
+    /// write, flush) runs on the blocking pool so a slow disk never parks a
+    /// runtime worker. The broadcast still follows the completed write, so a
+    /// subscriber that replays after seeing seq N finds N.
+    async fn publish_async(self: &Arc<Self>, chat_id: &str, event: &AgentEvent) -> u64 {
+        if !self.pre_publish(chat_id, event) {
+            return 0;
+        }
+        let this = self.clone();
+        let (chat, ev) = (chat_id.to_string(), event.clone());
+        let seq = match tokio::task::spawn_blocking(move || this.append_journal(&chat, &ev)).await {
+            Ok(seq) => seq,
+            Err(err) => {
+                tracing::error!(chat = %chat_id, error = %err, "journal append task failed");
+                0
+            }
+        };
+        self.broadcast_journaled(chat_id, event, seq)
+    }
+
+    /// Ephemeral frames broadcast only (returns false); the rest also update
+    /// per-chat usage state before they are journaled.
+    fn pre_publish(&self, chat_id: &str, event: &AgentEvent) -> bool {
         // Belt on top of the drive_run gate: a progress frame must never reach
         // the journal, whatever path delivered it — including one nested in a
         // subagent wrapper, whose child's live output is the biggest such frame.
         if is_ephemeral(event) {
             self.broadcast_ephemeral(chat_id, event.clone());
-            return 0;
-        }
-        // The summary text is journal-only unless this host opted into the doc:
-        // the live feed is not where a recap belongs either, so the broadcast
-        // copy carries the cycle's size and availability, not its prose.
-        if matches!(event, AgentEvent::ContextCompaction { .. }) {
-            return self.publish_compaction(chat_id, event);
+            return false;
         }
         let usage_changed = match event {
             AgentEvent::SessionStarted { model, .. } => {
@@ -2036,51 +2063,50 @@ impl Inner {
         if usage_changed {
             self.broadcast_usage(chat_id);
         }
-        let seq = match self.journal.append(chat_id, event) {
-            Ok(seq) => seq,
-            Err(err) => {
-                tracing::error!(chat = %chat_id, error = %err, "journal append failed");
-                0
-            }
-        };
-        if let Some(hub) = lock(&self.hubs).get(chat_id) {
-            let _ = hub.send(JournaledEvent {
-                seq,
-                event: event.clone(),
-            });
+        if usage_changed {
+            self.broadcast_usage(chat_id);
         }
-        seq
+        true
     }
 
-    /// One compaction frame: the WHOLE event goes to the journal (summary text
-    /// included — that is what `GetCompactionSummary` reads back), while the
-    /// live feed gets the same frame with the prose removed. The recap is model
-    /// text about the entire conversation; a broadcast copy would put it on
-    /// every subscriber's heap and in every reconnect replay for a chip that
-    /// only needs to say "compacted, N bytes available".
-    fn publish_compaction(&self, chat_id: &str, event: &AgentEvent) -> u64 {
-        let seq = match self.journal.append(chat_id, event) {
-            Ok(seq) => seq,
+    /// Append with one retry. A persistent failure is logged once per streak and
+    /// the frame goes out with seq 0 ("no durable position"): the wire protocol
+    /// has no journal-failure signal to carry it.
+    fn append_journal(&self, chat_id: &str, event: &AgentEvent) -> u64 {
+        let mut result = self.journal.append(chat_id, event);
+        if result.is_err() {
+            result = self.journal.append(chat_id, event);
+        }
+        match result {
+            Ok(seq) => {
+                lock(&self.journal_failing).remove(chat_id);
+                seq
+            }
             Err(err) => {
-                tracing::error!(chat = %chat_id, error = %err, "journal append failed");
+                if lock(&self.journal_failing).insert(chat_id.to_string()) {
+                    tracing::error!(chat = %chat_id, error = %err, "journal append failed after retry; events are live-only until it recovers");
+                }
                 0
             }
-        };
-        let mut stripped = event.clone();
+        }
+    }
+
+    /// Broadcast a journaled frame. A compaction frame's prose stays in the
+    /// journal (what `GetCompactionSummary` reads back): the live feed and every
+    /// reconnect replay only need "compacted, N bytes available".
+    fn broadcast_journaled(&self, chat_id: &str, event: &AgentEvent, seq: u64) -> u64 {
+        let mut event = event.clone();
         if let AgentEvent::ContextCompaction {
             summary,
             summary_delta,
             ..
-        } = &mut stripped
+        } = &mut event
         {
             *summary = None;
             *summary_delta = None;
         }
         if let Some(hub) = lock(&self.hubs).get(chat_id) {
-            let _ = hub.send(JournaledEvent {
-                seq,
-                event: stripped,
-            });
+            let _ = hub.send(JournaledEvent { seq, event });
         }
         seq
     }
