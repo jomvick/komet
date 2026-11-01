@@ -1339,7 +1339,10 @@ fn reasoning_stream(
         loop {
             let je = match rx.recv().await {
                 Ok(je) => je,
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+ tracing::warn!(stream = "reasoning", skipped, "live stream lagged; frames dropped (clients do not resubscribe on stream end)");
+ continue;
+ }
                 Err(_) => return None,
             };
             match &je.event {
@@ -1378,7 +1381,10 @@ fn activity_stream(
                 }
                 let je = match rx.recv().await {
                     Ok(je) => je,
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+ tracing::warn!(stream = "activity", skipped, "live stream lagged; frames dropped (clients do not resubscribe on stream end)");
+ continue;
+ }
                     Err(_) => return None,
                 };
                 match &je.event {
@@ -1475,7 +1481,10 @@ fn live_subagent_frames(
                 }
                 let next = match rx.recv().await {
                     Ok(next) => next,
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+ tracing::warn!(stream = "subagent", skipped, "live stream lagged; frames dropped (clients do not resubscribe on stream end)");
+ continue;
+ }
                     Err(_) => return None,
                 };
                 let mut feed = Vec::new();
