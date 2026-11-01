@@ -15,7 +15,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use serde::{Deserialize, Serialize};
 
@@ -50,16 +50,27 @@ const TAIL_CHUNK: u64 = 64 * 1024;
 struct ChatJournal {
     file: File,
     next_seq: u64,
-    last_used: u64,
     /// True when the file ends without a newline (torn write) — the next append
     /// starts with one so the torn line stays isolated.
     needs_newline: bool,
 }
 
+/// One chat's append state behind its own lock: disk I/O for one chat never
+/// blocks another. `None` until first append (or after a write failure drops
+/// the handle so the next append reopens from the file tail).
+#[derive(Default)]
+struct ChatSlot {
+    journal: Mutex<Option<ChatJournal>>,
+    last_used: AtomicU64,
+}
+
+type Slots = HashMap<String, Arc<ChatSlot>>;
+
 /// Append-only JSONL journal store, one file per chat.
 pub struct RunJournal {
     dir: PathBuf,
-    open_files: Mutex<HashMap<String, ChatJournal>>,
+    /// Held only for map lookups/inserts, never across file I/O.
+    open_files: Mutex<Slots>,
     tick: AtomicU64,
 }
 
@@ -74,7 +85,7 @@ impl RunJournal {
         })
     }
 
-    fn lock(&self) -> MutexGuard<'_, HashMap<String, ChatJournal>> {
+    fn lock(&self) -> MutexGuard<'_, Slots> {
         self.open_files
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -112,34 +123,42 @@ impl RunJournal {
         let _ = std::fs::remove_file(self.attempts_path(chat_id));
     }
 
-    /// Append one event; returns its journal seq.
-    pub fn append(&self, chat_id: &str, event: &AgentEvent) -> Result<u64, JournalError> {
+    fn slot(&self, chat_id: &str) -> Arc<ChatSlot> {
         let mut files = self.lock();
-        if !files.contains_key(chat_id) {
-            // Dropping a handle is safe: the next append reopens and reads the tail.
-            if files.len() >= OPEN_FILE_CAP {
-                evict_oldest(&mut files);
-            }
+        if let Some(slot) = files.get(chat_id) {
+            return slot.clone();
+        }
+        if files.len() >= OPEN_FILE_CAP {
+            evict_oldest(&mut files);
+        }
+        let slot = Arc::new(ChatSlot::default());
+        files.insert(chat_id.to_string(), slot.clone());
+        slot
+    }
+
+    /// Append one event; returns its journal seq. Each event is flushed before
+    /// returning: a live subscriber that sees seq N must find N when it replays,
+    /// and crash recovery reads the file's last event.
+    pub fn append(&self, chat_id: &str, event: &AgentEvent) -> Result<u64, JournalError> {
+        let slot = self.slot(chat_id);
+        slot.last_used
+            .store(self.tick.fetch_add(1, Ordering::Relaxed), Ordering::Relaxed);
+        let mut guard = slot.journal.lock().unwrap_or_else(PoisonError::into_inner);
+        if guard.is_none() {
             let path = self.path_for(chat_id);
             let (next_seq, needs_newline) = scan_tail(&path)?;
             let file = OpenOptions::new().create(true).append(true).open(&path)?;
-            files.insert(
-                chat_id.to_string(),
-                ChatJournal {
-                    file,
-                    next_seq,
-                    last_used: 0,
-                    needs_newline,
-                },
-            );
+            *guard = Some(ChatJournal {
+                file,
+                next_seq,
+                needs_newline,
+            });
         }
-        // Entry guaranteed present; avoid unwrap in a library path regardless.
-        let Some(journal) = files.get_mut(chat_id) else {
+        let Some(journal) = guard.as_mut() else {
             return Err(JournalError::Io(std::io::Error::other(
                 "journal entry vanished under lock",
             )));
         };
-        journal.last_used = self.tick.fetch_add(1, Ordering::Relaxed);
         let seq = journal.next_seq;
         let line = serde_json::to_string(&JournalLineRef { seq, event })?;
         let mut buf = Vec::with_capacity(line.len() + 2);
@@ -148,8 +167,15 @@ impl RunJournal {
         }
         buf.extend_from_slice(line.as_bytes());
         buf.push(b'\n');
-        journal.file.write_all(&buf)?;
-        journal.file.flush()?;
+        let written = journal
+            .file
+            .write_all(&buf)
+            .and_then(|()| journal.file.flush());
+        if let Err(err) = written {
+            // The file may hold a partial line: reopen from the tail next time.
+            *guard = None;
+            return Err(err.into());
+        }
         journal.needs_newline = false;
         journal.next_seq = seq + 1;
         Ok(seq)
@@ -329,7 +355,10 @@ impl RunJournal {
     /// leave a transcript behind, and a stale `.resume` would hand a deleted
     /// run its revival budget on the next crash scan.
     pub fn discard(&self, chat_id: &str) -> Result<(), JournalError> {
-        self.lock().remove(chat_id);
+        let slot = self.lock().remove(chat_id);
+        if let Some(slot) = slot {
+            *slot.journal.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        }
         for path in [self.path_for(chat_id), self.attempts_path(chat_id)] {
             if path.exists() {
                 std::fs::remove_file(path)?;
@@ -389,11 +418,13 @@ fn read_lines(path: &Path) -> Result<Vec<(u64, AgentEvent)>, JournalError> {
     Ok(out)
 }
 
-/// Remove the least recently used entry.
-fn evict_oldest(files: &mut HashMap<String, ChatJournal>) {
+/// Remove the least recently used entry nobody else holds: evicting a slot an
+/// appender still uses would let a second handle reuse its stale next seq.
+fn evict_oldest(files: &mut Slots) {
     if let Some(victim) = files
         .iter()
-        .min_by_key(|(_, j)| j.last_used)
+        .filter(|(_, slot)| Arc::strong_count(slot) == 1)
+        .min_by_key(|(_, slot)| slot.last_used.load(Ordering::Relaxed))
         .map(|(k, _)| k.clone())
     {
         files.remove(&victim);
@@ -843,5 +874,53 @@ mod tests {
         assert!(!files.contains_key("c1"));
         drop(files);
         assert_eq!(journal.append("c1", &text("c")).unwrap(), 2);
+    }
+
+    #[test]
+    fn concurrent_appends_to_different_chats_keep_per_chat_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = std::sync::Arc::new(RunJournal::open(dir.path()).unwrap());
+        // More chats than the open-file cap, so eviction races appends too.
+        let chats = OPEN_FILE_CAP + 4;
+        let handles: Vec<_> = (0..chats)
+            .map(|c| {
+                let journal = journal.clone();
+                std::thread::spawn(move || {
+                    let id = format!("chat{c}");
+                    for i in 0..50u64 {
+                        assert_eq!(journal.append(&id, &text("x")).unwrap(), i + 1);
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        for c in 0..chats {
+            let seqs: Vec<u64> = journal
+                .replay(&format!("chat{c}"), 0)
+                .unwrap()
+                .into_iter()
+                .map(|(s, _)| s)
+                .collect();
+            assert_eq!(seqs, (1..=50).collect::<Vec<_>>());
+        }
+    }
+
+    #[test]
+    fn a_failed_write_drops_the_handle_and_the_next_append_recovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = RunJournal::open(dir.path()).unwrap();
+        assert_eq!(journal.append("c", &text("a")).unwrap(), 1);
+        // Remove the directory entry's parent so reopening fails, then restore it.
+        let path = journal.path_for("c");
+        let saved = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        *journal.slot("c").journal.lock().unwrap() = None;
+        std::fs::remove_dir_all(dir.path()).unwrap();
+        assert!(journal.append("c", &text("b")).is_err());
+        std::fs::create_dir_all(dir.path()).unwrap();
+        std::fs::write(&path, saved).unwrap();
+        assert_eq!(journal.append("c", &text("b")).unwrap(), 2);
     }
 }
