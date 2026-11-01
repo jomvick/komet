@@ -1,7 +1,7 @@
 //! The gpui side of the terminal seam.
 //!
 //! The emulator *mechanics* — grid, scrollback, selection, alt-screen,
-//! truecolour cells, mouse-reporting modes, the byte feed, titles and the bell —
+//! truecolour cells, mouse-reporting modes, the byte feed, titles —
 //! live in the `komet-term` crate, which has no gpui dependency so the engine can
 //! feed the same state machine from its PTY pump. What stays here is the re-export
 //! the panel and the view already spoke (so `crate::terminal::emulator::*` paths
