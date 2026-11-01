@@ -10,7 +10,9 @@
 
 use super::*;
 use crate::pickers::{breadcrumbs, browser_rows, completion_prefix_len, parent_path};
+use super::sidebar_memo::{FlatRows, SidebarRow};
 use gpui::FocusHandle;
+use std::rc::Rc;
 use komet_proto::{ChatIndicator, Device, FolderListing, RepoRef, Space};
 
 /// The space-filter dropdown, `Some` while open. The same searchable-menu
@@ -1152,78 +1154,33 @@ impl Shell {
     /// The sidebar's Sessions list: every session (idle included) of the
     /// filter space — or all spaces under "All" — attention-sorted. Rows are
     /// keyed for the FLIP resort glide.
-    pub(super) fn render_active_rows(
+pub(super) fn render_active_rows(
         &mut self,
         theme: &Theme,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> Vec<(String, f32, AnyElement)> {
+    ) -> (Rc<FlatRows>, Vec<AnyElement>) {
         let now = Utc::now();
         let filter = self.settings.space_filter.clone();
-        let rows: Vec<(ChatIndicator, komet_proto::Chat, String, Option<String>)> = {
+        let flat = {
             let state = self.state.read(cx);
-            state
-                .overview_chats(now)
-                .into_iter()
-                .filter(|(_, chat)| match &filter {
-                    Some(space_id) => chat.space_id.as_deref() == Some(space_id.as_str()),
-                    None => true,
-                })
-                .map(|(status, chat)| {
-                    // Line 1 is "project @ device" (t3code's project row);
-                    // project-less sessions read as their home-dir cwd `~`.
-                    let space = state.space_for_chat(chat);
-                    let mut folder = match (space, chat.space_id.as_deref()) {
-                        (Some(space), _) => space.display_name().to_string(),
-                        (None, None) => "~".to_string(),
-                        (None, Some(_)) => "?".to_string(),
-                    };
-                    // Unknown device → no fragment, same as the archived list.
-                    if let Some(device) = state.device_name(&chat.device_id) {
-                        folder = format!("{folder} @ {device}");
-                    }
-                    // The branch shows whenever the engine has stamped one —
-                    // main-checkout sessions included, not just worktrees.
-                    let branch = chat
-                        .branch
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|b| !b.is_empty())
-                        .map(str::to_string);
-                    (status, chat.clone(), folder, branch)
-                })
-                .collect()
+            self.sidebar_memo.borrow_mut().flat(
+                state,
+                filter.as_deref(),
+                now,
+                super::CHAT_ROW_HEIGHT,
+            )
         };
         let selected = self.state.read(cx).selected_chat.clone();
-        rows.into_iter()
-            .map(|(status, chat, folder, branch)| {
-                let time_ago: SharedString =
-                    format_time_ago(chat.last_message_at.unwrap_or(chat.created_at), now).into();
-                let is_selected = selected.as_deref() == Some(chat.id.as_str());
-                let height = super::CHAT_ROW_HEIGHT;
-                let harness = chat.config.as_ref().map(|c| c.harness);
-                let element = self.render_chat_row(
-                    chat.id.clone(),
-                    transcript::single_line(
-                        &chat.title.clone().unwrap_or_else(|| "New session".into()),
-                    )
-                    .into(),
-                    time_ago,
-                    folder.into(),
-                    branch.map(SharedString::from),
-                    harness,
-                    status,
-                    is_selected,
-                    false,
-                    chat.pinned,
-                    theme,
-                    window,
-                    cx,
-                );
-                (format!("c:{}", chat.id), height, element)
-            })
-            .collect()
+        let elements = flat
+            .rows
+            .iter()
+            .map(|r| self.render_sidebar_row(r, selected.as_deref(), now, theme, window, cx))
+            .collect();
+        (flat, elements)
     }
+
+
 
     /// Builds one collapsible folder header for the "All projects" grouped
     /// view: `[📁 icon] [Project name] ── [N] [▶/▼] [+]`.
@@ -1370,39 +1327,54 @@ impl Shell {
             .into_any_element()
     }
 
-    #[allow(clippy::too_many_arguments)] // row render seam: call sites pass what they have
-    fn render_grouped_session_row(
+    fn render_sidebar_row(
         &mut self,
-        status: ChatIndicator,
-        chat: komet_proto::Chat,
-        folder: String,
-        branch: Option<String>,
+        row: &SidebarRow,
         selected: Option<&str>,
         now: chrono::DateTime<Utc>,
         theme: &Theme,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let is_selected = selected == Some(chat.id.as_str());
-        let time_ago: SharedString =
-            format_time_ago(chat.last_message_at.unwrap_or(chat.created_at), now).into();
-        let harness = chat.config.as_ref().map(|config| config.harness);
+        let time_ago: SharedString = format_time_ago(row.last_activity, now).into();
         self.render_chat_row(
-            chat.id.clone(),
-            transcript::single_line(&chat.title.clone().unwrap_or_else(|| "New session".into()))
-                .into(),
+            row.id.clone(),
+            transcript::single_line(row.title.as_deref().unwrap_or("New session")).into(),
             time_ago,
-            folder.into(),
-            branch.map(SharedString::from),
-            harness,
-            status,
-            is_selected,
+            row.folder.clone().into(),
+            row.branch.clone().map(SharedString::from),
+            row.harness,
+            row.status,
+            selected == Some(row.id.as_str()),
             false,
-            chat.pinned,
+            row.pinned,
             theme,
             window,
             cx,
         )
+    }
+
+    /// A folder's rows: all when expanded, else just the selected one.
+    fn render_session_group(
+        &mut self,
+        rows: &[SidebarRow],
+        collapsed: bool,
+        selected: Option<&str>,
+        now: chrono::DateTime<Utc>,
+        theme: &Theme,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let mut rows_div = div().flex().flex_col().gap(px(2.0)).pb(px(4.0));
+        let mut any = false;
+        for row in rows
+            .iter()
+            .filter(|r| !collapsed || selected == Some(r.id.as_str()))
+        {
+            any = true;
+            rows_div = rows_div.child(self.render_sidebar_row(row, selected, now, theme, window, cx));
+        }
+        any.then(|| rows_div.into_any_element())
     }
 
     /// "All projects" sidebar view: sessions grouped by project folder.
@@ -1417,256 +1389,75 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
         let now = Utc::now();
-
-        // Collect all needed data from state while holding read lock.
-        type SessionEntry = (
-            komet_proto::ChatIndicator,
-            komet_proto::Chat,
-            String,
-            Option<String>,
-        );
-        struct SpaceGroup {
-            id: String,
-            name: String,
-            sessions: Vec<SessionEntry>,
-        }
-        let (groups, projectless): (Vec<SpaceGroup>, Vec<SessionEntry>) = {
+        let data = {
             let state = self.state.read(cx);
-            let spaces = state.spaces_sorted();
-
-            // Bucket chats by space in one pass (this runs on every Shell frame),
-            // most recent first; only the rows that are rendered get cloned.
-            let mut by_space: std::collections::HashMap<&str, Vec<&komet_proto::Chat>> =
-                std::collections::HashMap::new();
-            for chat in state.chats.iter().filter(|c| !c.archived) {
-                if let Some(space_id) = chat.space_id.as_deref() {
-                    by_space.entry(space_id).or_default().push(chat);
-                }
-            }
-            for chats in by_space.values_mut() {
-                chats.sort_by_key(|c| std::cmp::Reverse(c.last_message_at.unwrap_or(c.created_at)));
-            }
-
-            // Build groups: one per space in alphabetical order.
-            let space_groups: Vec<SpaceGroup> = spaces
-                .iter()
-                .map(|space| {
-                    let chats: Vec<komet_proto::Chat> = by_space
-                        .get(space.id.as_str())
-                        .map(|chats| chats.iter().map(|c| (*c).clone()).collect())
-                        .unwrap_or_default();
-                    let sessions = chats
-                        .into_iter()
-                        .map(|chat| {
-                            let status = state.display_status_for(&chat, now);
-                            let mut folder = space.display_name().to_string();
-                            if let Some(device) = state.device_name(&chat.device_id) {
-                                folder = format!("{folder} @ {device}");
-                            }
-                            let branch = chat
-                                .branch
-                                .as_deref()
-                                .map(str::trim)
-                                .filter(|b| !b.is_empty())
-                                .map(str::to_string);
-                            (status, chat, folder, branch)
-                        })
-                        .collect();
-                    SpaceGroup {
-                        id: space.id.clone(),
-                        name: space.display_name().to_string(),
-                        sessions,
-                    }
-                })
-                .collect();
-
-            // Project-less sessions (space_id = None, or dangling space).
-            let mut orphan_chats: Vec<&komet_proto::Chat> = state
-                .chats
-                .iter()
-                .filter(|c| !c.archived && c.space_id.is_none())
-                .collect();
-            orphan_chats
-                .sort_by_key(|c| std::cmp::Reverse(c.last_message_at.unwrap_or(c.created_at)));
-            let orphan_chats = orphan_chats.into_iter().cloned();
-            let projectless_rows: Vec<(
-                komet_proto::ChatIndicator,
-                komet_proto::Chat,
-                String,
-                Option<String>,
-            )> = orphan_chats
-                .map(|chat| {
-                    let status = state.display_status_for(&chat, now);
-                    let mut folder = "~".to_string();
-                    if let Some(device) = state.device_name(&chat.device_id) {
-                        folder = format!("~ @ {device}");
-                    }
-                    let branch = chat
-                        .branch
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|b| !b.is_empty())
-                        .map(str::to_string);
-                    (status, chat, folder, branch)
-                })
-                .collect();
-
-            (space_groups, projectless_rows)
+            self.sidebar_memo.borrow_mut().grouped(state, now)
         };
-
         let selected = self.state.read(cx).selected_chat.clone();
+        let selected = selected.as_deref();
         let mut elements: Vec<AnyElement> = Vec::new();
 
         if !self.settings.project_tree_expanded {
-            let selected_session = groups
-                .into_iter()
-                .flat_map(|group| group.sessions)
-                .chain(projectless)
-                .find(|(_, chat, _, _)| selected.as_deref() == Some(chat.id.as_str()));
-            if let Some((status, chat, folder, branch)) = selected_session {
-                elements.push(self.render_grouped_session_row(
-                    status,
-                    chat,
-                    folder,
-                    branch,
-                    selected.as_deref(),
-                    now,
-                    theme,
-                    window,
-                    cx,
-                ));
+            let row = data
+                .groups
+                .iter()
+                .flat_map(|g| g.rows.iter())
+                .chain(data.projectless.iter())
+                .find(|r| selected == Some(r.id.as_str()));
+            if let Some(row) = row {
+                elements.push(self.render_sidebar_row(row, selected, now, theme, window, cx));
             }
             return elements;
         }
 
-        for group in groups {
+        for group in &data.groups {
             let is_collapsed = !self.expanded_spaces.contains(&group.id);
-            let count = group.sessions.len();
-            let header = self.render_space_folder_header(
+            elements.push(self.render_space_folder_header(
                 Some(group.id.clone()),
-                SharedString::from(group.name),
-                count,
+                SharedString::from(group.name.clone()),
+                group.rows.len(),
                 is_collapsed,
                 theme,
                 cx,
-            );
-            elements.push(header);
-
-            if is_collapsed {
-                if let Some((status, chat, folder, branch)) = group
-                    .sessions
-                    .into_iter()
-                    .find(|(_, chat, _, _)| selected.as_deref() == Some(chat.id.as_str()))
-                {
-                    elements.push(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap(px(2.0))
-                            .pb(px(4.0))
-                            .child(self.render_grouped_session_row(
-                                status,
-                                chat,
-                                folder,
-                                branch,
-                                selected.as_deref(),
-                                now,
-                                theme,
-                                window,
-                                cx,
-                            ))
-                            .into_any_element(),
-                    );
-                }
-            } else {
-                if group.sessions.is_empty() {
-                    // Placeholder: "No conversations yet"
-                    elements.push(
-                        div()
-                            .px(px(Theme::SPACE_SM + 6.0))
-                            .pb(px(4.0))
-                            .text_size(px(12.0))
-                            .text_color(theme.text_faint)
-                            .child(SharedString::from("No conversations yet"))
-                            .into_any_element(),
-                    );
-                } else {
-                    let mut rows_div = div().flex().flex_col().gap(px(2.0)).pb(px(4.0));
-                    for (status, chat, folder, branch) in group.sessions {
-                        let element = self.render_grouped_session_row(
-                            status,
-                            chat,
-                            folder,
-                            branch,
-                            selected.as_deref(),
-                            now,
-                            theme,
-                            window,
-                            cx,
-                        );
-                        rows_div = rows_div.child(element);
-                    }
-                    elements.push(rows_div.into_any_element());
-                }
+            ));
+            if !is_collapsed && group.rows.is_empty() {
+                elements.push(
+                    div()
+                        .px(px(Theme::SPACE_SM + 6.0))
+                        .pb(px(4.0))
+                        .text_size(px(12.0))
+                        .text_color(theme.text_faint)
+                        .child(SharedString::from("No conversations yet"))
+                        .into_any_element(),
+                );
+            } else if let Some(el) =
+                self.render_session_group(&group.rows, is_collapsed, selected, now, theme, window, cx)
+            {
+                elements.push(el);
             }
         }
 
         // Project-less sessions at the bottom (if any).
-        if !projectless.is_empty() {
-            let orphan_id = "__projectless__".to_string();
-            let is_collapsed = !self.expanded_spaces.contains(&orphan_id);
-            let count = projectless.len();
-            let header = self.render_space_folder_header(
+        if !data.projectless.is_empty() {
+            let is_collapsed = !self.expanded_spaces.contains("__projectless__");
+            elements.push(self.render_space_folder_header(
                 None,
                 SharedString::from("~"),
-                count,
+                data.projectless.len(),
                 is_collapsed,
                 theme,
                 cx,
-            );
-            elements.push(header);
-            if is_collapsed {
-                if let Some((status, chat, folder, branch)) = projectless
-                    .into_iter()
-                    .find(|(_, chat, _, _)| selected.as_deref() == Some(chat.id.as_str()))
-                {
-                    elements.push(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap(px(2.0))
-                            .pb(px(4.0))
-                            .child(self.render_grouped_session_row(
-                                status,
-                                chat,
-                                folder,
-                                branch,
-                                selected.as_deref(),
-                                now,
-                                theme,
-                                window,
-                                cx,
-                            ))
-                            .into_any_element(),
-                    );
-                }
-            } else {
-                let mut rows_div = div().flex().flex_col().gap(px(2.0)).pb(px(4.0));
-                for (status, chat, folder, branch) in projectless {
-                    let element = self.render_grouped_session_row(
-                        status,
-                        chat,
-                        folder,
-                        branch,
-                        selected.as_deref(),
-                        now,
-                        theme,
-                        window,
-                        cx,
-                    );
-                    rows_div = rows_div.child(element);
-                }
-                elements.push(rows_div.into_any_element());
+            ));
+            if let Some(el) = self.render_session_group(
+                &data.projectless,
+                is_collapsed,
+                selected,
+                now,
+                theme,
+                window,
+                cx,
+            ) {
+                elements.push(el);
             }
         }
 
