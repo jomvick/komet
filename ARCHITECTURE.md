@@ -152,8 +152,8 @@ komet/
                                  # options catalogs
     engine/       komet-engine   # sessions engine (pub/sub, run journal, recovery, stall
                                  # watchdog), doc host + command executor, repos/worktrees,
-                                 # checkout-diff sync, terminals (portable-pty; opt-in text
-                                 # mirror via komet-term), uploads,
+                                 # checkout-diff sync, terminals (portable-pty; text mirror
+                                 # via komet-term on every terminal), uploads,
                                  # agent accounts (cred swap), auth (bearer via sync server),
                                  # device-room host/peers, identity, single-instance lock
     rpc/          komet-rpc      # UiRpc/ControlRpc: typed req/resp/stream over WS (tokio-
@@ -214,9 +214,9 @@ feature spec `docs/research/feature-inventory.md` §1.
   is requested. Pickers (harness/model, traits, repo w/ folder browser, branch w/ worktree
   toggle) as gpui popovers with `menu-in` scale/fade.
 - **Terminal**: `alacritty_terminal` (vte state machine, MIT/Apache) wrapped by `komet-term`, a
-  gpui-free emulator core shared by both sides — the UI paints its grid snapshots, the engine can
-  mirror a *tracked* terminal (opt-in per terminal, `KOMET_TERMINAL_TRACK=1` or `set_tracked`) and
-  answer screen/tail/delta-since-seq reads in clear text; `portable-pty` on the engine side; custom
+  gpui-free emulator core shared by both sides — the UI paints its grid snapshots, the engine
+  mirrors every terminal and answers screen/tail/delta-since-seq/last-command reads in clear text —
+  agents may list and read any Komet terminal over MCP but never write to, open or close one; `portable-pty` on the engine side; custom
   gpui grid element; tabs w/ drag-reorder (150ms sliding transforms), height drag 160px–55vh, 12ms
   input coalescing / 80ms resize debounce, 1MB replay, detach ≠ close.
 - **Diff pane**: unified-patch parser → virtualized file/hunk/line rows, per-file collapse
