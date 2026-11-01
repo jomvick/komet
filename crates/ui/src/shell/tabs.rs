@@ -223,10 +223,7 @@ impl Shell {
         };
         // GitHub and project-open controls sit immediately before the
         // right-pane toggle at the titlebar's trailing edge.
-        let (github, github_slot) = match self.render_github_button(&theme, cx) {
-            Some((button, width)) => (Some(button), width + 8.0),
-            None => (None, 0.0),
-        };
+        let github = self.render_github_button(&theme, cx);
         let panel_toggle = header_icon_button(
             "toggle-changes",
             icons::SIDEBAR_MINIMALISTIC,
@@ -265,7 +262,6 @@ impl Shell {
             // pane's left border whatever the buttons' widths are (no more
             // hand-budgeted `strip_tail`): the tabs and the `+` take the
             // space left after the buttons and scroll if there are too many.
-            let _ = github_slot;
             let gap_budget = if takeover { 8.0 } else { 16.0 };
             let avail = self.viewport_width - row_left - gap_budget;
             // The right pane's SURFACE TABS (t3 RightPanelTabs) — the diff

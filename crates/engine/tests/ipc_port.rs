@@ -7,12 +7,17 @@ use komet_engine::{EngineCore, default_registry, serve_ipc};
 use komet_proto::HarnessId;
 
 async fn free_port() -> u16 {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    listener.local_addr().unwrap().port()
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.set_reuseaddr(true).unwrap();
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    socket.local_addr().unwrap().port()
 }
 
 #[tokio::test]
 async fn a_second_engine_cannot_take_the_port_or_replace_its_token() {
+    let run_dir = tempfile::tempdir().unwrap();
+    // Safety: set before async tasks spawn in this test
+    unsafe { std::env::set_var("KOMET_RUNTIME_DIR", run_dir.path()) };
     let dir_a = tempfile::tempdir().unwrap();
     let dir_b = tempfile::tempdir().unwrap();
     let core_a = EngineCore::assemble(

@@ -206,25 +206,43 @@ impl EngineCore {
         let assembly_start = std::time::Instant::now();
         let data_dir = profile.device_root();
         std::fs::create_dir_all(data_dir)?;
-        tracing::info!(elapsed_ms = assembly_start.elapsed().as_millis(), "created data dir");
+        tracing::info!(
+            elapsed_ms = assembly_start.elapsed().as_millis(),
+            "created data dir"
+        );
         // Crash shield first: report a previous crashed run (and clear its
         // marker) before any store opens, then arm the panic hook. Every
         // construction path funnels through here.
         crash_shield::install(data_dir);
-        tracing::info!(elapsed_ms = assembly_start.elapsed().as_millis(), "crash shield installed");
+        tracing::info!(
+            elapsed_ms = assembly_start.elapsed().as_millis(),
+            "crash shield installed"
+        );
         let legacy_uploads_root = profile.claim_legacy_uploads_root()?;
-        tracing::info!(elapsed_ms = assembly_start.elapsed().as_millis(), "legacy uploads claimed");
+        tracing::info!(
+            elapsed_ms = assembly_start.elapsed().as_millis(),
+            "legacy uploads claimed"
+        );
         let device_id = load_or_create_device_id(data_dir)?;
-        tracing::info!(elapsed_ms = assembly_start.elapsed().as_millis(), "device id loaded");
+        tracing::info!(
+            elapsed_ms = assembly_start.elapsed().as_millis(),
+            "device id loaded"
+        );
         // This device's harness enablement (Settings → Agents) rides the
         // engine data dir — per-device, like the CLI installs it gates.
         registry.load_prefs(data_dir);
-        tracing::info!(elapsed_ms = assembly_start.elapsed().as_millis(), "registry prefs loaded");
+        tracing::info!(
+            elapsed_ms = assembly_start.elapsed().as_millis(),
+            "registry prefs loaded"
+        );
         // Persistent model discovery cache: the picker renders instantly on
         // boot instead of re-probing every agent (opencode's cold Node boot
         // measured ~13s under the app's 4-way boot prefetch).
         registry.load_models_cache(data_dir);
-        tracing::info!(elapsed_ms = assembly_start.elapsed().as_millis(), "models cache loaded");
+        tracing::info!(
+            elapsed_ms = assembly_start.elapsed().as_millis(),
+            "models cache loaded"
+        );
         // Boot refresh: revalidate the persisted models for every offered
         // harness with an installed CLI (except Mock) in the background, two
         // at a time. Never blocks boot; a failed probe keeps the prior cache.
@@ -270,9 +288,15 @@ impl EngineCore {
                 }
             }
         }
-        tracing::info!(elapsed_ms = assembly_start.elapsed().as_millis(), "models warm scheduled");
+        tracing::info!(
+            elapsed_ms = assembly_start.elapsed().as_millis(),
+            "models warm scheduled"
+        );
         let journal = Arc::new(RunJournal::open(profile.store_root().join("journals"))?);
-        tracing::info!(elapsed_ms = assembly_start.elapsed().as_millis(), "journal opened");
+        tracing::info!(
+            elapsed_ms = assembly_start.elapsed().as_millis(),
+            "journal opened"
+        );
         // The workspace needs a handle too: a chat's journal (its transcript and
         // its auto-resume budget) dies with the chat row, wherever the delete
         // comes from — RPC, space cascade, or the orphan sweep.
@@ -292,7 +316,10 @@ impl EngineCore {
             mcp_secrets.clone(),
         );
         let device_name = local_device_name(&device_id);
-        tracing::info!(elapsed_ms = assembly_start.elapsed().as_millis(), "device name resolved");
+        tracing::info!(
+            elapsed_ms = assembly_start.elapsed().as_millis(),
+            "device name resolved"
+        );
         let runtime = crate::workspace_runtime::WorkspaceRuntime::open(
             profile.store_root(),
             &device_id,
@@ -303,7 +330,10 @@ impl EngineCore {
             edge.clone(),
             true,
         )?;
-        tracing::info!(elapsed_ms = assembly_start.elapsed().as_millis(), "workspace runtime opened");
+        tracing::info!(
+            elapsed_ms = assembly_start.elapsed().as_millis(),
+            "workspace runtime opened"
+        );
         let store = runtime.store.clone();
         let store_for_import = store.clone();
         let doc_host = runtime.doc_host;

@@ -17,8 +17,6 @@ type GitHubKey = (String, Option<String>);
 /// overflows when the control is visible.
 pub(super) const GITHUB_BUTTON_WIDTH: f32 = 44.0;
 const GITHUB_RETRY_WIDTH: f32 = 78.0;
-/// The terminal toggle sitting right of the GitHub trigger.
-const TERMINAL_TOGGLE_WIDTH: f32 = 28.0;
 
 #[derive(Default)]
 pub(super) struct GitHubHeader {
@@ -311,7 +309,7 @@ impl Shell {
         &mut self,
         theme: &Theme,
         cx: &mut Context<Self>,
-    ) -> Option<(AnyElement, f32)> {
+    ) -> Option<AnyElement> {
         let Some(key) = self.github_target(cx) else {
             self.github.key = None;
             self.github.status = None;
@@ -323,12 +321,7 @@ impl Shell {
         self.ensure_github_status(key, false, cx);
         let Some(status) = self.github.status.clone() else {
             let failed = self.github.status_error.is_some();
-            return failed.then(|| {
-                (
-                    self.render_github_status_retry(theme, cx),
-                    GITHUB_RETRY_WIDTH,
-                )
-            });
+            return failed.then(|| self.render_github_status_retry(theme, cx));
         };
 
         let width = trigger_width(None);
@@ -436,10 +429,7 @@ impl Shell {
             .gap(px(6.0))
             .child(trigger)
             .child(terminal_toggle);
-        Some((
-            controls.into_any_element(),
-            width + 6.0 + TERMINAL_TOGGLE_WIDTH,
-        ))
+        Some(controls.into_any_element())
     }
 
     /// The status lookup failed: keep a control in the slot so the lookup can

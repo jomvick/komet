@@ -436,13 +436,12 @@ impl EngineHandle {
         // On Linux, the managed engine often fails to bind IPC within the timeout.
         // Default to embedded for faster startup; managed can be enabled via env var.
         #[cfg(target_os = "linux")]
-        let use_managed = config.managed_engine && std::env::var("KOMET_USE_MANAGED_ENGINE").is_ok();
+        let use_managed =
+            config.managed_engine && std::env::var("KOMET_USE_MANAGED_ENGINE").is_ok();
         #[cfg(not(target_os = "linux"))]
         let use_managed = config.managed_engine;
 
-        if use_managed
-            && let Some(handle) = Self::start_managed_engine(&config).await
-        {
+        if use_managed && let Some(handle) = Self::start_managed_engine(&config).await {
             return Ok(handle);
         }
 
@@ -3258,8 +3257,15 @@ mod tests {
 
     /// A localhost port that was just free (bind :0, read, drop).
     async fn free_port() -> u16 {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        listener.local_addr().unwrap().port()
+        if std::env::var_os("KOMET_RUNTIME_DIR").is_none() {
+            let tmp_run = std::env::temp_dir().join("komet-test-run");
+            let _ = std::fs::create_dir_all(&tmp_run);
+            unsafe { std::env::set_var("KOMET_RUNTIME_DIR", &tmp_run) };
+        }
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.set_reuseaddr(true).unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        socket.local_addr().unwrap().port()
     }
 
     struct LegacyIdentityRpc;

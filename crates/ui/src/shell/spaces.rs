@@ -1214,7 +1214,10 @@ impl Shell {
                 let element = self.render_chat_row(
                     row.chat.id.clone(),
                     transcript::single_line(
-                        &row.chat.title.clone().unwrap_or_else(|| "New session".into()),
+                        &row.chat
+                            .title
+                            .clone()
+                            .unwrap_or_else(|| "New session".into()),
                     )
                     .into(),
                     time_ago,

@@ -837,14 +837,32 @@ mod tests {
         let tool_names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
 
         // Terminal tools must be exactly these two
-        assert!(tool_names.contains(&"terminal_list"), "terminal_list must be present");
-        assert!(tool_names.contains(&"terminal_read"), "terminal_read must be present");
+        assert!(
+            tool_names.contains(&"terminal_list"),
+            "terminal_list must be present"
+        );
+        assert!(
+            tool_names.contains(&"terminal_read"),
+            "terminal_read must be present"
+        );
 
         // No write operations on terminals should be exposed
-        assert!(!tool_names.iter().any(|n| n.contains("write")), "No terminal write tools");
-        assert!(!tool_names.iter().any(|n| n.contains("open")), "No terminal open tools");
-        assert!(!tool_names.iter().any(|n| n.contains("close")), "No terminal close tools");
-        assert!(!tool_names.iter().any(|n| n.contains("paste")), "No terminal paste tools");
+        assert!(
+            !tool_names.iter().any(|n| n.contains("write")),
+            "No terminal write tools"
+        );
+        assert!(
+            !tool_names.iter().any(|n| n.contains("open")),
+            "No terminal open tools"
+        );
+        assert!(
+            !tool_names.iter().any(|n| n.contains("close")),
+            "No terminal close tools"
+        );
+        assert!(
+            !tool_names.iter().any(|n| n.contains("paste")),
+            "No terminal paste tools"
+        );
 
         // Both terminal tools must be readonly
         for tool in &tools {
