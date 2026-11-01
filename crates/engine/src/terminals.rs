@@ -11,31 +11,16 @@
 //! - Ownership: M5 is single-user local — every IPC/relay caller is the device
 //!   owner, so the per-user owner re-checks from komet's Router land with real
 //!   multi-account auth in M6.
-//! - **Tracking** (opt-in, per terminal): the same bytes that ride the replay
-//!   window are folded into a `komet_term::TerminalMirror`, so the engine knows
-//!   what the terminal *displays* and not only what it printed: the current
-//!   screen in clear text, the last N lines, and what appeared since a given
-//!   `seq`. Off by default — an untracked terminal pays one `Option` check per
-//!   output batch, never an emulator — and switchable at runtime with
-//!   [`Terminals::set_tracked`] or for every new terminal with
-//!   `KOMET_TERMINAL_TRACK=1`.
-//! - **Visibility** (the agent gate): a terminal is invisible to agents until a
-//!   human grants reads with [`Terminals::set_agent_visible`] — there is no MCP
-//!   tool for the flag, so an agent cannot lift it on itself. The gated reads
-//!   ([`Terminals::agent_screen_text`], [`Terminals::agent_tail_text`],
-//!   [`Terminals::agent_text_delta`]) check the grant FIRST and refuse loudly;
-//!   granting also switches tracking on (and revoking off), so the grant can
-//!   never be a no-op and a hidden terminal never keeps clear-text scrollback.
-//!   One bounded exception: a terminal an AGENT opened through
-//!   [`Terminals::open_agent_terminal`] is readable at birth — but only by
-//!   the run that created it (the `owner` identity the MCP endpoint already
-//!   authenticates per call). Another agent run reading it is refused: the
-//!   scrollback of a terminal the human typed into (through approved
-//!   `terminal_send_input` calls) holds what the human approved typing there —
-//!   tokens, `env` output. The birth grant is what keeps the wanted
-//!   `terminal_run` → `running` + `sinceSeq` → `terminal_read` delta flow
-//!   alive without a human click per terminal; the owner bound is what stops
-//!   it from meaning "readable by every run on the machine".
+//! - **Text mirror** (always on, every terminal): the same bytes that ride the
+//!   replay window are folded into a `komet_term::TerminalMirror`, so the engine
+//!   knows what the terminal *displays* and not only what it printed: the
+//!   current screen in clear text, the last N lines, what appeared since a given
+//!   `seq`, and the last OSC 133 command block.
+//! - **Agents read, never write**: the MCP surface lists and reads every
+//!   terminal ([`Terminals::screen_text`], [`Terminals::tail_text`],
+//!   [`Terminals::text_delta`], [`Terminals::last_command`]); nothing reachable by
+//!   an agent opens, closes, resizes or types into one. Input comes from the UI
+//!   (`WriteTerminal`) only.
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
@@ -53,7 +38,7 @@ use komet_term::{Emulator, TerminalMirror, TextDelta};
 // The read replies and the list row are transport types (komet_proto, shared
 // with the RPC layer and the UI). Re-exported here so `crate::terminals` stays
 // the engine's vocabulary for them (see the re-export in `lib.rs`).
-use komet_proto::{TerminalCommand, TerminalEvent, TerminalRunResult, TerminalSession};
+use komet_proto::{TerminalCommand, TerminalEvent, TerminalSession};
 pub use komet_proto::{TerminalDelta, TerminalInfo, TerminalScreen, TerminalTail};
 use komet_term::{BlockStatus, CommandBlock};
 
@@ -65,27 +50,13 @@ const MAX_REPLAY_BYTES: usize = 1024 * 1024;
 const EXITED_TTL: Duration = Duration::from_secs(30 * 60);
 const REAPER_INTERVAL: Duration = Duration::from_secs(60);
 
-/// Scrollback kept inside a tracked mirror. The UI grid keeps its own (user
+/// Scrollback kept inside a terminal's mirror. The UI grid keeps its own (user
 /// setting, 10k default); the engine only needs enough history to answer a tail
-/// read, and each tracked line costs a row of cells — so this is deliberately
-/// smaller. 1000 lines is a few MB per tracked terminal at a wide column count.
+/// read, and each mirrored line costs a row of cells — so this is deliberately
+/// smaller. 1000 lines is a few MB per terminal at a wide column count.
 const TRACKED_SCROLLBACK_LINES: usize = 1_000;
 
-/// Opt-in switch for tracking every terminal this engine opens.
-const TRACK_ENV: &str = "KOMET_TERMINAL_TRACK";
-
-/// Should terminals be tracked from the moment they open? `1`/`true`/`yes`/`on`
-/// enable it; anything else (including unset) leaves tracking off.
-fn track_new_terminals() -> bool {
-    std::env::var(TRACK_ENV)
-        .map(|v| {
-            let v = v.trim().to_ascii_lowercase();
-            v == "1" || v == "true" || v == "yes" || v == "on"
-        })
-        .unwrap_or(false)
-}
-
-/// The engine's mirror of one tracked terminal: the shared emulator core plus the
+/// The engine's mirror of one terminal: the shared emulator core plus the
 /// seq-stamped text journal. It answers the three reads an agent needs —
 /// [`TerminalMirror::screen_text`] (what is displayed), [`TerminalMirror::tail_text`]
 /// (what scrolled past) and [`TerminalMirror::delta_since`] (what appeared since
@@ -120,20 +91,6 @@ impl TerminalTrack {
     fn resize(&mut self, seq: u64, cols: u16, rows: u16) {
         self.mirror.resize(seq, cols, rows);
     }
-}
-
-/// The mirror of a tracked terminal, or the error telling the caller to track it
-/// — a read that answers "nothing" for an untracked terminal would be the
-/// silent no-op this project forbids.
-fn track_of<'a>(
-    session: &'a LiveTerminal,
-    terminal_id: &str,
-) -> Result<&'a TerminalTrack, EngineError> {
-    session.track.as_ref().ok_or_else(|| {
-        EngineError::Other(format!(
-            "Terminal {terminal_id} is not tracked; enable it with set_tracked or {TRACK_ENV}=1"
-        ))
-    })
 }
 
 /// Stamp a [`TextDelta`] answer from the mirror with the terminal's id (the
@@ -202,38 +159,6 @@ struct LiveTerminal {
     /// reports without needing a track.
     cwd: String,
     shell: String,
-    /// The human's grant that agents may read this terminal. Off by default,
-    /// switchable only over the RPC/UI surface (`SetTerminalAgentVisible`) —
-    /// no MCP tool exposes it, so an agent cannot lift it on itself. Turning
-    /// it on also turns the text mirror on (a read without a mirror is the
-    /// "not tracked" error, so the grant without the mirror would be a
-    /// no-op); turning it off drops the mirror again. This flag is the HUMAN
-    /// door: the agent birth grant is the `owner` bound on the `agent_owned`
-    /// terminal, checked by `Terminals::agent_gate`, and it does NOT set
-    /// this flag.
-    agent_visible: bool,
-    /// `None` = not tracked: no emulator is built and the output pump does not
-    /// touch it (the default, and the cost of it is this one field).
-    track: Option<TerminalTrack>,
-    /// This terminal was opened by an AGENT through the permission-gated
-    /// `terminal_open` tool, on the human's approval of that call. Its
-    /// content is agent-produced, so the engine grants it readability AT
-    /// BIRTH (and tracking with it — an invisible read-back would make the
-    /// tool a no-op), bounded to the creating run by the `owner` field.
-    /// `close_agent_terminal` only accepts these: an agent may never kill a
-    /// human's shell. Human terminals keep this `false` and stay behind the
-    /// `agent_visible` grant for every read.
-    agent_owned: bool,
-    /// The id of the AGENT RUN that opened this terminal (the `run_id` the
-    /// MCP endpoint already authenticates with its per-run token), or `None`
-    /// for a human-opened terminal — and, as an honest gap, for an
-    /// agent-opened terminal whose caller carried no run identity. It is the
-    /// bound on the birth grant: `Terminals::agent_gate` lets a reader with
-    /// this id through WITHOUT a human grant, and refuses readers with any
-    /// other id (the flag that stays the human's alone is `agent_visible`).
-    /// An agent-opened terminal with `None` here cannot be bounded, so it
-    /// stays readable — the open path in production always carries the id.
-    owner: Option<String>,
     /// Wall-clock stamp of the newest OUTPUT batch (not input, not subscribe)
     /// — the silence fallback for terminals without OSC 133 markers measures
     /// quiet from this.
