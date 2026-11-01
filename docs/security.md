@@ -193,53 +193,26 @@ they constrain the agent CLI, not the machine.
   (disable the service, remove its data directory), and remove the desktop side
   first if you want to keep the mirror.
 
-## Agents driving Komet terminals (MCP execution surface)
+## Agents reading Komet terminals (MCP read-only surface)
 
-The Komet MCP server exposes six `terminal_*` tools (`crates/engine/src/mcp/catalog.rs`,
-backed by `crates/engine/src/terminals.rs`). They split into two doors, deliberately
-independent:
+The Komet MCP server exposes two `terminal_*` tools (`crates/engine/src/mcp/catalog.rs`,
+backed by `crates/engine/src/terminals.rs`): `terminal_list` and `terminal_read`
+(`screen`, `tail`, `delta`, `last_command` angles). Both are `readonly: true`.
 
-- **Reads** (`terminal_list`, `terminal_read`): gated by the per-terminal `agent_visible`
-  flag, which only a human can move (UI/RPC — there is no MCP tool for the flag, so an
-  agent cannot lift it on itself). The gate is checked first and refusals are loud.
-  Granting visibility also switches tracking on (revoking it off), so a hidden terminal
-  never keeps clear-text scrollback. One exception, and it is bounded (see `terminal_open`
-  below): a terminal an agent opened is readable by **its own run** without a human click;
-  every other run gets the same loud refusal, and `terminal_list` filters through the
-  identical gate, so a listing cannot leak the id, title or cwd of a terminal the reader
-  cannot read.
-- **Writes / execution** (`terminal_open`, `terminal_close`, `terminal_send_input`,
-  `terminal_run`): NOT gated by `agent_visible`. All four declare `readonly: false`, so
-  the server's permission policy answers `Ask` and **nothing executes without the human's
-  approval on that call** (a denial executes nothing; a dropped/cancelled prompt resolves
-  to Deny, never a silent allow). The separation is intentional: `agent_visible` protects
-  the *scrollback* (tokens, passwords, keys), while a write is a point action the human
-  approves case by case — an input the human just approved does not require the read flag,
-  and a read grant never authorizes a write.
+- **Agents can list and read every Komet terminal.** There is no per-terminal grant, no
+  opt-in and no owner bound: the engine mirrors the text of every terminal it opens, and
+  any run's agent may read it. Reads are capped (40,000 characters, tail ≤ 1,000 lines)
+  and `last_command` refuses loudly when the shell emitted no OSC 133 markers. Treat
+  anything printed in a Komet terminal (tokens, `env` output) as visible to agents.
+- **Agents cannot write.** No MCP tool opens, closes, resizes, types into or runs a
+  command in a terminal; input reaches a PTY only from the user's own UI (`WriteTerminal`
+  RPC). Agents run commands in their CLI's own pty (see below), never in a Komet terminal.
 
-Per-tool guarantees, as tested (`crates/engine/tests/terminal_agent_reads.rs`,
-`crates/engine/src/mcp/server.rs` permission tests):
-
-- `terminal_send_input` writes raw PTY bytes (text or control keys) to one terminal,
-  capped at 64 KiB per call (`MAX_INPUT_BYTES`).
-- `terminal_run` types a command and waits at most `waitMs` (default 10 s, max 20 s); a
-  command outliving the wait answers `running` with a delta anchor instead of timing out.
-- `terminal_close` closes **agent-owned** terminals only — an approved call can never kill
-  a human's shell; human terminals are closed by the human (UI/RPC).
-- `terminal_open` creates a fresh terminal owned by the calling agent, born readable and
-  tracked: the human approved the opening, and reading back the agent's own typing is
-  inside that approval. The birth grant is **bounded to the creating run** — the terminal
-  records the `run_id` of the caller (the same identity the endpoint authenticates with
-  its per-run bearer token, `crates/engine/src/mcp/server.rs`), and `Terminals::agent_gate`
-  lets only that run read or list it. Another run is refused: the scrollback of an
-  agent-opened terminal also holds whatever the human later approved typing into it
-  (tokens, `env` output), which is exactly what made the old unbounded
-  `agent_owned → granted` a leak. A human's `SetTerminalAgentVisible` grant overrides the
-  bound and opens the terminal to every run, as with any other terminal.
-
-As always in this file: these approvals constrain the *agent's* reach into Komet-owned
-terminals, they are not an OS isolation — the PTY runs the user's shell with the user's
-privileges (see [Sandbox is not a host boundary](#sandbox-is-not-a-host-boundary)).
+As always in this file: this constrains the *agent's* reach into Komet-owned terminals,
+it is not an OS isolation — the PTY runs the user's shell with the user's privileges (see
+[Sandbox is not a host boundary](#sandbox-is-not-a-host-boundary)). Covered by
+`crates/engine/tests/terminal_agent_reads.rs` and the catalog/server tests in
+`crates/engine/src/mcp/`.
 
 ## Reading the agent's own shell (right-panel « Shell agent »)
 
@@ -254,29 +227,11 @@ status/summary and streams no partial stdout — see the matrix in `ARCHITECTURE
 Security properties of that surface:
 
 - **Read-only, by construction.** No `Input`, no key binding, no clickable path to a PTY
-  or to a `terminal_send_input`/`terminal_run` equivalent. It is a projection of the
-  transcript, not a terminal, so it cannot become a write door wearing a terminal's face.
+  or to any terminal write. It is a projection of the transcript, not a terminal, so it
+  cannot become a write door wearing a terminal's face.
 - **Nothing durable.** The output tails are render-local (`Transcript::shell_tails`): never
   journaled, never written to the doc, cleared on a chat switch, bounded to a window of
   recent commands. The durable record of a tool stays the doc's chip, whose
   success-output contract is unchanged.
-- **No bearing on the terminal read gate.** The `agent_visible` gate
-  (`crates/engine/src/terminals.rs`, `crates/mcp`) decides whether an **agent** may read a
-  **Komet** terminal, which is a human decision. A human reading their own agent's
-  transcript grants nothing and bypasses nothing.
-
-Audit note — resolved (the `agent_owned → granted` exception): the audit found that a
-terminal **created by an agent** came up `agent_owned → granted`, i.e. readable by *any*
-agent run without a human decision — one run could read back what another run (or the
-human, through approved inputs) had put in that shell. The retained fix keeps the birth
-grant but bounds it to the creating run: explicit human grant
-(`SetTerminalAgentVisible`), no recorded owner (an identity-less open path that production
-does not take), or `owner == calling run` are the only ways `Terminals::agent_gate` lets a
-read through, and `terminal_list` applies the identical predicate. The blunt inversion —
-`agent_owned → OFF` everywhere — was explicitly rejected: it would kill the wanted
-`terminal_run` → `running` + `sinceSeq` → `terminal_read` delta flow and demand a human
-click per terminal an agent opens. Human terminals are unchanged: strict human grant,
-`agent_visible` off by default. Proven by `crates/engine/tests/terminal_agent_reads.rs`
-(`another_run_cannot_read_or_list_a_terminal_run_a_opened`,
-`the_creator_run_follows_a_running_answer_with_its_delta_read`) alongside the pre-existing
-guard tests.
+- **No bearing on terminals.** A human reading their own agent's transcript grants
+  nothing and bypasses nothing; Komet terminals stay read-only for agents regardless.

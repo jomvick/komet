@@ -2678,7 +2678,6 @@ impl Shell {
         TerminalPrefs {
             font_size: self.settings.terminal_font_size,
             scrollback_lines: self.settings.terminal_scrollback_lines,
-            bell_audible: self.settings.terminal_bell_audible,
         }
     }
 
@@ -2705,11 +2704,6 @@ impl Shell {
         match event {
             TerminalPanelEvent::FontSizeChanged(size) => {
                 self.settings.terminal_font_size = *size;
-                self.schedule_save(cx);
-                self.push_terminal_prefs(&panel, cx);
-            }
-            TerminalPanelEvent::BellAudibleChanged(audible) => {
-                self.settings.terminal_bell_audible = *audible;
                 self.schedule_save(cx);
                 self.push_terminal_prefs(&panel, cx);
             }
