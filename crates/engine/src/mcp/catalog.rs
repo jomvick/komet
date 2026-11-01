@@ -5,7 +5,7 @@ use serde::Serialize;
 
 use crate::composio::{ComposioSession, ComposioTool, is_read_action_slug};
 use komet_proto::{
-    TerminalCommand, TerminalDelta, TerminalInfo, TerminalRunResult, TerminalScreen, TerminalTail,
+    TerminalCommand, TerminalDelta, TerminalInfo, TerminalScreen, TerminalTail,
 };
 
 #[derive(Debug, Clone, Serialize)]
@@ -55,53 +55,16 @@ pub trait McpHost: Send + Sync {
     fn list_sessions(&self) -> Vec<SessionSummary>;
     fn session_status(&self, id: &str) -> Option<SessionSummary>;
     fn list_spaces(&self) -> Vec<SpaceSummary>;
-    /// Terminals the CALLING run may read: the human-granted ones
-    /// (`agent_visible == true`) plus the ones this very run opened (bounded
-    /// birth grant — see `Terminals::open_agent_terminal`). Nothing else may
-    /// appear: hidden terminals' ids, cwds and titles are not agent data, and
-    /// a terminal another run opened is exactly as private. The host filters
-    /// through `Terminals::list_terminals_for_reader`, the same gate the
-    /// reads pass, so listing cannot leak what reading refuses.
+    /// Every terminal, readable by agents (read-only: agents can never
+    /// write to, open or close a terminal).
     fn list_terminals_for_agents(&self) -> Vec<TerminalInfo>;
-    /// One gated read, as the calling run; `Err(message)` carries the engine's
-    /// refusal (not visible / another run's terminal / not tracked) up to the
-    /// agent verbatim.
+    /// One read; `Err(message)` carries the engine's refusal (unknown
+    /// terminal, no OSC 133 markers) up to the agent verbatim.
     fn read_terminal_for_agents(
         &self,
         terminal_id: &str,
         angle: &TerminalAngle,
     ) -> Result<TerminalRead, String>;
-
-    // ---- write surface: lifecycle, input, execution ----------------------
-    //
-    // These four are NOT gated by `agent_visible`. That flag protects READS
-    // (a human scrollback holds tokens, passwords, keys); a WRITE is a point
-    // action the human approves PER CALL through the MCP permission prompt —
-    // every `terminal_*` tool below declares `readonly: false`, so the
-    // server's policy answers `Ask` and nothing executes without the
-    // approval (a denial executes nothing, provably). The two doors stay
-    // separate on purpose; `docs/security.md` is the rule: these approvals
-    // constrain the agent's reach, they are not an OS isolation.
-
-    /// `terminal_open`: a NEW terminal owned by the CALLING run — readable at
-    /// birth by that run alone (tracked from birth too; the human approved the
-    /// opening, reading back the agent's own typing is inside that approval,
-    /// but the grant is bounded: another run gets the gate's refusal).
-    fn open_terminal_for_agent(&self, cwd: Option<String>) -> Result<TerminalInfo, String>;
-    /// `terminal_close`: agent-owned terminals only — an approved call must
-    /// never kill a human's shell.
-    fn close_terminal_for_agent(&self, terminal_id: &str) -> Result<(), String>;
-    /// `terminal_send_input`: raw PTY bytes (text or control keys).
-    fn send_input_to_terminal(&self, terminal_id: &str, bytes: &[u8]) -> Result<(), String>;
-    /// `terminal_run`: type and wait for completion AT MOST `wait_ms`; past
-    /// that the host answers `running` with the delta anchor instead of ever
-    /// hitting the endpoint's tool timeout.
-    async fn run_in_terminal(
-        &self,
-        terminal_id: &str,
-        command: &str,
-        wait_ms: u64,
-    ) -> Result<TerminalRunResult, String>;
 }
 
 #[derive(Debug, Clone)]
@@ -170,7 +133,7 @@ impl McpCatalog {
             ToolDef {
                 name: "terminal_list".into(),
                 title: "List terminals".into(),
-                description: "List the terminals YOUR run may read: the human terminals granted to agents, plus the terminals this run itself opened. Anything else is absent — id, title, cwd, shell, grid size, seq, tracking alike (a terminal you cannot read is not something this list reveals) — and no tool here can lift the human's grant.".into(),
+                description: "List every Komet terminal with id, title, cwd, shell, grid size and seq. Read-only: agents can read terminals but never write to, open or close them.".into(),
                 input_schema: obj_schema(&[], &[]),
                 readonly: true,
                 composio_slug: None,
@@ -178,7 +141,7 @@ impl McpCatalog {
             ToolDef {
                 name: "terminal_read".into(),
                 title: "Read a terminal".into(),
-                description: "Read one readable terminal in clear text: angle \"screen\" (current grid — the read for a full-screen app), \"tail\" (last `lines` lines), \"delta\" (what appeared after `sinceSeq`, a seq a previous read reported), \"last_command\" (the newest OSC 133 command block: command, cwd, output, exit code — refuses if the shell emits no markers). Readable means: granted by the human, or opened by YOUR run. Output is capped keeping the END; a refused (not granted / another run's / not tracked) terminal errors, never answers empty.".into(),
+                description: "Read one  terminal in clear text: angle \"screen\" (current grid — the read for a full-screen app), \"tail\" (last `lines` lines), \"delta\" (what appeared after `sinceSeq`, a seq a previous read reported), \"last_command\" (the newest OSC 133 command block: command, cwd, output, exit code — refuses if the shell emits no markers). Output is capped keeping the END; an unknown terminal errors, never answers empty.".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -191,57 +154,6 @@ impl McpCatalog {
                     "additionalProperties": false,
                 }),
                 readonly: true,
-                composio_slug: None,
-            },
-            ToolDef {
-                name: "terminal_open".into(),
-                title: "Open a terminal".into(),
-                description: "Open a NEW terminal your run owns (a shell of the user's choosing is not possible; it is the default login shell) in `cwd` (optional; defaults to the engine's directory). Reads work on it right away — for YOUR run only: the birth grant is bounded to the run that opened it, so another run cannot read back what this one typed (or what a human approved typing in). REQUIRES the human's approval on every call.".into(),
-                input_schema: obj_schema(&[("cwd", "string")], &[]),
-                readonly: false,
-                composio_slug: None,
-            },
-            ToolDef {
-                name: "terminal_close".into(),
-                title: "Close a terminal".into(),
-                description: "Close a terminal the agent opened (see `terminal_open`). A human's terminal can never be closed this way, approved or not. REQUIRES the human's approval on every call.".into(),
-                input_schema: obj_schema(&[("terminalId", "string")], &["terminalId"]),
-                readonly: false,
-                composio_slug: None,
-            },
-            ToolDef {
-                name: "terminal_send_input".into(),
-                title: "Send input to a terminal".into(),
-                description: "Type raw input into a terminal: `text` (written verbatim — include \\n to submit) OR one `keys` control token (ctrl+c | ctrl+d | ctrl+l | enter | tab | esc | backspace). Point action, approved per call; it does not open the terminal to reading — reads stay behind the visibility grant. REQUIRES the human's approval on every call.".into(),
-                input_schema: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "terminalId": {"type": "string"},
-                        "text": {"type": "string"},
-                        "keys": {"type": "string", "enum": ["ctrl+c", "ctrl+d", "ctrl+l", "enter", "tab", "esc", "backspace"]},
-                    },
-                    "required": ["terminalId"],
-                    "additionalProperties": false,
-                }),
-                readonly: false,
-                composio_slug: None,
-            },
-            ToolDef {
-                name: "terminal_run".into(),
-                title: "Run a command and wait".into(),
-                description: "Type `command` into `terminalId` (a granted terminal — approved per call, the visibility grant is not consulted for the write itself) or into a fresh agent-owned terminal when no id is given, then wait up to `waitMs` (default 10000, max 20000) for it to finish. Answers done/settled with the command's output block (command, cwd, exit code when markers backed) — or `running` WITH `sinceSeq` when it outlives the wait: long commands never time out here, keep following with `terminal_read` delta from `sinceSeq`. REQUIRES the human's approval on every call.".into(),
-                input_schema: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "command": {"type": "string"},
-                        "terminalId": {"type": "string"},
-                        "cwd": {"type": "string"},
-                        "waitMs": {"type": "number"},
-                    },
-                    "required": ["command"],
-                    "additionalProperties": false,
-                }),
-                readonly: false,
                 composio_slug: None,
             },
         ];
@@ -365,79 +277,6 @@ impl McpCatalog {
                     .map_err(CatalogError::ExecutionFailed)?;
                 Ok(terminal_read_json(read))
             }
-            "terminal_open" => {
-                let cwd = input
-                    .get("cwd")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string);
-                let info = self
-                    .host
-                    .open_terminal_for_agent(cwd)
-                    .map_err(CatalogError::ExecutionFailed)?;
-                Ok(serde_json::json!({ "terminal": info }))
-            }
-            "terminal_close" => {
-                let terminal_id = input
-                    .get("terminalId")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| CatalogError::MissingArg("terminalId".into()))?;
-                self.host
-                    .close_terminal_for_agent(terminal_id)
-                    .map_err(CatalogError::ExecutionFailed)?;
-                Ok(serde_json::json!({ "closed": terminal_id }))
-            }
-            "terminal_send_input" => {
-                let terminal_id = input
-                    .get("terminalId")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| CatalogError::MissingArg("terminalId".into()))?;
-                let text = input.get("text").and_then(|v| v.as_str());
-                let keys = input.get("keys").and_then(|v| v.as_str());
-                let bytes: Vec<u8> = match (text, keys) {
-                    (Some(_), Some(_)) => {
-                        return Err(CatalogError::ExecutionFailed(
-                            "pass `text` OR `keys`, not both".into(),
-                        ));
-                    }
-                    (Some(text), None) => text.as_bytes().to_vec(),
-                    (None, Some(keys)) => key_bytes(keys)?,
-                    (None, None) => {
-                        return Err(CatalogError::MissingArg("text or keys".into()));
-                    }
-                };
-                self.host
-                    .send_input_to_terminal(terminal_id, &bytes)
-                    .map_err(CatalogError::ExecutionFailed)?;
-                Ok(serde_json::json!({ "terminalId": terminal_id, "written": bytes.len() }))
-            }
-            "terminal_run" => {
-                let command = input
-                    .get("command")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| CatalogError::MissingArg("command".into()))?;
-                let wait_ms = clamp_run_wait(input.get("waitMs").and_then(|v| v.as_u64()));
-                let target = match input.get("terminalId").and_then(|v| v.as_str()) {
-                    Some(id) => id.to_string(),
-                    None => {
-                        // No terminal asked for: a fresh agent-owned one,
-                        // created under this same approved call.
-                        let cwd = input
-                            .get("cwd")
-                            .and_then(|v| v.as_str())
-                            .map(str::to_string);
-                        self.host
-                            .open_terminal_for_agent(cwd)
-                            .map_err(CatalogError::ExecutionFailed)?
-                            .terminal_id
-                    }
-                };
-                let result = self
-                    .host
-                    .run_in_terminal(&target, command, wait_ms)
-                    .await
-                    .map_err(CatalogError::ExecutionFailed)?;
-                Ok(terminal_run_json(result))
-            }
             _ => match (&tool.composio_slug, &self.composio) {
                 (Some(slug), Some(session)) => session
                     .execute(slug, input)
@@ -457,42 +296,6 @@ pub(crate) const MAX_TERMINAL_READ_CHARS: usize = 40_000;
 /// An agent cannot ask for more tail lines than the tracked mirror holds.
 pub(crate) const MAX_TERMINAL_TAIL_LINES: usize = 1_000;
 pub(crate) const DEFAULT_TERMINAL_TAIL_LINES: usize = 200;
-/// `terminal_run`'s wait bounds. The hard ceiling keeps the call strictly
-/// inside the endpoint's 30 s `TOOL_TIMEOUT`: past `waitMs` the answer is
-/// `running` + `sinceSeq`, never a timed-out call or an untracked process.
-pub(crate) const DEFAULT_TERMINAL_RUN_WAIT_MS: u64 = 10_000;
-pub(crate) const MAX_TERMINAL_RUN_WAIT_MS: u64 = 20_000;
-const _: () = assert!(
-    MAX_TERMINAL_RUN_WAIT_MS < crate::mcp::server::TOOL_TIMEOUT.as_millis() as u64,
-    "terminal_run's ceiling must stay strictly inside the endpoint's TOOL_TIMEOUT"
-);
-
-fn clamp_run_wait(requested: Option<u64>) -> u64 {
-    requested
-        .unwrap_or(DEFAULT_TERMINAL_RUN_WAIT_MS)
-        .min(MAX_TERMINAL_RUN_WAIT_MS)
-}
-
-/// The `keys` control tokens of `terminal_send_input` → PTY bytes. Ctrl-C is
-/// the one an agent most needs (and must be able to send as a point action
-/// under a per-call approval, not as a read grant).
-fn key_bytes(keys: &str) -> Result<Vec<u8>, CatalogError> {
-    Ok(match keys.to_ascii_lowercase().as_str() {
-        "ctrl+c" => vec![0x03],
-        "ctrl+d" => vec![0x04],
-        "ctrl+l" => vec![0x0c],
-        "enter" | "return" => b"\r".to_vec(),
-        "tab" => b"\t".to_vec(),
-        "esc" => vec![0x1b],
-        "backspace" => vec![0x7f],
-        other => {
-            return Err(CatalogError::ExecutionFailed(format!(
-                "unknown key {other:?}; expected ctrl+c | ctrl+d | ctrl+l | enter | tab | esc | backspace"
-            )));
-        }
-    })
-}
-
 fn clamp_tail_lines(requested: Option<u64>) -> usize {
     requested.map_or(DEFAULT_TERMINAL_TAIL_LINES, |v| {
         (v.min(MAX_TERMINAL_TAIL_LINES as u64) as usize).max(1)
@@ -558,38 +361,6 @@ fn terminal_read_json(read: TerminalRead) -> serde_json::Value {
     }
 }
 
-/// The wire shape of one `terminal_run` answer. The `running` branch is the
-/// timeout escape: `sinceSeq` is the delta anchor the agent follows with on
-/// the next `terminal_read`.
-fn terminal_run_json(result: TerminalRunResult) -> serde_json::Value {
-    let (lines, capped) = cap_lines_tail(result.lines, MAX_TERMINAL_READ_CHARS);
-    let mut json = serde_json::json!({
-        "terminalId": result.terminal_id,
-        "status": result.status,
-        "command": result.command,
-        "cwd": result.cwd,
-        "exitCode": result.exit_code,
-        "markerBacked": result.marker_backed,
-        "sinceSeq": result.since_seq,
-        "seq": result.seq,
-        "truncated": capped,
-        "lines": lines,
-        "trackingEnabled": result.tracking_enabled,
-    });
-    if result.status == "running" {
-        json["next"] = serde_json::json!(format!(
-            "still running — call terminal_read with angle \"delta\" and sinceSeq {} (or \"last_command\" once it prints a prompt again)",
-            result.since_seq
-        ));
-    }
-    if result.status == "settled" && !result.marker_backed {
-        json["note"] = serde_json::json!(
-            "closed by the silence fallback (no OSC 133 markers in this shell): output is quiet, but the exit code is unknown — not guessed"
-        );
-    }
-    json
-}
-
 /// Keep the trailing lines that fit in `budget` chars, oldest dropped first;
 /// when not even one line fits, keep the end of the newest line. Returns the
 /// kept lines and whether anything was dropped.
@@ -650,7 +421,7 @@ mod tests {
     use super::*;
     use komet_proto::{TerminalDelta, TerminalInfo, TerminalScreen, TerminalTail};
 
-    fn info(id: &str, visible: bool) -> TerminalInfo {
+    fn info(id: &str) -> TerminalInfo {
         TerminalInfo {
             terminal_id: id.into(),
             title: Some("cargo watch".into()),
@@ -659,35 +430,15 @@ mod tests {
             cols: 80,
             rows: 24,
             seq: 7,
-            tracked: visible,
-            agent_visible: visible,
+            tracked: true,
             exited: false,
         }
     }
 
-    /// Denies every read the way the engine does (the host forwards the gate's
-    /// message verbatim) and lists nothing — a FakeHost standing in for an
-    /// engine whose terminals were never granted. Writes record that they were
-    /// reached: the permission tests assert a denied call never gets here.
+    /// Refuses every read the way the engine does for an unknown terminal
+    /// (the host forwards the message verbatim) and lists nothing.
     #[derive(Default)]
-    struct FakeHost {
-        write_calls: AtomicUsize,
-    }
-
-    fn refused_run() -> TerminalRunResult {
-        TerminalRunResult {
-            terminal_id: "t-refused".into(),
-            status: "done".into(),
-            command: None,
-            cwd: None,
-            exit_code: None,
-            marker_backed: false,
-            since_seq: 0,
-            seq: 0,
-            lines: vec![],
-            tracking_enabled: false,
-        }
-    }
+    struct FakeHost;
 
     #[async_trait::async_trait]
     impl McpHost for FakeHost {
@@ -717,37 +468,16 @@ mod tests {
             _angle: &TerminalAngle,
         ) -> Result<TerminalRead, String> {
             Err(format!(
-                "Terminal {terminal_id} is not visible to agents; a human must grant access with SetTerminalAgentVisible"
+                "Unknown terminal {terminal_id}"
             ))
         }
 
-        fn open_terminal_for_agent(&self, _cwd: Option<String>) -> Result<TerminalInfo, String> {
-            self.write_calls.fetch_add(1, Ordering::Relaxed);
-            Err("no terminal openings in this test host".into())
-        }
 
-        fn close_terminal_for_agent(&self, _terminal_id: &str) -> Result<(), String> {
-            self.write_calls.fetch_add(1, Ordering::Relaxed);
-            Err("no terminal closings in this test host".into())
-        }
 
-        fn send_input_to_terminal(&self, _terminal_id: &str, _bytes: &[u8]) -> Result<(), String> {
-            self.write_calls.fetch_add(1, Ordering::Relaxed);
-            Err("no terminal input in this test host".into())
-        }
 
-        async fn run_in_terminal(
-            &self,
-            _terminal_id: &str,
-            _command: &str,
-            _wait_ms: u64,
-        ) -> Result<TerminalRunResult, String> {
-            self.write_calls.fetch_add(1, Ordering::Relaxed);
-            Ok(refused_run())
-        }
     }
 
-    /// One granted terminal, answering reads with canned text and recording
+    /// One terminal, answering reads with canned text and recording
     /// whether (and how) the host was consulted.
     struct GrantedHost {
         read_calls: AtomicUsize,
@@ -757,9 +487,6 @@ mod tests {
         /// Whether this terminal's shell emits OSC 133 markers. Without them
         /// `last_command` must refuse loudly, never guess.
         markers: bool,
-        /// Records every write the host was asked for (permission tests count
-        /// these: a denied call must leave it at zero).
-        write_calls: AtomicUsize,
     }
 
     impl GrantedHost {
@@ -770,7 +497,6 @@ mod tests {
                 tail_lines: 8,
                 line_len: 10,
                 markers: true,
-                write_calls: AtomicUsize::new(0),
             }
         }
 
@@ -796,7 +522,7 @@ mod tests {
         }
 
         fn list_terminals_for_agents(&self) -> Vec<TerminalInfo> {
-            vec![info("t-visible", true)]
+            vec![info("t-visible")]
         }
 
         fn read_terminal_for_agents(
@@ -852,64 +578,14 @@ mod tests {
             })
         }
 
-        fn open_terminal_for_agent(&self, cwd: Option<String>) -> Result<TerminalInfo, String> {
-            self.write_calls.fetch_add(1, Ordering::Relaxed);
-            let mut terminal = info("t-agent", true);
-            terminal.cwd = cwd.unwrap_or_else(|| "/agent-cwd".into());
-            Ok(terminal)
-        }
 
-        fn close_terminal_for_agent(&self, _terminal_id: &str) -> Result<(), String> {
-            self.write_calls.fetch_add(1, Ordering::Relaxed);
-            Ok(())
-        }
 
-        fn send_input_to_terminal(&self, _terminal_id: &str, bytes: &[u8]) -> Result<(), String> {
-            self.write_calls.fetch_add(1, Ordering::Relaxed);
-            *self.last_angle.lock().unwrap() = Some(TerminalAngle::Tail { lines: bytes.len() });
-            Ok(())
-        }
 
-        async fn run_in_terminal(
-            &self,
-            terminal_id: &str,
-            command: &str,
-            wait_ms: u64,
-        ) -> Result<TerminalRunResult, String> {
-            self.write_calls.fetch_add(1, Ordering::Relaxed);
-            // A canned "long command": never finishes inside a tiny wait.
-            if wait_ms == 0 {
-                return Ok(TerminalRunResult {
-                    terminal_id: terminal_id.into(),
-                    status: "running".into(),
-                    command: Some(command.into()),
-                    cwd: None,
-                    exit_code: None,
-                    marker_backed: true,
-                    since_seq: 7,
-                    seq: 7,
-                    lines: vec![],
-                    tracking_enabled: false,
-                });
-            }
-            Ok(TerminalRunResult {
-                terminal_id: terminal_id.into(),
-                status: "done".into(),
-                command: Some(command.into()),
-                cwd: Some("/repo".into()),
-                exit_code: Some(0),
-                marker_backed: true,
-                since_seq: 3,
-                seq: 9,
-                lines: vec!["built ok".into()],
-                tracking_enabled: false,
-            })
-        }
     }
 
     #[tokio::test]
     async fn catalog_lists_default_tools_and_executes() {
-        let catalog = McpCatalog::komet_default(Arc::new(FakeHost::default()));
+        let catalog = McpCatalog::komet_default(Arc::new(FakeHost));
         let names: Vec<_> = catalog.list().into_iter().map(|tool| tool.name).collect();
         assert_eq!(
             names,
@@ -919,10 +595,6 @@ mod tests {
                 "list_spaces".to_string(),
                 "terminal_list".to_string(),
                 "terminal_read".to_string(),
-                "terminal_open".to_string(),
-                "terminal_close".to_string(),
-                "terminal_send_input".to_string(),
-                "terminal_run".to_string(),
             ]
         );
         let v = catalog
@@ -941,55 +613,36 @@ mod tests {
         );
     }
 
-    /// The read gate an agent cannot lift: no tool sets visibility or
-    /// tracking. The WRITE tools that exist since step 5 are a different door
-    /// — they must all be non-readonly, because the ONLY thing standing
-    /// between them and the PTY is the per-call human approval the server
-    /// demands for non-readonly tools (`readonly: true` would silently
-    /// auto-allow them through the default policy).
+    /// Agents read terminals but never write: every tool is read-only and no
+    /// tool can open, close, type into or run anything in a terminal.
     #[tokio::test]
-    async fn no_tool_lifts_the_read_gate_and_writes_always_ask() {
-        let catalog = McpCatalog::komet_default(Arc::new(FakeHost::default()));
+    async fn catalog_has_no_terminal_write_tools() {
+        let catalog = McpCatalog::komet_default(Arc::new(FakeHost));
         for tool in catalog.list() {
-            let lower = tool.name.to_ascii_lowercase();
-            for forbidden in ["set", "visible", "track", "grant"] {
+            assert!(tool.readonly, "{} must be read-only", tool.name);
+            for forbidden in ["open", "close", "send", "input", "run", "set", "grant"] {
                 assert!(
-                    !lower.contains(forbidden),
-                    "tool {} would move the read gate",
+                    !tool.name.contains(forbidden),
+                    "tool {} would write to a terminal",
                     tool.name
                 );
             }
         }
-        let writes: Vec<_> = catalog
+        let terminal_tools: Vec<_> = catalog
             .list()
             .into_iter()
-            .filter(|t| !t.readonly)
             .map(|t| t.name)
+            .filter(|name| name.starts_with("terminal_"))
             .collect();
-        assert_eq!(
-            writes,
-            vec![
-                "terminal_open",
-                "terminal_close",
-                "terminal_send_input",
-                "terminal_run"
-            ],
-            "exactly the four approved-per-call writes may exist"
-        );
-        for name in &writes {
-            assert!(
-                !catalog.is_readonly(name, &serde_json::json!({})),
-                "{name} must never auto-allow"
-            );
-        }
-        // Reads stay auto-allowed.
-        for name in ["list_sessions", "terminal_list", "terminal_read"] {
-            assert!(catalog.is_readonly(name, &serde_json::json!({})));
-        }
+        assert_eq!(terminal_tools, vec!["terminal_list", "terminal_read"]);
+        let err = catalog
+            .execute("terminal_run", serde_json::json!({"command": "ls"}))
+            .await;
+        assert!(err.is_err(), "terminal_run must not exist");
     }
 
     #[tokio::test]
-    async fn terminal_list_answers_with_the_granted_terminals() {
+    async fn terminal_list_answers_with_the_terminals() {
         let catalog = McpCatalog::komet_default(Arc::new(GrantedHost::new()));
         let v = catalog
             .execute("terminal_list", serde_json::json!({}))
@@ -1005,12 +658,12 @@ mod tests {
         assert_eq!(terminals[0]["tracked"], true);
     }
 
-    /// The guard, end to end through the tool: a tracked-but-not-granted
+    /// The guard, end to end through the tool: an unknown
     /// terminal is refused with the engine's message, never answered with an
     /// empty string (a silent empty read would be the no-op this forbids).
     #[tokio::test]
-    async fn terminal_read_refuses_a_terminal_that_is_not_granted() {
-        let catalog = McpCatalog::komet_default(Arc::new(FakeHost::default()));
+    async fn terminal_read_surfaces_the_engine_refusal() {
+        let catalog = McpCatalog::komet_default(Arc::new(FakeHost));
         for angle in ["screen", "tail", "delta"] {
             let mut args = serde_json::json!({"terminalId": "t-hidden", "angle": angle});
             if angle == "delta" {
@@ -1021,7 +674,7 @@ mod tests {
                 .await
                 .expect_err("invisible terminal must be refused, not echoed empty");
             let msg = err.to_string();
-            assert!(msg.contains("not visible to agents"), "{msg}");
+            assert!(msg.contains("Unknown terminal"), "{msg}");
         }
     }
 
@@ -1145,118 +798,6 @@ mod tests {
         assert_eq!(host.read_calls.load(Ordering::Relaxed), 1);
     }
 
-    /// The execution side of the writing tools, through the host: `terminal_run`
-    /// on a terminal WITHOUT an id opens an agent-owned one first, and a
-    /// command outliving its wait answers with the tracking anchor instead of
-    /// failing.
-    #[tokio::test]
-    async fn terminal_run_opens_when_asked_and_escapes_long_commands() {
-        let host = Arc::new(GrantedHost::new());
-        let catalog = McpCatalog::komet_default(host.clone());
-        // waitMs 0 on the canned host = the "not finished inside the wait" path.
-        let v = catalog
-            .execute(
-                "terminal_run",
-                serde_json::json!({"command": "make world", "waitMs": 0}),
-            )
-            .await
-            .expect("run escapes into running");
-        assert_eq!(v["status"], "running");
-        assert_eq!(v["sinceSeq"], 7);
-        assert!(v["next"].as_str().unwrap().contains("terminal_read"));
-        // No terminalId given → an agent terminal was opened for the command.
-        assert_eq!(v["terminalId"], "t-agent");
-        assert_eq!(host.write_calls.load(Ordering::Relaxed), 2, "open + run");
-
-        // A finished one carries the block.
-        let host = Arc::new(GrantedHost::new());
-        let catalog = McpCatalog::komet_default(host.clone());
-        let v = catalog
-            .execute(
-                "terminal_run",
-                serde_json::json!({"command": "echo ok", "terminalId": "t-visible"}),
-            )
-            .await
-            .expect("run done");
-        assert_eq!(v["status"], "done");
-        assert_eq!(v["exitCode"], 0);
-        assert_eq!(v["lines"][0], "built ok");
-        // Only the run itself: the caller named a terminal, none was opened.
-        assert_eq!(host.write_calls.load(Ordering::Relaxed), 1);
-    }
-
-    #[tokio::test]
-    async fn send_input_takes_text_or_one_control_key_never_both() {
-        let host = Arc::new(GrantedHost::new());
-        let catalog = McpCatalog::komet_default(host.clone());
-        let v = catalog
-            .execute(
-                "terminal_send_input",
-                serde_json::json!({"terminalId": "t-visible", "keys": "ctrl+c"}),
-            )
-            .await
-            .expect("ctrl+c");
-        assert_eq!(v["written"], 1);
-        // The engine's write path saw the raw interrupt byte.
-        assert_eq!(
-            *host.last_angle.lock().unwrap(),
-            Some(TerminalAngle::Tail { lines: 1 })
-        );
-
-        let err = catalog
-            .execute(
-                "terminal_send_input",
-                serde_json::json!({"terminalId": "t-visible", "text": "ls\n", "keys": "enter"}),
-            )
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("not both"), "{err}");
-        let err = catalog
-            .execute(
-                "terminal_send_input",
-                serde_json::json!({"terminalId": "t-visible"}),
-            )
-            .await
-            .unwrap_err();
-        assert!(matches!(err, CatalogError::MissingArg(_)), "{err}");
-    }
-
-    #[test]
-    fn control_keys_map_to_the_pty_bytes() {
-        assert_eq!(key_bytes("ctrl+c").unwrap(), vec![0x03]);
-        assert_eq!(key_bytes("CTRL+C").unwrap(), vec![0x03]);
-        assert_eq!(key_bytes("ctrl+d").unwrap(), vec![0x04]);
-        assert_eq!(key_bytes("ctrl+l").unwrap(), vec![0x0c]);
-        assert_eq!(key_bytes("enter").unwrap(), b"\r");
-        assert_eq!(key_bytes("esc").unwrap(), vec![0x1b]);
-        let err = key_bytes("super+z").expect_err("unknown key refuses");
-        assert!(err.to_string().contains("unknown key"), "{err}");
-    }
-
-    /// The 30 s TOOL_TIMEOUT bypass, stated in one line: whatever the agent
-    /// asks, the wait is clamped strictly below it. The ceiling/timeout
-    /// invariant itself is a `const assert` next to `MAX_TERMINAL_RUN_WAIT_MS`
-    /// — it cannot rot into a passing test of a broken constant.
-    #[test]
-    fn run_waits_are_clamped_below_the_tool_timeout() {
-        assert_eq!(clamp_run_wait(None), DEFAULT_TERMINAL_RUN_WAIT_MS);
-        assert_eq!(clamp_run_wait(Some(1_000)), 1_000);
-        assert_eq!(clamp_run_wait(Some(u64::MAX)), MAX_TERMINAL_RUN_WAIT_MS);
-    }
-
-    #[tokio::test]
-    async fn write_tools_surface_the_engine_refusal_verbatim() {
-        let catalog = McpCatalog::komet_default(Arc::new(FakeHost::default()));
-        let err = catalog
-            .execute(
-                "terminal_close",
-                serde_json::json!({"terminalId": "t-human"}),
-            )
-            .await
-            .expect_err("FakeHost refuses like the engine does for a human terminal");
-        assert!(err.to_string().contains("no terminal closings"), "{err}");
-    }
-
     #[tokio::test]
     async fn terminal_read_delta_carries_only_the_answered_range() {
         let host = Arc::new(GrantedHost::new());
@@ -1303,7 +844,7 @@ mod tests {
 
     #[test]
     fn composio_mutations_require_permission_but_reads_do_not() {
-        let catalog = McpCatalog::komet_default(Arc::new(FakeHost::default()));
+        let catalog = McpCatalog::komet_default(Arc::new(FakeHost));
         assert!(catalog.is_readonly(
             "composio_composio_multi_execute_tool",
             &serde_json::json!({"tools": [{"tool_slug": "GMAIL_SEARCH_EMAILS"}]})
