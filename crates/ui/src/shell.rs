@@ -77,9 +77,11 @@ use crate::transcript::{
 const SPLIT_RIGHT_PANE_MIN: f32 = 560.0;
 
 mod github;
+mod sidebar_memo;
 mod spaces;
 mod tabs;
 
+use sidebar_memo::SidebarMemo;
 use spaces::{AddSpaceFlow, RenameSpaceDialog};
 
 actions!(
@@ -1211,6 +1213,8 @@ pub struct Shell {
     /// Last rendered sidebar order (key + estimated height) — the FLIP baseline
     /// for the §1.6 resort glide.
     sidebar_prev_order: Vec<(String, f32)>,
+    /// Memoized sidebar grouping/sorting (see `sidebar_memo`).
+    sidebar_memo: std::cell::RefCell<SidebarMemo>,
     /// Per-key paint offsets of the resort in flight, keyed elements restart on
     /// `resort_epoch` bumps.
     sidebar_resort: std::collections::HashMap<String, f32>,
@@ -1497,6 +1501,7 @@ impl Shell {
             panels: SessionPanels::default(),
             active_chat: String::new(),
             sidebar_prev_order: Vec::new(),
+            sidebar_memo: Default::default(),
             sidebar_resort: std::collections::HashMap::new(),
             sidebar_new_keys: std::collections::HashSet::new(),
             resort_epoch: 0,
@@ -4990,7 +4995,8 @@ impl Shell {
             // Keyed rows: (stable key, estimated height, element) — the key + height
             // list drives the §1.6 resort FLIP diff below (attention-bucket
             // promotions glide; cleared rows just go).
-            let keyed: Vec<(String, f32, AnyElement)> = self.render_active_rows(theme, window, cx);
+            let (flat, elements) = self.render_active_rows(theme, window, cx);
+            let order = &flat.order;
 
             // Resort glide (§1.6 View Transitions parity): when the ORDER of a live
             // list changes (new activity resort, grouping flip), surviving rows
@@ -4999,11 +5005,10 @@ impl Shell {
             // over 260ms cubic-bezier(0.22,1,0.36,1). New rows fade in; removals
             // just go (matching the original). First fill and chat switches (which
             // don't reorder) never animate.
-            let order: Vec<(String, f32)> = keyed.iter().map(|(k, h, _)| (k.clone(), *h)).collect();
-            if self.sidebar_prev_order != order {
+            if self.sidebar_prev_order != *order {
                 if !self.sidebar_prev_order.is_empty() {
                     let offsets =
-                        resort_offsets(&self.sidebar_prev_order, &order, SIDEBAR_LIST_GAP);
+                        resort_offsets(&self.sidebar_prev_order, order, SIDEBAR_LIST_GAP);
                     let prev_keys: std::collections::HashSet<&str> = self
                         .sidebar_prev_order
                         .iter()
@@ -5020,13 +5025,14 @@ impl Shell {
                         self.sidebar_new_keys = new_keys;
                     }
                 }
-                self.sidebar_prev_order = order;
+                self.sidebar_prev_order = order.clone();
             }
             let epoch = self.resort_epoch;
-            keyed
-                .into_iter()
-                .map(|(key, _, element)| {
-                    if let Some(dy) = self.sidebar_resort.get(&key).copied() {
+            flat.order
+                .iter()
+                .zip(elements)
+                .map(|((key, _), element)| {
+                    if let Some(dy) = self.sidebar_resort.get(key).copied() {
                         let id = SharedString::from(format!("resort-{epoch}-{key}"));
                         div()
                             .child(element)
@@ -5034,7 +5040,7 @@ impl Shell {
                                 el.relative().top(px(dy * (1.0 - t)))
                             })
                             .into_any_element()
-                    } else if self.sidebar_new_keys.contains(&key) {
+                    } else if self.sidebar_new_keys.contains(key) {
                         let id = SharedString::from(format!("row-in-{epoch}-{key}"));
                         motion::fade_quick(id, div().child(element)).into_any_element()
                     } else {
