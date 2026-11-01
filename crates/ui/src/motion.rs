@@ -40,15 +40,20 @@ pub use gpui::AnimationExt;
 // Pulse clock — frame-synchronized drive for the repeating loaders
 // ---------------------------------------------------------------------------
 
-/// How long a view stays on the tick list after its last spinner paint. One
-/// lease outlives a few missed frames; an unmounted spinner stops renewing and
+/// How long a view stays on the tick list after its last spinner render. One
+/// lease outlives a few missed ticks; an unmounted spinner stops renewing and
 /// the view drops off, letting the clock park.
-/// 100ms (was 300ms): the clock parks sooner after a spinner unmounts.
 const PULSE_LEASE: Duration = Duration::from_millis(100);
+
+/// Loader cadence. Notifying a view dirties every ancestor up to the window
+/// root, so each loader frame re-renders the shell; ~30 fps keeps the dotted
+/// loaders smooth without running that pass at the display's 60–120 Hz.
+const PULSE_INTERVAL: Duration = Duration::from_millis(33);
 
 struct PulseClock {
     epoch: Instant,
     leases: HashMap<EntityId, Instant>,
+    ticking: bool,
 }
 
 impl Global for PulseClock {}
@@ -58,68 +63,77 @@ impl Default for PulseClock {
         Self {
             epoch: Instant::now(),
             leases: HashMap::new(),
+            ticking: false,
         }
     }
 }
 
 impl PulseClock {
+    /// Renew `view`'s lease; true when the ticker is parked and must start.
     fn renew(&mut self, view: EntityId, now: Instant) -> bool {
-        let already_active = self.leases.get(&view).is_some_and(|until| *until > now);
         self.leases.insert(view, now + PULSE_LEASE);
-        !already_active
+        !std::mem::replace(&mut self.ticking, true)
     }
 
     fn active_views(&mut self, now: Instant) -> Vec<EntityId> {
         self.leases.retain(|_, until| *until > now);
         self.leases.keys().copied().collect()
     }
+
+    /// One tick: the views to notify, parking the ticker once none remain.
+    fn tick(&mut self, now: Instant) -> Vec<EntityId> {
+        let views = self.active_views(now);
+        if views.is_empty() {
+            self.ticking = false;
+        }
+        views
+    }
 }
 
-fn renew_pulse_lease(view: EntityId, window: &mut Window, cx: &mut App) -> bool {
+fn renew_pulse_lease(view: EntityId, cx: &mut App) -> bool {
     if cx.reduce_motion() {
         return false;
     }
-    let now = Instant::now();
-    let first_frame = cx.default_global::<PulseClock>().renew(view, now);
-    if first_frame {
-        // Prime the frame loop when a spinner mounts after the root's
-        // `pulse_frame` check for this pass. The root's render tail is not
-        // guaranteed to run for a child-only invalidation, so ask the window
-        // for the next frame directly.
-        cx.notify(view);
-        window.request_animation_frame();
+    if cx
+        .default_global::<PulseClock>()
+        .renew(view, Instant::now())
+    {
+        cx.spawn(async move |cx| {
+            loop {
+                cx.background_executor().timer(PULSE_INTERVAL).await;
+                let alive = cx.update(|cx| {
+                    let views = cx.default_global::<PulseClock>().tick(Instant::now());
+                    for view in &views {
+                        cx.notify(*view);
+                    }
+                    !views.is_empty()
+                });
+                if !alive {
+                    break;
+                }
+            }
+        })
+        .detach();
     }
     true
 }
 
 /// Current phase `[0,1)` of a repeating spec, plus a lease that keeps the
-/// calling view re-rendering while its spinner stays mounted. The root frame
-/// driver requests the next vsync only while leases remain. All cells across
-/// all views share one epoch, so multi-instance loaders stay phase-locked.
-/// Reduced motion returns a static 0 and schedules nothing.
-pub fn pulse_delta(spec: &MotionSpec, view: EntityId, window: &mut Window, cx: &mut App) -> f32 {
-    if !renew_pulse_lease(view, window, cx) {
+/// calling view re-rendering while its spinner stays mounted. A shared timer
+/// notifies leased views at [`PULSE_INTERVAL`] and parks when none remain. All
+/// cells across all views share one epoch, so multi-instance loaders stay
+/// phase-locked. Reduced motion returns a static 0 and schedules nothing.
+pub fn pulse_delta(spec: &MotionSpec, view: EntityId, _window: &mut Window, cx: &mut App) -> f32 {
+    if !renew_pulse_lease(view, cx) {
         return 0.0;
     }
     let clock = cx.default_global::<PulseClock>();
     (clock.epoch.elapsed().as_secs_f32() / spec.total().as_secs_f32()).fract()
 }
 
-/// Register a view for redraws from the root's vsync-driven pulse clock.
-pub fn pulse_lease(view: EntityId, window: &mut Window, cx: &mut App) {
-    renew_pulse_lease(view, window, cx);
-}
-
-/// Advance pulse leases once per root frame. Active child views are notified;
-/// the root itself is already rendering and must not schedule an extra pass.
-pub fn pulse_frame(root: EntityId, cx: &mut App) -> bool {
-    let views = cx
-        .default_global::<PulseClock>()
-        .active_views(Instant::now());
-    for view in views.iter().copied().filter(|view| *view != root) {
-        cx.notify(view);
-    }
-    !views.is_empty()
+/// Register a view for redraws from the shared pulse ticker.
+pub fn pulse_lease(view: EntityId, _window: &mut Window, cx: &mut App) {
+    renew_pulse_lease(view, cx);
 }
 
 /// Elapsed time in seconds from the shared pulse clock epoch.
@@ -717,17 +731,18 @@ mod tests {
     }
 
     #[test]
-    fn pulse_clock_requests_a_frame_only_for_new_or_expired_leases() {
+    fn pulse_ticker_starts_once_and_parks_when_leases_lapse() {
         let mut clock = PulseClock::default();
         let now = Instant::now();
         let view = EntityId::from(1);
 
-        assert!(clock.renew(view, now));
+        assert!(clock.renew(view, now), "first lease starts the ticker");
         assert!(!clock.renew(view, now + Duration::from_millis(20)));
-        assert!(clock.renew(
-            view,
-            now + Duration::from_millis(20) + PULSE_LEASE + Duration::from_millis(1)
-        ));
+        assert_eq!(clock.tick(now + Duration::from_millis(30)), vec![view]);
+
+        let lapsed = now + Duration::from_millis(20) + PULSE_LEASE + Duration::from_millis(1);
+        assert!(clock.tick(lapsed).is_empty());
+        assert!(clock.renew(view, lapsed), "a parked ticker restarts");
     }
 
     #[test]

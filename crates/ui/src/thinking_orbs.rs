@@ -9,7 +9,7 @@
 //! - High-performance GPU-rendered rounded quads for anti-aliased dots & stroke paths for lines.
 //! - Accurate 3D projection, depth shading, and z-sorting.
 //! - Light / Dark theme awareness (`white` ink inversion).
-//! - Automatic frame throttling and `reduce_motion` accessibility support.
+//! - Frame throttling via the shared pulse clock and `reduce_motion` support.
 
 use std::time::Instant;
 
@@ -1117,10 +1117,12 @@ impl IntoElement for ThinkingOrb {
                         let time = if reduced || paused {
                             0.0
                         } else {
-                            if let Some(v) = driven_view {
-                                crate::motion::pulse_lease(v, window, cx);
+                            // Driven orbs tick with the shared pulse clock;
+                            // only an undriven orb pulls frames itself.
+                            match driven_view {
+                                Some(v) => crate::motion::pulse_lease(v, window, cx),
+                                None => window.request_animation_frame(),
                             }
-                            window.request_animation_frame();
                             orb_time()
                         };
 

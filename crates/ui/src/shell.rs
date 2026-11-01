@@ -9320,10 +9320,9 @@ impl Render for Shell {
             root
         };
 
-        // Manual tweens, hover fades, and leased pulse animations share this
-        // root's vsync cadence; nothing polls while all three are idle.
-        let pulses_active = motion::pulse_frame(cx.entity_id(), cx);
-        if self.motion_active.get() | motion::hover_frame(cx.entity_id(), cx) | pulses_active {
+        // Manual tweens and hover fades share this root's vsync cadence;
+        // looping loaders run on the slower pulse ticker (`motion`).
+        if self.motion_active.get() | motion::hover_frame(cx.entity_id(), cx) {
             window.request_animation_frame();
         }
 

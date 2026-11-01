@@ -122,6 +122,8 @@ ignore = "0.4"
 # Distribution profile (scripts/package-linux.sh): thin LTO buys most of fat
 # LTO's size/speed win at a fraction of the link time; strip debug symbols.
 lto = "thin"
+# One codegen unit: slower release links, faster and smaller binary.
+codegen-units = 1
 strip = "symbols"
 
 [profile.dev]
