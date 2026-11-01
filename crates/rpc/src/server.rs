@@ -22,6 +22,8 @@ pub async fn serve_connection(
     out: mpsc::Sender<String>,
     mut inbound: mpsc::Receiver<String>,
 ) {
+    const PRUNE_MIN: usize = 64;
+    let mut prune_at = PRUNE_MIN;
     let mut running: HashMap<u64, tokio::task::AbortHandle> = HashMap::new();
     while let Some(payload) = inbound.recv().await {
         // ndjson: a transport may batch several frames per message.
@@ -37,7 +39,11 @@ pub async fn serve_connection(
                     continue;
                 }
             };
-            running.retain(|_, task| !task.is_finished());
+            // Amortised pruning: scan only when the map has doubled since the last scan.
+            if running.len() >= prune_at {
+                running.retain(|_, task| !task.is_finished());
+                prune_at = (running.len() * 2).max(PRUNE_MIN);
+            }
             if frame.cancel {
                 if let Some(task) = running.remove(&frame.id) {
                     task.abort();
@@ -48,6 +54,15 @@ pub async fn serve_connection(
                 tracing::warn!(id = frame.id, "rpc: frame has neither method nor cancel");
                 continue;
             };
+            // Replies are routed by id, so a second live request with the same id
+            // would interleave its frames into the first caller's pending slot, and
+            // replacing the handle would make the first task uncancellable. Keep the
+            // original running and drop the duplicate without replying (any reply
+            // would be delivered to the original caller).
+            if running.get(&frame.id).is_some_and(|t| !t.is_finished()) {
+                tracing::warn!(id = frame.id, "rpc: dropping request with in-flight id");
+                continue;
+            }
             let task = tokio::spawn(handle_request(
                 service.clone(),
                 out.clone(),
