@@ -1160,67 +1160,76 @@ impl Shell {
     ) -> Vec<(String, f32, AnyElement)> {
         let now = Utc::now();
         let filter = self.settings.space_filter.clone();
-        let rows: Vec<(ChatIndicator, komet_proto::Chat, String, Option<String>)> = {
-            let state = self.state.read(cx);
-            state
-                .overview_chats(now)
-                .into_iter()
-                .filter(|(_, chat)| match &filter {
-                    Some(space_id) => chat.space_id.as_deref() == Some(space_id.as_str()),
-                    None => true,
-                })
-                .map(|(status, chat)| {
-                    // Line 1 is "project @ device" (t3code's project row);
-                    // project-less sessions read as their home-dir cwd `~`.
-                    let space = state.space_for_chat(chat);
-                    let mut folder = match (space, chat.space_id.as_deref()) {
-                        (Some(space), _) => space.display_name().to_string(),
-                        (None, None) => "~".to_string(),
-                        (None, Some(_)) => "?".to_string(),
-                    };
-                    // Unknown device → no fragment, same as the archived list.
-                    if let Some(device) = state.device_name(&chat.device_id) {
-                        folder = format!("{folder} @ {device}");
-                    }
-                    // The branch shows whenever the engine has stamped one —
-                    // main-checkout sessions included, not just worktrees.
-                    let branch = chat
-                        .branch
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|b| !b.is_empty())
-                        .map(str::to_string);
-                    (status, chat.clone(), folder, branch)
-                })
-                .collect()
+        let revision = self.sidebar_cache_revision(cx);
+        let rows: Vec<super::SidebarSessionRow> = match &self.sidebar_active_cache {
+            Some((cached_revision, cached_rows)) if *cached_revision == revision => {
+                cached_rows.clone()
+            }
+            _ => {
+                let state = self.state.read(cx);
+                let rows: Vec<super::SidebarSessionRow> = state
+                    .overview_chats(now)
+                    .into_iter()
+                    .filter(|(_, chat)| match &filter {
+                        Some(space_id) => chat.space_id.as_deref() == Some(space_id.as_str()),
+                        None => true,
+                    })
+                    .map(|(status, chat)| {
+                        let space = state.space_for_chat(chat);
+                        let mut folder = match (space, chat.space_id.as_deref()) {
+                            (Some(space), _) => space.display_name().to_string(),
+                            (None, None) => "~".to_string(),
+                            (None, Some(_)) => "?".to_string(),
+                        };
+                        if let Some(device) = state.device_name(&chat.device_id) {
+                            folder = format!("{folder} @ {device}");
+                        }
+                        let branch = chat
+                            .branch
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|b| !b.is_empty())
+                            .map(str::to_string);
+                        super::SidebarSessionRow {
+                            status,
+                            chat: chat.clone(),
+                            folder,
+                            branch,
+                        }
+                    })
+                    .collect();
+                self.sidebar_active_cache = Some((revision, rows.clone()));
+                rows
+            }
         };
         let selected = self.state.read(cx).selected_chat.clone();
         rows.into_iter()
-            .map(|(status, chat, folder, branch)| {
+            .map(|row| {
                 let time_ago: SharedString =
-                    format_time_ago(chat.last_message_at.unwrap_or(chat.created_at), now).into();
-                let is_selected = selected.as_deref() == Some(chat.id.as_str());
+                    format_time_ago(row.chat.last_message_at.unwrap_or(row.chat.created_at), now)
+                        .into();
+                let is_selected = selected.as_deref() == Some(row.chat.id.as_str());
                 let height = super::CHAT_ROW_HEIGHT;
-                let harness = chat.config.as_ref().map(|c| c.harness);
+                let harness = row.chat.config.as_ref().map(|c| c.harness);
                 let element = self.render_chat_row(
-                    chat.id.clone(),
+                    row.chat.id.clone(),
                     transcript::single_line(
-                        &chat.title.clone().unwrap_or_else(|| "New session".into()),
+                        &row.chat.title.clone().unwrap_or_else(|| "New session".into()),
                     )
                     .into(),
                     time_ago,
-                    folder.into(),
-                    branch.map(SharedString::from),
+                    row.folder.into(),
+                    row.branch.map(SharedString::from),
                     harness,
-                    status,
+                    row.status,
                     is_selected,
                     false,
-                    chat.pinned,
+                    row.chat.pinned,
                     theme,
                     window,
                     cx,
                 );
-                (format!("c:{}", chat.id), height, element)
+                (format!("c:{}", row.chat.id), height, element)
             })
             .collect()
     }

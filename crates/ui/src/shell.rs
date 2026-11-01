@@ -12,6 +12,7 @@
 //! dock. Double-clicking a handle resets that pane to its default width.
 
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -28,7 +29,7 @@ use komet_engine::InstanceLock;
 use komet_engine::environments::LOCAL_ENV_ID;
 use komet_engine::harness_cli::HarnessCliStatus;
 use komet_engine::registry::{HarnessDescriptor, descriptor_enabled};
-use komet_proto::{AuthState, HarnessId, WorkspaceScope};
+use komet_proto::{AuthState, ChatIndicator, HarnessId, WorkspaceScope};
 use komet_rpc::methods;
 
 use crate::changes::{Changes, ChangesEvent};
@@ -1027,6 +1028,14 @@ struct OrgGateUi {
     _events: Subscription,
 }
 
+#[derive(Clone, Debug)]
+pub(super) struct SidebarSessionRow {
+    pub(super) status: ChatIndicator,
+    pub(super) chat: komet_proto::Chat,
+    pub(super) folder: String,
+    pub(super) branch: Option<String>,
+}
+
 pub struct Shell {
     state: Entity<AppState>,
     transcript: Entity<Transcript>,
@@ -1208,6 +1217,9 @@ pub struct Shell {
     panels: SessionPanels,
     /// The panel key of the chat currently shown ("" = new-chat canvas).
     active_chat: String,
+    /// Cached main-session metadata: the sidebar only re-sorts/rebuilds this
+    /// when the visible chat set or filter changes.
+    sidebar_active_cache: Option<(u64, Vec<SidebarSessionRow>)>,
     /// Last rendered sidebar order (key + estimated height) — the FLIP baseline
     /// for the §1.6 resort glide.
     sidebar_prev_order: Vec<(String, f32)>,
@@ -1275,6 +1287,26 @@ pub struct Shell {
 }
 
 impl Shell {
+    fn sidebar_cache_revision(&self, cx: &mut Context<Self>) -> u64 {
+        let state = self.state.read(cx);
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+
+        for chat in state.visible_chats().filter(|c| !c.archived) {
+            chat.id.hash(&mut hasher);
+            chat.space_id.hash(&mut hasher);
+            chat.device_id.hash(&mut hasher);
+            chat.pinned.hash(&mut hasher);
+            chat.last_message_at
+                .map(|ts| ts.timestamp_millis())
+                .hash(&mut hasher);
+            chat.created_at.timestamp_millis().hash(&mut hasher);
+            chat.branch.hash(&mut hasher);
+        }
+
+        self.settings.space_filter.hash(&mut hasher);
+        hasher.finish()
+    }
+
     pub fn new(state: Entity<AppState>, boot: EngineBootConfig, cx: &mut Context<Self>) -> Self {
         let observation = cx.observe(&state, |this: &mut Shell, state, cx| {
             this.on_state_changed(&state, cx);
@@ -1496,6 +1528,7 @@ impl Shell {
             settings,
             panels: SessionPanels::default(),
             active_chat: String::new(),
+            sidebar_active_cache: None,
             sidebar_prev_order: Vec::new(),
             sidebar_resort: std::collections::HashMap::new(),
             sidebar_new_keys: std::collections::HashSet::new(),
