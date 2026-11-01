@@ -3056,14 +3056,12 @@ impl Transcript {
 
     /// Rebuild rows from app state; splice minimal ranges into the list.
     fn sync(&mut self, cx: &mut Context<Self>) {
-        let (selected, entries, echoes) = {
-            let s = self.state.read(cx);
-            (
-                s.selected_chat.clone(),
-                s.transcript.clone(),
-                s.pending_echoes().to_vec(),
-            )
-        };
+        // Rows are built from a borrow of the state: this runs on every
+        // AppState notify, and cloning the whole transcript here cost
+        // O(transcript bytes) each time.
+        let state = self.state.clone();
+        let s = state.read(cx);
+        let selected = s.selected_chat.clone();
 
         let attached = selected != self.chat_id;
         if attached {
@@ -3110,12 +3108,13 @@ impl Transcript {
         // Todo diffs derive from entry order: restart the cursor so every
         // pass computes the same diffs whether rows came from cache or not.
         self.todo_cursor = None;
-        for entry in &entries {
+        for entry in &s.transcript {
             new_rows.extend(self.rows_for(entry, false));
         }
-        for echo in &echoes {
+        for echo in s.pending_echoes() {
             new_rows.extend(self.rows_for(echo, true));
         }
+        let has_entries = !s.transcript.is_empty();
 
         // Text already streamed before this (re)attach is the veil BASELINE:
         // its rows' veils seed instead of fading (render creates them from
@@ -3127,7 +3126,7 @@ impl Transcript {
             self.veil_baseline.clear();
             self.veil_attach_pending = true;
         }
-        if self.veil_attach_pending && !entries.is_empty() {
+        if self.veil_attach_pending && has_entries {
             self.veil_attach_pending = false;
             self.veil_baseline = new_rows
                 .iter()
