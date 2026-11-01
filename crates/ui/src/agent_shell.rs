@@ -22,10 +22,9 @@
 //!   output)" the agent never claimed.
 //!
 //! Orthogonality note for the security audit: this panel has nothing to do with
-//! the `agent_visible` read gate on Komet terminals
-//! (`crates/engine/src/terminals.rs`) — that gate decides whether an AGENT may
-//! read a Komet terminal, which is a human decision. A human reading their own
-//! agent's transcript is not a permission decision and grants nothing.
+//! agent access to Komet terminals (agents may read them, never write). A human
+//! reading their own agent's transcript is not a permission decision and grants
+//! nothing.
 
 use gpui::{AnyElement, SharedString, div, prelude::*, px};
 use komet_proto::ProgressSurface;
