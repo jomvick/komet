@@ -10,10 +10,7 @@
 //! new tab, mod+shift+W close, mod+shift+] / [ cycle, F2 rename, mod+= / - /
 //! 0 font zoom, mod+shift+Up / Down walk the OSC 133 command prompts and
 //! mod+shift+O jumps to the output of the command under the viewport top. Tab
-//! labels prefer a rename, then the OSC title, then `cwd · shell`; a BEL flashes
-//! the tab, dots the grid, and optionally chimes. An eye on the tab says the
-//! terminal's text is currently readable by agents
-//! (the tab's `agent_visible` flag), toggled from the right-click menu).
+//! labels prefer a rename, then the OSC title, then `cwd · shell`.
 //!
 //! Data path per tab: `OpenTerminal` → `SubscribeTerminal` stream; Data frames
 //! (base64) feed the [`Emulator`]; query responses write back; the stream
@@ -57,9 +54,6 @@ use super::view::{
 /// Fixed tab width — drag-reorder math stays analytic.
 pub const TAB_WIDTH: f32 = 118.0;
 pub const TAB_BAR_HEIGHT: f32 = 40.0;
-
-/// How long a BEL keeps the tab flashing / the grid dotted.
-pub const BELL_FLASH: Duration = Duration::from_millis(900);
 
 actions!(
     terminal,
@@ -277,24 +271,6 @@ pub fn tab_title(
     }
 }
 
-/// Consume a pending BEL from the emulator and stamp the flash. Returns
-/// `true` exactly when a NEW bell arrived — the caller rings (flash +
-/// optional chime) on that edge only. Every frame that touches a tab must
-/// call this; an unconsumed bell would otherwise re-fire forever.
-pub fn consume_bell(emu: &mut Emulator, flash: &mut Option<Instant>, now: Instant) -> bool {
-    if emu.take_bell() {
-        *flash = Some(now);
-        true
-    } else {
-        false
-    }
-}
-
-/// Whether a tab's BEL is still visibly ringing at `now`.
-pub fn bell_ringing(flash: Option<Instant>, now: Instant) -> bool {
-    flash.is_some_and(|fired| now.saturating_duration_since(fired) < BELL_FLASH)
-}
-
 fn decode_base64(data: &str) -> Vec<u8> {
     base64::engine::general_purpose::STANDARD
         .decode(data)
@@ -368,14 +344,6 @@ struct TerminalTab {
     session_shell: Option<String>,
     /// Rename applied by the user (F2 / context menu); wins over everything.
     custom_title: Option<SharedString>,
-    /// When a BEL last rang on this tab; drives the flash + grid dot.
-    bell_flash: Option<Instant>,
-    /// The human's grant that agents may read this terminal's text — the
-    /// engine's `agent_visible` flag, mirrored here for the tab badge. It only
-    /// ever moves when `SetTerminalAgentVisible` answers `ok`, or when
-    /// `ListTerminals` reports the engine's truth after a (re)open: a badge
-    /// that lies about exposure is worse than no badge.
-    agent_visible: bool,
 }
 
 /// Settings the panel renders from (kept in sync by the shell, which owns
@@ -385,7 +353,6 @@ struct TerminalTab {
 pub struct TerminalPrefs {
     pub font_size: f32,
     pub scrollback_lines: u32,
-    pub bell_audible: bool,
 }
 
 impl Default for TerminalPrefs {
@@ -393,18 +360,16 @@ impl Default for TerminalPrefs {
         Self {
             font_size: TERMINAL_FONT_SIZE_DEFAULT,
             scrollback_lines: TERMINAL_SCROLLBACK_DEFAULT,
-            bell_audible: false,
         }
     }
 }
 
-/// Panel → shell communication. Font/bell events carry the new value so the
+/// Panel → shell communication. Font events carry the new value so the
 /// shell can persist it and mirror it onto the other panel instance (drawer
 /// vs embedded); `TabClosed` lets the embedded surface strip drop its tab.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TerminalPanelEvent {
     FontSizeChanged(f32),
-    BellAudibleChanged(bool),
     TabActivated(u64),
     TabClosed(u64),
 }
