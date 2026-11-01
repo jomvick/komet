@@ -8,7 +8,7 @@
 //!   the custom grid-painting element;
 //! - [`panel`] — session-scoped tabs, subscriptions with reconnect backoff,
 //!   drag-reorder, the Cmd/Ctrl+J toggle, tab chrome (new/close/cycle/rename,
-//!   useful titles, visual bell) and font zoom; settings persist through the
+//!   useful titles) and font zoom; settings persist through the
 //!   shell via [`panel::TerminalPanelEvent`].
 //!
 //! Method names come from `komet_rpc::methods` and wire types from
