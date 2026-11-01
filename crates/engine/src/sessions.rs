@@ -727,7 +727,6 @@ impl SessionsEngine {
         let mut catalog = McpCatalog::komet_default(Arc::new(EngineMcpHost::new(
             self.clone(),
             workspace,
-            run_id,
         )));
         match self.inner.mcp_secrets.composio_platform_api_key() {
             Ok(Some(api_key)) => {
