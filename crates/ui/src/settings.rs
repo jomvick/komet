@@ -158,9 +158,6 @@ pub struct UiSettings {
     /// Scrollback lines kept per terminal tab. Applied when a tab's emulator
     /// is built — a running tab keeps its current capacity until reopened.
     pub terminal_scrollback_lines: u32,
-    /// Play a chime on a terminal BEL (`\x07` / OSC bell) in addition to the
-    /// visual flash. `KOMET_DISABLE_SOUND` still wins.
-    pub terminal_bell_audible: bool,
     /// Customizable shortcut combos (feature-inventory §1.4).
     pub keymap: KeymapConfig,
     /// Light/dark preference. Defaults to following the OS.
@@ -205,7 +202,6 @@ impl Default for UiSettings {
             terminal_open: false,
             terminal_font_size: TERMINAL_FONT_SIZE_DEFAULT,
             terminal_scrollback_lines: TERMINAL_SCROLLBACK_DEFAULT,
-            terminal_bell_audible: false,
             keymap: KeymapConfig::default(),
             appearance: crate::appearance::AppearanceMode::default(),
             wallpaper_path: None,
@@ -533,7 +529,6 @@ mod tests {
             terminal_open: true,
             terminal_font_size: 15.0,
             terminal_scrollback_lines: 5_000,
-            terminal_bell_audible: true,
             keymap: KeymapConfig {
                 toggle_sidebar: "mod-shift-s".into(),
                 ..KeymapConfig::default()
@@ -762,14 +757,13 @@ mod tests {
         );
     }
 
-    /// The chrome settings (font size, scrollback, audible bell) must load,
+    /// The chrome settings (font size, scrollback) must load,
     /// clamp on hand-edited files, and stay absent-safe for older files.
     #[test]
     fn terminal_chrome_settings_round_trip_and_clamp() {
         let d = UiSettings::default();
         assert_eq!(d.terminal_font_size, 13.0);
         assert_eq!(d.terminal_scrollback_lines, 10_000);
-        assert!(!d.terminal_bell_audible);
 
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -780,7 +774,6 @@ mod tests {
         let loaded = UiSettings::load(dir.path());
         assert_eq!(loaded.terminal_font_size, TERMINAL_FONT_SIZE_MAX);
         assert_eq!(loaded.terminal_scrollback_lines, TERMINAL_SCROLLBACK_MIN);
-        assert!(loaded.terminal_bell_audible);
 
         // A file from before these settings existed keeps defaults, not a
         // failed parse.
@@ -788,6 +781,5 @@ mod tests {
         let old = UiSettings::load(dir.path());
         assert_eq!(old.terminal_font_size, TERMINAL_FONT_SIZE_DEFAULT);
         assert_eq!(old.terminal_scrollback_lines, TERMINAL_SCROLLBACK_DEFAULT);
-        assert!(!old.terminal_bell_audible);
     }
 }
