@@ -1948,11 +1948,7 @@ impl RpcService for EngineRpc {
             // doc path, second consumer — the fold is untouched.
             methods::WATCH_REASONING => {
                 let p: ChatParams = parse_params(params)?;
-                let from = self.sessions.latest_seq(&p.chat_id);
-                let (_replay, rx) = self
-                    .sessions
-                    .subscribe(&p.chat_id, from)
-                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                let rx = self.sessions.subscribe_live(&p.chat_id);
                 Ok(RpcReply::Stream(reasoning_stream(rx)))
             }
             // Live activity: same hub, ephemeral frames only. The engine's
@@ -1960,11 +1956,7 @@ impl RpcService for EngineRpc {
             // host's numbers rather than measuring the wire.
             methods::WATCH_ACTIVITY => {
                 let p: ChatParams = parse_params(params)?;
-                let from = self.sessions.latest_seq(&p.chat_id);
-                let (_replay, rx) = self
-                    .sessions
-                    .subscribe(&p.chat_id, from)
-                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                let rx = self.sessions.subscribe_live(&p.chat_id);
                 let feeds = self.sessions.subagent_feeds();
                 Ok(RpcReply::Stream(activity_stream(rx, feeds, p.chat_id)))
             }
