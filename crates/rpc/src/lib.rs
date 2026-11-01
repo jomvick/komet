@@ -163,7 +163,6 @@ pub mod methods {
     // itself. The three reads answer only for terminals carrying that grant,
     // and refuse loudly otherwise (guard first, then the "not tracked" error).
     pub const LIST_TERMINALS: &str = "ListTerminals";
-    pub const SET_TERMINAL_AGENT_VISIBLE: &str = "SetTerminalAgentVisible";
     pub const READ_TERMINAL_SCREEN: &str = "ReadTerminalScreen";
     pub const READ_TERMINAL_TAIL: &str = "ReadTerminalTail";
     pub const READ_TERMINAL_DELTA: &str = "ReadTerminalDelta";
