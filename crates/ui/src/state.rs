@@ -433,7 +433,14 @@ impl EngineHandle {
             return Ok(handle);
         }
 
-        if config.managed_engine
+        // On Linux, the managed engine often fails to bind IPC within the timeout.
+        // Default to embedded for faster startup; managed can be enabled via env var.
+        #[cfg(target_os = "linux")]
+        let use_managed = config.managed_engine && std::env::var("KOMET_USE_MANAGED_ENGINE").is_ok();
+        #[cfg(not(target_os = "linux"))]
+        let use_managed = config.managed_engine;
+
+        if use_managed
             && let Some(handle) = Self::start_managed_engine(&config).await
         {
             return Ok(handle);
@@ -728,8 +735,10 @@ impl EngineHandle {
         // healthy children and forced the slower embedded path. Wait for the
         // real condition instead — IPC attach or child exit — with a generous
         // cap and a heartbeat so a slow boot is visible in the log.
-        const START_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
-        const PROGRESS_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
+        // Reduced from 180s to 5s because the embedded engine assembles in ~16s,
+        // and if the managed engine takes longer we should fall back to embedded.
+        const START_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+        const PROGRESS_EVERY: std::time::Duration = std::time::Duration::from_secs(2);
         let started = tokio::time::Instant::now();
         let deadline = started + START_TIMEOUT;
         let mut next_progress = started + PROGRESS_EVERY;
