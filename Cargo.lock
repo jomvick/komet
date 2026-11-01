@@ -3698,6 +3698,7 @@ dependencies = [
  "komet-rpc",
  "komet-sync",
  "komet-sync-server",
+ "komet-term",
  "komet-update",
  "libc",
  "loro",
@@ -3729,6 +3730,7 @@ dependencies = [
  "base64",
  "futures",
  "komet-proto",
+ "komet-term",
  "libc",
  "reqwest",
  "serde",
@@ -3857,10 +3859,16 @@ dependencies = [
 ]
 
 [[package]]
-name = "komet-ui"
+name = "komet-term"
 version = "1.3.1"
 dependencies = [
  "alacritty_terminal",
+]
+
+[[package]]
+name = "komet-ui"
+version = "1.3.1"
+dependencies = [
  "anyhow",
  "async-trait",
  "base64",
@@ -3876,6 +3884,7 @@ dependencies = [
  "komet-proto",
  "komet-rpc",
  "komet-syntax",
+ "komet-term",
  "komet-update",
  "libc",
  "nucleo-matcher",

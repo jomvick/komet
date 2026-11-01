@@ -1,0 +1,4 @@
+{"type":"started","key":"v2:94a3aa597fc650e2e74c944767129f4a597f9bc63849e3be8b06cb0788140ef6","timestamp":1793455467626}
+{"type":"started","key":"v2:c79f0541ccaeaef73352581241f6f69143c704ef01ecc2ea29f3e596d027d917","timestamp":1793455467626}
+{"type":"event","key":"v2:94a3aa597fc650e2e74c944767129f4a597f9bc63849e3be8b06cb0788140ef6","event":{"kind":"attempt_started","attempt":1,"maxAttempts":6},"timestamp":1793455467674}
+{"type":"event","key":"v2:c79f0541ccaeaef73352581241f6f69143c704ef01ecc2ea29f3e596d027d917","event":{"kind":"attempt_started","attempt":1,"maxAttempts":6},"timestamp":1793455467674}

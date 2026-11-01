@@ -37,8 +37,12 @@ pub fn interaction_surface(id: HarnessId) -> HarnessInteractionSurface {
             compaction: CompactionSurface::LifecycleWithSummary,
             subagents: SubagentSurface::Tagged,
             plans: PlanSurface::ToolChip,
-            // The CLI gives no partial tool stdout: declared, never simulated.
-            tool_progress: ProgressSurface::None,
+            // No partial tool stdout on the 2.1.x wire — declared, never
+            // simulated. What IS carried: a background Bash task's settled
+            // `task_notification` (status + the CLI's own one-line summary) as
+            // a final `ToolProgress` snapshot, which is `Final`, not
+            // `Streaming`.
+            tool_progress: ProgressSurface::Final,
         },
         HarnessId::Codex => HarnessInteractionSurface {
             // `item/tool/requestUserInput` round-trips through `request_input`

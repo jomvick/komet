@@ -58,7 +58,7 @@ pub use rpc::EngineRpc;
 pub use run_journal::{JournalError, RunJournal};
 pub use sessions::{JournaledEvent, SessionsEngine, SteerOutcome};
 pub use spaces::SpacesSync;
-pub use terminals::Terminals;
+pub use terminals::{TerminalDelta, TerminalScreen, TerminalTail, Terminals};
 pub use titles::TitleGenerator;
 pub use uploads::{AttachmentChunk, Uploads};
 pub use workspace_files::{WorkspaceFiles, WorkspaceFilesError};
@@ -308,6 +308,9 @@ impl EngineCore {
         doc_host.spawn_transcript_salvage(profile.store_root().join("journals"));
         let repos = Repos::new(data_dir, &device_id);
         let terminals = Terminals::new();
+        // The internal MCP catalog reaches the terminals (terminal_list /
+        // terminal_read); the RPC service gets the same handle below.
+        sessions.set_terminals(terminals.clone());
         let uploads = Uploads::from_root_with_fallback(
             profile.uploads_root(),
             legacy_uploads_root.as_deref(),

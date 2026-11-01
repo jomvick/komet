@@ -4,6 +4,9 @@ use std::sync::Arc;
 use serde::Serialize;
 
 use crate::composio::{ComposioSession, ComposioTool, is_read_action_slug};
+use komet_proto::{
+    TerminalCommand, TerminalDelta, TerminalInfo, TerminalRunResult, TerminalScreen, TerminalTail,
+};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SessionSummary {
@@ -19,11 +22,86 @@ pub struct SpaceSummary {
     pub name: Option<String>,
 }
 
+/// Which slice of a terminal an agent asked to read (`terminal_read`'s `angle`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TerminalAngle {
+    Screen,
+    Tail {
+        lines: usize,
+    },
+    Delta {
+        since_seq: u64,
+    },
+    /// The newest OSC 133 command block: command, cwd, output, exit code.
+    /// Refuses (loudly, at the host) when the shell never emitted markers —
+    /// guessing where the prompt was is the silent lie this forbids.
+    LastCommand,
+}
+
+/// One terminal read answered by the host BEFORE the catalog's byte cap. The
+/// engine's gate (agent visibility, then tracking) is what produced — or
+/// refused — it; the host reports refusals as `String` errors so the MCP
+/// layer surfaces them verbatim.
+#[derive(Debug, Clone)]
+pub enum TerminalRead {
+    Screen(TerminalScreen),
+    Tail(TerminalTail),
+    Delta(TerminalDelta),
+    Command(TerminalCommand),
+}
+
 #[async_trait::async_trait]
 pub trait McpHost: Send + Sync {
     fn list_sessions(&self) -> Vec<SessionSummary>;
     fn session_status(&self, id: &str) -> Option<SessionSummary>;
     fn list_spaces(&self) -> Vec<SpaceSummary>;
+    /// Terminals the CALLING run may read: the human-granted ones
+    /// (`agent_visible == true`) plus the ones this very run opened (bounded
+    /// birth grant — see `Terminals::open_agent_terminal`). Nothing else may
+    /// appear: hidden terminals' ids, cwds and titles are not agent data, and
+    /// a terminal another run opened is exactly as private. The host filters
+    /// through `Terminals::list_terminals_for_reader`, the same gate the
+    /// reads pass, so listing cannot leak what reading refuses.
+    fn list_terminals_for_agents(&self) -> Vec<TerminalInfo>;
+    /// One gated read, as the calling run; `Err(message)` carries the engine's
+    /// refusal (not visible / another run's terminal / not tracked) up to the
+    /// agent verbatim.
+    fn read_terminal_for_agents(
+        &self,
+        terminal_id: &str,
+        angle: &TerminalAngle,
+    ) -> Result<TerminalRead, String>;
+
+    // ---- write surface: lifecycle, input, execution ----------------------
+    //
+    // These four are NOT gated by `agent_visible`. That flag protects READS
+    // (a human scrollback holds tokens, passwords, keys); a WRITE is a point
+    // action the human approves PER CALL through the MCP permission prompt —
+    // every `terminal_*` tool below declares `readonly: false`, so the
+    // server's policy answers `Ask` and nothing executes without the
+    // approval (a denial executes nothing, provably). The two doors stay
+    // separate on purpose; `docs/security.md` is the rule: these approvals
+    // constrain the agent's reach, they are not an OS isolation.
+
+    /// `terminal_open`: a NEW terminal owned by the CALLING run — readable at
+    /// birth by that run alone (tracked from birth too; the human approved the
+    /// opening, reading back the agent's own typing is inside that approval,
+    /// but the grant is bounded: another run gets the gate's refusal).
+    fn open_terminal_for_agent(&self, cwd: Option<String>) -> Result<TerminalInfo, String>;
+    /// `terminal_close`: agent-owned terminals only — an approved call must
+    /// never kill a human's shell.
+    fn close_terminal_for_agent(&self, terminal_id: &str) -> Result<(), String>;
+    /// `terminal_send_input`: raw PTY bytes (text or control keys).
+    fn send_input_to_terminal(&self, terminal_id: &str, bytes: &[u8]) -> Result<(), String>;
+    /// `terminal_run`: type and wait for completion AT MOST `wait_ms`; past
+    /// that the host answers `running` with the delta anchor instead of ever
+    /// hitting the endpoint's tool timeout.
+    async fn run_in_terminal(
+        &self,
+        terminal_id: &str,
+        command: &str,
+        wait_ms: u64,
+    ) -> Result<TerminalRunResult, String>;
 }
 
 #[derive(Debug, Clone)]
@@ -87,6 +165,83 @@ impl McpCatalog {
                 description: "List workspace spaces with id, path and name.".into(),
                 input_schema: obj_schema(&[], &[]),
                 readonly: true,
+                composio_slug: None,
+            },
+            ToolDef {
+                name: "terminal_list".into(),
+                title: "List terminals".into(),
+                description: "List the terminals YOUR run may read: the human terminals granted to agents, plus the terminals this run itself opened. Anything else is absent — id, title, cwd, shell, grid size, seq, tracking alike (a terminal you cannot read is not something this list reveals) — and no tool here can lift the human's grant.".into(),
+                input_schema: obj_schema(&[], &[]),
+                readonly: true,
+                composio_slug: None,
+            },
+            ToolDef {
+                name: "terminal_read".into(),
+                title: "Read a terminal".into(),
+                description: "Read one readable terminal in clear text: angle \"screen\" (current grid — the read for a full-screen app), \"tail\" (last `lines` lines), \"delta\" (what appeared after `sinceSeq`, a seq a previous read reported), \"last_command\" (the newest OSC 133 command block: command, cwd, output, exit code — refuses if the shell emits no markers). Readable means: granted by the human, or opened by YOUR run. Output is capped keeping the END; a refused (not granted / another run's / not tracked) terminal errors, never answers empty.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "terminalId": {"type": "string"},
+                        "angle": {"type": "string", "enum": ["screen", "tail", "delta", "last_command"]},
+                        "lines": {"type": "number"},
+                        "sinceSeq": {"type": "number"},
+                    },
+                    "required": ["terminalId", "angle"],
+                    "additionalProperties": false,
+                }),
+                readonly: true,
+                composio_slug: None,
+            },
+            ToolDef {
+                name: "terminal_open".into(),
+                title: "Open a terminal".into(),
+                description: "Open a NEW terminal your run owns (a shell of the user's choosing is not possible; it is the default login shell) in `cwd` (optional; defaults to the engine's directory). Reads work on it right away — for YOUR run only: the birth grant is bounded to the run that opened it, so another run cannot read back what this one typed (or what a human approved typing in). REQUIRES the human's approval on every call.".into(),
+                input_schema: obj_schema(&[("cwd", "string")], &[]),
+                readonly: false,
+                composio_slug: None,
+            },
+            ToolDef {
+                name: "terminal_close".into(),
+                title: "Close a terminal".into(),
+                description: "Close a terminal the agent opened (see `terminal_open`). A human's terminal can never be closed this way, approved or not. REQUIRES the human's approval on every call.".into(),
+                input_schema: obj_schema(&[("terminalId", "string")], &["terminalId"]),
+                readonly: false,
+                composio_slug: None,
+            },
+            ToolDef {
+                name: "terminal_send_input".into(),
+                title: "Send input to a terminal".into(),
+                description: "Type raw input into a terminal: `text` (written verbatim — include \\n to submit) OR one `keys` control token (ctrl+c | ctrl+d | ctrl+l | enter | tab | esc | backspace). Point action, approved per call; it does not open the terminal to reading — reads stay behind the visibility grant. REQUIRES the human's approval on every call.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "terminalId": {"type": "string"},
+                        "text": {"type": "string"},
+                        "keys": {"type": "string", "enum": ["ctrl+c", "ctrl+d", "ctrl+l", "enter", "tab", "esc", "backspace"]},
+                    },
+                    "required": ["terminalId"],
+                    "additionalProperties": false,
+                }),
+                readonly: false,
+                composio_slug: None,
+            },
+            ToolDef {
+                name: "terminal_run".into(),
+                title: "Run a command and wait".into(),
+                description: "Type `command` into `terminalId` (a granted terminal — approved per call, the visibility grant is not consulted for the write itself) or into a fresh agent-owned terminal when no id is given, then wait up to `waitMs` (default 10000, max 20000) for it to finish. Answers done/settled with the command's output block (command, cwd, exit code when markers backed) — or `running` WITH `sinceSeq` when it outlives the wait: long commands never time out here, keep following with `terminal_read` delta from `sinceSeq`. REQUIRES the human's approval on every call.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "string"},
+                        "terminalId": {"type": "string"},
+                        "cwd": {"type": "string"},
+                        "waitMs": {"type": "number"},
+                    },
+                    "required": ["command"],
+                    "additionalProperties": false,
+                }),
+                readonly: false,
                 composio_slug: None,
             },
         ];
@@ -173,6 +328,116 @@ impl McpCatalog {
                     .unwrap_or_else(|| serde_json::json!({"session": null})))
             }
             "list_spaces" => Ok(serde_json::json!({"spaces": self.host.list_spaces()})),
+            "terminal_list" => Ok(serde_json::json!({
+                "terminals": self.host.list_terminals_for_agents()
+            })),
+            "terminal_read" => {
+                let terminal_id = input
+                    .get("terminalId")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| CatalogError::MissingArg("terminalId".into()))?;
+                let angle = match input.get("angle").and_then(|v| v.as_str()) {
+                    None => return Err(CatalogError::MissingArg("angle".into())),
+                    Some("screen") => TerminalAngle::Screen,
+                    Some("tail") => TerminalAngle::Tail {
+                        lines: clamp_tail_lines(input.get("lines").and_then(|v| v.as_u64())),
+                    },
+                    Some("delta") => {
+                        let since_seq = input
+                            .get("sinceSeq")
+                            .and_then(|v| v.as_u64())
+                            .ok_or_else(|| CatalogError::MissingArg("sinceSeq".into()))?;
+                        TerminalAngle::Delta { since_seq }
+                    }
+                    // The honest slice: the host refuses when the shell never
+                    // emitted markers (guessing the prompt boundary is the
+                    // silent lie this forbids).
+                    Some("last_command") => TerminalAngle::LastCommand,
+                    Some(other) => {
+                        return Err(CatalogError::ExecutionFailed(format!(
+                            "unknown angle {other:?}; expected screen | tail | delta | last_command"
+                        )));
+                    }
+                };
+                let read = self
+                    .host
+                    .read_terminal_for_agents(terminal_id, &angle)
+                    .map_err(CatalogError::ExecutionFailed)?;
+                Ok(terminal_read_json(read))
+            }
+            "terminal_open" => {
+                let cwd = input
+                    .get("cwd")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                let info = self
+                    .host
+                    .open_terminal_for_agent(cwd)
+                    .map_err(CatalogError::ExecutionFailed)?;
+                Ok(serde_json::json!({ "terminal": info }))
+            }
+            "terminal_close" => {
+                let terminal_id = input
+                    .get("terminalId")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| CatalogError::MissingArg("terminalId".into()))?;
+                self.host
+                    .close_terminal_for_agent(terminal_id)
+                    .map_err(CatalogError::ExecutionFailed)?;
+                Ok(serde_json::json!({ "closed": terminal_id }))
+            }
+            "terminal_send_input" => {
+                let terminal_id = input
+                    .get("terminalId")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| CatalogError::MissingArg("terminalId".into()))?;
+                let text = input.get("text").and_then(|v| v.as_str());
+                let keys = input.get("keys").and_then(|v| v.as_str());
+                let bytes: Vec<u8> = match (text, keys) {
+                    (Some(_), Some(_)) => {
+                        return Err(CatalogError::ExecutionFailed(
+                            "pass `text` OR `keys`, not both".into(),
+                        ));
+                    }
+                    (Some(text), None) => text.as_bytes().to_vec(),
+                    (None, Some(keys)) => key_bytes(keys)?,
+                    (None, None) => {
+                        return Err(CatalogError::MissingArg("text or keys".into()));
+                    }
+                };
+                self.host
+                    .send_input_to_terminal(terminal_id, &bytes)
+                    .map_err(CatalogError::ExecutionFailed)?;
+                Ok(serde_json::json!({ "terminalId": terminal_id, "written": bytes.len() }))
+            }
+            "terminal_run" => {
+                let command = input
+                    .get("command")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| CatalogError::MissingArg("command".into()))?;
+                let wait_ms = clamp_run_wait(input.get("waitMs").and_then(|v| v.as_u64()));
+                let target = match input.get("terminalId").and_then(|v| v.as_str()) {
+                    Some(id) => id.to_string(),
+                    None => {
+                        // No terminal asked for: a fresh agent-owned one,
+                        // created under this same approved call.
+                        let cwd = input
+                            .get("cwd")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string);
+                        self.host
+                            .open_terminal_for_agent(cwd)
+                            .map_err(CatalogError::ExecutionFailed)?
+                            .terminal_id
+                    }
+                };
+                let result = self
+                    .host
+                    .run_in_terminal(&target, command, wait_ms)
+                    .await
+                    .map_err(CatalogError::ExecutionFailed)?;
+                Ok(terminal_run_json(result))
+            }
             _ => match (&tool.composio_slug, &self.composio) {
                 (Some(slug), Some(session)) => session
                     .execute(slug, input)
@@ -182,6 +447,177 @@ impl McpCatalog {
             },
         }
     }
+}
+
+/// Char budget a single `terminal_read` reply may carry: the MCP endpoint runs
+/// a 30s `TOOL_TIMEOUT` with four concurrent calls, so a read must stay bounded
+/// — never a 1 MB dump. On overflow the END is kept (terminal answers live at
+/// the bottom: the latest output, the error, the prompt).
+pub(crate) const MAX_TERMINAL_READ_CHARS: usize = 40_000;
+/// An agent cannot ask for more tail lines than the tracked mirror holds.
+pub(crate) const MAX_TERMINAL_TAIL_LINES: usize = 1_000;
+pub(crate) const DEFAULT_TERMINAL_TAIL_LINES: usize = 200;
+/// `terminal_run`'s wait bounds. The hard ceiling keeps the call strictly
+/// inside the endpoint's 30 s `TOOL_TIMEOUT`: past `waitMs` the answer is
+/// `running` + `sinceSeq`, never a timed-out call or an untracked process.
+pub(crate) const DEFAULT_TERMINAL_RUN_WAIT_MS: u64 = 10_000;
+pub(crate) const MAX_TERMINAL_RUN_WAIT_MS: u64 = 20_000;
+const _: () = assert!(
+    MAX_TERMINAL_RUN_WAIT_MS < crate::mcp::server::TOOL_TIMEOUT.as_millis() as u64,
+    "terminal_run's ceiling must stay strictly inside the endpoint's TOOL_TIMEOUT"
+);
+
+fn clamp_run_wait(requested: Option<u64>) -> u64 {
+    requested
+        .unwrap_or(DEFAULT_TERMINAL_RUN_WAIT_MS)
+        .min(MAX_TERMINAL_RUN_WAIT_MS)
+}
+
+/// The `keys` control tokens of `terminal_send_input` → PTY bytes. Ctrl-C is
+/// the one an agent most needs (and must be able to send as a point action
+/// under a per-call approval, not as a read grant).
+fn key_bytes(keys: &str) -> Result<Vec<u8>, CatalogError> {
+    Ok(match keys.to_ascii_lowercase().as_str() {
+        "ctrl+c" => vec![0x03],
+        "ctrl+d" => vec![0x04],
+        "ctrl+l" => vec![0x0c],
+        "enter" | "return" => b"\r".to_vec(),
+        "tab" => b"\t".to_vec(),
+        "esc" => vec![0x1b],
+        "backspace" => vec![0x7f],
+        other => {
+            return Err(CatalogError::ExecutionFailed(format!(
+                "unknown key {other:?}; expected ctrl+c | ctrl+d | ctrl+l | enter | tab | esc | backspace"
+            )));
+        }
+    })
+}
+
+fn clamp_tail_lines(requested: Option<u64>) -> usize {
+    requested.map_or(DEFAULT_TERMINAL_TAIL_LINES, |v| {
+        (v.min(MAX_TERMINAL_TAIL_LINES as u64) as usize).max(1)
+    })
+}
+
+/// The wire shape of one capped terminal read. Field names match the proto
+/// transport types (camelCase); `truncated` folds the engine's own flag (a
+/// dropped journal range) with this cap having bitten.
+fn terminal_read_json(read: TerminalRead) -> serde_json::Value {
+    match read {
+        TerminalRead::Screen(screen) => {
+            let (lines, capped) = cap_lines_tail(screen.lines, MAX_TERMINAL_READ_CHARS);
+            serde_json::json!({
+                "angle": "screen",
+                "terminalId": screen.terminal_id,
+                "cols": screen.cols,
+                "rows": screen.rows,
+                "seq": screen.seq,
+                "title": screen.title,
+                "lines": lines,
+                "truncated": capped,
+            })
+        }
+        TerminalRead::Tail(tail) => {
+            let (lines, capped) = cap_lines_tail(tail.lines, MAX_TERMINAL_READ_CHARS);
+            serde_json::json!({
+                "angle": "tail",
+                "terminalId": tail.terminal_id,
+                "seq": tail.seq,
+                "requested": tail.requested,
+                "lines": lines,
+                "truncated": capped,
+            })
+        }
+        TerminalRead::Delta(delta) => {
+            let (lines, capped) = cap_lines_tail(delta.lines, MAX_TERMINAL_READ_CHARS);
+            serde_json::json!({
+                "angle": "delta",
+                "terminalId": delta.terminal_id,
+                "fromSeq": delta.from_seq,
+                "throughSeq": delta.through_seq,
+                "needsSnapshot": delta.needs_snapshot,
+                "truncated": delta.truncated || capped,
+                "lines": lines,
+            })
+        }
+        TerminalRead::Command(command) => {
+            let (lines, capped) = cap_lines_tail(command.lines, MAX_TERMINAL_READ_CHARS);
+            serde_json::json!({
+                "angle": "last_command",
+                "terminalId": command.terminal_id,
+                "status": command.status,
+                "command": command.command,
+                "cwd": command.cwd,
+                "exitCode": command.exit_code,
+                "markerBacked": command.marker_backed,
+                "seq": command.seq,
+                "truncated": capped,
+                "lines": lines,
+            })
+        }
+    }
+}
+
+/// The wire shape of one `terminal_run` answer. The `running` branch is the
+/// timeout escape: `sinceSeq` is the delta anchor the agent follows with on
+/// the next `terminal_read`.
+fn terminal_run_json(result: TerminalRunResult) -> serde_json::Value {
+    let (lines, capped) = cap_lines_tail(result.lines, MAX_TERMINAL_READ_CHARS);
+    let mut json = serde_json::json!({
+        "terminalId": result.terminal_id,
+        "status": result.status,
+        "command": result.command,
+        "cwd": result.cwd,
+        "exitCode": result.exit_code,
+        "markerBacked": result.marker_backed,
+        "sinceSeq": result.since_seq,
+        "seq": result.seq,
+        "truncated": capped,
+        "lines": lines,
+        "trackingEnabled": result.tracking_enabled,
+    });
+    if result.status == "running" {
+        json["next"] = serde_json::json!(format!(
+            "still running — call terminal_read with angle \"delta\" and sinceSeq {} (or \"last_command\" once it prints a prompt again)",
+            result.since_seq
+        ));
+    }
+    if result.status == "settled" && !result.marker_backed {
+        json["note"] = serde_json::json!(
+            "closed by the silence fallback (no OSC 133 markers in this shell): output is quiet, but the exit code is unknown — not guessed"
+        );
+    }
+    json
+}
+
+/// Keep the trailing lines that fit in `budget` chars, oldest dropped first;
+/// when not even one line fits, keep the end of the newest line. Returns the
+/// kept lines and whether anything was dropped.
+fn cap_lines_tail(lines: Vec<String>, budget: usize) -> (Vec<String>, bool) {
+    if lines.is_empty() {
+        return (lines, false);
+    }
+    let mut used = 0usize;
+    let mut keep_from = lines.len();
+    for (ix, line) in lines.iter().enumerate().rev() {
+        let cost = line.chars().count() + 1;
+        if used + cost > budget {
+            break;
+        }
+        used += cost;
+        keep_from = ix;
+    }
+    if keep_from == 0 {
+        return (lines, false);
+    }
+    if keep_from == lines.len() {
+        // Not even the newest line fits whole: its end still says something.
+        let last = lines.last().expect("non-empty");
+        let count = last.chars().count();
+        let tail = last.chars().skip(count.saturating_sub(budget)).collect();
+        return (vec![tail], true);
+    }
+    (lines[keep_from..].to_vec(), true)
 }
 
 fn collect_tool_slugs(value: &serde_json::Value, output: &mut Vec<String>) {
@@ -208,10 +644,52 @@ fn collect_tool_slugs(value: &serde_json::Value, output: &mut Vec<String>) {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
+    use komet_proto::{TerminalDelta, TerminalInfo, TerminalScreen, TerminalTail};
 
-    struct FakeHost;
+    fn info(id: &str, visible: bool) -> TerminalInfo {
+        TerminalInfo {
+            terminal_id: id.into(),
+            title: Some("cargo watch".into()),
+            cwd: "/r".into(),
+            shell: "sh".into(),
+            cols: 80,
+            rows: 24,
+            seq: 7,
+            tracked: visible,
+            agent_visible: visible,
+            exited: false,
+        }
+    }
 
+    /// Denies every read the way the engine does (the host forwards the gate's
+    /// message verbatim) and lists nothing — a FakeHost standing in for an
+    /// engine whose terminals were never granted. Writes record that they were
+    /// reached: the permission tests assert a denied call never gets here.
+    #[derive(Default)]
+    struct FakeHost {
+        write_calls: AtomicUsize,
+    }
+
+    fn refused_run() -> TerminalRunResult {
+        TerminalRunResult {
+            terminal_id: "t-refused".into(),
+            status: "done".into(),
+            command: None,
+            cwd: None,
+            exit_code: None,
+            marker_backed: false,
+            since_seq: 0,
+            seq: 0,
+            lines: vec![],
+            tracking_enabled: false,
+        }
+    }
+
+    #[async_trait::async_trait]
     impl McpHost for FakeHost {
         fn list_sessions(&self) -> Vec<SessionSummary> {
             vec![]
@@ -228,21 +706,225 @@ mod tests {
                 name: None,
             }]
         }
+
+        fn list_terminals_for_agents(&self) -> Vec<TerminalInfo> {
+            vec![]
+        }
+
+        fn read_terminal_for_agents(
+            &self,
+            terminal_id: &str,
+            _angle: &TerminalAngle,
+        ) -> Result<TerminalRead, String> {
+            Err(format!(
+                "Terminal {terminal_id} is not visible to agents; a human must grant access with SetTerminalAgentVisible"
+            ))
+        }
+
+        fn open_terminal_for_agent(&self, _cwd: Option<String>) -> Result<TerminalInfo, String> {
+            self.write_calls.fetch_add(1, Ordering::Relaxed);
+            Err("no terminal openings in this test host".into())
+        }
+
+        fn close_terminal_for_agent(&self, _terminal_id: &str) -> Result<(), String> {
+            self.write_calls.fetch_add(1, Ordering::Relaxed);
+            Err("no terminal closings in this test host".into())
+        }
+
+        fn send_input_to_terminal(&self, _terminal_id: &str, _bytes: &[u8]) -> Result<(), String> {
+            self.write_calls.fetch_add(1, Ordering::Relaxed);
+            Err("no terminal input in this test host".into())
+        }
+
+        async fn run_in_terminal(
+            &self,
+            _terminal_id: &str,
+            _command: &str,
+            _wait_ms: u64,
+        ) -> Result<TerminalRunResult, String> {
+            self.write_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(refused_run())
+        }
+    }
+
+    /// One granted terminal, answering reads with canned text and recording
+    /// whether (and how) the host was consulted.
+    struct GrantedHost {
+        read_calls: AtomicUsize,
+        last_angle: Mutex<Option<TerminalAngle>>,
+        tail_lines: usize,
+        line_len: usize,
+        /// Whether this terminal's shell emits OSC 133 markers. Without them
+        /// `last_command` must refuse loudly, never guess.
+        markers: bool,
+        /// Records every write the host was asked for (permission tests count
+        /// these: a denied call must leave it at zero).
+        write_calls: AtomicUsize,
+    }
+
+    impl GrantedHost {
+        fn new() -> Self {
+            Self {
+                read_calls: AtomicUsize::new(0),
+                last_angle: Mutex::new(None),
+                tail_lines: 8,
+                line_len: 10,
+                markers: true,
+                write_calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn without_markers() -> Self {
+            let mut host = Self::new();
+            host.markers = false;
+            host
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl McpHost for GrantedHost {
+        fn list_sessions(&self) -> Vec<SessionSummary> {
+            vec![]
+        }
+
+        fn session_status(&self, _id: &str) -> Option<SessionSummary> {
+            None
+        }
+
+        fn list_spaces(&self) -> Vec<SpaceSummary> {
+            vec![]
+        }
+
+        fn list_terminals_for_agents(&self) -> Vec<TerminalInfo> {
+            vec![info("t-visible", true)]
+        }
+
+        fn read_terminal_for_agents(
+            &self,
+            terminal_id: &str,
+            angle: &TerminalAngle,
+        ) -> Result<TerminalRead, String> {
+            self.read_calls.fetch_add(1, Ordering::Relaxed);
+            *self.last_angle.lock().unwrap() = Some(angle.clone());
+            let lines: Vec<String> = (0..self.tail_lines)
+                .map(|ix| format!("line-{ix:03}-{}", "x".repeat(self.line_len)))
+                .collect();
+            Ok(match angle {
+                TerminalAngle::Screen => TerminalRead::Screen(TerminalScreen {
+                    terminal_id: terminal_id.into(),
+                    cols: 80,
+                    rows: 24,
+                    seq: 9,
+                    title: None,
+                    lines,
+                }),
+                TerminalAngle::Tail { lines: asked } => TerminalRead::Tail(TerminalTail {
+                    terminal_id: terminal_id.into(),
+                    seq: 9,
+                    requested: *asked,
+                    lines,
+                }),
+                TerminalAngle::Delta { since_seq } => TerminalRead::Delta(TerminalDelta {
+                    terminal_id: terminal_id.into(),
+                    from_seq: *since_seq,
+                    through_seq: *since_seq + 2,
+                    lines,
+                    needs_snapshot: false,
+                    truncated: false,
+                }),
+                TerminalAngle::LastCommand => {
+                    if !self.markers {
+                        return Err(
+                            "the `last_command` angle needs command markers (OSC 133), which this shell never emitted; use `tail` or `delta`".into(),
+                        );
+                    }
+                    TerminalRead::Command(TerminalCommand {
+                        terminal_id: terminal_id.into(),
+                        status: "done".into(),
+                        command: Some("make test".into()),
+                        cwd: Some("/repo".into()),
+                        exit_code: Some(2),
+                        marker_backed: true,
+                        seq: 9,
+                        lines: lines.clone(),
+                    })
+                }
+            })
+        }
+
+        fn open_terminal_for_agent(&self, cwd: Option<String>) -> Result<TerminalInfo, String> {
+            self.write_calls.fetch_add(1, Ordering::Relaxed);
+            let mut terminal = info("t-agent", true);
+            terminal.cwd = cwd.unwrap_or_else(|| "/agent-cwd".into());
+            Ok(terminal)
+        }
+
+        fn close_terminal_for_agent(&self, _terminal_id: &str) -> Result<(), String> {
+            self.write_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn send_input_to_terminal(&self, _terminal_id: &str, bytes: &[u8]) -> Result<(), String> {
+            self.write_calls.fetch_add(1, Ordering::Relaxed);
+            *self.last_angle.lock().unwrap() = Some(TerminalAngle::Tail { lines: bytes.len() });
+            Ok(())
+        }
+
+        async fn run_in_terminal(
+            &self,
+            terminal_id: &str,
+            command: &str,
+            wait_ms: u64,
+        ) -> Result<TerminalRunResult, String> {
+            self.write_calls.fetch_add(1, Ordering::Relaxed);
+            // A canned "long command": never finishes inside a tiny wait.
+            if wait_ms == 0 {
+                return Ok(TerminalRunResult {
+                    terminal_id: terminal_id.into(),
+                    status: "running".into(),
+                    command: Some(command.into()),
+                    cwd: None,
+                    exit_code: None,
+                    marker_backed: true,
+                    since_seq: 7,
+                    seq: 7,
+                    lines: vec![],
+                    tracking_enabled: false,
+                });
+            }
+            Ok(TerminalRunResult {
+                terminal_id: terminal_id.into(),
+                status: "done".into(),
+                command: Some(command.into()),
+                cwd: Some("/repo".into()),
+                exit_code: Some(0),
+                marker_backed: true,
+                since_seq: 3,
+                seq: 9,
+                lines: vec!["built ok".into()],
+                tracking_enabled: false,
+            })
+        }
     }
 
     #[tokio::test]
-    async fn catalog_lists_three_readonly_tools_and_executes() {
-        let catalog = McpCatalog::komet_default(Arc::new(FakeHost));
+    async fn catalog_lists_default_tools_and_executes() {
+        let catalog = McpCatalog::komet_default(Arc::new(FakeHost::default()));
         let names: Vec<_> = catalog.list().into_iter().map(|tool| tool.name).collect();
         assert_eq!(
             names,
             vec![
                 "list_sessions".to_string(),
                 "get_session_status".to_string(),
-                "list_spaces".to_string()
+                "list_spaces".to_string(),
+                "terminal_list".to_string(),
+                "terminal_read".to_string(),
+                "terminal_open".to_string(),
+                "terminal_close".to_string(),
+                "terminal_send_input".to_string(),
+                "terminal_run".to_string(),
             ]
         );
-        assert!(catalog.list().iter().all(|t| t.readonly));
         let v = catalog
             .execute("list_spaces", serde_json::json!({}))
             .await
@@ -259,9 +941,369 @@ mod tests {
         );
     }
 
+    /// The read gate an agent cannot lift: no tool sets visibility or
+    /// tracking. The WRITE tools that exist since step 5 are a different door
+    /// — they must all be non-readonly, because the ONLY thing standing
+    /// between them and the PTY is the per-call human approval the server
+    /// demands for non-readonly tools (`readonly: true` would silently
+    /// auto-allow them through the default policy).
+    #[tokio::test]
+    async fn no_tool_lifts_the_read_gate_and_writes_always_ask() {
+        let catalog = McpCatalog::komet_default(Arc::new(FakeHost::default()));
+        for tool in catalog.list() {
+            let lower = tool.name.to_ascii_lowercase();
+            for forbidden in ["set", "visible", "track", "grant"] {
+                assert!(
+                    !lower.contains(forbidden),
+                    "tool {} would move the read gate",
+                    tool.name
+                );
+            }
+        }
+        let writes: Vec<_> = catalog
+            .list()
+            .into_iter()
+            .filter(|t| !t.readonly)
+            .map(|t| t.name)
+            .collect();
+        assert_eq!(
+            writes,
+            vec![
+                "terminal_open",
+                "terminal_close",
+                "terminal_send_input",
+                "terminal_run"
+            ],
+            "exactly the four approved-per-call writes may exist"
+        );
+        for name in &writes {
+            assert!(
+                !catalog.is_readonly(name, &serde_json::json!({})),
+                "{name} must never auto-allow"
+            );
+        }
+        // Reads stay auto-allowed.
+        for name in ["list_sessions", "terminal_list", "terminal_read"] {
+            assert!(catalog.is_readonly(name, &serde_json::json!({})));
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_list_answers_with_the_granted_terminals() {
+        let catalog = McpCatalog::komet_default(Arc::new(GrantedHost::new()));
+        let v = catalog
+            .execute("terminal_list", serde_json::json!({}))
+            .await
+            .expect("terminal_list");
+        let terminals = v["terminals"].as_array().expect("array");
+        assert_eq!(terminals.len(), 1);
+        assert_eq!(terminals[0]["terminalId"], "t-visible");
+        assert_eq!(terminals[0]["title"], "cargo watch");
+        assert_eq!(terminals[0]["cwd"], "/r");
+        assert_eq!(terminals[0]["cols"], 80);
+        assert_eq!(terminals[0]["rows"], 24);
+        assert_eq!(terminals[0]["tracked"], true);
+    }
+
+    /// The guard, end to end through the tool: a tracked-but-not-granted
+    /// terminal is refused with the engine's message, never answered with an
+    /// empty string (a silent empty read would be the no-op this forbids).
+    #[tokio::test]
+    async fn terminal_read_refuses_a_terminal_that_is_not_granted() {
+        let catalog = McpCatalog::komet_default(Arc::new(FakeHost::default()));
+        for angle in ["screen", "tail", "delta"] {
+            let mut args = serde_json::json!({"terminalId": "t-hidden", "angle": angle});
+            if angle == "delta" {
+                args["sinceSeq"] = serde_json::json!(3);
+            }
+            let err = catalog
+                .execute("terminal_read", args)
+                .await
+                .expect_err("invisible terminal must be refused, not echoed empty");
+            let msg = err.to_string();
+            assert!(msg.contains("not visible to agents"), "{msg}");
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_read_screen_returns_the_capped_grid() {
+        let host = Arc::new(GrantedHost::new());
+        let catalog = McpCatalog::komet_default(host.clone());
+        let v = catalog
+            .execute(
+                "terminal_read",
+                serde_json::json!({"terminalId": "t-visible", "angle": "screen"}),
+            )
+            .await
+            .expect("screen read");
+        assert_eq!(v["angle"], "screen");
+        assert_eq!(v["seq"], 9);
+        assert_eq!(v["lines"].as_array().map(Vec::len), Some(8));
+        assert_eq!(v["truncated"], false);
+        assert_eq!(
+            *host.last_angle.lock().unwrap(),
+            Some(TerminalAngle::Screen),
+            "the screen angle must reach the gated engine read"
+        );
+    }
+
+    /// A read never ships 1 MB: over budget the END of the answer is kept (the
+    /// newest lines, and the tail of a single huge one).
+    #[tokio::test]
+    async fn terminal_read_truncation_keeps_the_end() {
+        let mut host = GrantedHost::new();
+        host.tail_lines = 600;
+        host.line_len = 200;
+        let host = Arc::new(host);
+        let catalog = McpCatalog::komet_default(host.clone());
+        let v = catalog
+            .execute(
+                "terminal_read",
+                serde_json::json!({"terminalId": "t-visible", "angle": "tail", "lines": 600}),
+            )
+            .await
+            .expect("tail read");
+        let lines = v["lines"].as_array().expect("lines");
+        let total: usize = lines
+            .iter()
+            .map(|l| l.as_str().unwrap().chars().count())
+            .sum();
+        assert!(total <= MAX_TERMINAL_READ_CHARS, "{total} over budget");
+        assert_eq!(v["truncated"], true);
+        assert!(
+            lines
+                .last()
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .starts_with("line-599-"),
+            "the newest line must survive"
+        );
+        assert!(
+            !lines[0].as_str().unwrap().starts_with("line-000"),
+            "oldest dropped"
+        );
+    }
+
+    #[test]
+    fn cap_lines_tail_keeps_the_end_of_one_giant_line() {
+        let huge = format!("head{}TAIL", "z".repeat(MAX_TERMINAL_READ_CHARS));
+        let (kept, capped) = cap_lines_tail(vec![huge], MAX_TERMINAL_READ_CHARS);
+        assert!(capped);
+        assert_eq!(kept.len(), 1);
+        assert!(kept[0].ends_with("TAIL"));
+        assert!(kept[0].chars().count() <= MAX_TERMINAL_READ_CHARS);
+        // Under budget: untouched.
+        let (kept, capped) = cap_lines_tail(vec!["a".into(), "b".into()], 10);
+        assert_eq!(kept, vec!["a".to_string(), "b".to_string()]);
+        assert!(!capped);
+    }
+
+    /// With markers on the terminal, `last_command` is a REAL angle: command,
+    /// cwd, output and a NON-ZERO exit code travel back through the tool.
+    #[tokio::test]
+    async fn terminal_read_last_command_answers_the_block() {
+        let host = Arc::new(GrantedHost::new());
+        let catalog = McpCatalog::komet_default(host.clone());
+        let v = catalog
+            .execute(
+                "terminal_read",
+                serde_json::json!({"terminalId": "t-visible", "angle": "last_command"}),
+            )
+            .await
+            .expect("last_command read");
+        assert_eq!(v["angle"], "last_command");
+        assert_eq!(v["status"], "done");
+        assert_eq!(v["command"], "make test");
+        assert_eq!(v["cwd"], "/repo");
+        assert_eq!(v["exitCode"], 2, "a non-zero exit must not be laundered");
+        assert_eq!(v["markerBacked"], true);
+        assert_eq!(v["lines"].as_array().map(Vec::len), Some(8));
+        assert_eq!(
+            *host.last_angle.lock().unwrap(),
+            Some(TerminalAngle::LastCommand),
+            "the angle must reach the gated engine read"
+        );
+    }
+
+    /// Without markers the same angle still refuses loudly (nothing is
+    /// fabricated from the prompt geometry).
+    #[tokio::test]
+    async fn terminal_read_last_command_refuses_without_markers() {
+        let host = Arc::new(GrantedHost::without_markers());
+        let catalog = McpCatalog::komet_default(host.clone());
+        let err = catalog
+            .execute(
+                "terminal_read",
+                serde_json::json!({"terminalId": "t-visible", "angle": "last_command"}),
+            )
+            .await
+            .expect_err("must refuse, not fabricate a command boundary");
+        assert!(err.to_string().contains("command markers"), "{err}");
+        // The refusal went THROUGH the gate path (the host was consulted and
+        // answered honestly), not a silent empty success.
+        assert_eq!(host.read_calls.load(Ordering::Relaxed), 1);
+    }
+
+    /// The execution side of the writing tools, through the host: `terminal_run`
+    /// on a terminal WITHOUT an id opens an agent-owned one first, and a
+    /// command outliving its wait answers with the tracking anchor instead of
+    /// failing.
+    #[tokio::test]
+    async fn terminal_run_opens_when_asked_and_escapes_long_commands() {
+        let host = Arc::new(GrantedHost::new());
+        let catalog = McpCatalog::komet_default(host.clone());
+        // waitMs 0 on the canned host = the "not finished inside the wait" path.
+        let v = catalog
+            .execute(
+                "terminal_run",
+                serde_json::json!({"command": "make world", "waitMs": 0}),
+            )
+            .await
+            .expect("run escapes into running");
+        assert_eq!(v["status"], "running");
+        assert_eq!(v["sinceSeq"], 7);
+        assert!(v["next"].as_str().unwrap().contains("terminal_read"));
+        // No terminalId given → an agent terminal was opened for the command.
+        assert_eq!(v["terminalId"], "t-agent");
+        assert_eq!(host.write_calls.load(Ordering::Relaxed), 2, "open + run");
+
+        // A finished one carries the block.
+        let host = Arc::new(GrantedHost::new());
+        let catalog = McpCatalog::komet_default(host.clone());
+        let v = catalog
+            .execute(
+                "terminal_run",
+                serde_json::json!({"command": "echo ok", "terminalId": "t-visible"}),
+            )
+            .await
+            .expect("run done");
+        assert_eq!(v["status"], "done");
+        assert_eq!(v["exitCode"], 0);
+        assert_eq!(v["lines"][0], "built ok");
+        // Only the run itself: the caller named a terminal, none was opened.
+        assert_eq!(host.write_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn send_input_takes_text_or_one_control_key_never_both() {
+        let host = Arc::new(GrantedHost::new());
+        let catalog = McpCatalog::komet_default(host.clone());
+        let v = catalog
+            .execute(
+                "terminal_send_input",
+                serde_json::json!({"terminalId": "t-visible", "keys": "ctrl+c"}),
+            )
+            .await
+            .expect("ctrl+c");
+        assert_eq!(v["written"], 1);
+        // The engine's write path saw the raw interrupt byte.
+        assert_eq!(
+            *host.last_angle.lock().unwrap(),
+            Some(TerminalAngle::Tail { lines: 1 })
+        );
+
+        let err = catalog
+            .execute(
+                "terminal_send_input",
+                serde_json::json!({"terminalId": "t-visible", "text": "ls\n", "keys": "enter"}),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not both"), "{err}");
+        let err = catalog
+            .execute(
+                "terminal_send_input",
+                serde_json::json!({"terminalId": "t-visible"}),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CatalogError::MissingArg(_)), "{err}");
+    }
+
+    #[test]
+    fn control_keys_map_to_the_pty_bytes() {
+        assert_eq!(key_bytes("ctrl+c").unwrap(), vec![0x03]);
+        assert_eq!(key_bytes("CTRL+C").unwrap(), vec![0x03]);
+        assert_eq!(key_bytes("ctrl+d").unwrap(), vec![0x04]);
+        assert_eq!(key_bytes("ctrl+l").unwrap(), vec![0x0c]);
+        assert_eq!(key_bytes("enter").unwrap(), b"\r");
+        assert_eq!(key_bytes("esc").unwrap(), vec![0x1b]);
+        let err = key_bytes("super+z").expect_err("unknown key refuses");
+        assert!(err.to_string().contains("unknown key"), "{err}");
+    }
+
+    /// The 30 s TOOL_TIMEOUT bypass, stated in one line: whatever the agent
+    /// asks, the wait is clamped strictly below it. The ceiling/timeout
+    /// invariant itself is a `const assert` next to `MAX_TERMINAL_RUN_WAIT_MS`
+    /// — it cannot rot into a passing test of a broken constant.
+    #[test]
+    fn run_waits_are_clamped_below_the_tool_timeout() {
+        assert_eq!(clamp_run_wait(None), DEFAULT_TERMINAL_RUN_WAIT_MS);
+        assert_eq!(clamp_run_wait(Some(1_000)), 1_000);
+        assert_eq!(clamp_run_wait(Some(u64::MAX)), MAX_TERMINAL_RUN_WAIT_MS);
+    }
+
+    #[tokio::test]
+    async fn write_tools_surface_the_engine_refusal_verbatim() {
+        let catalog = McpCatalog::komet_default(Arc::new(FakeHost::default()));
+        let err = catalog
+            .execute(
+                "terminal_close",
+                serde_json::json!({"terminalId": "t-human"}),
+            )
+            .await
+            .expect_err("FakeHost refuses like the engine does for a human terminal");
+        assert!(err.to_string().contains("no terminal closings"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn terminal_read_delta_carries_only_the_answered_range() {
+        let host = Arc::new(GrantedHost::new());
+        let catalog = McpCatalog::komet_default(host.clone());
+        let v = catalog
+            .execute(
+                "terminal_read",
+                serde_json::json!({"terminalId": "t-visible", "angle": "delta", "sinceSeq": 5}),
+            )
+            .await
+            .expect("delta read");
+        assert_eq!(v["fromSeq"], 5);
+        assert_eq!(v["throughSeq"], 7);
+        assert_eq!(v["needsSnapshot"], false);
+        assert_eq!(v["truncated"], false);
+        assert_eq!(
+            *host.last_angle.lock().unwrap(),
+            Some(TerminalAngle::Delta { since_seq: 5 })
+        );
+        // Missing range anchor: refused with a missing-argument error.
+        let err = catalog
+            .execute(
+                "terminal_read",
+                serde_json::json!({"terminalId": "t-visible", "angle": "delta"}),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CatalogError::MissingArg(arg) if arg == "sinceSeq"));
+        let err = catalog
+            .execute("terminal_read", serde_json::json!({"angle": "screen"}))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CatalogError::MissingArg(arg) if arg == "terminalId"));
+    }
+
+    /// A tail request is clamped to what the tracked mirror can honestly hold.
+    #[test]
+    fn tail_requests_are_clamped() {
+        assert_eq!(clamp_tail_lines(None), DEFAULT_TERMINAL_TAIL_LINES);
+        assert_eq!(clamp_tail_lines(Some(50)), 50);
+        assert_eq!(clamp_tail_lines(Some(0)), 1);
+        assert_eq!(clamp_tail_lines(Some(u64::MAX)), MAX_TERMINAL_TAIL_LINES);
+    }
+
     #[test]
     fn composio_mutations_require_permission_but_reads_do_not() {
-        let catalog = McpCatalog::komet_default(Arc::new(FakeHost));
+        let catalog = McpCatalog::komet_default(Arc::new(FakeHost::default()));
         assert!(catalog.is_readonly(
             "composio_composio_multi_execute_tool",
             &serde_json::json!({"tools": [{"tool_slug": "GMAIL_SEARCH_EMAILS"}]})

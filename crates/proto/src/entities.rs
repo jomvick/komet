@@ -807,6 +807,141 @@ pub enum TerminalEvent {
     },
 }
 
+/// One row of the `ListTerminals` reply: what a caller can address without
+/// reading the terminal itself. `agent_visible` is the human's grant that any
+/// agent read (RPC `ReadTerminal*` and the `terminal_read` MCP tool) checks
+/// before touching the mirror; `tracked` says whether the engine currently
+/// mirrors the output as text (making a terminal agent-visible switches
+/// tracking on, hiding it switches tracking back off).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalInfo {
+    pub terminal_id: String,
+    /// OSC title if the program set one (only observable while tracked).
+    #[serde(default)]
+    pub title: Option<String>,
+    pub cwd: String,
+    /// Shell basename (`zsh`, `bash`, …).
+    pub shell: String,
+    /// Grid size the PTY was last given (clamped).
+    pub cols: u16,
+    pub rows: u16,
+    /// Newest output sequence number.
+    pub seq: u64,
+    pub tracked: bool,
+    pub agent_visible: bool,
+    pub exited: bool,
+}
+
+/// `ReadTerminalScreen` reply — the terminal's current screen in clear text,
+/// one entry per viewport row, top to bottom. The read that means something
+/// for a full-screen program (vim, `less`, `htop`): its scrollback is escape
+/// drafts, its display is these rows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalScreen {
+    pub terminal_id: String,
+    pub cols: usize,
+    pub rows: usize,
+    /// The newest output sequence number folded into the mirror; pass it to
+    /// `ReadTerminalDelta` to read only what follows.
+    pub seq: u64,
+    /// OSC title if the program set one.
+    #[serde(default)]
+    pub title: Option<String>,
+    /// Viewport rows, top to bottom, trailing grid padding trimmed.
+    pub lines: Vec<String>,
+}
+
+/// `ReadTerminalTail` reply — the last lines of the terminal's text, oldest
+/// first. `requested` is the asked-for count; `lines` may hold fewer on a
+/// young terminal (or fewer than asked once the read was capped).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalTail {
+    pub terminal_id: String,
+    pub seq: u64,
+    pub requested: usize,
+    pub lines: Vec<String>,
+}
+
+/// `ReadTerminalDelta` reply — the text that appeared after `from_seq`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalDelta {
+    pub terminal_id: String,
+    pub from_seq: u64,
+    /// The newest output sequence number folded into the mirror.
+    pub through_seq: u64,
+    /// Text that appeared after `from_seq`, oldest first.
+    pub lines: Vec<String>,
+    /// Something in the range rewrote the screen (a redraw, `clear`, a resize,
+    /// an alt-screen flip) rather than appending to it: read the screen
+    /// instead of applying `lines` as an append.
+    pub needs_snapshot: bool,
+    /// Output batches older than the journal were dropped (or the read itself
+    /// was capped, keeping the end), so this does not cover the whole range.
+    pub truncated: bool,
+}
+
+/// The `terminal_read` `last_command` answer: one command block sliced by
+/// OSC 133 markers. `status` is `"done"` (a `D` arrived — `exitCode` answers
+/// it), `"running"` (between `C` and `D`), or `"settled"` (a marker-free
+/// stretch closed by the silence fallback: `markerBacked == false`, so the
+/// exit code is genuinely unknown and stays `null`). A terminal without any
+/// markers never answers this — the read refuses loudly instead of guessing
+/// where the prompt is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalCommand {
+    pub terminal_id: String,
+    pub status: String,
+    /// What was typed, when the markers (or the prompt slice) say.
+    #[serde(default)]
+    pub command: Option<String>,
+    /// The directory the block ran in, from the markers' `Cwd=` payload.
+    #[serde(default)]
+    pub cwd: Option<String>,
+    /// Only `Some` after a marker-delivered `D` carried a numeric status.
+    #[serde(default)]
+    pub exit_code: Option<i32>,
+    pub marker_backed: bool,
+    /// Newest output sequence folded into the mirror at read time.
+    pub seq: u64,
+    /// The block's output region, oldest line first.
+    pub lines: Vec<String>,
+}
+
+/// The `terminal_run` answer. A `running` status ALWAYS carries the tracking
+/// anchor (`sinceSeq`) instead of hitting the endpoint's 30 s tool timeout:
+/// the agent keeps following with a `terminal_read` delta from there and
+/// re-asks later. Long commands therefore end with an id, never with a dead
+/// process or a timed-out call.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalRunResult {
+    pub terminal_id: String,
+    /// `"done"`, `"settled"` (silence fallback, exit unknown) or `"running"`.
+    pub status: String,
+    #[serde(default)]
+    pub command: Option<String>,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub exit_code: Option<i32>,
+    pub marker_backed: bool,
+    /// When `running`: pass this as `sinceSeq` to a delta read to catch up.
+    pub since_seq: u64,
+    /// Newest output sequence folded into the mirror at reply time.
+    pub seq: u64,
+    /// The command's output when it finished; empty while still running.
+    pub lines: Vec<String>,
+    /// True when the run had to switch the text mirror on (an untracked
+    /// terminal has nothing to observe completion with — the run enables it
+    /// and says so instead of failing quietly).
+    pub tracking_enabled: bool,
+}
+
 /// One in-flight queued-attachment transfer (the `WatchTransfers` stream):
 /// raw-byte progress of the engine-side relay leg pushing staged bytes to a
 /// remote host. An entry appears when a file's chunks start moving, updates

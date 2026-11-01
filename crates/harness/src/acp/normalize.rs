@@ -923,9 +923,11 @@ fn enum_choices(values: &[Value], names: Option<&Value>) -> Vec<(String, Value)>
         .collect()
 }
 
+type VariantChoices = (Vec<(String, Value)>, Vec<String>);
+
 /// `oneOf`/`anyOf` `{const, title, description}` variants → label/value pairs
 /// plus descriptions aligned with them (empty only when all are empty).
-fn variant_choices(variants: &[Value]) -> Result<(Vec<(String, Value)>, Vec<String>), String> {
+fn variant_choices(variants: &[Value]) -> Result<VariantChoices, String> {
     let mut choices = Vec::with_capacity(variants.len());
     let mut descriptions = Vec::with_capacity(variants.len());
     for variant in variants {

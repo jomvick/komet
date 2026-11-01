@@ -20,12 +20,19 @@ use gpui::{
 
 use crate::theme::{Appearance, Theme, current_appearance, rgb_to_hsl};
 
-use super::emulator::{CellColor, CellSnapshot, Side};
+use super::emulator::{CellColor, CellSnapshot, MouseModes, MouseProtocol, Side};
 use super::panel::TerminalPanel;
 
-/// Terminal font metrics (mono).
+/// Default terminal font metrics (mono). The live values come from the
+/// `terminalFontSize` setting ([`line_height_for`] derives the line height at
+/// the shipped 18/13 ratio); these are the fallbacks/defaults.
 pub const TERM_FONT_SIZE: f32 = 13.0;
 pub const TERM_LINE_HEIGHT: f32 = 18.0;
+/// Grid line height for a font size: keeps the shipped 18/13 proportion, so
+/// the default 13 px font still measures exactly 18 px rows.
+pub fn line_height_for(font_size: f32) -> f32 {
+    font_size * (TERM_LINE_HEIGHT / TERM_FONT_SIZE)
+}
 /// Inner padding of the grid area.
 pub const TERM_PADDING: f32 = 12.0;
 
@@ -420,6 +427,176 @@ pub fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
 }
 
 // ---------------------------------------------------------------------------
+// Pointer → mouse-report bytes
+// ---------------------------------------------------------------------------
+
+/// Which pointer button a report is about, decoupled from `gpui`'s enum so the
+/// encoder is a pure, unit-testable function (the panel maps between them).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReportButton {
+    Left,
+    Middle,
+    Right,
+}
+
+impl ReportButton {
+    /// The PTY button number: 0 left, 1 middle, 2 right.
+    fn code(self) -> u16 {
+        match self {
+            ReportButton::Left => 0,
+            ReportButton::Middle => 1,
+            ReportButton::Right => 2,
+        }
+    }
+}
+
+/// A pointer gesture to translate for the PTY.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PointerEvent {
+    Press {
+        button: ReportButton,
+    },
+    /// Motion with a button held (DECSET 1002 and above).
+    Drag {
+        button: ReportButton,
+    },
+    Release {
+        button: ReportButton,
+    },
+    /// Buttonless hover motion (DECSET 1003 any-event only).
+    Motion,
+    /// One wheel notch; `up` selects button 64 (up) vs 65 (down).
+    Wheel {
+        up: bool,
+    },
+}
+
+/// Modifiers folded into the reported button code (shift +4, alt +8, ctrl +16).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PointerMods {
+    pub shift: bool,
+    pub alt: bool,
+    pub ctrl: bool,
+}
+
+impl PointerMods {
+    fn bits(self) -> u16 {
+        (if self.shift { 4 } else { 0 })
+            + (if self.alt { 8 } else { 0 })
+            + (if self.ctrl { 16 } else { 0 })
+    }
+}
+
+/// Where the pointer router sends a gesture. Three outcomes because "the app
+/// asked for the mouse but this particular gesture isn't reported" is distinct
+/// from "no mouse mode, the UI keeps it": under an active protocol the UI must
+/// NOT silently start a selection the app cannot see, so such gestures are
+/// dropped rather than falling back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MouseRoute {
+    /// Write these bytes to the PTY (a mouse report, or an AltScroll arrow).
+    Send(Vec<u8>),
+    /// Keep it in the UI — the pre-existing selection / scrollback behaviour.
+    Local,
+    /// Drop it: a protocol is active but this gesture isn't reported.
+    Ignore,
+}
+
+/// AltScroll arrow bytes: the up/down key a full-screen app receives for a
+/// wheel notch when it asked for NO mouse mode. SS3 (`ESC O x`) in application
+/// cursor mode, else CSI (`ESC [ x`).
+fn alt_scroll_bytes(up: bool, app_cursor: bool) -> Vec<u8> {
+    let intro = if app_cursor { b'O' } else { b'[' };
+    let letter = if up { b'A' } else { b'B' };
+    vec![0x1b, intro, letter]
+}
+
+/// SGR (DECSET 1006) report: `ESC [ < b ; x ; y M` (press/motion) or `m`
+/// (release). Coordinates are 1-based grid cells.
+fn sgr_report(cb: u16, x: u16, y: u16, release: bool) -> Vec<u8> {
+    let term = if release { 'm' } else { 'M' };
+    format!("\x1b[<{cb};{x};{y}{term}").into_bytes()
+}
+
+/// Legacy X10/"normal" report (`ESC [ M` + three `value + 32` bytes). Each
+/// field is a single byte, so coordinates clamp to 223 (`223 + 32 = 255`) — the
+/// grid can exceed that, but the legacy encoding physically cannot address it.
+fn legacy_report(cb: u16, x: u16, y: u16) -> Vec<u8> {
+    let clamp = |v: u16| v.min(223) as u8 + 32;
+    vec![0x1b, b'[', b'M', cb.min(223) as u8 + 32, clamp(x), clamp(y)]
+}
+
+/// Translate a pointer gesture into PTY routing given the current mouse modes.
+///
+/// `col`/`row` are the **viewport cell** indices (0-based) the pointer landed
+/// on — the terminal's cell grid, not UI pixels and not the scrollback line.
+/// They become the 1-based report coordinates; the panel derives them from
+/// [`cell_at`], which already clamps into the grid. This is the boundary the
+/// whole feature hinges on: a TUI addresses cells, so feeding it a pixel or a
+/// scrolled-back history line would move its cursor to the wrong place.
+///
+/// `None`-style outcomes are encoded in [`MouseRoute`] rather than an `Option`
+/// so the caller cannot mistake "ignore" for "handle it locally".
+pub fn route_pointer(
+    modes: &MouseModes,
+    event: &PointerEvent,
+    col: usize,
+    row: usize,
+    mods: &PointerMods,
+) -> MouseRoute {
+    let x = (col as u16).saturating_add(1);
+    let y = (row as u16).saturating_add(1);
+
+    if modes.protocol == MouseProtocol::Off {
+        return match event {
+            // Full-screen apps that request no mouse mode still scroll the
+            // wheel as arrow keys — but only on the alt screen; on the primary
+            // screen the wheel drives the UI's own scrollback.
+            PointerEvent::Wheel { up } if modes.alt_screen => {
+                MouseRoute::Send(alt_scroll_bytes(*up, modes.app_cursor))
+            }
+            _ => MouseRoute::Local,
+        };
+    }
+
+    // A protocol is active. Shift opts back into the UI (force a local
+    // selection). The wheel has no selection meaning, so it never honours the
+    // override and keeps reporting to the app.
+    let wheel = matches!(event, PointerEvent::Wheel { .. });
+    if mods.shift && !wheel {
+        return MouseRoute::Local;
+    }
+
+    // Which gestures this protocol reports. Anything outside the set is
+    // dropped, not handled locally — the app owns the pointer.
+    match (modes.protocol, event) {
+        (_, PointerEvent::Press { .. })
+        | (_, PointerEvent::Release { .. })
+        | (_, PointerEvent::Wheel { .. })
+        | (MouseProtocol::Drag | MouseProtocol::Any, PointerEvent::Drag { .. })
+        | (MouseProtocol::Any, PointerEvent::Motion) => {}
+        _ => return MouseRoute::Ignore,
+    }
+
+    let (cb_base, release) = match event {
+        PointerEvent::Press { button } => (button.code(), false),
+        PointerEvent::Drag { button } => (button.code() + 32, false),
+        // Buttonless motion: button 3 ("none") + the 32 motion bit.
+        PointerEvent::Motion => (35, false),
+        PointerEvent::Wheel { up } => (if *up { 64 } else { 65 }, false),
+        PointerEvent::Release { button } => (button.code(), true),
+    };
+    let cb = cb_base + mods.bits();
+    MouseRoute::Send(if modes.sgr {
+        sgr_report(cb, x, y, release)
+    } else {
+        // Legacy signals release as button + 3 within the same `ESC [ M`.
+        let legacy_cb = if release { cb + 3 } else { cb };
+        legacy_report(legacy_cb, x, y)
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Input coalescer (pure buffer; the panel owns the 12 ms timer)
 // ---------------------------------------------------------------------------
 
@@ -477,6 +654,13 @@ pub struct TerminalPrepaint {
     lines: Vec<Vec<(usize, ShapedLine)>>,
     /// Grid cell advance, so paint can place segments by column.
     cell_w: Pixels,
+    /// Frame's line height — derived from the configured font size, so paint
+    /// must not re-derive it from the default constant (rows would drift
+    /// between prepaint and paint on a zoomed grid).
+    line_h: Pixels,
+    /// Visual-bell indicator: a small dot in the grid's top-right corner while
+    /// the tab's BEL is ringing. Painted last so it sits above the glyphs.
+    bell_dot: Option<PaintQuad>,
     cursor: Option<PaintQuad>,
 }
 
@@ -538,14 +722,16 @@ impl gpui::Element for TerminalElement {
             ("dlig".into(), 0),
         ]));
         // Font probe: measure the actual advance of the resolved mono font so
-        // cols/rows track real glyph metrics, not a guessed aspect ratio.
-        let font_size = px(TERM_FONT_SIZE);
+        // cols/rows track real glyph metrics, not a guessed aspect ratio. The
+        // size itself is a setting — the panel owns the configured one.
+        let font_size_px = self.panel.update(cx, |panel, _| panel.font_size());
+        let font_size = px(font_size_px);
         let font_id = window.text_system().resolve_font(&mono);
         let cell_w = window
             .text_system()
             .em_advance(font_id, font_size)
-            .unwrap_or(px(TERM_FONT_SIZE * 0.6));
-        let line_h = px(TERM_LINE_HEIGHT);
+            .unwrap_or(px(font_size_px * 0.6));
+        let line_h = px(line_height_for(font_size_px));
 
         let inner_w = f32::from(bounds.size.width) - 2.0 * TERM_PADDING;
         let inner_h = f32::from(bounds.size.height) - 2.0 * TERM_PADDING;
@@ -558,7 +744,7 @@ impl gpui::Element for TerminalElement {
             bounds.left() + px(TERM_PADDING),
             bounds.top() + px(TERM_PADDING),
         );
-        let snapshot = self.panel.update(cx, |panel, cx| {
+        let (snapshot, bell_ringing) = self.panel.update(cx, |panel, cx| {
             panel.on_grid_metrics(
                 super::panel::GridGeometry {
                     origin,
@@ -569,7 +755,8 @@ impl gpui::Element for TerminalElement {
                 },
                 cx,
             );
-            panel.active_grid_snapshot(cx)
+            let bell = panel.bell_indicator_active(cx);
+            (panel.active_grid_snapshot(cx), bell)
         });
         let Some(snapshot) = snapshot else {
             return TerminalPrepaint {
@@ -577,9 +764,22 @@ impl gpui::Element for TerminalElement {
                 sel_quads: Vec::new(),
                 lines: Vec::new(),
                 cell_w,
+                line_h,
+                bell_dot: None,
                 cursor: None,
             };
         };
+        // A BEL with no grid to sit on would be invisible anyway — the dot is
+        // painted only when there is a live viewport.
+        let bell_dot = bell_ringing.then(|| {
+            fill(
+                Bounds::new(
+                    point(bounds.right() - px(20.0), bounds.top() + px(9.0)),
+                    size(px(7.0), px(7.0)),
+                ),
+                theme.warning,
+            )
+        });
 
         let mut bg_quads = Vec::new();
         let mut sel_quads = Vec::new();
@@ -658,6 +858,8 @@ impl gpui::Element for TerminalElement {
             sel_quads,
             lines,
             cell_w,
+            line_h,
+            bell_dot,
             cursor,
         }
     }
@@ -672,7 +874,7 @@ impl gpui::Element for TerminalElement {
         window: &mut Window,
         cx: &mut App,
     ) {
-        let line_h = px(TERM_LINE_HEIGHT);
+        let line_h = prepaint.line_h;
         let origin = point(
             bounds.left() + px(TERM_PADDING),
             bounds.top() + px(TERM_PADDING),
@@ -700,6 +902,10 @@ impl gpui::Element for TerminalElement {
             }
             if let Some(cursor) = prepaint.cursor.take() {
                 window.paint_quad(cursor);
+            }
+            // Visual-bell dot, last: it must sit above the grid it flags.
+            if let Some(dot) = prepaint.bell_dot.take() {
+                window.paint_quad(dot);
             }
         });
     }
@@ -1002,6 +1208,312 @@ mod tests {
         );
     }
 
+    // ---- pointer → mouse reports ----
+
+    fn sgr(protocol: MouseProtocol) -> MouseModes {
+        MouseModes {
+            protocol,
+            sgr: true,
+            alt_screen: false,
+            app_cursor: false,
+        }
+    }
+
+    fn no_mods() -> PointerMods {
+        PointerMods::default()
+    }
+
+    /// The core regression: with no mouse mode the pointer stays the UI's.
+    /// Presses are local (selection) and the wheel is local (scrollback).
+    #[test]
+    fn pointer_stays_local_when_no_mouse_mode() {
+        let off = MouseModes::NONE;
+        assert_eq!(
+            route_pointer(
+                &off,
+                &PointerEvent::Press {
+                    button: ReportButton::Left
+                },
+                3,
+                1,
+                &no_mods()
+            ),
+            MouseRoute::Local
+        );
+        assert_eq!(
+            route_pointer(&off, &PointerEvent::Wheel { up: true }, 3, 1, &no_mods()),
+            MouseRoute::Local,
+            "primary-screen wheel keeps scrolling the UI scrollback"
+        );
+    }
+
+    /// SGR coordinates are 1-based grid cells derived from the viewport cell,
+    /// and the button codes follow xterm: left 0 / middle 1 / right 2.
+    #[test]
+    fn sgr_press_encodes_button_and_one_based_grid_cell() {
+        let m = sgr(MouseProtocol::Click);
+        // Left at the top-left cell (0,0) → column 1, row 1.
+        assert_eq!(
+            route_pointer(
+                &m,
+                &PointerEvent::Press {
+                    button: ReportButton::Left
+                },
+                0,
+                0,
+                &no_mods()
+            ),
+            MouseRoute::Send(b"\x1b[<0;1;1M".to_vec())
+        );
+        // Right at column 5, row 2 → 6;3, button 2.
+        assert_eq!(
+            route_pointer(
+                &m,
+                &PointerEvent::Press {
+                    button: ReportButton::Right
+                },
+                5,
+                2,
+                &no_mods()
+            ),
+            MouseRoute::Send(b"\x1b[<2;6;3M".to_vec())
+        );
+    }
+
+    #[test]
+    fn sgr_drag_release_and_wheel() {
+        let m = sgr(MouseProtocol::Drag);
+        // Drag adds the 32 motion bit.
+        assert_eq!(
+            route_pointer(
+                &m,
+                &PointerEvent::Drag {
+                    button: ReportButton::Left
+                },
+                4,
+                7,
+                &no_mods()
+            ),
+            MouseRoute::Send(b"\x1b[<32;5;8M".to_vec())
+        );
+        // Release uses button code as-is but terminates with 'm'.
+        assert_eq!(
+            route_pointer(
+                &m,
+                &PointerEvent::Release {
+                    button: ReportButton::Left
+                },
+                4,
+                7,
+                &no_mods()
+            ),
+            MouseRoute::Send(b"\x1b[<0;5;8m".to_vec())
+        );
+        // Wheel: up 64, down 65, always press ('M').
+        assert_eq!(
+            route_pointer(&m, &PointerEvent::Wheel { up: true }, 0, 0, &no_mods()),
+            MouseRoute::Send(b"\x1b[<64;1;1M".to_vec())
+        );
+        assert_eq!(
+            route_pointer(&m, &PointerEvent::Wheel { up: false }, 0, 0, &no_mods()),
+            MouseRoute::Send(b"\x1b[<65;1;1M".to_vec())
+        );
+    }
+
+    /// Modifiers fold into the button code: shift +4, alt +8, ctrl +16.
+    #[test]
+    fn sgr_modifiers_add_to_the_button_code() {
+        let m = sgr(MouseProtocol::Click);
+        let mods = PointerMods {
+            shift: false,
+            alt: true,
+            ctrl: true,
+        };
+        assert_eq!(
+            route_pointer(
+                &m,
+                &PointerEvent::Press {
+                    button: ReportButton::Left
+                },
+                0,
+                0,
+                &mods
+            ),
+            MouseRoute::Send(b"\x1b[<24;1;1M".to_vec())
+        );
+    }
+
+    /// Without SGR (1006), reports use the legacy X10 encoding: `ESC [ M` then
+    /// three `value + 32` bytes; release is signalled as button + 3.
+    #[test]
+    fn legacy_encoding_when_sgr_off() {
+        let m = MouseModes {
+            protocol: MouseProtocol::Click,
+            sgr: false,
+            alt_screen: false,
+            app_cursor: false,
+        };
+        assert_eq!(
+            route_pointer(
+                &m,
+                &PointerEvent::Press {
+                    button: ReportButton::Left
+                },
+                0,
+                0,
+                &no_mods()
+            ),
+            MouseRoute::Send(vec![0x1b, b'[', b'M', 32, 33, 33])
+        );
+        assert_eq!(
+            route_pointer(
+                &m,
+                &PointerEvent::Release {
+                    button: ReportButton::Left
+                },
+                0,
+                0,
+                &no_mods()
+            ),
+            MouseRoute::Send(vec![0x1b, b'[', b'M', 35, 33, 33]),
+            "legacy release is button + 3"
+        );
+    }
+
+    /// Click-tracking (1000) reports presses/releases but NOT motion; the
+    /// gesture is dropped rather than falling back to a UI selection.
+    #[test]
+    fn click_mode_ignores_motion_drag_and_hover() {
+        let click = sgr(MouseProtocol::Click);
+        assert_eq!(
+            route_pointer(
+                &click,
+                &PointerEvent::Drag {
+                    button: ReportButton::Left
+                },
+                0,
+                0,
+                &no_mods()
+            ),
+            MouseRoute::Ignore
+        );
+        assert_eq!(
+            route_pointer(&click, &PointerEvent::Motion, 0, 0, &no_mods()),
+            MouseRoute::Ignore
+        );
+    }
+
+    /// Drag-tracking reports held-button motion but not buttonless hover;
+    /// any-event tracking reports both.
+    #[test]
+    fn drag_vs_any_event_motion_reporting() {
+        let drag = sgr(MouseProtocol::Drag);
+        assert_eq!(
+            route_pointer(&drag, &PointerEvent::Motion, 0, 0, &no_mods()),
+            MouseRoute::Ignore,
+            "1002 does not report buttonless hover"
+        );
+        assert!(matches!(
+            route_pointer(
+                &drag,
+                &PointerEvent::Drag {
+                    button: ReportButton::Left
+                },
+                0,
+                0,
+                &no_mods()
+            ),
+            MouseRoute::Send(_)
+        ));
+
+        let any = sgr(MouseProtocol::Any);
+        // Motion (button 3 "none") + 32 motion bit = 35.
+        assert_eq!(
+            route_pointer(&any, &PointerEvent::Motion, 2, 2, &no_mods()),
+            MouseRoute::Send(b"\x1b[<35;3;3M".to_vec())
+        );
+    }
+
+    /// Shift is the escape hatch out of mouse capture: it forces a local
+    /// selection even while a protocol is active. The wheel keeps reporting.
+    #[test]
+    fn shift_forces_local_selection() {
+        let m = sgr(MouseProtocol::Drag);
+        let shift = PointerMods {
+            shift: true,
+            alt: false,
+            ctrl: false,
+        };
+        assert_eq!(
+            route_pointer(
+                &m,
+                &PointerEvent::Press {
+                    button: ReportButton::Left
+                },
+                0,
+                0,
+                &shift
+            ),
+            MouseRoute::Local
+        );
+        assert_eq!(
+            route_pointer(&m, &PointerEvent::Wheel { up: true }, 0, 0, &shift),
+            MouseRoute::Send(b"\x1b[<68;1;1M".to_vec()),
+            "shift+wheel is still a wheel report (64 + shift 4), not a selection"
+        );
+    }
+
+    /// AltScroll: a full-screen app that asked for NO mouse mode still scrolls
+    /// the wheel as arrows (the whole point of vim/less wheel support). SS3 in
+    /// application cursor mode, CSI otherwise; on the primary screen it's local.
+    #[test]
+    fn alt_scroll_routes_wheel_to_arrows_in_the_alt_screen() {
+        let alt = MouseModes {
+            protocol: MouseProtocol::Off,
+            sgr: false,
+            alt_screen: true,
+            app_cursor: false,
+        };
+        assert_eq!(
+            route_pointer(&alt, &PointerEvent::Wheel { up: true }, 0, 0, &no_mods()),
+            MouseRoute::Send(b"\x1b[A".to_vec())
+        );
+        assert_eq!(
+            route_pointer(&alt, &PointerEvent::Wheel { up: false }, 0, 0, &no_mods()),
+            MouseRoute::Send(b"\x1b[B".to_vec())
+        );
+
+        let alt_app = MouseModes {
+            app_cursor: true,
+            ..alt
+        };
+        assert_eq!(
+            route_pointer(
+                &alt_app,
+                &PointerEvent::Wheel { up: true },
+                0,
+                0,
+                &no_mods()
+            ),
+            MouseRoute::Send(b"\x1bOA".to_vec()),
+            "DECCKM selects the SS3 arrow"
+        );
+
+        // A press is still local in the alt screen without a mouse mode.
+        assert_eq!(
+            route_pointer(
+                &alt,
+                &PointerEvent::Press {
+                    button: ReportButton::Left
+                },
+                0,
+                0,
+                &no_mods()
+            ),
+            MouseRoute::Local
+        );
+    }
+
     #[test]
     fn coalescer_schedules_once_per_burst() {
         let mut c = InputCoalescer::default();
@@ -1148,6 +1660,17 @@ mod tests {
     fn timing_constants_match_spec() {
         assert_eq!(COALESCE_MS, 12);
         assert_eq!(RESIZE_DEBOUNCE_MS, 80);
+    }
+
+    /// The line height is now derived from a configurable font size; the
+    /// shipped pair (13 px / 18 px rows) must stay the anchor of the ratio.
+    #[test]
+    fn line_height_follows_the_font_size_at_the_shipped_ratio() {
+        assert_eq!(line_height_for(TERM_FONT_SIZE), TERM_LINE_HEIGHT);
+        // Bigger font, bigger rows — and strictly monotonic, so a zoom step
+        // always changes the grid.
+        assert!(line_height_for(14.0) > line_height_for(13.0));
+        assert!(line_height_for(12.0) < line_height_for(13.0));
     }
 
     // ---- pointer → cell ----

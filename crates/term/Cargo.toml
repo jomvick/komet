@@ -1,0 +1,10 @@
+[package]
+name = "komet-term"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "gpui-free terminal emulator core: grid, scrollback, selection, alt-screen, mouse modes, plain-text reads"
+
+[dependencies]
+alacritty_terminal.workspace = true

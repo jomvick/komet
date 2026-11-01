@@ -41,6 +41,552 @@ pub fn login_shell_path() -> Option<&'static OsStr> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// OSC 133 shell integration (step 5 of the terminal story)
+// ---------------------------------------------------------------------------
+
+/// OSC 133 command markers for the terminals Komet opens.
+///
+/// The terminal parser (`komet-term`) can only slice a transcript into command
+/// blocks if the *shell* emits `A`/`B`/`C`/`D` markers. This module generates
+/// the init code that makes it do so, per real shell, and describes how the
+/// launch must change to load it. Nothing here is visual: every emitted
+/// sequence is an OSC string the parser consumes and the screen never shows.
+///
+/// Rules this module lives by:
+/// - **Detect the real shell first.** The snippet is chosen by the resolved
+///   launch path's basename (`bash`, `zsh`, `fish`). Anything else (`sh`,
+///   `dash`, `csh`, `nu`, …) gets NO injection — emitting bash init code to a
+///   shell that cannot parse it is corruption, not a no-op. Those terminals
+///   keep working through the parser's silence fallback, which is honest about
+///   knowing no command text or exit code.
+/// - **Chain, never clobber.** A user's `PS1`, `PROMPT_COMMAND`, `precmd` or
+///   fish event handlers survive: ours are prepended/appended around theirs,
+///   and the invisible `B` marker is *appended* to PS1 (guarded so a re-painted
+///   prompt does not accumulate duplicates).
+/// - **PowerShell / Windows: deliberately NOT DONE.** No snippet is generated
+///   for it (plan returns `None`), and that is a declared gap, not a silent
+///   absence: `docs/PARITY.md`-style follow-up owns the PowerShell
+///   (`PSReadLine`) port.
+///
+/// `KOMET_SHELL_INTEGRATION=0` disables injection entirely (escape hatch for a
+/// snippet that wedges someone's rc — the shells then fall back to silence).
+pub mod integration {
+    use std::path::{Path, PathBuf};
+    use std::sync::OnceLock;
+
+    /// How a Komet terminal's shell launch must change to load the snippet.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct ShellIntegration {
+        /// Extra arguments appended to the shell command line.
+        pub extra_args: Vec<String>,
+        /// True when the login flag (`-l`) must NOT be passed because the
+        /// injected init emulates it (bash `--rcfile` reads no profile while
+        /// `-l` is absent, so the wrapper sources the user's profile files
+        /// itself). The snippet files are written once per process.
+        pub drop_login_flag: bool,
+        /// Environment for the shell child process.
+        pub env: Vec<(String, String)>,
+    }
+
+    /// The per-process directory holding the snippet files. Created lazily;
+    /// files are tiny, idempotent, and live in the temp dir (cleaned at exit
+    /// by the OS alongside everything else in TMPDIR).
+    fn snippet_dir() -> Option<&'static Path> {
+        static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
+        DIR.get_or_init(|| {
+            let dir = std::env::temp_dir()
+                .join(format!("komet-shell-integration-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).ok()?;
+            Some(dir)
+        })
+        .as_deref()
+    }
+
+    fn write_snippet(name: &str, contents: &str) -> Option<PathBuf> {
+        let path = snippet_dir()?.join(name);
+        std::fs::write(&path, contents).ok()?;
+        Some(path)
+    }
+
+    /// The integration plan for the shell about to be launched, or `None`
+    /// when the shell gets no injection (unsupported/disabled — callers must
+    /// then launch exactly as before).
+    pub fn plan(shell_path: &str) -> Option<ShellIntegration> {
+        plan_flagged(shell_path, !integration_disabled())
+    }
+
+    fn integration_disabled() -> bool {
+        std::env::var_os("KOMET_SHELL_INTEGRATION")
+            .is_some_and(|v| v.eq_ignore_ascii_case("0") || v.eq_ignore_ascii_case("false"))
+    }
+
+    /// `plan` with the escape hatch decided by the caller (tests use this
+    /// instead of mutating the process environment).
+    fn plan_flagged(shell_path: &str, enabled: bool) -> Option<ShellIntegration> {
+        if !enabled {
+            return None;
+        }
+        #[cfg(unix)]
+        {
+            let name = Path::new(shell_path)
+                .file_name()?
+                .to_string_lossy()
+                .to_string();
+            // Stripped/renamed shells (`bash.exe`, a login shell invoked as
+            // `-bash`) keep matching on the trimmed basename.
+            let name = name.trim_start_matches('-').trim_end_matches(".exe");
+            match name {
+                "bash" => bash_plan(),
+                "zsh" => zsh_plan(),
+                "fish" => fish_plan(),
+                _ => None,
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            // NOT DONE on Windows: the PowerShell port is a declared gap
+            // (see the module docs), not a silent absence.
+            let _ = shell_path;
+            None
+        }
+    }
+
+    /// Emitted on every real shell: `\e]133;…\a` stays invisible to the grid.
+    /// `Cwd=` rides the A/D markers so a block knows where it ran.
+    fn bash_integration() -> String {
+        r#"# Komet OSC 133 integration — sourced last, chains, never clobbers.
+if [ -n "${KOMET_OSC133_LOADED:-}" ]; then return 0 2>/dev/null; fi
+KOMET_OSC133_LOADED=1
+
+__komet_osc133_pre() {
+  local __komet_st=$?
+  printf '\033]133;D;%s;Cwd=%s\007' "$__komet_st" "$PWD"
+  printf '\033]133;A;Cwd=%s\007' "$PWD"
+  # B (prompt end) is APPENDED to PS1 as a zero-width sequence. Guarded so a
+  # prompt tool that repaints PS1 every prompt does not accumulate markers.
+  # The OSC MUST ride its own BEL (`\007`): an unterminated OSC string swallows
+  # every byte up to the next ESC, i.e. the echoed command line itself, and the
+  # grid then never shows what was typed.
+  case "$PS1" in
+    *']133;B'*) ;;
+    *) PS1="${PS1}\\[\\033]133;B\\007\\]" ;;
+  esac
+}
+
+# C (output start) rides PS0: bash expands PS0 right after the command line is
+# read and before it runs — no DEBUG trap, no false C from PROMPT_COMMAND
+# segments. The user's own PS0 is kept, ours appended (OSC bytes are not
+# echoed by PS0's writer, so no width bookkeeping is needed).
+PS0="${PS0}$(printf '\033]133;C\007')"
+
+# Chain PROMPT_COMMAND with ours FIRST: it must capture $? before anything
+# else in the prompt pipeline can overwrite it.
+if [ -n "${PROMPT_COMMAND:-}" ]; then
+  PROMPT_COMMAND="__komet_osc133_pre;$PROMPT_COMMAND"
+else
+  PROMPT_COMMAND="__komet_osc133_pre"
+fi
+"#
+        .to_string()
+    }
+
+    fn bash_wrapper(integration: &Path) -> String {
+        format!(
+            r#"# Komet: interactive bash with shell integration. `--rcfile` bypasses the
+# login sequence, so emulate it: /etc/profile, then the first profile that
+# exists, and ~/.bashrc only when no profile chain would have sourced it.
+[ -f /etc/profile ] && . /etc/profile
+__komet_profile=""
+for __komet_f in "$HOME/.bash_profile" "$HOME/.bash_login" "$HOME/.profile"; do
+  if [ -f "$__komet_f" ]; then . "$__komet_f"; __komet_profile=1; break; fi
+done
+if [ -z "$__komet_profile" ] && [ -f "$HOME/.bashrc" ]; then . "$HOME/.bashrc"; fi
+. "{}"
+"#,
+            integration.display()
+        )
+    }
+
+    fn bash_plan() -> Option<ShellIntegration> {
+        let integration = write_snippet("komet-bash-integration.sh", &bash_integration())?;
+        let wrapper = write_snippet("komet-bash-wrapper.sh", &bash_wrapper(&integration))?;
+        Some(ShellIntegration {
+            extra_args: vec!["--rcfile".into(), wrapper.display().to_string()],
+            drop_login_flag: true,
+            env: Vec::new(),
+        })
+    }
+
+    /// Launch arguments for bash in the exact order bash accepts them: on
+    /// bash 5.3 a LONG option written after a short flag (`-i --rcfile F`) is
+    /// rejected with `bash: --: invalid option`, so the plan's `--rcfile` must
+    /// come first. `interactive_first` is only for the tests, which cannot use
+    /// a PTY and must ask for interactivity by hand; the engine's PTY launch
+    /// needs neither flag and passes the plan's arguments as they are.
+    #[cfg(test)]
+    fn bash_args(plan: &ShellIntegration, interactive: bool) -> Vec<String> {
+        let mut args = plan.extra_args.clone();
+        if interactive {
+            args.push("-i".into());
+        }
+        args
+    }
+
+    /// zsh: hooks via `add-zsh-hook`, which chains with the user's own
+    /// precmd/preexec functions (and preserves $status across them). The
+    /// launch swaps ZDOTDIR for a stub dir that sources the user's files
+    /// first — every startup file zsh would read still is read.
+    fn zsh_integration() -> String {
+        r#"# Komet OSC 133 integration — sourced after the user's .zshrc.
+if [ -n "${KOMET_OSC133_LOADED:-}" ]; then return 0 2>/dev/null; fi
+KOMET_OSC133_LOADED=1
+autoload -U add-zsh-hook
+
+__komet_osc133_pre() {
+  local __komet_st=$?
+  printf '\033]133;D;%s;Cwd=%s\007' "$__komet_st" "$PWD"
+  printf '\033]133;A;Cwd=%s\007' "$PWD"
+  case "$PS1" in
+    *']133;B'*) ;;
+    *) PS1="${PS1}%{\033]133;B\a%}" ;;
+  esac
+}
+__komet_osc133_preexec() { printf '\033]133;C\007' }
+add-zsh-hook precmd __komet_osc133_pre
+add-zsh-hook preexec __komet_osc133_preexec
+"#
+        .to_string()
+    }
+
+    /// One startup file of the stub ZDOTDIR: source the user's own version of
+    /// it (if any), then run `extra` (only `.zshrc` has any).
+    fn zsh_stub(name: &str, inner: &str, extra: &str) -> String {
+        format!(
+            concat!(
+                "# Komet ZDOTDIR stub: the user's own {} still runs first.\n",
+                "__komet_user_zdotdir=\"${{KOMET_USER_ZDOTDIR:-$HOME}}\"\n",
+                "[ -f \"$__komet_user_zdotdir/{}\" ] && source \"$__komet_user_zdotdir/{}\"\n",
+                "{}",
+            ),
+            name, inner, inner, extra
+        )
+    }
+
+    fn zsh_plan() -> Option<ShellIntegration> {
+        let dir = snippet_dir()?;
+        let rc_extra = format!(
+            "source \"{}\"\n{}",
+            dir.join("komet-zsh-integration.sh").display(),
+            zsh_integration()
+        );
+        // The dir itself must exist before the stubs land in it.
+        std::fs::create_dir_all(dir.join("zsh")).ok()?;
+        let zdotdir = dir.join("zsh");
+        for (file, inner) in [
+            (".zshenv", ".zshenv"),
+            (".zprofile", ".zprofile"),
+            (".zlogin", ".zlogin"),
+        ] {
+            std::fs::write(zdotdir.join(file), zsh_stub(file, inner, "")).ok()?;
+        }
+        std::fs::write(
+            zdotdir.join(".zshrc"),
+            zsh_stub(".zshrc", ".zshrc", &rc_extra),
+        )
+        .ok()?;
+        std::fs::write(zdotdir.join("komet-zsh-integration.sh"), zsh_integration()).ok()?;
+        let mut env = vec![("ZDOTDIR".to_string(), zdotdir.display().to_string())];
+        // Only forward a real ZDOTDIR; with none set the stub falls back to
+        // $HOME, which is exactly where zsh would have looked.
+        if let Ok(user_zdotdir) = std::env::var("ZDOTDIR") {
+            env.push(("KOMET_USER_ZDOTDIR".to_string(), user_zdotdir));
+        }
+        Some(ShellIntegration {
+            extra_args: Vec::new(),
+            drop_login_flag: false,
+            env,
+        })
+    }
+
+    /// fish: `--init-command` composes with the user's config without any
+    /// file swap, and event handlers chain by construction (a user's own
+    /// fish_precmd still runs — both subscribe to the event).
+    ///
+    /// fish also owns the login flag here: its `-l` means `--list-bindings`
+    /// (print the key map and EXIT), so the plain `-l` the launcher adds by
+    /// default would kill the shell at birth. The plan therefore drops it and
+    /// passes fish's long form `--login` itself, in the argument order fish
+    /// accepts.
+    fn fish_plan() -> Option<ShellIntegration> {
+        let path = write_snippet(
+            "komet-fish-integration.fish",
+            r#"# Komet OSC 133 integration — event handlers, chained by construction.
+function __komet_osc133_pre --event fish_precmd
+    printf '\033]133;D;%d;Cwd=%s\007' $status $PWD
+    printf '\033]133;A;Cwd=%s\007' $PWD
+end
+function __komet_osc133_preexec --event fish_preexec
+    printf '\033]133;C\007'
+end
+"#,
+        )?;
+        Some(ShellIntegration {
+            extra_args: vec![
+                "--login".into(),
+                "--init-command".into(),
+                format!("source {}", path.display()),
+            ],
+            drop_login_flag: true,
+            env: Vec::new(),
+        })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn which(name: &str) -> Option<String> {
+            let dirs = std::env::var_os("PATH")?;
+            std::env::split_paths(&dirs)
+                .map(|dir| dir.join(name))
+                .find(|candidate| candidate.is_file())
+                .map(|candidate| candidate.display().to_string())
+        }
+
+        /// Drive a scripted interactive shell session and return everything
+        /// it wrote. Interactive shells put the PROMPT (and PS0) on stderr
+        /// and command output on stdout — one PTY merges them, so the test
+        /// merges them too.
+        fn run_session<A: AsRef<std::ffi::OsStr>>(
+            program: &str,
+            args: &[A],
+            env: &[(&str, &str)],
+            stdin_cmds: &str,
+        ) -> String {
+            use std::io::Write as _;
+            use std::process::{Command, Stdio};
+            let mut child = Command::new(program)
+                .args(args)
+                .envs(env.iter().map(|(k, v)| (k, v.to_string())))
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap_or_else(|e| panic!("spawn {program}: {e}"));
+            child
+                .stdin
+                .take()
+                .expect("stdin")
+                .write_all(stdin_cmds.as_bytes())
+                .expect("type into the shell");
+            let out = child.wait_with_output().expect("shell exits");
+            // No status assertion: these scripts end on `false` on purpose (a
+            // non-zero exit must reach the markers), and every shell exits with
+            // the last command's code. What matters is the emitted stream.
+            let mut merged = String::from_utf8_lossy(&out.stdout).into_owned();
+            merged.push_str(&String::from_utf8_lossy(&out.stderr));
+            merged
+        }
+
+        fn owned_env(pairs: &[(String, String)]) -> Vec<(&str, &str)> {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect()
+        }
+
+        #[test]
+        fn unsupported_shells_get_no_injection() {
+            // Emitting bash init into a shell that cannot parse it is
+            // corruption — `sh`/`dash`/`nu` must plan nothing.
+            assert_eq!(plan_flagged("/bin/sh", true), None);
+            assert_eq!(plan_flagged("/usr/bin/dash", true), None);
+            assert_eq!(plan_flagged("/usr/local/bin/nu", true), None);
+        }
+
+        #[test]
+        fn the_escape_hatch_disables_everything() {
+            // `KOMET_SHELL_INTEGRATION=0` is the declared off-switch; the
+            // plan then disappears for shells that would otherwise inject.
+            assert_eq!(plan_flagged("/bin/bash", false), None);
+            assert!(plan_flagged("/bin/bash", true).is_some());
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn bash_plan_wraps_rcfile_and_drops_the_login_flag() {
+            if which("bash").is_none() {
+                eprintln!("no bash on this machine");
+                return;
+            }
+            let p = plan_flagged("/bin/bash", true).expect("bash plan");
+            assert!(p.drop_login_flag);
+            assert_eq!(p.extra_args.len(), 2);
+            assert_eq!(p.extra_args[0], "--rcfile");
+            assert!(
+                std::fs::read_to_string(&p.extra_args[1])
+                    .expect("wrapper exists")
+                    .contains("komet-bash-integration.sh")
+            );
+        }
+
+        /// The two invariants this step must not trade away: a personalised
+        /// PS1 survives, and so does a personalised PROMPT_COMMAND — while
+        /// the markers arrive around them, including the NON-ZERO exit code
+        /// of `false`.
+        #[cfg(unix)]
+        #[test]
+        fn bash_injection_keeps_a_custom_ps1_and_prompt_command_and_marks_exit() {
+            let Some(bash) = which("bash") else {
+                eprintln!("no bash on this machine");
+                return;
+            };
+            let home = tempfile::tempdir().expect("fake HOME");
+            std::fs::write(
+                home.path().join(".bashrc"),
+                "PS1='MYPROMPT> '\nPROMPT_COMMAND='echo pc-ran'\n",
+            )
+            .expect("write bashrc");
+            let p = plan_flagged("/bin/bash", true).expect("bash plan");
+            let mut env = vec![("HOME".to_string(), home.path().display().to_string())];
+            env.extend(p.env.iter().cloned());
+            // `false` first: its exit code must arrive as D;1. bash reads
+            // --rcfile only when interactive, hence -i (the PTY launch is
+            // interactive by construction).
+            let args = bash_args(&p, true);
+            let out = run_session(&bash, &args, &owned_env(&env), "false\ntrue\nexit\n");
+            assert!(out.contains("MYPROMPT> "), "the user's PS1 survived: {out}");
+            assert!(out.contains("pc-ran"), "the user's PROMPT_COMMAND ran");
+            assert!(
+                out.contains("\u{1b}]133;D;1;Cwd="),
+                "the failing command's exit code reached the stream: {out}"
+            );
+            assert!(
+                out.contains("\u{1b}]133;D;0;Cwd="),
+                "and the succeeding one's"
+            );
+            assert!(out.contains("\u{1b}]133;A;Cwd="), "prompt start marked");
+            assert!(out.contains("\u{1b}]133;B"), "prompt end marked");
+            assert!(out.contains("\u{1b}]133;C"), "output start marked");
+        }
+
+        /// Same stream through the real parser: after the shell emits its
+        /// markers the screen must show NONE of them (OSC strings are
+        /// consumed by the grid) and everything else must survive.
+        #[cfg(unix)]
+        #[test]
+        fn bash_markers_leave_no_visible_characters_on_the_grid() {
+            let Some(bash) = which("bash") else {
+                eprintln!("no bash on this machine");
+                return;
+            };
+            let home = tempfile::tempdir().expect("fake HOME");
+            std::fs::write(home.path().join(".bashrc"), "PS1='> '\n").expect("write bashrc");
+            let p = plan_flagged("/bin/bash", true).expect("bash plan");
+            let mut env = vec![("HOME".to_string(), home.path().display().to_string())];
+            env.extend(p.env.iter().cloned());
+            let args = bash_args(&p, true);
+            let out = run_session(&bash, &args, &owned_env(&env), "echo komet-visible\nexit\n");
+            // Feed the raw stream through the emulator: what it renders as
+            // text must contain the echo and no marker bytes.
+            let mut emu = komet_term::Emulator::with_scrollback(80, 24, 100);
+            emu.feed(out.as_bytes());
+            let screen = emu
+                .screen_text()
+                .iter()
+                .map(|line| line.trim_end())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                screen.contains("komet-visible"),
+                "output survived: {screen}"
+            );
+            assert!(
+                !screen.contains("133;"),
+                "no marker bytes on screen: {screen}"
+            );
+            let blocks = emu.command_blocks();
+            // Command TEXT must NOT be asserted here: with stdin a PIPE bash
+            // has no readline echo of the typed line (nothing between `B` and
+            // `C` carries `echo komet-visible`), and `run_session` concatenates
+            // stderr after stdout, so prompt, `C` and output never arrive in
+            // screen order — the parser would then legitimately read the
+            // prompt line as the command (`command: Some(">")`). Command
+            // capture on the PRODUCTION launch (a real PTY, kernel echo
+            // between `B` and `C`) is proven by komet-engine's
+            // `terminals::bash_injection_on_a_real_pty_reports_the_typed_
+            // command_to_agents`. What a pipe CAN honestly prove is the claim
+            // of this test's name: the markers reached the parser, were
+            // consumed off the grid, and still sliced a marker-backed block
+            // carrying the exit code.
+            assert!(
+                blocks
+                    .iter()
+                    .any(|b| b.marker_backed && b.exit_code == Some(0)),
+                "the parser consumed the off-screen markers into an exit-coded block: {blocks:?}"
+            );
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn zsh_injection_chains_precmd_and_marks_exit() {
+            let Some(zsh) = which("zsh") else {
+                eprintln!("no zsh on this machine");
+                return;
+            };
+            let home = tempfile::tempdir().expect("fake HOME");
+            // A classic (non-hook) precmd: zsh runs it AND add-zsh-hook
+            // runs ours — the user's prompt machinery must keep working.
+            std::fs::write(
+                home.path().join(".zshrc"),
+                "PS1='MYZPROMPT> '\nprecmd() { echo usr-ran; }\n",
+            )
+            .expect("write zshrc");
+            let p = plan_flagged("zsh", true).expect("zsh plan");
+            let mut env = vec![("HOME".to_string(), home.path().display().to_string())];
+            env.extend(p.env.iter().cloned());
+            let out = run_session(&zsh, &["-i"], &owned_env(&env), "false\nexit\n");
+            assert!(out.contains("MYZPROMPT> "), "the user's prompt survived");
+            assert!(out.contains("usr-ran"), "the user's own precmd still ran");
+            assert!(
+                out.contains("\u{1b}]133;D;1;Cwd="),
+                "zsh carried the exit code: {out}"
+            );
+            assert!(out.contains("\u{1b}]133;A;Cwd="));
+            assert!(out.contains("\u{1b}]133;C"), "preexec emitted C");
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn fish_injection_emits_markers_without_clobbering_prompt() {
+            let Some(fish) = which("fish") else {
+                eprintln!("no fish on this machine");
+                return;
+            };
+            let config = tempfile::tempdir().expect("fake config");
+            let p = plan_flagged("fish", true).expect("fish plan");
+            let mut env = vec![
+                (
+                    "XDG_CONFIG_HOME".to_string(),
+                    config.path().display().to_string(),
+                ),
+                ("HOME".to_string(), config.path().display().to_string()),
+            ];
+            env.extend(p.env.iter().cloned());
+            let mut args = vec!["--interactive".to_string()];
+            args.extend(p.extra_args.iter().cloned());
+            let out = run_session(&fish, &args, &owned_env(&env), "false\nexit\n");
+            assert!(
+                out.contains("\u{1b}]133;D;1"),
+                "fish carried the exit code: {out}"
+            );
+            assert!(out.contains("\u{1b}]133;A;Cwd="));
+            assert!(out.contains("\u{1b}]133;C"));
+        }
+    }
+}
+
 /// Kick off the snapshot on a background thread so the first harness resolve
 /// doesn't pay the shell-startup latency inline. Call at daemon startup.
 pub fn prewarm() {

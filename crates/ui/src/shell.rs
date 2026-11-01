@@ -60,7 +60,10 @@ use crate::state::{
     org_name_valid, parse_orgs, sort_memberships,
 };
 use crate::subagent::{SubagentEvent, SubagentOpen, SubagentPanel};
-use crate::terminal::panel::{TerminalPanel, ToggleTerminal, clamp_terminal_height};
+use crate::terminal::panel::{
+    NewTerminalTab, TerminalPanel, TerminalPanelEvent, TerminalPrefs, ToggleTerminal,
+    clamp_terminal_height,
+};
 use crate::theme::Theme;
 use crate::transcript::{
     self, ErrorOpenAccounts, ErrorOpenModelPicker, ErrorRetryTurn, RevealLastCompaction,
@@ -175,6 +178,9 @@ pub fn apply_keymap(cx: &mut App, keymap: &KeymapConfig) {
         // bar); pressing it again dismisses.
         KeyBinding::new(&platform_combo("mod-k"), AddSpacePalette, None),
     ]);
+    // Terminal tab/font chrome (Ctx+Shift+W/F2/=/-/0…). `init` bound these at
+    // startup, but the clear above removed them, so re-bind the same set.
+    cx.bind_keys(crate::terminal::panel::chrome_bindings());
 }
 
 /// The settings sections (feature-inventory §1.5 routes).
@@ -251,8 +257,8 @@ pub enum Route {
 }
 
 /// One right-pane surface tab: a workspace browser, an individual workspace
-/// file editor, a git-diff page, an embedded terminal, or a subagent
-/// transcript. `Picker` is the empty surface chooser.
+/// file editor, a git-diff page, an embedded terminal, a subagent transcript,
+/// or the agent's own shell (read-only). `Picker` is the empty surface chooser.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RightSurface {
     #[default]
@@ -264,6 +270,10 @@ pub enum RightSurface {
     /// A subagent's transcript, read-only (per-subagent viz) — the handle
     /// keys [`Shell::subagent_tabs`].
     Subagent(u64),
+    /// The agent's own shell commands, read-only (« Shell agent »). One per
+    /// chat, not per handle: it is a view of the transcript's tool events, not
+    /// a terminal Komet owns — so there is nothing here to close or to type in.
+    AgentShell,
 }
 
 fn push_unique_right_surface(tabs: &mut Vec<RightSurface>, surface: RightSurface) -> bool {
@@ -1053,6 +1063,10 @@ pub struct Shell {
     /// entity from the bottom drawer's (own PTYs, own grid geometry; one
     /// panel can only size one visible grid at a time).
     right_terminal: Option<Entity<TerminalPanel>>,
+    /// Panel → shell chrome events (font zoom persistence, surface-tab
+    /// bookkeeping). One subscription per panel entity.
+    terminal_event_sub: Option<Subscription>,
+    right_terminal_event_sub: Option<Subscription>,
     /// The surface-tab strip's `+` menu (Terminal / Git diff rows).
     right_plus: popover::Popup<()>,
     /// Titlebar GitHub control: its dropdown + the checkout's status.
@@ -1289,6 +1303,10 @@ impl Shell {
                     };
                     this.add_subagent_surface(open, cx);
                 }
+                // A Run chip's badge: the read-only shell log of this chat.
+                TranscriptEvent::OpenAgentShell => {
+                    this.add_agent_shell_surface(cx);
+                }
             },
         );
         // Every send glides the prompt to the viewport top and reserves the
@@ -1393,6 +1411,8 @@ impl Shell {
             archived_hover: None,
             terminal: None,
             right_terminal: None,
+            terminal_event_sub: None,
+            right_terminal_event_sub: None,
             right_plus: popover::Popup::default(),
             github_menu: popover::Popup::default(),
             project_open_menu: popover::Popup::default(),
@@ -1956,7 +1976,13 @@ impl Shell {
         if let Some(terminal) = &self.right_terminal {
             return terminal.clone();
         }
+        let prefs = self.terminal_prefs();
         let terminal = cx.new(|cx| TerminalPanel::new_embedded(self.state.clone(), cx));
+        terminal.update(cx, |panel, cx| panel.set_prefs(prefs, cx));
+        let sub = cx.subscribe(&terminal, |this, panel, event: &TerminalPanelEvent, cx| {
+            this.on_terminal_panel_event(panel, event, cx);
+        });
+        self.right_terminal_event_sub = Some(sub);
         self.right_terminal = Some(terminal.clone());
         terminal
     }
@@ -2018,6 +2044,14 @@ impl Shell {
                     .subagent_tabs
                     .get(id)
                     .map(|panel| (*surface, panel.read(cx).tab_title(), false, None)),
+                RightSurface::AgentShell => Some((
+                    *surface,
+                    SharedString::from("Shell agent"),
+                    false,
+                    Some(SharedString::from(
+                        "Read-only view of the agent's own shell",
+                    )),
+                )),
             })
             .collect()
     }
@@ -2105,6 +2139,10 @@ impl Shell {
                 if let Some(panel) = self.subagent_tabs.get(&id).cloned() {
                     panel.update(cx, |panel, cx| panel.ensure_started(cx));
                 }
+            }
+            RightSurface::AgentShell => {
+                // Nothing to load or start: the surface reads the transcript
+                // at paint time and owns no subscription by design.
             }
             RightSurface::Picker => {}
         }
@@ -2290,7 +2328,8 @@ impl Shell {
             RightSurface::Diff(_)
             | RightSurface::Picker
             | RightSurface::Terminal(_)
-            | RightSurface::Subagent(_) => {
+            | RightSurface::Subagent(_)
+            | RightSurface::AgentShell => {
                 return None;
             }
         };
@@ -2455,6 +2494,10 @@ impl Shell {
                 self.subagent_tabs.remove(&id);
                 self.subagent_subs.remove(&id);
             }
+            RightSurface::AgentShell => {
+                // Nothing to tear down: the read-only surface owns no entity,
+                // no subscription, and no PTY.
+            }
             RightSurface::Picker => {}
         }
         self.panels.update(&key, |p| {
@@ -2579,6 +2622,26 @@ impl Shell {
         self.set_right_active(surface, cx);
     }
 
+    /// The picker's « Shell agent » card: the read-only log of the commands
+    /// the agent ran in its OWN shell (Claude/Codex keep that traffic out of
+    /// any Komet PTY). One tab per chat — it projects the transcript's tool
+    /// events, so a second tab would show the identical list.
+    fn add_agent_shell_surface(&mut self, cx: &mut Context<Self>) {
+        let key = self.panel_key(cx);
+        push_unique_right_surface(
+            self.right_tabs.entry(key.clone()).or_default(),
+            RightSurface::AgentShell,
+        );
+        // Same rule as a spawn chip's tab: opening a surface the user cannot
+        // see reads as the click doing nothing.
+        if !self.right_pane_open(cx) {
+            let from = self.right_target(cx);
+            self.panels.update(&key, |p| p.changes_open = true);
+            self.right_tween = Some(WidthTween::new(from, self.right_target(cx)));
+        }
+        self.set_right_active(RightSurface::AgentShell, cx);
+    }
+
     /// The picker's Terminal card / the `+` menu's Terminal row: every click
     /// opens a fresh embedded terminal tab.
     fn add_terminal_surface(&mut self, cx: &mut Context<Self>) {
@@ -2601,9 +2664,107 @@ impl Shell {
         if let Some(terminal) = &self.terminal {
             return terminal.clone();
         }
+        let prefs = self.terminal_prefs();
         let terminal = cx.new(|cx| TerminalPanel::new(self.state.clone(), cx));
+        terminal.update(cx, |panel, cx| panel.set_prefs(prefs, cx));
+        let sub = cx.subscribe(&terminal, |this, panel, event: &TerminalPanelEvent, cx| {
+            this.on_terminal_panel_event(panel, event, cx);
+        });
+        self.terminal_event_sub = Some(sub);
         self.terminal = Some(terminal.clone());
         terminal
+    }
+
+    /// The persisted terminal chrome settings, as the panels consume them.
+    fn terminal_prefs(&self) -> TerminalPrefs {
+        TerminalPrefs {
+            font_size: self.settings.terminal_font_size,
+            scrollback_lines: self.settings.terminal_scrollback_lines,
+            bell_audible: self.settings.terminal_bell_audible,
+        }
+    }
+
+    /// Mirror prefs onto the panel that did NOT report the change (updating
+    /// the emitter back into itself while it is mid-update would re-borrow
+    /// the entity).
+    fn push_terminal_prefs(&self, emitter: &Entity<TerminalPanel>, cx: &mut Context<Self>) {
+        let prefs = self.terminal_prefs();
+        for panel in [&self.terminal, &self.right_terminal].into_iter().flatten() {
+            if panel.entity_id() == emitter.entity_id() {
+                continue;
+            }
+            let panel = panel.clone();
+            panel.update(cx, |panel, cx| panel.set_prefs(prefs, cx));
+        }
+    }
+
+    fn on_terminal_panel_event(
+        &mut self,
+        panel: Entity<TerminalPanel>,
+        event: &TerminalPanelEvent,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            TerminalPanelEvent::FontSizeChanged(size) => {
+                self.settings.terminal_font_size = *size;
+                self.schedule_save(cx);
+                self.push_terminal_prefs(&panel, cx);
+            }
+            TerminalPanelEvent::BellAudibleChanged(audible) => {
+                self.settings.terminal_bell_audible = *audible;
+                self.schedule_save(cx);
+                self.push_terminal_prefs(&panel, cx);
+            }
+            TerminalPanelEvent::TabActivated(key) => {
+                // Embedded cycling: the surface strip highlights from shell
+                // state, so follow the panel's new active tab — but only if
+                // that tab has a surface (drawer tabs have none).
+                let key_panel = self.panel_key(cx);
+                let has = self
+                    .right_tabs
+                    .get(&key_panel)
+                    .is_some_and(|tabs| tabs.contains(&RightSurface::Terminal(*key)));
+                if has {
+                    self.panels.update(&key_panel, |p| {
+                        p.right_active = RightSurface::Terminal(*key)
+                    });
+                    cx.notify();
+                }
+            }
+            TerminalPanelEvent::TabClosed(key) => {
+                // Drop the surface for a closed embedded tab (the ✕ path also
+                // does this, but keyboard/menu closes land here; retaining an
+                // absent surface is a no-op). State-only: never update the
+                // emitting panel here, it is mid-update.
+                let key_panel = self.panel_key(cx);
+                let surface = RightSurface::Terminal(*key);
+                let had = if let Some(tabs) = self.right_tabs.get_mut(&key_panel) {
+                    let before = tabs.len();
+                    tabs.retain(|s| *s != surface);
+                    tabs.len() != before
+                } else {
+                    false
+                };
+                if had {
+                    let next = self
+                        .right_tabs
+                        .get(&key_panel)
+                        .and_then(|tabs| {
+                            tabs.iter().find_map(|s| match s {
+                                RightSurface::Terminal(k) => Some(RightSurface::Terminal(*k)),
+                                _ => None,
+                            })
+                        })
+                        .unwrap_or(RightSurface::Picker);
+                    self.panels.update(&key_panel, |p| {
+                        if p.right_active == surface {
+                            p.right_active = next;
+                        }
+                    });
+                    cx.notify();
+                }
+            }
+        }
     }
 
     fn terminal_target(&self, cx: &App) -> f32 {
@@ -7327,6 +7488,30 @@ impl Shell {
                         self.render_surface_picker(cx)
                     }
                 }
+                RightSurface::AgentShell => {
+                    // Read at paint time: the panel is a projection of the
+                    // transcript (commands from the doc's `Exec` chips, output
+                    // from the ephemeral activity tails), so it holds no
+                    // entity, no subscription — and no path to a PTY.
+                    let log = self.transcript.read(cx).agent_shell_log();
+                    let harness = self
+                        .composer
+                        .read(cx)
+                        .pickers()
+                        .read(cx)
+                        .resolved(cx)
+                        .harness;
+                    let agent = harness.map(|id| id.display_name().to_string());
+                    let surface = harness.map_or(komet_proto::ProgressSurface::None, |id| {
+                        komet_harness::capabilities::interaction_surface(id).tool_progress
+                    });
+                    crate::agent_shell::render(
+                        &log,
+                        agent.as_deref().unwrap_or("The agent"),
+                        surface,
+                        &theme,
+                    )
+                }
                 _ => self.render_surface_picker(cx),
             };
             // Files browser companion: shown alongside File editor tabs
@@ -7515,6 +7700,14 @@ impl Shell {
                                         this.add_terminal_surface(cx);
                                     }),
                                 ),
+                            )
+                            // The agent's own shell, in read-only: no Komet PTY
+                            // is involved, so nothing here can be typed into.
+                            .child(
+                                row("surface-card-agent-shell", icons::TERMINAL, "Shell agent")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.add_agent_shell_surface(cx);
+                                    })),
                             )
                             .child(
                                 row("surface-card-files", icons::FOLDER_WITH_FILES, "Files")
@@ -8854,6 +9047,16 @@ impl Render for Shell {
             .on_action(cx.listener(|this, _: &ToggleTerminal, window, cx| {
                 if matches!(this.route, Route::Chat) {
                     this.toggle_terminal(window, cx)
+                }
+            }))
+            // A new-tab request from the EMBEDDED panel deliberately bubbles
+            // here (the panel lets it pass): the `+` button and the keyboard
+            // equivalent must open a fresh surface tab, not just an in-panel
+            // tab. The drawer panel stops propagation and opens in-panel, so
+            // this handler only ever sees embedded requests.
+            .on_action(cx.listener(|this, _: &NewTerminalTab, _, cx| {
+                if matches!(this.route, Route::Chat) {
+                    this.add_terminal_surface(cx);
                 }
             }))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| this.toggle_sidebar(cx)))

@@ -13,6 +13,9 @@ komet-engine.workspace = true
 komet-harness.workspace = true
 komet-rpc.workspace = true
 komet-update.workspace = true
+# The emulator core lives here, not in alacritty_terminal directly: this crate
+# only paints it (see src/terminal).
+komet-term.workspace = true
 komet-syntax.workspace = true
 gpui.workspace = true
 gpui_platform.workspace = true
@@ -24,7 +27,6 @@ async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 pulldown-cmark.workspace = true
-alacritty_terminal.workspace = true
 base64 = "0.22"
 unicode-segmentation.workspace = true
 uuid.workspace = true

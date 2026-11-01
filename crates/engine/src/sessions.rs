@@ -50,6 +50,7 @@ use crate::mcp::server::{AskDecision, AskFn, McpEndpoint, PermissionAsk, Running
 use crate::mcp::{McpRegistry, McpSecretStore, ResolvedMcpServer};
 use crate::registry::HarnessRegistry;
 use crate::run_journal::RunJournal;
+use crate::terminals::Terminals;
 use crate::{EngineError, new_id, now_ms};
 
 /// One journaled event: the durable seq plus the event, as broadcast to subscribers.
@@ -450,6 +451,10 @@ struct Inner {
     mcp_registry: Arc<McpRegistry>,
     mcp_secrets: Arc<McpSecretStore>,
     agent_accounts: OnceLock<AgentAccounts>,
+    /// Device-local PTY terminals. The internal MCP catalog reaches them
+    /// through this back-edge for the `terminal_list` / `terminal_read` tools
+    /// (the agent gate itself lives in `crate::terminals`).
+    terminals: OnceLock<Terminals>,
     /// Set-once (first wins), cleared on runtime retirement: sessions and
     /// doc-host reference each other through Arcs, so this back-edge must be
     /// severable for a replaced engine graph to drop.
@@ -521,6 +526,7 @@ impl SessionsEngine {
                 mcp_registry,
                 mcp_secrets,
                 agent_accounts: OnceLock::new(),
+                terminals: OnceLock::new(),
                 doc_host: Mutex::new(None),
                 runs: Mutex::new(HashMap::new()),
                 hubs: Mutex::new(HashMap::new()),
@@ -558,6 +564,19 @@ impl SessionsEngine {
         if self.inner.agent_accounts.set(accounts).is_err() {
             tracing::warn!("agent accounts service was already wired to sessions");
         }
+    }
+
+    /// Wire the device's terminals so the internal MCP catalog can answer
+    /// `terminal_list` / `terminal_read` (once per engine graph).
+    pub fn set_terminals(&self, terminals: Terminals) {
+        if self.inner.terminals.set(terminals).is_err() {
+            tracing::warn!("terminals were already wired to sessions");
+        }
+    }
+
+    /// The device's terminals, when wired (`None` in bare test runtimes).
+    pub fn terminals(&self) -> Option<Terminals> {
+        self.inner.terminals.get().cloned()
     }
 
     /// Test-only constructor with ephemeral MCP stores.
@@ -705,8 +724,11 @@ impl SessionsEngine {
             tracing::warn!(chat = %chat_id, "internal MCP skipped: workspace not wired");
             return None;
         };
-        let mut catalog =
-            McpCatalog::komet_default(Arc::new(EngineMcpHost::new(self.clone(), workspace)));
+        let mut catalog = McpCatalog::komet_default(Arc::new(EngineMcpHost::new(
+            self.clone(),
+            workspace,
+            run_id,
+        )));
         match self.inner.mcp_secrets.composio_platform_api_key() {
             Ok(Some(api_key)) => {
                 let api = ComposioApi::new(api_key, self.inner.device_id.clone());
@@ -3745,12 +3767,12 @@ mod tests {
             },
         ];
         for event in events {
-            sessions.inner.publish(&chat, &event);
+            sessions.inner.publish(chat, &event);
             if let Some(next) = phase_change(&event, phase) {
                 phase = Some(next);
                 sessions
                     .inner
-                    .broadcast_ephemeral(&chat, AgentEvent::RunPhase { phase: next });
+                    .broadcast_ephemeral(chat, AgentEvent::RunPhase { phase: next });
             }
         }
         let mut seen = Vec::new();

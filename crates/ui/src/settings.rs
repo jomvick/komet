@@ -70,6 +70,19 @@ pub const TERMINAL_MAX_VH: f32 = 0.55;
 pub const TERMINAL_ABS_MAX_HEIGHT: f32 = 2000.0;
 pub const TERMINAL_DEFAULT_HEIGHT: f32 = 280.0;
 
+/// Terminal grid font size (px) — Ctrl+= / Ctrl+- / Ctrl+0 zoom it live.
+/// The line height follows at the shipped 18/13 ratio (see `line_height_for`
+/// in the terminal view), so one knob moves the whole grid consistently.
+pub const TERMINAL_FONT_SIZE_DEFAULT: f32 = 13.0;
+pub const TERMINAL_FONT_SIZE_MIN: f32 = 9.0;
+pub const TERMINAL_FONT_SIZE_MAX: f32 = 28.0;
+
+/// Scrollback capacity per terminal tab (lines). `alacritty_terminal` fixes
+/// this when the grid is built, so a change applies to *newly opened* tabs.
+pub const TERMINAL_SCROLLBACK_DEFAULT: u32 = 10_000;
+pub const TERMINAL_SCROLLBACK_MIN: u32 = 256;
+pub const TERMINAL_SCROLLBACK_MAX: u32 = 200_000;
+
 /// Debounce for settings writes after a drag/toggle.
 pub const SAVE_DEBOUNCE_MS: u64 = 400;
 
@@ -140,6 +153,14 @@ pub struct UiSettings {
     pub terminal_height: f32,
     /// Legacy — see [`Self::right_pane_open`].
     pub terminal_open: bool,
+    /// Terminal grid font size (px); the line height derives from it.
+    pub terminal_font_size: f32,
+    /// Scrollback lines kept per terminal tab. Applied when a tab's emulator
+    /// is built — a running tab keeps its current capacity until reopened.
+    pub terminal_scrollback_lines: u32,
+    /// Play a chime on a terminal BEL (`\x07` / OSC bell) in addition to the
+    /// visual flash. `KOMET_DISABLE_SOUND` still wins.
+    pub terminal_bell_audible: bool,
     /// Customizable shortcut combos (feature-inventory §1.4).
     pub keymap: KeymapConfig,
     /// Light/dark preference. Defaults to following the OS.
@@ -182,6 +203,9 @@ impl Default for UiSettings {
             right_pane_open: false,
             terminal_height: TERMINAL_DEFAULT_HEIGHT,
             terminal_open: false,
+            terminal_font_size: TERMINAL_FONT_SIZE_DEFAULT,
+            terminal_scrollback_lines: TERMINAL_SCROLLBACK_DEFAULT,
+            terminal_bell_audible: false,
             keymap: KeymapConfig::default(),
             appearance: crate::appearance::AppearanceMode::default(),
             wallpaper_path: None,
@@ -405,6 +429,15 @@ impl UiSettings {
             TERMINAL_ABS_MAX_HEIGHT,
             TERMINAL_DEFAULT_HEIGHT,
         );
+        self.terminal_font_size = clamp_or(
+            self.terminal_font_size,
+            TERMINAL_FONT_SIZE_MIN,
+            TERMINAL_FONT_SIZE_MAX,
+            TERMINAL_FONT_SIZE_DEFAULT,
+        );
+        self.terminal_scrollback_lines = self
+            .terminal_scrollback_lines
+            .clamp(TERMINAL_SCROLLBACK_MIN, TERMINAL_SCROLLBACK_MAX);
         self.files_autosave_delay_ms = self
             .files_autosave_delay_ms
             .clamp(FILES_AUTOSAVE_DELAY_MIN_MS, FILES_AUTOSAVE_DELAY_MAX_MS);
@@ -498,6 +531,9 @@ mod tests {
             right_pane_open: true,
             terminal_height: 320.0,
             terminal_open: true,
+            terminal_font_size: 15.0,
+            terminal_scrollback_lines: 5_000,
+            terminal_bell_audible: true,
             keymap: KeymapConfig {
                 toggle_sidebar: "mod-shift-s".into(),
                 ..KeymapConfig::default()
@@ -724,5 +760,34 @@ mod tests {
             UiSettings::load(dir.path()).terminal_height,
             TERMINAL_ABS_MAX_HEIGHT
         );
+    }
+
+    /// The chrome settings (font size, scrollback, audible bell) must load,
+    /// clamp on hand-edited files, and stay absent-safe for older files.
+    #[test]
+    fn terminal_chrome_settings_round_trip_and_clamp() {
+        let d = UiSettings::default();
+        assert_eq!(d.terminal_font_size, 13.0);
+        assert_eq!(d.terminal_scrollback_lines, 10_000);
+        assert!(!d.terminal_bell_audible);
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            UiSettings::path(dir.path()),
+            r#"{"terminalFontSize": 40, "terminalScrollbackLines": 7, "terminalBellAudible": true}"#,
+        )
+        .unwrap();
+        let loaded = UiSettings::load(dir.path());
+        assert_eq!(loaded.terminal_font_size, TERMINAL_FONT_SIZE_MAX);
+        assert_eq!(loaded.terminal_scrollback_lines, TERMINAL_SCROLLBACK_MIN);
+        assert!(loaded.terminal_bell_audible);
+
+        // A file from before these settings existed keeps defaults, not a
+        // failed parse.
+        std::fs::write(UiSettings::path(dir.path()), r#"{"sidebarWidth": 300}"#).unwrap();
+        let old = UiSettings::load(dir.path());
+        assert_eq!(old.terminal_font_size, TERMINAL_FONT_SIZE_DEFAULT);
+        assert_eq!(old.terminal_scrollback_lines, TERMINAL_SCROLLBACK_DEFAULT);
+        assert!(!old.terminal_bell_audible);
     }
 }

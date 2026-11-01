@@ -604,6 +604,139 @@ pub enum RowKind {
     },
 }
 
+/// How far a command got, as the read-only agent-shell panel states it. Only
+/// what the doc's chip already knows (`resolved` / `is_error`) — the panel
+/// invents no lifecycle of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentShellStatus {
+    Running,
+    Done,
+    Failed,
+}
+
+impl AgentShellStatus {
+    pub fn label(self) -> &'static str {
+        match self {
+            AgentShellStatus::Running => "running",
+            AgentShellStatus::Done => "done",
+            AgentShellStatus::Failed => "failed",
+        }
+    }
+}
+
+/// One command the AGENT ran in its OWN shell, for the read-only "Shell agent"
+/// panel. Claude Code and Codex execute outside any Komet PTY, so the human has
+/// no window on that traffic otherwise; this row is Komet's view of it, built
+/// from the harness's tool events and never from a terminal Komet controls.
+/// There is deliberately no input affordance attached to this data.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AgentShellEntry {
+    /// Doc part id (= the wire's tool call id): keys the ephemeral output tail.
+    pub id: SharedString,
+    pub command: SharedString,
+    pub status: AgentShellStatus,
+    /// What the command printed: the harness's streamed/settled output when it
+    /// exposed one (whole tail of it, with [`Self::output_live`] telling the
+    /// panel where it came from), else the doc's error summary, else nothing.
+    pub output: Vec<SharedString>,
+    pub truncated_by: usize,
+    /// `true` when `output` is the `WatchActivity` tail (ephemeral, live while
+    /// the command runs and — for harnesses that send a settled snapshot — the
+    /// whole print once it ends). `false` when it is the durable chip detail.
+    pub output_live: bool,
+}
+
+/// Lines kept per entry in the shell panel: a whole `cargo test` run is a few
+/// hundred lines, and this view exists to be read, not folded to two.
+const SHELL_ENTRY_MAX_LINES: usize = 240;
+
+/// The agent's shell commands, in transcript order, from the doc's tool rows
+/// plus the ephemeral output tails. Pure so it is testable without a gpui
+/// context; a tool that is not an `Exec` call is simply not a shell command.
+pub fn agent_shell_entries(
+    rows: &[Row],
+    tails: &[(SharedString, SharedString)],
+) -> Vec<AgentShellEntry> {
+    let mut out: Vec<AgentShellEntry> = Vec::new();
+    for row in rows {
+        let RowKind::ToolGroup { tools, .. } = &row.kind else {
+            continue;
+        };
+        for tool in tools.iter() {
+            let ToolCall::Exec { command } = &tool.call else {
+                continue;
+            };
+            let status = if !tool.resolved {
+                AgentShellStatus::Running
+            } else if tool.is_error {
+                AgentShellStatus::Failed
+            } else {
+                AgentShellStatus::Done
+            };
+            // The ephemeral tail wins: it is the command's own print (and, for
+            // a settled Codex command, the whole `aggregatedOutput` with its
+            // exit code), where the doc keeps at most an error summary.
+            let (lines, truncated_by, output_live) = match tails
+                .iter()
+                .find(|(id, _)| *id == tool.part_id)
+                .map(|(_, text)| text.as_str())
+            {
+                Some(text) => {
+                    let ToolDetail::Output {
+                        lines,
+                        truncated_by,
+                    } = output_lines(text, SHELL_ENTRY_MAX_LINES)
+                    else {
+                        unreachable!("output_lines builds an Output");
+                    };
+                    (lines, truncated_by, true)
+                }
+                None => match tool.detail.as_deref() {
+                    Some(ToolDetail::Output {
+                        lines,
+                        truncated_by,
+                    }) => (lines.clone(), *truncated_by, false),
+                    // A diff/stat detail is an edit's payload, not a shell's.
+                    _ => (Vec::new(), 0, false),
+                },
+            };
+            out.push(AgentShellEntry {
+                id: tool.part_id.clone(),
+                command: SharedString::from(command.clone()),
+                status,
+                output: lines,
+                truncated_by,
+                output_live,
+            });
+        }
+    }
+    out
+}
+
+/// Remember one output tail for the shell panel (arrival-ordered, bounded).
+/// Unlike the chip buffer, a resolved tool keeps its tail: the panel's job is
+/// showing what a command printed AFTER it finished.
+fn remember_shell_tail(
+    tails: &mut Vec<(SharedString, SharedString)>,
+    id: &str,
+    text: &str,
+    cap: usize,
+) {
+    if let Some(slot) = tails.iter_mut().find(|(key, _)| key == id) {
+        slot.1 = SharedString::from(text.to_owned());
+        return;
+    }
+    tails.push((SharedString::from(id), SharedString::from(text.to_owned())));
+    let overflow = tails.len().saturating_sub(cap);
+    if overflow > 0 {
+        tails.drain(0..overflow);
+    }
+}
+
+/// Cap on retained tails (see [`remember_shell_tail`]): a bounded window of
+/// the run's most recent command output, never a journal.
+const SHELL_TAIL_CAP: usize = 200;
+
 /// Small stable tag for `perf`'s per-row counters. `RowKind` is not `Hash`
 /// (it carries `Arc`s and `SharedString`s), and the tag is what the window
 /// log prints — so it must not change with row content.
@@ -1946,6 +2079,12 @@ pub struct Transcript {
     /// of an unresolved tool; never journaled, never replayed, cleared when the
     /// turn ends or the chat changes.
     tool_progress: HashMap<SharedString, SharedString>,
+    /// Output tails for the read-only "Shell agent" panel, in arrival order
+    /// (see [`remember_shell_tail`]). Same ephemeral contract as
+    /// `tool_progress` — nothing journaled, nothing written to the doc, gone
+    /// on a chat switch — but NOT pruned when a tool resolves: a finished
+    /// command's print is exactly what that panel is for.
+    shell_tails: Vec<(SharedString, SharedString)>,
     /// Live subagent counters (`WatchActivity` `subagentStatus` frames), keyed by
     /// the SPAWN chip's doc part id. The host measured them; this map only
     /// carries them to the chip. Same lifetime rule as `tool_progress`: nothing
@@ -2009,6 +2148,10 @@ pub enum TranscriptEvent {
         target_device_id: Option<SharedString>,
         spawn: subagent::SubagentSpawn,
     },
+    /// A Run chip's « Shell » badge was clicked: open the read-only
+    /// « Shell agent » surface. No payload — the panel is a projection of THIS
+    /// chat's transcript, and a read-only view has nothing to address.
+    OpenAgentShell,
 }
 
 impl EventEmitter<TranscriptEvent> for Transcript {}
@@ -2142,6 +2285,7 @@ impl Transcript {
             blob_details: HashMap::new(),
             reasoning_text: String::new(),
             tool_progress: HashMap::new(),
+            shell_tails: Vec::new(),
             subagent_live: HashMap::new(),
             run_phase: None,
             activity_chat: None,
@@ -2944,6 +3088,9 @@ impl Transcript {
             // …and the live tool-output watch with it: its frames are keyed by
             // the previous chat's tool ids.
             self.stop_activity();
+            // The shell panel's tails are chat-qualified keys too — a new chat
+            // must not inherit the previous one's command output.
+            self.shell_tails.clear();
             self.veils.clear();
             self.render_cache.borrow_mut().clear();
             self.highlights.entries.clear();
@@ -3526,6 +3673,14 @@ impl Transcript {
             })
     }
 
+    /// The agent's own shell commands, for the read-only "Shell agent" panel:
+    /// the doc's `Exec` chips in transcript order, each with the output tail
+    /// the harness exposed. Render-time derivation — this view holds no state,
+    /// owns no PTY, and offers no way to type into anything.
+    pub fn agent_shell_log(&self) -> Vec<AgentShellEntry> {
+        agent_shell_entries(&self.rows, &self.shell_tails)
+    }
+
     /// Drop the live tool-output watch and clear its buffers. Render-local
     /// like `folds`: nothing here is ever written to the doc.
     fn stop_activity(&mut self) {
@@ -3658,6 +3813,15 @@ impl Transcript {
                                     if !id.is_empty() && !text.is_empty() {
                                         // Coalesced frames are tail snapshots: replace.
                                         this.tool_progress.insert(id.into(), text.into());
+                                        // …and keep a copy the resolved chip no
+                                        // longer needs but the read-only shell
+                                        // panel does.
+                                        remember_shell_tail(
+                                            &mut this.shell_tails,
+                                            id,
+                                            text,
+                                            SHELL_TAIL_CAP,
+                                        );
                                         cx.notify();
                                     }
                                 }
@@ -5137,6 +5301,32 @@ impl Transcript {
                     }
                     _ => None,
                 };
+                let header_badge: Option<gpui::AnyElement> = spawn_badge
+                    .map(|badge| badge.into_any_element())
+                    .or_else(|| {
+                        // A Run chip's own badge: open the read-only « Shell agent »
+                        // panel, where the agent's command stream lives (Claude and
+                        // Codex run it in their own pty, so no Komet terminal shows
+                        // it). Opens a pane — it never sends anything anywhere.
+                        matches!(tool.call, ToolCall::Exec { .. }).then(|| {
+                            div()
+                                .id(SharedString::from(format!("{key}-shell")))
+                                .flex_none()
+                                .px(px(5.0))
+                                .rounded(px(4.0))
+                                .cursor_pointer()
+                                .text_size(px(10.5))
+                                .text_color(theme.text_muted)
+                                .child(SharedString::from("Shell"))
+                                .on_click(cx.listener(|_this, _, _, cx| {
+                                    // The chip's own click expands its detail; the
+                                    // badge's stops there (same rule as a spawn).
+                                    cx.stop_propagation();
+                                    cx.emit(TranscriptEvent::OpenAgentShell);
+                                }))
+                                .into_any_element()
+                        })
+                    });
                 let mut action = div()
                     .h(px(action_height))
                     .min_w_0()
@@ -5145,7 +5335,7 @@ impl Transcript {
                     .flex_col()
                     .overflow_hidden()
                     .child(
-                        chip_header_row(tool, theme, action_is_open, spawn_badge)
+                        chip_header_row(tool, theme, action_is_open, header_badge)
                             .id(SharedString::from(format!("{key}-hdr")))
                             .cursor_pointer()
                             .on_click(cx.listener(move |this, _, _, cx| {
@@ -6691,6 +6881,112 @@ mod tests {
             output_bytes: None,
             diff_ref: None,
         }
+    }
+
+    #[test]
+    fn agent_shell_log_reads_commands_from_the_doc_and_output_from_the_stream() {
+        let exec =
+            |id: &str, command: &str, output: Option<&str>, resolved, is_error| MessagePart::Tool {
+                id: id.into(),
+                call: ToolCall::Exec {
+                    command: command.into(),
+                },
+                is_error,
+                resolved,
+                output: output.map(str::to_owned),
+                diff: None,
+                output_ref: None,
+                output_bytes: None,
+                diff_ref: None,
+                diff_stats: None,
+                subagent_ref: None,
+                subagent_status: None,
+                subagent_tail: None,
+                subagent_duration_ms: None,
+                subagent_tool_count: None,
+            };
+        let entry = assistant(
+            "m1",
+            MessageStatus::Complete,
+            vec![
+                exec("c1", "cargo test", Some("test result: ok"), true, false),
+                MessagePart::Tool {
+                    id: "r1".into(),
+                    call: ToolCall::ReadFile {
+                        path: "src/main.rs".into(),
+                    },
+                    is_error: false,
+                    resolved: true,
+                    output: None,
+                    diff: None,
+                    output_ref: None,
+                    output_bytes: None,
+                    diff_ref: None,
+                    diff_stats: None,
+                    subagent_ref: None,
+                    subagent_status: None,
+                    subagent_tail: None,
+                    subagent_duration_ms: None,
+                    subagent_tool_count: None,
+                },
+                exec("c2", "rm /nope", Some("no such file"), true, true),
+                exec("c3", "sleep 60", None, false, false),
+            ],
+        );
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        let tails: Vec<(SharedString, SharedString)> = vec![(
+            "c1".into(),
+            "running 1 test\ntest result: ok. 3 passed\nexit code: 0".into(),
+        )];
+        let log = agent_shell_entries(&rows, &tails);
+        assert_eq!(log.len(), 3, "only the agent's shell calls are listed");
+        // The streamed tail wins over the doc's own (absent, here) summary.
+        assert_eq!(log[0].id, SharedString::from("c1"));
+        assert_eq!(log[0].command, SharedString::from("cargo test"));
+        assert_eq!(log[0].status, AgentShellStatus::Done);
+        assert!(log[0].output_live);
+        assert_eq!(
+            log[0]
+                .output
+                .iter()
+                .map(|l| l.to_string())
+                .collect::<Vec<_>>(),
+            vec![
+                "running 1 test",
+                "test result: ok. 3 passed",
+                "exit code: 0"
+            ]
+        );
+        // No stream tail for a failed command: the doc's error summary is all
+        // there is, and the panel shows exactly that rather than nothing.
+        assert_eq!(log[1].status, AgentShellStatus::Failed);
+        assert!(!log[1].output_live);
+        assert_eq!(log[1].output.len(), 1);
+        // An unresolved command reads as running with no output yet.
+        assert_eq!(log[2].status, AgentShellStatus::Running);
+        assert!(log[2].output.is_empty());
+    }
+
+    #[test]
+    fn shell_tails_update_in_place_and_stay_bounded() {
+        let mut tails = Vec::new();
+        remember_shell_tail(&mut tails, "a", "first", 2);
+        // A coalesced frame replaces the tail for the same tool id — no second
+        // entry, no duplication of what the chip already streamed.
+        remember_shell_tail(&mut tails, "a", "first second", 2);
+        assert_eq!(tails.len(), 1);
+        assert_eq!(tails[0].1.to_string(), "first second");
+        remember_shell_tail(&mut tails, "b", "b1", 2);
+        remember_shell_tail(&mut tails, "c", "c1", 2);
+        // The cap drops the OLDEST tails: a bounded window of recent command
+        // output, never a journal.
+        assert_eq!(
+            tails
+                .iter()
+                .map(|(id, _)| id.to_string())
+                .collect::<Vec<_>>(),
+            vec!["b", "c"]
+        );
     }
 
     #[test]

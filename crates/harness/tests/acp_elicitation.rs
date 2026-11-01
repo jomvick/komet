@@ -56,6 +56,7 @@ fn request(prompt: &str) -> RunRequest {
 }
 
 type Asked = Arc<Mutex<Vec<(Vec<UserInputQuestion>, QuestionSource)>>>;
+type AnswerFn = dyn Fn(&[UserInputQuestion]) -> Vec<UserInputAnswer> + Send + Sync;
 
 struct TestRun {
     controls: RunControls,
@@ -68,8 +69,7 @@ fn bridge(
 ) -> TestRun {
     let asked: Asked = Arc::default();
     let seen = Arc::clone(&asked);
-    let answer: Arc<dyn Fn(&[UserInputQuestion]) -> Vec<UserInputAnswer> + Send + Sync> =
-        Arc::new(answer);
+    let answer: Arc<AnswerFn> = Arc::new(answer);
     let (steer_tx, steer_rx) = mpsc::channel(8);
     let token = CancellationToken::new();
     TestRun {

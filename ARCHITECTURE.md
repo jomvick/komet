@@ -152,14 +152,21 @@ komet/
                                  # options catalogs
     engine/       komet-engine   # sessions engine (pub/sub, run journal, recovery, stall
                                  # watchdog), doc host + command executor, repos/worktrees,
-                                 # checkout-diff sync, terminals (portable-pty), uploads,
+                                 # checkout-diff sync, terminals (portable-pty; opt-in text
+                                 # mirror via komet-term), uploads,
                                  # agent accounts (cred swap), auth (bearer via sync server),
                                  # device-room host/peers, identity, single-instance lock
     rpc/          komet-rpc      # UiRpc/ControlRpc: typed req/resp/stream over WS (tokio-
                                  # tungstenite) + in-memory transport; device-room virtual
                                  # sockets ({s,k,to,from} frames)
+    term/         komet-term     # gpui-free terminal emulator core (alacritty Term + vte):
+                                 # grid/scrollback/selection/alt-screen/truecolour cells, mouse
+                                 # report modes, titles + bell, and the plain-text reads an
+                                 # engine needs (screen, tail, delta since seq). Shared by
+                                 # komet-ui's panel and komet-engine's PTY pump.
     ui/           komet-ui       # gpui app: shell, sidebar, conversation, composer,
-                                 # terminal view, diff pane, settings, animation kit
+                                 # terminal view (paint + theme over komet-term), diff pane,
+                                 # settings, animation kit
     syntax/       komet-syntax   # tree-sitter syntax highlighting contracts (paint-only
                                  # token runs; no UI/RPC/engine deps)
      update/       komet-update   # self-update: versioned dirs + `current` symlink, service
@@ -206,9 +213,12 @@ feature spec `docs/research/feature-inventory.md` §1.
   images, QuestionPanel (paged, 1-9 keys, 220ms auto-advance) replacing the composer while input
   is requested. Pickers (harness/model, traits, repo w/ folder browser, branch w/ worktree
   toggle) as gpui popovers with `menu-in` scale/fade.
-- **Terminal**: `alacritty_terminal` (vte state machine, MIT/Apache) + `portable-pty` on the
-  engine side; custom gpui grid element; tabs w/ drag-reorder (150ms sliding transforms), height
-  drag 160px–55vh, 12ms input coalescing / 80ms resize debounce, 1MB replay, detach ≠ close.
+- **Terminal**: `alacritty_terminal` (vte state machine, MIT/Apache) wrapped by `komet-term`, a
+  gpui-free emulator core shared by both sides — the UI paints its grid snapshots, the engine can
+  mirror a *tracked* terminal (opt-in per terminal, `KOMET_TERMINAL_TRACK=1` or `set_tracked`) and
+  answer screen/tail/delta-since-seq reads in clear text; `portable-pty` on the engine side; custom
+  gpui grid element; tabs w/ drag-reorder (150ms sliding transforms), height drag 160px–55vh, 12ms
+  input coalescing / 80ms resize debounce, 1MB replay, detach ≠ close.
 - **Diff pane**: unified-patch parser → virtualized file/hunk/line rows, per-file collapse
   (180ms height tween), time-sliced highlight, 200ms width transition on the pane itself.
 - **Animation kit** (`komet-ui::motion`): small helpers over gpui `Animation` reproducing the
@@ -301,8 +311,8 @@ no-op).
 
 | Harness | Questions | Compaction | Subagents | Plans | Tool progress |
 | --- | --- | --- | --- | --- | --- |
-| Claude Code | `Native` (`AskUserQuestion`) | `LifecycleWithSummary` | `Tagged` | `ToolChip` (`TodoWrite`) | `None` (the CLI streams no partial tool stdout) |
-| Codex | `Native` (`item/tool/requestUserInput`) | `BoundaryOnly` | `Tagged` | `LivePanel` | `Streaming` (`outputDelta`) |
+| Claude Code | `Native` (`AskUserQuestion`) | `LifecycleWithSummary` | `Tagged` | `ToolChip` (`TodoWrite`) | `Final` (no partial tool stdout on the 2.1.x wire; a background Bash task's settled `task_notification` — status + the CLI's own one-line summary — reaches `ToolProgress` as a final snapshot) |
+| Codex | `Native` (`item/tool/requestUserInput`) | `BoundaryOnly` | `Tagged` | `LivePanel` | `Streaming` (`outputDelta`, closed by a settled `aggregatedOutput` + exit-code snapshot) |
 | Cursor | `None` (`askQuestion` has no answer channel in the SDK) | `BoundaryOnly` | `Tagged` (`taskUpdate`) | `ToolChip` | `Final` (the shim maps no partial content) |
 | Grok / OpenCode | `PermissionShaped` | `None` (Gate B) | `NestedSession` | `ToolChip` | `Streaming` |
 | Devin / GitHub Copilot / Hermes / Pi / Cline / Qoder | `PermissionShaped` | `None` (Gate B) | `TaggedIfEmitted` | `ToolChip` | `Streaming` |

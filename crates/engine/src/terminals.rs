@@ -11,6 +11,31 @@
 //! - Ownership: M5 is single-user local — every IPC/relay caller is the device
 //!   owner, so the per-user owner re-checks from komet's Router land with real
 //!   multi-account auth in M6.
+//! - **Tracking** (opt-in, per terminal): the same bytes that ride the replay
+//!   window are folded into a `komet_term::TerminalMirror`, so the engine knows
+//!   what the terminal *displays* and not only what it printed: the current
+//!   screen in clear text, the last N lines, and what appeared since a given
+//!   `seq`. Off by default — an untracked terminal pays one `Option` check per
+//!   output batch, never an emulator — and switchable at runtime with
+//!   [`Terminals::set_tracked`] or for every new terminal with
+//!   `KOMET_TERMINAL_TRACK=1`.
+//! - **Visibility** (the agent gate): a terminal is invisible to agents until a
+//!   human grants reads with [`Terminals::set_agent_visible`] — there is no MCP
+//!   tool for the flag, so an agent cannot lift it on itself. The gated reads
+//!   ([`Terminals::agent_screen_text`], [`Terminals::agent_tail_text`],
+//!   [`Terminals::agent_text_delta`]) check the grant FIRST and refuse loudly;
+//!   granting also switches tracking on (and revoking off), so the grant can
+//!   never be a no-op and a hidden terminal never keeps clear-text scrollback.
+//!   One bounded exception: a terminal an AGENT opened through
+//!   [`Terminals::open_agent_terminal`] is readable at birth — but only by
+//!   the run that created it (the `owner` identity the MCP endpoint already
+//!   authenticates per call). Another agent run reading it is refused: the
+//!   scrollback of a terminal the human typed into (through approved
+//!   `terminal_send_input` calls) holds what the human approved typing there —
+//!   tokens, `env` output. The birth grant is what keeps the wanted
+//!   `terminal_run` → `running` + `sinceSeq` → `terminal_read` delta flow
+//!   alive without a human click per terminal; the owner bound is what stops
+//!   it from meaning "readable by every run on the machine".
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
@@ -23,7 +48,14 @@ use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use tokio::sync::mpsc;
 
 use komet_doc::TERMINAL_OUTPUT_BATCH_MS;
-use komet_proto::{TerminalEvent, TerminalSession};
+use komet_term::{Emulator, TerminalMirror, TextDelta};
+
+// The read replies and the list row are transport types (komet_proto, shared
+// with the RPC layer and the UI). Re-exported here so `crate::terminals` stays
+// the engine's vocabulary for them (see the re-export in `lib.rs`).
+use komet_proto::{TerminalCommand, TerminalEvent, TerminalRunResult, TerminalSession};
+pub use komet_proto::{TerminalDelta, TerminalInfo, TerminalScreen, TerminalTail};
+use komet_term::{BlockStatus, CommandBlock};
 
 use crate::{EngineError, new_id};
 
@@ -33,6 +65,125 @@ const MAX_REPLAY_BYTES: usize = 1024 * 1024;
 const EXITED_TTL: Duration = Duration::from_secs(30 * 60);
 const REAPER_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Scrollback kept inside a tracked mirror. The UI grid keeps its own (user
+/// setting, 10k default); the engine only needs enough history to answer a tail
+/// read, and each tracked line costs a row of cells — so this is deliberately
+/// smaller. 1000 lines is a few MB per tracked terminal at a wide column count.
+const TRACKED_SCROLLBACK_LINES: usize = 1_000;
+
+/// Opt-in switch for tracking every terminal this engine opens.
+const TRACK_ENV: &str = "KOMET_TERMINAL_TRACK";
+
+/// Should terminals be tracked from the moment they open? `1`/`true`/`yes`/`on`
+/// enable it; anything else (including unset) leaves tracking off.
+fn track_new_terminals() -> bool {
+    std::env::var(TRACK_ENV)
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            v == "1" || v == "true" || v == "yes" || v == "on"
+        })
+        .unwrap_or(false)
+}
+
+/// The engine's mirror of one tracked terminal: the shared emulator core plus the
+/// seq-stamped text journal. It answers the three reads an agent needs —
+/// [`TerminalMirror::screen_text`] (what is displayed), [`TerminalMirror::tail_text`]
+/// (what scrolled past) and [`TerminalMirror::delta_since`] (what appeared since
+/// the last read) — and nothing else. Emulation policy lives in `komet-term`;
+/// this type only owns the grid size the engine picked and the engine's answers.
+#[derive(Debug)]
+struct TerminalTrack {
+    mirror: TerminalMirror,
+}
+
+impl TerminalTrack {
+    fn new(cols: u16, rows: u16) -> Self {
+        let emulator = Emulator::with_scrollback(cols, rows, TRACKED_SCROLLBACK_LINES);
+        Self {
+            mirror: TerminalMirror::new(emulator),
+        }
+    }
+
+    /// Fold one output batch. The emulator's PTY write-back (DSR/DA query
+    /// answers) is deliberately dropped: the engine mirrors the stream, it does
+    /// not drive it, and answering from here would double every reply the UI's
+    /// own grid already sends.
+    fn feed(&mut self, seq: u64, bytes: &[u8]) {
+        let _responses = self.mirror.feed(seq, bytes);
+    }
+
+    /// A resize re-wraps the grid: no delta across it can be an append, so the
+    /// journal marks the step as needing a fresh screen read. It is stamped at
+    /// the newest *output* seq (a resize is not output and mints no seq), which
+    /// is what makes [`Terminals::text_delta`] report `needs_snapshot` to a
+    /// caller that is otherwise caught up.
+    fn resize(&mut self, seq: u64, cols: u16, rows: u16) {
+        self.mirror.resize(seq, cols, rows);
+    }
+}
+
+/// The mirror of a tracked terminal, or the error telling the caller to track it
+/// — a read that answers "nothing" for an untracked terminal would be the
+/// silent no-op this project forbids.
+fn track_of<'a>(
+    session: &'a LiveTerminal,
+    terminal_id: &str,
+) -> Result<&'a TerminalTrack, EngineError> {
+    session.track.as_ref().ok_or_else(|| {
+        EngineError::Other(format!(
+            "Terminal {terminal_id} is not tracked; enable it with set_tracked or {TRACK_ENV}=1"
+        ))
+    })
+}
+
+/// Stamp a [`TextDelta`] answer from the mirror with the terminal's id (the
+/// proto `TerminalDelta` is a transport type, so it carries no `From` impl for
+/// the engine-private `komet-term` journal step).
+fn terminal_delta(terminal_id: &str, delta: TextDelta) -> TerminalDelta {
+    TerminalDelta {
+        terminal_id: terminal_id.to_string(),
+        from_seq: delta.from_seq,
+        through_seq: delta.through_seq,
+        lines: delta.lines,
+        needs_snapshot: delta.needs_snapshot,
+        truncated: delta.truncated,
+    }
+}
+
+/// The wire word for a block's boundary state. `"done"` means a marker `D`
+/// arrived (and `exit_is_known` says whether its code came with it);
+/// `"settled"` is the silence fallback's honest "quiet, exit unknown".
+fn block_status(block: &CommandBlock) -> &'static str {
+    match block.status {
+        BlockStatus::Done => "done",
+        BlockStatus::Running => "running",
+        BlockStatus::Settled => "settled",
+        BlockStatus::Prompt => "prompt",
+    }
+}
+
+/// Slice one command block into the `last_command` read's answer.
+fn command_read(
+    terminal_id: &str,
+    seq: u64,
+    track: &TerminalTrack,
+    block: &CommandBlock,
+) -> TerminalCommand {
+    TerminalCommand {
+        terminal_id: terminal_id.to_string(),
+        status: block_status(block).to_string(),
+        command: block.command.clone(),
+        cwd: block.cwd.clone(),
+        exit_code: if block.exit_is_known() {
+            block.exit_code
+        } else {
+            None
+        },
+        marker_backed: block.marker_backed,
+        seq,
+        lines: track.mirror.block_lines(block),
+    }
+}
 struct LiveTerminal {
     master: Box<dyn portable_pty::MasterPty + Send>,
     writer: Box<dyn Write + Send>,
@@ -43,6 +194,50 @@ struct LiveTerminal {
     seq: u64,
     last_active_at: std::time::Instant,
     exited: bool,
+    /// The grid size the PTY was last given (clamped), so a mirror turned on
+    /// later starts at the size the program is actually drawing into.
+    cols: u16,
+    rows: u16,
+    /// Opening cwd and shell basename — the identity `Terminals::list_terminals`
+    /// reports without needing a track.
+    cwd: String,
+    shell: String,
+    /// The human's grant that agents may read this terminal. Off by default,
+    /// switchable only over the RPC/UI surface (`SetTerminalAgentVisible`) —
+    /// no MCP tool exposes it, so an agent cannot lift it on itself. Turning
+    /// it on also turns the text mirror on (a read without a mirror is the
+    /// "not tracked" error, so the grant without the mirror would be a
+    /// no-op); turning it off drops the mirror again. This flag is the HUMAN
+    /// door: the agent birth grant is the `owner` bound on the `agent_owned`
+    /// terminal, checked by `Terminals::agent_gate`, and it does NOT set
+    /// this flag.
+    agent_visible: bool,
+    /// `None` = not tracked: no emulator is built and the output pump does not
+    /// touch it (the default, and the cost of it is this one field).
+    track: Option<TerminalTrack>,
+    /// This terminal was opened by an AGENT through the permission-gated
+    /// `terminal_open` tool, on the human's approval of that call. Its
+    /// content is agent-produced, so the engine grants it readability AT
+    /// BIRTH (and tracking with it — an invisible read-back would make the
+    /// tool a no-op), bounded to the creating run by the `owner` field.
+    /// `close_agent_terminal` only accepts these: an agent may never kill a
+    /// human's shell. Human terminals keep this `false` and stay behind the
+    /// `agent_visible` grant for every read.
+    agent_owned: bool,
+    /// The id of the AGENT RUN that opened this terminal (the `run_id` the
+    /// MCP endpoint already authenticates with its per-run token), or `None`
+    /// for a human-opened terminal — and, as an honest gap, for an
+    /// agent-opened terminal whose caller carried no run identity. It is the
+    /// bound on the birth grant: `Terminals::agent_gate` lets a reader with
+    /// this id through WITHOUT a human grant, and refuses readers with any
+    /// other id (the flag that stays the human's alone is `agent_visible`).
+    /// An agent-opened terminal with `None` here cannot be bounded, so it
+    /// stays readable — the open path in production always carries the id.
+    owner: Option<String>,
+    /// Wall-clock stamp of the newest OUTPUT batch (not input, not subscribe)
+    /// — the silence fallback for terminals without OSC 133 markers measures
+    /// quiet from this.
+    last_output_at: std::time::Instant,
 }
 
 impl LiveTerminal {
@@ -51,6 +246,9 @@ impl LiveTerminal {
     /// attached stream ends after delivering the event.
     fn emit(&mut self, event: TerminalEvent) {
         self.last_active_at = std::time::Instant::now();
+        if matches!(event, TerminalEvent::Data { .. }) {
+            self.last_output_at = std::time::Instant::now();
+        }
         let bytes = match &event {
             TerminalEvent::Data { data, .. } => data.len(),
             TerminalEvent::Exit { .. } => 16,
@@ -138,7 +336,7 @@ impl Terminals {
     /// Open a login shell in `cwd`. The PTY outlives every subscriber; it dies on
     /// [`Self::close`], shell exit + TTL, or engine shutdown.
     pub fn open(&self, cwd: &str, cols: u16, rows: u16) -> Result<TerminalSession, EngineError> {
-        self.open_with_shell(cwd, cols, rows, None)
+        self.open_impl(cwd, cols, rows, None, false, None)
     }
 
     /// Explicit shell override (tests use `/bin/sh`).
@@ -148,6 +346,52 @@ impl Terminals {
         cols: u16,
         rows: u16,
         shell: Option<&str>,
+    ) -> Result<TerminalSession, EngineError> {
+        self.open_impl(cwd, cols, rows, shell, false, None)
+    }
+
+    /// The agent lifecycle tool `terminal_open`: a NEW terminal the calling
+    /// RUN gets to itself. The human approved the opening (MCP permission per
+    /// call), so the read grant + tracking start on — reading back what the
+    /// agent itself typed is inside that approval, and a terminal the agent
+    /// could open but never read would be the forbidden silent no-op. The
+    /// grant is BOUNDED: only `owner_run` (the run id the MCP endpoint
+    /// authenticates with its per-run token) reads it; another agent run is
+    /// refused by [`Self::agent_gate`] even though the terminal was "granted
+    /// at birth" — the scrollback also holds whatever the human approved
+    /// typing into it. `owner_run = None` keeps the terminal readable by
+    /// every agent run (no identity to bound it by); the production open path
+    /// always carries the id. Human terminals are untouched by this: their
+    /// `agent_visible` grant still only moves over RPC/UI
+    /// (`SetTerminalAgentVisible`).
+    pub fn open_agent_terminal(
+        &self,
+        cwd: Option<&str>,
+        cols: u16,
+        rows: u16,
+        owner_run: Option<&str>,
+    ) -> Result<TerminalSession, EngineError> {
+        let fallback;
+        let dir = match cwd {
+            Some(c) => c,
+            None => {
+                fallback = std::env::current_dir()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| String::from("/"));
+                &fallback
+            }
+        };
+        self.open_impl(dir, cols, rows, None, true, owner_run)
+    }
+
+    fn open_impl(
+        &self,
+        cwd: &str,
+        cols: u16,
+        rows: u16,
+        shell: Option<&str>,
+        agent_owned: bool,
+        agent_owner_run: Option<&str>,
     ) -> Result<TerminalSession, EngineError> {
         if lock(&self.inner.sessions).len() >= MAX_TERMINALS {
             return Err(EngineError::Other(format!(
@@ -167,12 +411,32 @@ impl Terminals {
             .unwrap_or_else(|| shell.clone());
 
         let pty = native_pty_system();
+        let size = clamp_size(cols, rows);
         let pair = pty
-            .openpty(clamp_size(cols, rows))
+            .openpty(size)
             .map_err(|e| EngineError::Other(format!("could not open a pty: {e}")))?;
         let mut cmd = CommandBuilder::new(&shell);
-        if !cfg!(windows) {
+        // OSC 133 shell integration (step 5 A): the harness detects the REAL
+        // shell and hands back launch changes that CHAIN the user's own
+        // prompt machinery (`bash` → `--rcfile` wrapper that sources the
+        // user's files first, `zsh` → ZDOTDIR stub dir, `fish` →
+        // `--init-command`). Anything it does not know (`sh`, `dash`, …) and
+        // the whole PowerShell/Windows case get NO injection — a declared
+        // gap, and the parser's silence fallback covers those terminals.
+        let integration = komet_harness::shell_env::integration::plan(&shell);
+        let drop_login_flag = integration
+            .as_ref()
+            .is_some_and(|plan| plan.drop_login_flag);
+        if !cfg!(windows) && !drop_login_flag {
             cmd.arg("-l"); // login shell — the user's real PATH/profile
+        }
+        if let Some(plan) = integration.as_ref() {
+            for (key, value) in &plan.env {
+                cmd.env(key, value);
+            }
+            for arg in &plan.extra_args {
+                cmd.arg(arg);
+            }
         }
         cmd.cwd(cwd);
         cmd.env("TERM", "xterm-256color");
@@ -203,7 +467,25 @@ impl Terminals {
             replay_bytes: 0,
             seq: 0,
             last_active_at: std::time::Instant::now(),
+            last_output_at: std::time::Instant::now(),
             exited: false,
+            cols: size.cols,
+            rows: size.rows,
+            cwd: cwd.to_string(),
+            shell: shell_name.clone(),
+            // The agent-opened terminal keeps its birth READ GRANT, bounded to
+            // the creating run by `owner` (see [`Self::open_agent_terminal`]);
+            // `agent_visible` is the human's flag alone and starts denied for
+            // every terminal — `SetTerminalAgentVisible` is what flips it.
+            agent_visible: false,
+            agent_owned,
+            owner: if agent_owned {
+                agent_owner_run.map(str::to_string)
+            } else {
+                None
+            },
+            track: (agent_owned || track_new_terminals())
+                .then(|| TerminalTrack::new(size.cols, size.rows)),
         }));
         lock(&self.inner.sessions).insert(id.clone(), session.clone());
 
@@ -263,6 +545,16 @@ impl Terminals {
         let bytes = BASE64
             .decode(data)
             .unwrap_or_else(|_| data.as_bytes().to_vec());
+        self.write_raw(terminal_id, &bytes)
+    }
+
+    /// The raw-PTY write path shared by RPC `WriteTerminal` and the MCP
+    /// `terminal_send_input`/`terminal_run` tools. NOT gated by
+    /// `agent_visible`: that flag is the READ door (scrollback holds tokens);
+    /// an input is a point action the human approved per call through the MCP
+    /// permission prompt (or the user's own keystrokes over RPC). The two
+    /// doors stay separate on purpose — see `docs/security.md`.
+    pub fn write_raw(&self, terminal_id: &str, bytes: &[u8]) -> Result<(), EngineError> {
         if bytes.len() > MAX_INPUT_BYTES {
             return Err(EngineError::Other("Terminal input is too large".into()));
         }
@@ -274,7 +566,7 @@ impl Terminals {
         session.last_active_at = std::time::Instant::now();
         session
             .writer
-            .write_all(&bytes)
+            .write_all(bytes)
             .and_then(|_| session.writer.flush())
             .map_err(|e| EngineError::Other(format!("Terminal write failed: {e}")))
     }
@@ -286,10 +578,447 @@ impl Terminals {
         if session.exited {
             return Ok(());
         }
+        let size = clamp_size(cols, rows);
         session
             .master
-            .resize(clamp_size(cols, rows))
-            .map_err(|e| EngineError::Other(format!("Terminal resize failed: {e}")))
+            .resize(size)
+            .map_err(|e| EngineError::Other(format!("Terminal resize failed: {e}")))?;
+        session.cols = size.cols;
+        session.rows = size.rows;
+        // A tracked grid must follow the PTY size or every read after this would
+        // describe the wrong wrapping. Stamped at the newest output seq: a
+        // resize is not output, and mints no seq of its own.
+        let seq = session.seq;
+        if let Some(track) = session.track.as_mut() {
+            track.resize(seq, size.cols, size.rows);
+        }
+        Ok(())
+    }
+
+    /// Turn the engine's text mirror on or off for one terminal.
+    ///
+    /// Switching it on rebuilds the grid at the terminal's current size and
+    /// replays the bytes still in the 1 MB window through it, so the very first
+    /// read describes what the user is looking at instead of an empty screen
+    /// that fills in from the next keystroke. Switching it off drops the mirror
+    /// (and its memory) immediately.
+    pub fn set_tracked(&self, terminal_id: &str, tracked: bool) -> Result<(), EngineError> {
+        let session = self.session(terminal_id)?;
+        let mut session = lock(&session);
+        session.last_active_at = std::time::Instant::now();
+        match (tracked, session.track.is_some()) {
+            (true, true) | (false, false) => Ok(()),
+            (true, false) => {
+                let (cols, rows) = (session.cols, session.rows);
+                let mut track = TerminalTrack::new(cols, rows);
+                for event in &session.replay {
+                    if let TerminalEvent::Data { seq, data } = event
+                        && let Ok(bytes) = BASE64.decode(data)
+                    {
+                        track.feed(*seq, &bytes);
+                    }
+                }
+                session.track = Some(track);
+                Ok(())
+            }
+            (false, true) => {
+                session.track = None;
+                Ok(())
+            }
+        }
+    }
+
+    /// Is this terminal's output being mirrored as text?
+    pub fn is_tracked(&self, terminal_id: &str) -> Result<bool, EngineError> {
+        let session = self.session(terminal_id)?;
+        Ok(lock(&session).track.is_some())
+    }
+
+    /// The human's grant that agents may read this terminal (the backing state
+    /// for `SetTerminalAgentVisible`; there is deliberately no MCP tool for it).
+    /// Granting also switches the text mirror on — a visible-but-untracked
+    /// terminal would only ever answer "not tracked", making the grant a
+    /// silent no-op — and revoking switches it back off, so no clear-text
+    /// scrollback is kept in memory for a terminal no agent may read.
+    pub fn set_agent_visible(&self, terminal_id: &str, visible: bool) -> Result<(), EngineError> {
+        let session = self.session(terminal_id)?;
+        lock(&session).agent_visible = visible;
+        self.set_tracked(terminal_id, visible)
+    }
+
+    /// Has the human granted agent reads on this terminal?
+    pub fn is_agent_visible(&self, terminal_id: &str) -> Result<bool, EngineError> {
+        let session = self.session(terminal_id)?;
+        Ok(lock(&session).agent_visible)
+    }
+
+    /// Rows for `ListTerminals` / `terminal_list`. Reports every terminal with
+    /// its `agent_visible` flag — callers that serve agents must NOT use this
+    /// raw list: they go through [`Self::list_terminals_for_reader`], which
+    /// applies the same gate as the reads (an agent should not even learn the
+    /// ids, cwds and titles of the terminals it cannot read — including the
+    /// other runs' agent-opened ones, which the raw `agent_visible` flag says
+    /// nothing about).
+    pub fn list_terminals(&self) -> Vec<TerminalInfo> {
+        let sessions: Vec<(String, Arc<Mutex<LiveTerminal>>)> = lock(&self.inner.sessions)
+            .iter()
+            .map(|(id, session)| (id.clone(), session.clone()))
+            .collect();
+        let mut infos = Vec::with_capacity(sessions.len());
+        for (id, session) in sessions {
+            let session = lock(&session);
+            infos.push(TerminalInfo {
+                terminal_id: id,
+                title: session
+                    .track
+                    .as_ref()
+                    .and_then(|track| track.mirror.title().map(str::to_string)),
+                cwd: session.cwd.clone(),
+                shell: session.shell.clone(),
+                cols: session.cols,
+                rows: session.rows,
+                seq: session.seq,
+                tracked: session.track.is_some(),
+                agent_visible: session.agent_visible,
+                exited: session.exited,
+            });
+        }
+        infos
+    }
+
+    /// The rows an AGENT may see: exactly the terminals its read gate passes
+    /// (`agent_visible` granted by a human, or opened by ITS own run), so a
+    /// listing can never leak the ids, cwds or titles of what the reader
+    /// cannot read. `reader_run` is the calling run's id (`None` = no agent
+    /// identity, the human/IPC surface).
+    pub fn list_terminals_for_reader(&self, reader_run: Option<&str>) -> Vec<TerminalInfo> {
+        self.list_terminals()
+            .into_iter()
+            .filter(|info| self.agent_gate(&info.terminal_id, reader_run).is_ok())
+            .collect()
+    }
+
+    /// The agent gate, checked BEFORE any read and before the tracking gate:
+    /// a terminal the human never marked visible is refused even when its
+    /// mirror is fully fed. Three ways through, and only three:
+    /// 1. the human's explicit `agent_visible` grant (any reader),
+    /// 2. an agent-opened terminal with NO recorded owner run — nothing to
+    ///    bound the birth grant with (the production open path always
+    ///    carries the id; see [`Self::open_agent_terminal`]),
+    /// 3. an agent-opened terminal READ BY ITS CREATOR RUN — the bounded
+    ///    birth grant that keeps `terminal_run` → `running` + `sinceSeq` →
+    ///    `terminal_read` delta alive without a human click per terminal.
+    ///
+    /// Any other run reading a creator-bounded terminal is refused: the
+    /// scrollback holds what the human approved typing there. The error says
+    /// what would grant access because it goes to the agent that has to stop,
+    /// not because hidden terminals are discoverable — ids reach agents
+    /// anyway through a visible terminal's own output (a pasted `ps`, a
+    /// shell banner).
+    fn agent_gate(&self, terminal_id: &str, reader_run: Option<&str>) -> Result<(), EngineError> {
+        let session = self.session(terminal_id)?;
+        let session = lock(&session);
+        if session.agent_visible {
+            return Ok(());
+        }
+        if session.agent_owned {
+            return match session.owner.as_deref() {
+                None => Ok(()),
+                Some(owner) if Some(owner) == reader_run => Ok(()),
+                Some(owner) => Err(EngineError::Other(format!(
+                    "Terminal {terminal_id} was opened by agent run {owner}; its birth grant covers its creator run only — a human must grant access with SetTerminalAgentVisible to open it to other runs"
+                ))),
+            };
+        }
+        Err(EngineError::Other(format!(
+            "Terminal {terminal_id} is not visible to agents; a human must grant access with SetTerminalAgentVisible"
+        )))
+    }
+
+    /// [`Self::agent_screen_text_for_run`] read with NO agent identity (the
+    /// human/IPC surface — creator-bounded agent terminals refuse; only the
+    /// human grant lets a gate read through from here).
+    pub fn agent_screen_text(&self, terminal_id: &str) -> Result<TerminalScreen, EngineError> {
+        self.agent_screen_text_for_run(terminal_id, None)
+    }
+
+    /// [`Self::screen_text`] behind the agent gate, for a reader run.
+    pub fn agent_screen_text_for_run(
+        &self,
+        terminal_id: &str,
+        reader_run: Option<&str>,
+    ) -> Result<TerminalScreen, EngineError> {
+        self.agent_gate(terminal_id, reader_run)?;
+        self.screen_text(terminal_id)
+    }
+
+    /// [`Self::agent_tail_text_for_run`] read with NO agent identity.
+    pub fn agent_tail_text(
+        &self,
+        terminal_id: &str,
+        lines: usize,
+    ) -> Result<TerminalTail, EngineError> {
+        self.agent_tail_text_for_run(terminal_id, lines, None)
+    }
+
+    /// [`Self::tail_text`] behind the agent gate, for a reader run.
+    pub fn agent_tail_text_for_run(
+        &self,
+        terminal_id: &str,
+        lines: usize,
+        reader_run: Option<&str>,
+    ) -> Result<TerminalTail, EngineError> {
+        self.agent_gate(terminal_id, reader_run)?;
+        self.tail_text(terminal_id, lines)
+    }
+
+    /// [`Self::agent_text_delta_for_run`] read with NO agent identity.
+    pub fn agent_text_delta(
+        &self,
+        terminal_id: &str,
+        since_seq: u64,
+    ) -> Result<TerminalDelta, EngineError> {
+        self.agent_text_delta_for_run(terminal_id, since_seq, None)
+    }
+
+    /// [`Self::text_delta`] behind the agent gate, for a reader run.
+    pub fn agent_text_delta_for_run(
+        &self,
+        terminal_id: &str,
+        since_seq: u64,
+        reader_run: Option<&str>,
+    ) -> Result<TerminalDelta, EngineError> {
+        self.agent_gate(terminal_id, reader_run)?;
+        self.text_delta(terminal_id, since_seq)
+    }
+
+    /// Close ONLY an agent-owned terminal (one opened through the
+    /// permission-gated `terminal_open`). A human's shell is closed by the
+    /// human (UI/RPC `CloseTerminal`) — an approved "close a terminal" tool
+    /// call must never be able to kill someone's session by id guessing.
+    pub fn close_agent_terminal(&self, terminal_id: &str) -> Result<(), EngineError> {
+        let owned = lock(&self.inner.sessions)
+            .get(terminal_id)
+            .map(|session| lock(session).agent_owned)
+            .ok_or_else(|| EngineError::Other("Terminal not found".into()))?;
+        if !owned {
+            return Err(EngineError::Other(format!(
+                "Terminal {terminal_id} belongs to a human; only the human (or their UI) closes it — terminal_close takes agent-opened terminals only"
+            )));
+        }
+        self.close(terminal_id)
+    }
+
+    /// The `last_command` angle behind the same read gate as every other
+    /// agent read: the OSC 133 blocks only slice a terminal's own text, and
+    /// a terminal without any markers refuses loudly instead of guessing
+    /// where the prompt was. No agent identity — only a human-granted
+    /// terminal passes.
+    pub fn agent_last_command(&self, terminal_id: &str) -> Result<TerminalCommand, EngineError> {
+        self.agent_last_command_for_run(terminal_id, None)
+    }
+
+    /// Same, for a reader run (the birth grant of a creator-bounded terminal
+    /// passes only for the run that opened it).
+    pub fn agent_last_command_for_run(
+        &self,
+        terminal_id: &str,
+        reader_run: Option<&str>,
+    ) -> Result<TerminalCommand, EngineError> {
+        self.agent_gate(terminal_id, reader_run)?;
+        let session = self.session(terminal_id)?;
+        let session = lock(&session);
+        let track = track_of(&session, terminal_id)?;
+        if !track.mirror.saw_markers() {
+            return Err(EngineError::Other(format!(
+                "Terminal {terminal_id} has no command markers (OSC 133) — its shell did not load the Komet integration, so there is no honest boundary to slice `last_command` from; use the `tail` or `delta` angle"
+            )));
+        }
+        let block = track.mirror.last_command_block().ok_or_else(|| {
+            EngineError::Other(format!(
+                "No command has run in terminal {terminal_id} since its markers began"
+            ))
+        })?;
+        Ok(command_read(terminal_id, session.seq, track, &block))
+    }
+
+    /// `terminal_run`: type `command` into `terminal_id`, then watch for the
+    /// OSC 133 `D` (or, marker-free shells, the silence fallback closing the
+    /// stretch). Bounded by `wait`: past it the call ANSWERS `running` with
+    /// the `sinceSeq` anchor instead of hanging the endpoint's 30 s
+    /// TOOL_TIMEOUT — never a timed-out call, never an untracked process.
+    ///
+    /// Not gated by `agent_visible` (a write is the human's per-call approval,
+    /// and on a human terminal the approved command's own block is the only
+    /// text returned — not the scrollback). An untracked terminal gets its
+    /// mirror switched on for the run (reported in `tracking_enabled`): a
+    /// "run and wait" without an observer would be the no-op this forbids.
+    pub async fn agent_run(
+        &self,
+        terminal_id: &str,
+        command: &str,
+        wait: Duration,
+        silence: Duration,
+    ) -> Result<TerminalRunResult, EngineError> {
+        let session = self.session(terminal_id)?;
+        let tracking_enabled = if lock(&session).track.is_none() {
+            self.set_tracked(terminal_id, true)?;
+            true
+        } else {
+            false
+        };
+        let baseline = lock(&session)
+            .track
+            .as_ref()
+            .and_then(|track| track.mirror.last_command_block())
+            .map(|block| block.index);
+        let start_seq = lock(&session).seq;
+        let payload = format!("{}\n", command.trim_end_matches('\n'));
+        self.write_raw(terminal_id, payload.as_bytes())?;
+
+        let started = std::time::Instant::now();
+        let mut last_seq = start_seq;
+        let mut last_output_seen = std::time::Instant::now();
+        loop {
+            let finished = {
+                let mut session = lock(&session);
+                if session.exited {
+                    return Err(EngineError::Other(format!(
+                        "Terminal {terminal_id} exited while running {command:?}"
+                    )));
+                }
+                // Copy the seq first: `track` below re-borrows the session
+                // mutably, and the loop needs both facts independently.
+                let seq_now = session.seq;
+                let track = session
+                    .track
+                    .as_mut()
+                    .expect("run switched tracking on above");
+                // Silence fallback: only when the shell emits NO markers (a
+                // `D` that has not arrived means the command IS still running
+                // there), only after a real quiet stretch, and the settled
+                // block says `marker_backed: false` — never an invented exit.
+                if !track.mirror.saw_markers()
+                    && seq_now == last_seq
+                    && last_output_seen.elapsed() >= silence
+                {
+                    track.mirror.settle_silence();
+                }
+                if seq_now != last_seq {
+                    last_seq = seq_now;
+                    last_output_seen = std::time::Instant::now();
+                }
+                track
+                    .mirror
+                    .last_command_block()
+                    .filter(|block| {
+                        // Freshness: a block that already existed at launch is
+                        // not OUR command (human terminals carry history).
+                        baseline.is_none_or(|bi| block.index > bi)
+                    })
+                    .filter(|block| block.status != BlockStatus::Running)
+                    .map(|block| {
+                        let lines = track.mirror.block_lines(&block);
+                        (block, lines, seq_now)
+                    })
+            };
+            if let Some((block, lines, seq)) = finished {
+                let status = block_status(&block).to_string();
+                let exit_code = if block.exit_is_known() {
+                    block.exit_code
+                } else {
+                    None
+                };
+                let marker_backed = block.marker_backed;
+                return Ok(TerminalRunResult {
+                    terminal_id: terminal_id.to_string(),
+                    status,
+                    command: block.command,
+                    cwd: block.cwd,
+                    exit_code,
+                    marker_backed,
+                    since_seq: start_seq,
+                    seq,
+                    lines,
+                    tracking_enabled,
+                });
+            }
+            if started.elapsed() >= wait {
+                // The long-command contract: hand back the tracking anchor.
+                return Ok(TerminalRunResult {
+                    terminal_id: terminal_id.to_string(),
+                    status: "running".to_string(),
+                    command: Some(command.to_string()),
+                    cwd: None,
+                    exit_code: None,
+                    marker_backed: lock(&session)
+                        .track
+                        .as_ref()
+                        .is_some_and(|track| track.mirror.saw_markers()),
+                    since_seq: start_seq,
+                    seq: last_seq,
+                    lines: Vec::new(),
+                    tracking_enabled,
+                });
+            }
+            tokio::time::sleep(Duration::from_millis(60)).await;
+        }
+    }
+
+    /// Request 1 — the current screen in clear text, one entry per viewport row,
+    /// top to bottom. This is the read for a full-screen program: its scrollback
+    /// is a pile of escape drafts, its display is these rows. Errors when the
+    /// terminal is not tracked (see [`Self::set_tracked`]).
+    pub fn screen_text(&self, terminal_id: &str) -> Result<TerminalScreen, EngineError> {
+        let session = self.session(terminal_id)?;
+        let session = lock(&session);
+        let track = track_of(&session, terminal_id)?;
+        Ok(TerminalScreen {
+            terminal_id: terminal_id.to_string(),
+            cols: track.mirror.cols(),
+            rows: track.mirror.rows(),
+            seq: track.mirror.seq(),
+            title: track.mirror.title().map(str::to_string),
+            lines: track.mirror.screen_text(),
+        })
+    }
+
+    /// Request 2 — the last `lines` lines of the terminal's text in clear text,
+    /// oldest first (the scrollback tail, then the viewport). Asking for more
+    /// than the mirror holds returns everything it has, so the count comes back in
+    /// [`TerminalTail::requested`] rather than as padding.
+    pub fn tail_text(&self, terminal_id: &str, lines: usize) -> Result<TerminalTail, EngineError> {
+        let session = self.session(terminal_id)?;
+        let session = lock(&session);
+        let track = track_of(&session, terminal_id)?;
+        Ok(TerminalTail {
+            terminal_id: terminal_id.to_string(),
+            seq: track.mirror.seq(),
+            requested: lines,
+            lines: track.mirror.tail_text(lines),
+        })
+    }
+
+    /// Request 3 — the text that appeared after `since_seq`, which is the seq a
+    /// previous [`Self::screen_text`] or [`Self::tail_text`] read reported. Steps
+    /// newer than `since_seq` only; nothing follows an already-caught-up seq.
+    ///
+    /// `needs_snapshot` says a plain append cannot describe the range (the program
+    /// rewrote the screen, the grid was resized, the alt screen flipped) and
+    /// [`Self::screen_text`] is the right read; `truncated` says the journal no
+    /// longer holds the whole range asked for.
+    pub fn text_delta(
+        &self,
+        terminal_id: &str,
+        since_seq: u64,
+    ) -> Result<TerminalDelta, EngineError> {
+        let session = self.session(terminal_id)?;
+        let session = lock(&session);
+        let track = track_of(&session, terminal_id)?;
+        Ok(terminal_delta(
+            terminal_id,
+            track.mirror.delta_since(since_seq),
+        ))
     }
 
     /// Kill the shell (if still running) and drop the session + replay buffer.
@@ -358,6 +1087,13 @@ async fn pump_output(
         };
         let mut session = lock(&session);
         let seq = session.next_seq();
+        // Tracked terminals fold the exact bytes of this batch, under the same
+        // lock and with the same seq the subscribers are handed — so a text read
+        // and a replay line up. Untracked ones pay this one branch and nothing
+        // else: no emulator exists to feed (see [`crate::Terminals::set_tracked`]).
+        if let Some(track) = session.track.as_mut() {
+            track.feed(seq, &buffer);
+        }
         session.emit(TerminalEvent::Data {
             seq,
             data: BASE64.encode(&buffer),
@@ -419,5 +1155,570 @@ async fn reaper_task(inner: Weak<TerminalsInner>) {
             let session = lock(session);
             !(session.exited && session.last_active_at.elapsed() > EXITED_TTL)
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Feed a tracked mirror the way the output pump does: one seq per batch.
+    fn scripted(cols: u16, rows: u16) -> TerminalTrack {
+        TerminalTrack::new(cols, rows)
+    }
+
+    fn text(lines: &[&str]) -> Vec<String> {
+        lines.iter().map(|line| line.to_string()).collect()
+    }
+
+    // ---- the three reads, on a scripted byte stream (no PTY, no UI) ----
+
+    #[test]
+    fn request_1_and_2_answer_in_clear_text() {
+        let mut track = scripted(40, 4);
+        track.feed(1, b"$ ");
+        track.feed(2, b"ls\r\nnotes.txt\r\n");
+
+        let screen = track.mirror.screen_text();
+        assert_eq!(screen[0], "$ ls");
+        assert_eq!(screen[1], "notes.txt");
+        // Clear text: no escape bytes survive into a read.
+        assert!(
+            screen
+                .iter()
+                .all(|line| !line.contains('\x1b') && !line.contains('\r')),
+            "{screen:?}"
+        );
+
+        // Request 2 hands back the tail, oldest first, viewport last. The cursor
+        // sits on the row after `notes.txt` (the batch ended with CRLF), so the
+        // tail ends on the empty rows the grid still holds.
+        assert_eq!(track.mirror.tail_text(2), text(&["", ""]));
+        assert_eq!(track.mirror.tail_text(3), text(&["notes.txt", "", ""]));
+        let everything = track.mirror.tail_text(40);
+        assert_eq!(everything.first().unwrap(), "$ ls");
+        assert_eq!(track.mirror.seq(), 2);
+    }
+
+    #[test]
+    fn request_3_reports_only_what_followed_the_seq() {
+        let mut track = scripted(40, 4);
+        for (ix, line) in ["first", "second", "third"].iter().enumerate() {
+            track.feed(ix as u64 + 1, format!("{line}\r\n").as_bytes());
+        }
+
+        let delta = track.mirror.delta_since(2);
+        assert_eq!(delta.from_seq, 2);
+        assert_eq!(delta.through_seq, 3);
+        assert_eq!(delta.lines, text(&["third"]), "not the lines before seq 2");
+        assert!(!delta.needs_snapshot);
+        assert!(!delta.truncated);
+
+        // Already caught up: nothing follows.
+        assert!(track.mirror.delta_since(3).lines.is_empty());
+        // From before the first byte: the whole transcript, in order.
+        assert_eq!(
+            track.mirror.delta_since(0).lines,
+            text(&["first", "second", "third"])
+        );
+    }
+
+    /// A full-screen program repaints the same rows, so the screen read is the
+    /// one that stays true; the journal flags the repaint instead of pretending
+    /// the repaint was an append.
+    #[test]
+    fn request_1_is_the_read_for_a_full_screen_app() {
+        let mut track = scripted(20, 3);
+        track.feed(1, b"leftover output\r\n");
+        track.feed(2, b"\x1b[?1049h\x1b[Hstatus: running\r\ncol a   col b");
+        assert_eq!(
+            track.mirror.screen_text(),
+            text(&["status: running", "col a   col b", ""])
+        );
+        assert!(
+            track.mirror.delta_since(1).needs_snapshot,
+            "entering the alt screen is not an append"
+        );
+        // The app repaints its status row, erasing the rest of the line the way
+        // a TUI does (without `[K` the longer old text would still show).
+        track.feed(3, b"\x1b[Hstatus: done\x1b[K");
+        assert_eq!(track.mirror.screen_text()[0], "status: done");
+        assert!(track.mirror.delta_since(2).needs_snapshot);
+        // Leaving restores the shell screen.
+        track.feed(4, b"\x1b[?1049l");
+        assert_eq!(track.mirror.screen_text()[0], "leftover output");
+    }
+
+    /// A resize is not output: it is stamped at the newest output seq and must
+    /// still invalidate a caller that is caught up on that seq.
+    #[test]
+    fn a_resize_is_folded_at_the_newest_output_seq() {
+        let mut track = scripted(20, 3);
+        track.feed(1, b"header\r\nbody");
+        assert_eq!(track.mirror.screen_text(), text(&["header", "body", ""]));
+
+        track.resize(1, 40, 3);
+        assert_eq!(track.mirror.cols(), 40);
+        let delta = track.mirror.delta_since(1);
+        assert!(delta.lines.is_empty(), "no output followed seq 1");
+        assert!(
+            delta.needs_snapshot,
+            "but the wrapping changed, so the caller's text is stale"
+        );
+
+        // Output after the resize diffs cleanly again.
+        track.feed(2, b"\r\nfooter");
+        let after = track.mirror.delta_since(1);
+        assert_eq!(after.lines, text(&["footer"]));
+    }
+
+    // ---- the wiring: the pump feeds the mirror, and only when asked to ----
+
+    async fn open_sh(terminals: &Terminals, cwd: &str) -> TerminalSession {
+        terminals
+            .open_with_shell(cwd, 80, 24, Some("/bin/sh"))
+            .expect("open sh")
+    }
+
+    fn decoded(events: &[TerminalEvent]) -> String {
+        let mut out = Vec::new();
+        for event in events {
+            if let TerminalEvent::Data { data, .. } = event {
+                out.extend(BASE64.decode(data).expect("valid base64"));
+            }
+        }
+        String::from_utf8_lossy(&out).to_string()
+    }
+
+    /// Drain until the transcript holds `marker`. Because the pump feeds the
+    /// mirror under the same lock, before the event is sent, seeing the event
+    /// means the mirror already has those bytes.
+    async fn drain_until(
+        rx: &mut mpsc::UnboundedReceiver<TerminalEvent>,
+        events: &mut Vec<TerminalEvent>,
+        marker: &str,
+    ) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        while !decoded(events).contains(marker) {
+            let event = tokio::time::timeout_at(deadline, rx.recv())
+                .await
+                .expect("terminal event before timeout")
+                .expect("terminal stream alive");
+            events.push(event);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_untracked_terminal_is_not_emulated_and_says_so() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let terminals = Terminals::new();
+        let session = open_sh(&terminals, &tmp.path().to_string_lossy()).await;
+        // Normalize against a developer running the suite with the env switch on.
+        terminals.set_tracked(&session.id, false).unwrap();
+
+        assert!(!terminals.is_tracked(&session.id).expect("is_tracked"));
+        // Refusing loudly beats answering with an empty screen.
+        for result in [
+            terminals.screen_text(&session.id).map(|_| ()),
+            terminals.tail_text(&session.id, 10).map(|_| ()),
+            terminals.text_delta(&session.id, 0).map(|_| ()),
+        ] {
+            let err = result.expect_err("reads on an untracked terminal must fail");
+            assert!(
+                err.to_string().contains("not tracked"),
+                "explicit error, got: {err}"
+            );
+        }
+
+        // The terminal itself is unaffected: output still streams.
+        let mut rx = terminals.subscribe(&session.id, None).expect("subscribe");
+        let mut events = Vec::new();
+        terminals
+            .write(&session.id, &BASE64.encode("echo un1racked\n"))
+            .expect("write");
+        drain_until(&mut rx, &mut events, "un1racked").await;
+        terminals.close(&session.id).expect("close");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tracking_follows_live_output_and_the_delta_stays_in_range() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let terminals = Terminals::new();
+        let session = open_sh(&terminals, &tmp.path().to_string_lossy()).await;
+        let mut rx = terminals.subscribe(&session.id, None).expect("subscribe");
+        let mut events = Vec::new();
+
+        terminals.set_tracked(&session.id, true).expect("track");
+        assert!(terminals.is_tracked(&session.id).unwrap());
+
+        terminals
+            .write(&session.id, &BASE64.encode("echo on7 tracked\n"))
+            .expect("write");
+        drain_until(&mut rx, &mut events, "on7 tracked").await;
+
+        let screen = terminals.screen_text(&session.id).expect("screen");
+        assert_eq!(screen.rows, 24);
+        assert!(
+            screen.lines.iter().any(|line| line.contains("on7 tracked")),
+            "the live output should be on the mirrored screen: {:?}",
+            screen.lines
+        );
+        let seq_after_first = screen.seq;
+        let tail = terminals
+            .tail_text(&session.id, 24)
+            .expect("tail on a tracked terminal");
+        assert_eq!(tail.requested, 24);
+        assert_eq!(tail.lines.len(), 24, "a fresh grid holds exactly its rows");
+
+        // A second command: the delta since the first read must carry the second
+        // and not repeat the first.
+        terminals
+            .write(&session.id, &BASE64.encode("echo lat9r than seq\n"))
+            .expect("write");
+        drain_until(&mut rx, &mut events, "lat9r than seq").await;
+        let delta = terminals
+            .text_delta(&session.id, seq_after_first)
+            .expect("delta");
+        assert_eq!(delta.from_seq, seq_after_first);
+        assert!(delta.through_seq > seq_after_first);
+        assert!(
+            delta.lines.iter().any(|line| line.contains("lat9r")),
+            "the delta must carry what followed: {:?}",
+            delta.lines
+        );
+        assert!(
+            !delta.lines.iter().any(|line| line.contains("on7")),
+            "and nothing that came before seq {}: {:?}",
+            seq_after_first,
+            delta.lines
+        );
+
+        // Turning tracking off frees the mirror and the reads refuse again.
+        terminals.set_tracked(&session.id, false).expect("untrack");
+        assert!(terminals.screen_text(&session.id).is_err());
+        terminals.close(&session.id).expect("close");
+    }
+
+    /// Enabling tracking mid-stream replays the bytes still in the window, so the
+    /// first read is not an empty screen that only fills in from the next key.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn enabling_tracking_replays_the_retained_window() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let terminals = Terminals::new();
+        let session = open_sh(&terminals, &tmp.path().to_string_lossy()).await;
+        let mut rx = terminals.subscribe(&session.id, None).expect("subscribe");
+        let mut events = Vec::new();
+
+        // Output lands while nothing is mirrored.
+        terminals
+            .write(&session.id, &BASE64.encode("echo earli3r replayed\n"))
+            .expect("write");
+        drain_until(&mut rx, &mut events, "earli3r replayed").await;
+
+        terminals.set_tracked(&session.id, true).expect("track");
+        let screen = terminals.screen_text(&session.id).expect("screen");
+        assert!(
+            screen
+                .lines
+                .iter()
+                .any(|line| line.contains("earli3r replayed")),
+            "the replay should have been folded in: {:?}",
+            screen.lines
+        );
+        // The seq the caller is holding from the replay is the live one.
+        assert!(
+            terminals
+                .text_delta(&session.id, screen.seq)
+                .expect("delta")
+                .lines
+                .is_empty(),
+            "nothing has followed the replayed window"
+        );
+        terminals.close(&session.id).expect("close");
+    }
+
+    // ---- the agent gate: a human decision, never an agent's own ----
+
+    /// The core guard: a terminal whose mirror is fully fed is STILL refused to
+    /// agents until a human grants the read. Tracking is not visibility.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn agent_reads_refuse_a_terminal_the_human_never_marked_visible() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let terminals = Terminals::new();
+        let session = open_sh(&terminals, &tmp.path().to_string_lossy()).await;
+        let mut rx = terminals.subscribe(&session.id, None).expect("subscribe");
+        let mut events = Vec::new();
+
+        // Feed the mirror the way a curious agent would find it: tracked, with
+        // live output, but nobody ever granted visibility.
+        terminals.set_tracked(&session.id, true).expect("track");
+        terminals
+            .write(&session.id, &BASE64.encode("echo g0 tesla-gate\n"))
+            .expect("write");
+        drain_until(&mut rx, &mut events, "g0 tesla-gate").await;
+        assert!(
+            terminals
+                .screen_text(&session.id)
+                .expect("ungated read works")
+                .lines
+                .iter()
+                .any(|line| line.contains("g0 tesla-gate")),
+            "the mirror IS fed — the refusal below is the gate, not emptiness"
+        );
+
+        assert!(
+            !terminals
+                .is_agent_visible(&session.id)
+                .expect("default deny")
+        );
+        for result in [
+            terminals.agent_screen_text(&session.id).map(|_| ()),
+            terminals.agent_tail_text(&session.id, 10).map(|_| ()),
+            terminals.agent_text_delta(&session.id, 0).map(|_| ()),
+        ] {
+            let err = result.expect_err("gated reads on an invisible terminal must fail");
+            assert!(
+                err.to_string().contains("not visible to agents"),
+                "explicit denial, got: {err}"
+            );
+        }
+        terminals.close(&session.id).expect("close");
+    }
+
+    /// The grant is also the switch that makes the feature real: it turns
+    /// tracking on (so the first read answers, and never sits in the
+    /// grant-with-no-mirror no-op state), and revoking drops the mirror so no
+    /// clear-text scrollback lingers for a terminal agents cannot read.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn granting_visibility_switches_tracking_on_and_reads_answer() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let terminals = Terminals::new();
+        let session = open_sh(&terminals, &tmp.path().to_string_lossy()).await;
+        // Normalize against a developer running the suite with the env switch on.
+        terminals.set_tracked(&session.id, false).expect("untrack");
+        let mut rx = terminals.subscribe(&session.id, None).expect("subscribe");
+        let mut events = Vec::new();
+
+        terminals
+            .set_agent_visible(&session.id, true)
+            .expect("grant");
+        assert!(
+            terminals.is_tracked(&session.id).expect("tracked"),
+            "the grant must switch the mirror on or every read would fail"
+        );
+
+        terminals
+            .write(&session.id, &BASE64.encode("echo vis1ble grant\n"))
+            .expect("write");
+        drain_until(&mut rx, &mut events, "vis1ble grant").await;
+        let screen = terminals
+            .agent_screen_text(&session.id)
+            .expect("gated screen read");
+        assert!(
+            screen
+                .lines
+                .iter()
+                .any(|line| line.contains("vis1ble grant")),
+            "{:?}",
+            screen.lines
+        );
+        assert!(
+            !terminals
+                .agent_tail_text(&session.id, 5)
+                .expect("gated tail read")
+                .lines
+                .is_empty()
+        );
+        let seq = screen.seq;
+        terminals
+            .write(&session.id, &BASE64.encode("echo lat9r than grant\n"))
+            .expect("write");
+        drain_until(&mut rx, &mut events, "lat9r than grant").await;
+        let delta = terminals
+            .agent_text_delta(&session.id, seq)
+            .expect("gated delta read");
+        assert!(
+            delta
+                .lines
+                .iter()
+                .any(|line| line.contains("lat9r than grant")),
+            "{:?}",
+            delta.lines
+        );
+
+        // Revoking the grant: mirror gone AND the gate closed again.
+        terminals
+            .set_agent_visible(&session.id, false)
+            .expect("revoke");
+        assert!(!terminals.is_tracked(&session.id).expect("untracked"));
+        let err = terminals
+            .agent_screen_text(&session.id)
+            .expect_err("revoked terminal is refused");
+        assert!(
+            err.to_string().contains("not visible to agents"),
+            "the gate answers before the tracking check: {err}"
+        );
+        terminals.close(&session.id).expect("close");
+    }
+
+    /// `ListTerminals` state: identity, size and both switches, without a
+    /// track even being needed — the UI/step-6 toggle reads this.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn list_terminals_reports_identity_visibility_and_size() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let terminals = Terminals::new();
+        let session = open_sh(&terminals, &tmp.path().to_string_lossy()).await;
+        terminals.set_tracked(&session.id, false).expect("untrack");
+
+        let info = terminals
+            .list_terminals()
+            .into_iter()
+            .find(|info| info.terminal_id == session.id)
+            .expect("listed");
+        assert_eq!(info.cwd, tmp.path().to_string_lossy());
+        assert_eq!(info.shell, "sh");
+        assert_eq!((info.cols, info.rows), (80, 24));
+        assert!(!info.tracked);
+        assert!(!info.agent_visible, "agents see nothing by default");
+        assert!(!info.exited);
+
+        terminals
+            .set_agent_visible(&session.id, true)
+            .expect("grant");
+        let info = terminals
+            .list_terminals()
+            .into_iter()
+            .find(|info| info.terminal_id == session.id)
+            .expect("still listed");
+        assert!(info.agent_visible);
+        assert!(info.tracked, "the grant switched the mirror on");
+
+        terminals.close(&session.id).expect("close");
+        assert!(
+            !terminals
+                .list_terminals()
+                .iter()
+                .any(|info| info.terminal_id == session.id)
+        );
+    }
+
+    /// The command-capture claim the harness pipe tests CANNOT make: with
+    /// stdin a pipe, bash echoes nothing between the prompt-end `B` and the
+    /// output-start `C` (no readline echo), so the typed text never reaches
+    /// the grid. This drives bash over a REAL PTY exactly the way
+    /// [`Terminals::open_impl`] launches it — plan's `--rcfile` wrapper, no
+    /// `-l` (the wrapper emulates login), `TERM=xterm-256color` — and types
+    /// `echo komet-visible` through the PTY writer, so the kernel echoes it
+    /// the way a human's keystrokes are echoed in production. The question
+    /// this answers: does an agent reading `last_command` on a real Komet
+    /// terminal see the command, or see the prompt?
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bash_injection_on_a_real_pty_reports_the_typed_command_to_agents() {
+        if !std::path::Path::new("/bin/bash").is_file() {
+            eprintln!("no bash on this machine");
+            return;
+        }
+        let home = tempfile::tempdir().expect("fake HOME");
+        std::fs::write(home.path().join(".bashrc"), "PS1='> '\n").expect("write bashrc");
+        let plan = komet_harness::shell_env::integration::plan("/bin/bash").expect("bash plan");
+        // Same launch shape as open_impl: the wrapper emulates the login, so
+        // no `-l` is passed.
+        assert!(plan.drop_login_flag && plan.extra_args.len() == 2);
+
+        let pty_system = native_pty_system();
+        let pair = pty_system
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("openpty");
+        let mut cmd = CommandBuilder::new("/bin/bash");
+        for (key, value) in &plan.env {
+            cmd.env(key, value);
+        }
+        for arg in &plan.extra_args {
+            cmd.arg(arg);
+        }
+        cmd.env("HOME", home.path());
+        cmd.env("TERM", "xterm-256color");
+        cmd.cwd(home.path());
+        let mut child = pair.slave.spawn_command(cmd).expect("spawn bash on a pty");
+        drop(pair.slave);
+        let mut reader = pair.master.try_clone_reader().expect("pty reader");
+        let mut writer = pair.master.take_writer().expect("pty writer");
+
+        // Blocking pty read into a shared buffer, the way `read_pty` does.
+        let bytes: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        {
+            let bytes = Arc::clone(&bytes);
+            std::thread::Builder::new()
+                .name("pty-probe-read".into())
+                .spawn(move || {
+                    let mut chunk = [0u8; 8192];
+                    while let Ok(n) = reader.read(&mut chunk) {
+                        if n == 0 {
+                            break;
+                        }
+                        bytes
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .extend_from_slice(&chunk[..n]);
+                    }
+                })
+                .expect("reader thread");
+        }
+        let snapshot = || bytes.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        let contains =
+            |haystack: &[u8], needle: &[u8]| haystack.windows(needle.len()).any(|w| w == needle);
+        let wait_until = |pred: &dyn Fn(&[u8]) -> bool| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(15);
+            loop {
+                let now = snapshot();
+                if pred(&now) {
+                    return;
+                }
+                assert!(std::time::Instant::now() < deadline, "pty output stalled");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+
+        // The first prompt must fully paint (A … B) before typing.
+        wait_until(&|b| contains(b, b"\x1b]133;B"));
+        writer
+            .write_all(b"echo komet-visible\n")
+            .expect("type into the pty");
+        // `D;0` AFTER the echoed line: the command finished and its exit code
+        // rode the marker into the stream. (A `D;0` already exists at the
+        // first prompt — bash reports the empty command before the injection
+        // loaded — so the search starts at `komet-visible`, which only the
+        // echo or the output can print.)
+        wait_until(&|b| {
+            b.windows(b"komet-visible".len())
+                .position(|w| w == b"komet-visible")
+                .is_some_and(|at| contains(&b[at + b"komet-visible".len()..], b"\x1b]133;D;0"))
+        });
+        let _ = child.kill();
+
+        let mut emu = Emulator::with_scrollback(80, 24, 1000);
+        emu.feed(&snapshot());
+        let blocks = emu.command_blocks();
+        let typed = blocks
+            .iter()
+            .find(|block| {
+                block.command.as_deref() == Some("echo komet-visible") && block.exit_code == Some(0)
+            })
+            .unwrap_or_else(|| panic!("a real PTY must carry the typed line: {blocks:?}"));
+        // `B` marked the prompt end, so the command is the TYPED text of that
+        // line — not the prompt line itself (`LineWithPrompt` is the pipe-mode
+        // artifact the harness test can no longer claim to prove).
+        assert_eq!(typed.command_source, komet_term::CommandSource::Typed);
+        assert!(typed.marker_backed);
+        assert_eq!(
+            emu.block_lines(typed),
+            vec!["komet-visible".to_string()],
+            "the block's output is the echo, not the prompt"
+        );
     }
 }

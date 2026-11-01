@@ -35,7 +35,10 @@ const GOLDEN: &[(HarnessId, HarnessInteractionSurface)] = &[
             subagents: SubagentSurface::Tagged,
             plans: PlanSurface::ToolChip,
             // No partial tool stdout from this CLI: declared, never simulated.
-            tool_progress: ProgressSurface::None,
+            // What the wire does settle is a background Bash task's
+            // `task_notification` (status + one-line summary), mapped to a
+            // final `ToolProgress` snapshot — `Final`, not `Streaming`.
+            tool_progress: ProgressSurface::Final,
         },
     ),
     (
@@ -185,9 +188,28 @@ fn plan_and_progress_surfaces_match_the_mapped_wires() {
             id.as_str()
         );
     }
-    assert_eq!(
-        interaction_surface(HarnessId::ClaudeCode).tool_progress,
-        ProgressSurface::None,
+    // Claude Code has no partial tool stdout: `Streaming` would be a lie.
+    // What it does carry is the settled `task_notification` of a background
+    // Bash task — mapped in `claude/normalize.rs` (`Frame::System` arm) to a
+    // final `ToolProgress` snapshot, which is exactly `Final`.
+    let claude = interaction_surface(HarnessId::ClaudeCode).tool_progress;
+    assert_ne!(
+        claude,
+        ProgressSurface::Streaming,
         "Claude Code streams no partial tool output"
+    );
+    assert_eq!(
+        claude,
+        ProgressSurface::Final,
+        "Claude Code settles a background command's status as a final snapshot"
+    );
+    // Codex claims the live stream: `codex/normalize.rs::progress_events` maps
+    // `item/commandExecution/outputDelta` onto `ToolProgress { append: true }`,
+    // and `map_item` closes a command with the settled print + exit code as a
+    // `ToolProgress { append: false }` snapshot.
+    assert_eq!(
+        interaction_surface(HarnessId::Codex).tool_progress,
+        ProgressSurface::Streaming,
+        "Codex carries partial command output"
     );
 }

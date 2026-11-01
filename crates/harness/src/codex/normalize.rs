@@ -43,6 +43,28 @@ fn item_output_text(item: &Value, is_error: bool) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// The settled print of a completed command, whatever its exit: the whole
+/// `aggregatedOutput` plus the exit code the item reported. Carried ONLY as an
+/// ephemeral [`AgentEvent::ToolProgress`] snapshot — the durable
+/// [`AgentEvent::ToolResult`] keeps its lean success contract (the doc's fold
+/// stores an error summary and nothing for a success), so this frame is the one
+/// place the human can still read what a successful command printed, which is
+/// what the read-only "Shell agent" panel exists to show. `None` when the
+/// command printed nothing: a silent command must not add a frame.
+fn settled_command_output(item: &Value) -> Option<String> {
+    let printed = ["aggregatedOutput", "aggregated_output", "output"]
+        .into_iter()
+        .filter_map(|k| item.get(k).and_then(Value::as_str))
+        .map(str::trim)
+        .find(|s| !s.is_empty())?;
+    Some(
+        match field(item, &["exitCode", "exit_code"]).and_then(Value::as_i64) {
+            Some(code) => format!("{printed}\nexit code: {code}"),
+            None => printed.to_owned(),
+        },
+    )
+}
+
 /// Delta text under either spelling the app server has used
 /// (`delta` on agentMessage, `textDelta` on some reasoning builds).
 pub(crate) fn delta_text(params: &Value) -> Option<String> {
@@ -282,12 +304,24 @@ pub(crate) fn map_item(phase: Phase, item: &Value) -> Vec<AgentEvent> {
                     .and_then(Value::as_i64)
                     .unwrap_or(0);
                 let is_error = status == "failed" || exit_code != 0;
-                vec![AgentEvent::ToolResult {
+                let mut events = Vec::new();
+                // The settled tail first: the engine flushes buffered live
+                // output before any durable event, so this snapshot lands
+                // after the deltas it completes and never after the result.
+                if let Some(text) = settled_command_output(item) {
+                    events.push(AgentEvent::ToolProgress {
+                        id: id.clone(),
+                        text,
+                        append: false,
+                    });
+                }
+                events.push(AgentEvent::ToolResult {
                     id,
                     is_error,
                     output: item_output_text(item, is_error),
                     diff: None,
-                }]
+                });
+                events
             }
         },
         "fileChange" | "file_change" => {
@@ -819,6 +853,44 @@ mod tests {
         // Nothing to attribute the stream to: no id, or an empty chunk.
         assert!(progress_events(&json!({"delta": "x"})).is_empty());
         assert!(progress_events(&json!({"itemId": "c1", "delta": ""})).is_empty());
+    }
+
+    #[test]
+    fn command_completion_snapshot_carries_the_settled_print_and_exit_code() {
+        // A SUCCESSFUL command's whole output reaches the shell panel as an
+        // ephemeral snapshot — and still nothing durable (the ToolResult
+        // contract is unchanged).
+        let completed = map_item(
+            Phase::Completed,
+            &json!({"type": "commandExecution", "id": "c1", "status": "completed",
+                    "exit_code": 0, "aggregatedOutput": "test result: ok. 90 passed"}),
+        );
+        assert_eq!(
+            completed.first(),
+            Some(&AgentEvent::ToolProgress {
+                id: "c1".into(),
+                text: "test result: ok. 90 passed\nexit code: 0".into(),
+                append: false,
+            })
+        );
+        assert!(matches!(
+            completed.last(),
+            Some(AgentEvent::ToolResult { id, output: None, is_error: false, .. }) if id == "c1"
+        ));
+        // A command that printed nothing adds no frame at all.
+        let silent = map_item(
+            Phase::Completed,
+            &json!({"type": "commandExecution", "id": "c2", "status": "completed", "exit_code": 0}),
+        );
+        assert_eq!(
+            silent,
+            vec![AgentEvent::ToolResult {
+                id: "c2".into(),
+                is_error: false,
+                output: None,
+                diff: None,
+            }]
+        );
     }
 
     #[test]

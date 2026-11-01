@@ -254,6 +254,12 @@ pub(crate) struct Normalizer {
     /// which then opened as an empty, never-created subagent doc (user
     /// report 2026-08-20).
     agent_spawn_tools: std::collections::HashSet<String>,
+    /// tool_use ids of `Bash` calls (and of `task_started` background shell
+    /// tasks), recorded from the parent feed. The other half of the
+    /// `task_notification` gate: a spawn settles a subagent, a shell task
+    /// settles a command — and an id in neither set is a task this adapter
+    /// never saw, which stays dropped.
+    exec_tools: std::collections::HashSet<String>,
     /// Rotates at each assistant-frame close and at each steer; SessionStarted
     /// carries the first value so folds can attribute deltas from the start.
     assistant_message_id: String,
@@ -270,6 +276,7 @@ impl Normalizer {
             saw_init: false,
             agent_tasks: std::collections::HashMap::new(),
             agent_spawn_tools: std::collections::HashSet::new(),
+            exec_tools: std::collections::HashSet::new(),
             assistant_message_id: new_message_id(),
             compaction: None,
             session_id: None,
@@ -321,6 +328,7 @@ impl Normalizer {
                 self.saw_init = false;
                 self.agent_tasks.clear();
                 self.agent_spawn_tools.clear();
+                self.exec_tools.clear();
                 self.assistant_message_id = new_message_id();
                 self.compaction = None;
                 Vec::new()
@@ -344,6 +352,44 @@ impl Normalizer {
                     // precedes its notification on the wire, so the set is
                     // populated by the time a genuine one arrives.
                     if !self.agent_spawn_tools.contains(parent) {
+                        // A KNOWN background shell command: the CLI's only
+                        // parting words for it are this status word plus an
+                        // optional one-line `summary` — the 2.1.x wire streams
+                        // NO partial Bash stdout (its `stream_event` deltas are
+                        // assistant text/thinking/tool-input only, see
+                        // [`super::wire::StreamEventBody`]). So the settled
+                        // status is what this harness can offer, and it goes
+                        // on the ephemeral progress channel as a final
+                        // snapshot: broadcast-only, never journaled, and never
+                        // a lifecycle write that could stamp a spawn ref onto
+                        // an ordinary Run chip.
+                        if self.exec_tools.contains(parent) {
+                            let label = match f.status.as_deref().unwrap_or("") {
+                                "completed" | "complete" | "succeeded" | "success" => "finished",
+                                "failed" | "errored" | "error" => "failed",
+                                "killed" | "cancelled" | "canceled" | "stopped" | "interrupted" => {
+                                    "stopped"
+                                }
+                                // Non-terminal notification shapes: nothing settled.
+                                _ => return Vec::new(),
+                            };
+                            let summary = f
+                                .summary
+                                .as_deref()
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty());
+                            let text = match summary {
+                                Some(summary) => {
+                                    format!("Background command {label} — {summary}")
+                                }
+                                None => format!("Background command {label}"),
+                            };
+                            return vec![AgentEvent::ToolProgress {
+                                id: parent.to_owned(),
+                                text,
+                                append: false,
+                            }];
+                        }
                         return Vec::new();
                     }
                     let status = match f.status.as_deref().unwrap_or("") {
@@ -365,6 +411,20 @@ impl Normalizer {
                             reason: None,
                         },
                     )];
+                }
+                // A background SHELL task starting (`task_type` local_bash,
+                // no `subagent_type`): remember its call id so a later
+                // `task_notification` can be attributed even when the Bash
+                // tool_use frame was not the one that named it. The frame
+                // itself carries no content, so nothing is emitted — the
+                // command's chip is already open from its own tool_use.
+                if f.subtype == "task_started"
+                    && f.subagent_type.is_none()
+                    && f.task_type.as_deref() == Some("local_bash")
+                    && let Some(tool) = f.tool_use_id.as_deref().filter(|t| !t.is_empty())
+                {
+                    self.exec_tools.insert(tool.to_owned());
+                    return Vec::new();
                 }
                 // An AGENT task starting (subagent_type present — subagent-
                 // owned shell tasks carry the same subtype without it):
@@ -522,9 +582,18 @@ impl Normalizer {
                 }
                 // Record spawn tool ids up front: `task_notification` keys on
                 // them, and only foreground spawns ever get a `task_started`.
+                // Bash ids ride along for the other half of that gate.
                 for b in f.message.blocks() {
-                    if b.kind == "tool_use" && matches!(b.name.as_str(), "Agent" | "Task") {
-                        self.agent_spawn_tools.insert(b.id.clone());
+                    if b.kind == "tool_use" {
+                        match b.name.as_str() {
+                            "Agent" | "Task" => {
+                                self.agent_spawn_tools.insert(b.id.clone());
+                            }
+                            "Bash" => {
+                                self.exec_tools.insert(b.id.clone());
+                            }
+                            _ => {}
+                        }
                     }
                 }
                 let mut out: Vec<AgentEvent> = f
@@ -1230,10 +1299,33 @@ mod tests {
             norm.normalize(frame, false);
         }
         let done = crate::claude::wire::parse_frame(
-            r#"{"type":"system","subtype":"task_notification","task_id":"bg1","tool_use_id":"toolu_bash","status":"completed"}"#,
+            r#"{"type":"system","subtype":"task_notification","task_id":"bg1","tool_use_id":"toolu_bash","status":"completed","summary":"cloned 214 files"}"#,
         )
         .expect("parses");
-        assert!(norm.normalize(done, false).is_empty());
+        let settled = norm.normalize(done, false);
+        // No Done, no tag: the shell's settling is an ephemeral progress
+        // snapshot on the command's own chip.
+        assert_eq!(
+            settled,
+            vec![AgentEvent::ToolProgress {
+                id: "toolu_bash".into(),
+                text: "Background command finished — cloned 214 files".into(),
+                append: false,
+            }]
+        );
+        // A notification for a tool id this adapter never saw stays dropped
+        // (no orphan stream to invent an owner for).
+        let stranger = crate::claude::wire::parse_frame(
+            r#"{"type":"system","subtype":"task_notification","task_id":"bg9","tool_use_id":"toolu_unknown","status":"completed"}"#,
+        )
+        .expect("parses");
+        assert!(norm.normalize(stranger, false).is_empty());
+        // …and a non-terminal status settles nothing either.
+        let running = crate::claude::wire::parse_frame(
+            r#"{"type":"system","subtype":"task_notification","task_id":"bg1","tool_use_id":"toolu_bash","status":"running"}"#,
+        )
+        .expect("parses");
+        assert!(norm.normalize(running, false).is_empty());
     }
 
     #[test]

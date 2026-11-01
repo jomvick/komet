@@ -52,6 +52,17 @@ pub(crate) struct SystemFrame {
     /// `task_notification` terminal status (`completed`/`failed`/`killed`…).
     #[serde(default)]
     pub status: Option<String>,
+    /// `task_notification` closing words the CLI chose for itself — a
+    /// subagent's last line, or a background command's short report. The only
+    /// command OUTPUT text this frame type ever carries; a background Bash
+    /// task's stdout is not streamed on the 2.1.x wire at all.
+    #[serde(default)]
+    pub summary: Option<String>,
+    /// `task_started`: the task genus. `local_bash` is a background shell
+    /// command (a `Bash` call with `run_in_background`); subagent tasks are
+    /// told apart by [`SystemFrame::subagent_type`].
+    #[serde(default, alias = "taskType")]
+    pub task_type: Option<String>,
     /// `task_started`: the agent/task id (`SendMessage`'s `to:` address) —
     /// with `tool_use_id`, the agentId→spawn mapping steers need.
     #[serde(default, alias = "taskId")]

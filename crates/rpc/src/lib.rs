@@ -156,6 +156,17 @@ pub mod methods {
     pub const WRITE_TERMINAL: &str = "WriteTerminal";
     pub const RESIZE_TERMINAL: &str = "ResizeTerminal";
     pub const CLOSE_TERMINAL: &str = "CloseTerminal";
+    // Terminal read surface (ControlRpc, relay-forwardable — the terminal lives
+    // on the device that owns the PTY). `SetTerminalAgentVisible` is the HUMAN
+    // grant: it is deliberately exposed only over RPC (the UI/IPC surface),
+    // never as an MCP tool — an agent cannot make a terminal readable to
+    // itself. The three reads answer only for terminals carrying that grant,
+    // and refuse loudly otherwise (guard first, then the "not tracked" error).
+    pub const LIST_TERMINALS: &str = "ListTerminals";
+    pub const SET_TERMINAL_AGENT_VISIBLE: &str = "SetTerminalAgentVisible";
+    pub const READ_TERMINAL_SCREEN: &str = "ReadTerminalScreen";
+    pub const READ_TERMINAL_TAIL: &str = "ReadTerminalTail";
+    pub const READ_TERMINAL_DELTA: &str = "ReadTerminalDelta";
     /// Checkout-diff stream for the target device's chats (DataRpc,
     /// relay-forwardable — diffs are produced where the checkout lives).
     pub const WATCH_CHECKOUT_DIFFS: &str = "WatchCheckoutDiffs";
