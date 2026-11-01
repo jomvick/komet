@@ -26,15 +26,12 @@
 //! - Terminals (§3.4): `OpenTerminal {chatId?, spaceId?, cols, rows}` → `TerminalSession`,
 //!   `SubscribeTerminal {terminalId, afterSeq?}` → stream of `TerminalEvent`
 //!   (replay then live tail), `WriteTerminal {terminalId, data}`, `ResizeTerminal`,
-//!   `CloseTerminal`. Read-only agent surface: `ListTerminals` →
-//!   `{terminals: TerminalInfo[]}` (all rows, `agentVisible` included),
-//!   `SetTerminalAgentVisible {terminalId, visible}` (the human's grant — the
-//!   only way the flag moves) → `{ok}`, and `ReadTerminalScreen {terminalId}`
-//!   → `TerminalScreen`, `ReadTerminalTail {terminalId, lines}` →
+//!   `CloseTerminal`. Read surface: `ListTerminals` →
+//!   `{terminals: TerminalInfo[]}`, `ReadTerminalScreen {terminalId}` →
+//!   `TerminalScreen`, `ReadTerminalTail {terminalId, lines}` →
 //!   `TerminalTail`, `ReadTerminalDelta {terminalId, sinceSeq}` →
-//!   `TerminalDelta`; all three reads are gated by that flag (see
-//!   `crate::terminals` and docs/security.md — the flag is the boundary for
-//!   terminal text, and no MCP tool can lift it). M5 is single-user local:
+//!   `TerminalDelta`. Agents list and read every terminal over MCP but never
+//!   write to one (see `crate::terminals` and docs/security.md). M5 is single-user local:
 //!   per-user owner checks land with real multi-account auth in M6.
 //! - Agent accounts (§3.7): `ListAgentAccounts {usageMode?, forceUsage?}` →
 //!   `AgentAccountsSnapshot`, `ActivateAgentAccount`/`ForgetAgentAccount`
@@ -351,16 +348,6 @@ struct ResizeTerminalParams {
     terminal_id: String,
     cols: u16,
     rows: u16,
-}
-
-/// `SetTerminalAgentVisible` — the HUMAN-side grant backing the agent gate.
-/// Deliberately RPC-only (no MCP tool lifts this flag). Granting also switches
-/// the engine's text mirror on; revoking drops it (see `Terminals::set_agent_visible`).
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SetTerminalAgentVisibleParams {
-    terminal_id: String,
-    visible: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1290,7 +1277,6 @@ fn forwardable(method: &str) -> bool {
             // …and so do the read surface and its gate: a viewer (or the
             // step-6 toggle) on another device must reach the owning PTY.
             | methods::LIST_TERMINALS
-            | methods::SET_TERMINAL_AGENT_VISIBLE
             | methods::READ_TERMINAL_SCREEN
             | methods::READ_TERMINAL_TAIL
             | methods::READ_TERMINAL_DELTA
@@ -2722,24 +2708,11 @@ impl RpcService for EngineRpc {
             methods::LIST_TERMINALS => RpcReply::value(&serde_json::json!({
                 "terminals": self.terminals.list_terminals()
             })),
-            methods::SET_TERMINAL_AGENT_VISIBLE => {
-                // The agent gate is lifted only from here (the human/IPC
-                // surface). No MCP tool reaches it, so an agent cannot grant
-                // itself reads (docs/security.md: the sandbox is not a host
-                // boundary — this flag is the boundary for terminal text).
-                let p: SetTerminalAgentVisibleParams = parse_params(params)?;
-                self.terminals
-                    .set_agent_visible(&p.terminal_id, p.visible)
-                    .map_err(|e| RpcError::Failed(e.to_string()))?;
-                RpcReply::value(&serde_json::json!({ "ok": true }))
-            }
-            // The three reads answer only for agent-visible terminals — the
-            // gate error precedes the "not tracked" one (crate::terminals).
             methods::READ_TERMINAL_SCREEN => {
                 let p: TerminalIdParams = parse_params(params)?;
                 let screen = self
                     .terminals
-                    .agent_screen_text(&p.terminal_id)
+                    .screen_text(&p.terminal_id)
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&screen)
             }
@@ -2747,7 +2720,7 @@ impl RpcService for EngineRpc {
                 let p: ReadTerminalTailParams = parse_params(params)?;
                 let tail = self
                     .terminals
-                    .agent_tail_text(&p.terminal_id, p.lines)
+                    .tail_text(&p.terminal_id, p.lines)
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&tail)
             }
@@ -2755,7 +2728,7 @@ impl RpcService for EngineRpc {
                 let p: ReadTerminalDeltaParams = parse_params(params)?;
                 let delta = self
                     .terminals
-                    .agent_text_delta(&p.terminal_id, p.since_seq)
+                    .text_delta(&p.terminal_id, p.since_seq)
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&delta)
             }
@@ -2973,7 +2946,6 @@ mod tests {
     fn terminal_read_surface_is_forwardable_and_not_streaming() {
         for method in [
             methods::LIST_TERMINALS,
-            methods::SET_TERMINAL_AGENT_VISIBLE,
             methods::READ_TERMINAL_SCREEN,
             methods::READ_TERMINAL_TAIL,
             methods::READ_TERMINAL_DELTA,
