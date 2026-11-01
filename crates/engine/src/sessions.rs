@@ -806,6 +806,11 @@ impl SessionsEngine {
         Ok((replay, rx))
     }
 
+    /// Live-only receiver (no journal replay).
+    pub fn subscribe_live(&self, chat_id: &str) -> broadcast::Receiver<JournaledEvent> {
+        self.hub_receiver(chat_id)
+    }
+
     /// The chat's live receiver, subscribed before any journal projection so a
     /// frame appended in between lands in the stream (dedupe by `seq`).
     fn hub_receiver(&self, chat_id: &str) -> broadcast::Receiver<JournaledEvent> {
@@ -821,10 +826,9 @@ impl SessionsEngine {
     pub fn latest_seq(&self, chat_id: &str) -> u64 {
         self.inner
             .journal
-            .last_event(chat_id)
+            .last_seq(chat_id)
             .ok()
             .flatten()
-            .map(|(seq, _)| seq)
             .unwrap_or(0)
     }
 
