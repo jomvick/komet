@@ -16,3 +16,6 @@ edge/dist/
 # (they pin SCENARIO / env for the fake agents); only the real fixtures are tracked.
 crates/harness/tests/fixtures/fake-cline-acp-*.sh
 crates/harness/tests/fixtures/fake-acp-*.sh
+
+# Qoder CLI session artifacts
+.qoder/
