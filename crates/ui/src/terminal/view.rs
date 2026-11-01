@@ -658,9 +658,6 @@ pub struct TerminalPrepaint {
     /// must not re-derive it from the default constant (rows would drift
     /// between prepaint and paint on a zoomed grid).
     line_h: Pixels,
-    /// Visual-bell indicator: a small dot in the grid's top-right corner while
-    /// the tab's BEL is ringing. Painted last so it sits above the glyphs.
-    bell_dot: Option<PaintQuad>,
     cursor: Option<PaintQuad>,
 }
 
@@ -744,7 +741,7 @@ impl gpui::Element for TerminalElement {
             bounds.left() + px(TERM_PADDING),
             bounds.top() + px(TERM_PADDING),
         );
-        let (snapshot, bell_ringing) = self.panel.update(cx, |panel, cx| {
+        let snapshot = self.panel.update(cx, |panel, cx| {
             panel.on_grid_metrics(
                 super::panel::GridGeometry {
                     origin,
@@ -755,8 +752,7 @@ impl gpui::Element for TerminalElement {
                 },
                 cx,
             );
-            let bell = panel.bell_indicator_active(cx);
-            (panel.active_grid_snapshot(cx), bell)
+            panel.active_grid_snapshot(cx)
         });
         let Some(snapshot) = snapshot else {
             return TerminalPrepaint {
@@ -765,22 +761,9 @@ impl gpui::Element for TerminalElement {
                 lines: Vec::new(),
                 cell_w,
                 line_h,
-                bell_dot: None,
                 cursor: None,
             };
         };
-        // A BEL with no grid to sit on would be invisible anyway — the dot is
-        // painted only when there is a live viewport.
-        let bell_dot = bell_ringing.then(|| {
-            fill(
-                Bounds::new(
-                    point(bounds.right() - px(20.0), bounds.top() + px(9.0)),
-                    size(px(7.0), px(7.0)),
-                ),
-                theme.warning,
-            )
-        });
-
         let mut bg_quads = Vec::new();
         let mut sel_quads = Vec::new();
         let mut lines = Vec::with_capacity(snapshot.lines.len());
@@ -859,7 +842,6 @@ impl gpui::Element for TerminalElement {
             lines,
             cell_w,
             line_h,
-            bell_dot,
             cursor,
         }
     }
@@ -902,10 +884,6 @@ impl gpui::Element for TerminalElement {
             }
             if let Some(cursor) = prepaint.cursor.take() {
                 window.paint_quad(cursor);
-            }
-            // Visual-bell dot, last: it must sit above the grid it flags.
-            if let Some(dot) = prepaint.bell_dot.take() {
-                window.paint_quad(dot);
             }
         });
     }
