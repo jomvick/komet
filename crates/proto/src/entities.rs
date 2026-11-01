@@ -808,11 +808,8 @@ pub enum TerminalEvent {
 }
 
 /// One row of the `ListTerminals` reply: what a caller can address without
-/// reading the terminal itself. `agent_visible` is the human's grant that any
-/// agent read (RPC `ReadTerminal*` and the `terminal_read` MCP tool) checks
-/// before touching the mirror; `tracked` says whether the engine currently
-/// mirrors the output as text (making a terminal agent-visible switches
-/// tracking on, hiding it switches tracking back off).
+/// reading the terminal itself. `tracked` is true while the engine mirrors the
+/// output as text (always, for every terminal it opens).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TerminalInfo {
@@ -829,7 +826,6 @@ pub struct TerminalInfo {
     /// Newest output sequence number.
     pub seq: u64,
     pub tracked: bool,
-    pub agent_visible: bool,
     pub exited: bool,
 }
 
@@ -910,36 +906,6 @@ pub struct TerminalCommand {
     pub seq: u64,
     /// The block's output region, oldest line first.
     pub lines: Vec<String>,
-}
-
-/// The `terminal_run` answer. A `running` status ALWAYS carries the tracking
-/// anchor (`sinceSeq`) instead of hitting the endpoint's 30 s tool timeout:
-/// the agent keeps following with a `terminal_read` delta from there and
-/// re-asks later. Long commands therefore end with an id, never with a dead
-/// process or a timed-out call.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TerminalRunResult {
-    pub terminal_id: String,
-    /// `"done"`, `"settled"` (silence fallback, exit unknown) or `"running"`.
-    pub status: String,
-    #[serde(default)]
-    pub command: Option<String>,
-    #[serde(default)]
-    pub cwd: Option<String>,
-    #[serde(default)]
-    pub exit_code: Option<i32>,
-    pub marker_backed: bool,
-    /// When `running`: pass this as `sinceSeq` to a delta read to catch up.
-    pub since_seq: u64,
-    /// Newest output sequence folded into the mirror at reply time.
-    pub seq: u64,
-    /// The command's output when it finished; empty while still running.
-    pub lines: Vec<String>,
-    /// True when the run had to switch the text mirror on (an untracked
-    /// terminal has nothing to observe completion with — the run enables it
-    /// and says so instead of failing quietly).
-    pub tracking_enabled: bool,
 }
 
 /// One in-flight queued-attachment transfer (the `WatchTransfers` stream):
