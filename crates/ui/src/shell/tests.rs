@@ -1,3 +1,5 @@
+    use komet_engine::InstanceLock;
+
     use super::*;
 
     #[test]
