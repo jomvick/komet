@@ -566,8 +566,6 @@ struct TabGhost {
 struct TerminalMenuAvailability {
     copy: bool,
     paste: bool,
-    /// A tab is open: gates Select All / Rename / Close Tab.
-    tab: bool,
 }
 
 impl TerminalMenuAvailability {
@@ -575,14 +573,7 @@ impl TerminalMenuAvailability {
         Self {
             copy: has_selection,
             paste: clipboard_has_text,
-            tab: true,
         }
-    }
-
-    fn with_tab(mut self, tab: bool) -> Self {
-        self.tab = tab;
-        self.copy &= tab;
-        self
     }
 }
 
@@ -1617,7 +1608,6 @@ impl TerminalPanel {
         if self.relay_press(MouseButton::Right, event.position, &event.modifiers, cx) {
             return;
         }
-        let has_tab = self.active_tab_key(cx).is_some();
         let has_selection = self
             .with_active_emulator(cx, |emu| emu.has_selection())
             .unwrap_or(false);
@@ -1626,8 +1616,7 @@ impl TerminalPanel {
             .is_some_and(|item| item.text().is_some());
         self.context_menu.open(TerminalContextMenu {
             position: event.position,
-            availability: TerminalMenuAvailability::new(has_selection, clipboard_has_text)
-                .with_tab(has_tab),
+            availability: TerminalMenuAvailability::new(has_selection, clipboard_has_text),
         });
         cx.notify();
     }
@@ -1648,21 +1637,6 @@ impl TerminalPanel {
     /// Paste from the menu (bracketed-paste aware, same as Ctrl+Shift+V).
     fn paste_from_menu(&mut self, cx: &mut Context<Self>) {
         self.paste_clipboard(cx);
-    }
-
-    /// "New Terminal" menu row: dispatch the action so drawer and embedded
-    /// panels both land on the right code path (embedded bubbling to the
-    /// shell's surface machinery).
-    fn new_tab_from_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        window.dispatch_action(Box::new(NewTerminalTab), cx);
-    }
-
-    fn rename_from_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        window.dispatch_action(Box::new(RenameTerminalTab), cx);
-    }
-
-    fn select_all_from_menu(&mut self, cx: &mut Context<Self>) {
-        self.select_all(cx);
     }
 
     fn context_menu_row(
@@ -1713,34 +1687,11 @@ impl TerminalPanel {
             .flex_col();
         card = card
             .child(row(
-                "terminal-context-new",
-                "New terminal".into(),
-                true,
-                Self::new_tab_from_menu,
-                cx,
-            ))
-            .child(row(
-                "terminal-context-rename",
-                "Rename tab".into(),
-                availability.tab,
-                Self::rename_from_menu,
-                cx,
-            ))
-            .child(row(
                 "terminal-context-copy",
                 "Copy".into(),
                 availability.copy,
                 |this, _, cx| {
                     this.copy_from_menu(cx);
-                },
-                cx,
-            ))
-            .child(row(
-                "terminal-context-select-all",
-                "Select all".into(),
-                availability.tab,
-                |this, _, cx| {
-                    this.select_all_from_menu(cx);
                 },
                 cx,
             ))
@@ -2039,12 +1990,6 @@ impl TerminalPanel {
 
     fn active_tab_key(&self, cx: &App) -> Option<u64> {
         self.active_tab(cx).map(|tab| tab.key)
-    }
-
-    /// Select All: the whole history + viewport of the active tab.
-    fn select_all(&mut self, cx: &mut Context<Self>) {
-        self.with_active_emulator(cx, |emu| emu.select_all());
-        cx.notify();
     }
 
     fn action_zoom_font(&mut self, delta: f32, cx: &mut Context<Self>) {
@@ -2498,7 +2443,6 @@ mod tests {
             TerminalMenuAvailability {
                 copy: true,
                 paste: true,
-                tab: true,
             }
         );
         // No selection: Copy greys out, Paste still offered.
@@ -2507,7 +2451,6 @@ mod tests {
             TerminalMenuAvailability {
                 copy: false,
                 paste: true,
-                tab: true,
             }
         );
         // Empty clipboard: Paste greys out, Copy still offered.
@@ -2516,31 +2459,10 @@ mod tests {
             TerminalMenuAvailability {
                 copy: true,
                 paste: false,
-                tab: true,
             }
         );
         assert!(!TerminalMenuAvailability::new(false, false).copy);
         assert!(!TerminalMenuAvailability::new(false, false).paste);
-    }
-
-    #[test]
-    fn menu_availability_tab_gate() {
-        // No tab open: the tab rows go, and Copy cannot survive without one.
-        let gated = TerminalMenuAvailability::new(true, true).with_tab(false);
-        assert_eq!(
-            gated,
-            TerminalMenuAvailability {
-                copy: false,
-                paste: true,
-                tab: false,
-            }
-        );
-        // With a tab, Copy follows the selection only.
-        assert!(
-            TerminalMenuAvailability::new(true, false)
-                .with_tab(true)
-                .copy
-        );
     }
 
     #[test]

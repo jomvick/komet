@@ -239,7 +239,6 @@ pub struct Emulator {
     parser: Processor,
     capture: EventCapture,
     title: Option<String>,
-    bell: bool,
     /// OSC 133 command-boundary state: the bytes of the current batch that
     /// could not be classified yet (an OSC string split across two PTY reads),
     /// and the blocks the markers found so far describe.
@@ -268,7 +267,6 @@ impl Emulator {
             parser: Processor::new(),
             capture,
             title: None,
-            bell: false,
             held: Vec::new(),
             blocks: CommandTracker::default(),
         }
@@ -328,7 +326,6 @@ impl Emulator {
                 Event::PtyWrite(text) => responses.extend_from_slice(text.as_bytes()),
                 Event::Title(title) => self.title = Some(title),
                 Event::ResetTitle => self.title = None,
-                Event::Bell => self.bell = true,
                 _ => {}
             }
         }
@@ -436,11 +433,6 @@ impl Emulator {
     /// OSC title, if the running program set one.
     pub fn title(&self) -> Option<&str> {
         self.title.as_deref()
-    }
-
-    /// True once a BEL arrived; reading clears it.
-    pub fn take_bell(&mut self) -> bool {
-        std::mem::take(&mut self.bell)
     }
 
     /// Arrow keys should send SS3 (`ESC O A`) instead of CSI.
@@ -998,15 +990,14 @@ mod tests {
     }
 
     #[test]
-    fn osc_title_and_bell() {
+    fn osc_title() {
         let mut e = emu(20, 2);
         assert_eq!(e.title(), None);
         e.feed(b"\x1b]0;my title\x07");
         assert_eq!(e.title(), Some("my title"));
-        assert!(!e.take_bell());
+        // Komet has no bell: a bare BEL is simply ignored.
         e.feed(b"\x07");
-        assert!(e.take_bell());
-        assert!(!e.take_bell(), "bell reads clear it");
+        assert_eq!(e.title(), Some("my title"));
     }
 
     #[test]

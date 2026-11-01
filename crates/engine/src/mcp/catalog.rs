@@ -831,6 +831,30 @@ mod tests {
     }
 
     #[test]
+    fn catalog_exposes_only_terminal_list_and_terminal_read_for_terminals() {
+        let catalog = McpCatalog::komet_default(Arc::new(FakeHost));
+        let tools = catalog.list();
+        let tool_names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+
+        // Terminal tools must be exactly these two
+        assert!(tool_names.contains(&"terminal_list"), "terminal_list must be present");
+        assert!(tool_names.contains(&"terminal_read"), "terminal_read must be present");
+
+        // No write operations on terminals should be exposed
+        assert!(!tool_names.iter().any(|n| n.contains("write")), "No terminal write tools");
+        assert!(!tool_names.iter().any(|n| n.contains("open")), "No terminal open tools");
+        assert!(!tool_names.iter().any(|n| n.contains("close")), "No terminal close tools");
+        assert!(!tool_names.iter().any(|n| n.contains("paste")), "No terminal paste tools");
+
+        // Both terminal tools must be readonly
+        for tool in &tools {
+            if tool.name == "terminal_list" || tool.name == "terminal_read" {
+                assert!(tool.readonly, "{} must be readonly", tool.name);
+            }
+        }
+    }
+
+    #[test]
     fn composio_mutations_require_permission_but_reads_do_not() {
         let catalog = McpCatalog::komet_default(Arc::new(FakeHost));
         assert!(catalog.is_readonly(

@@ -372,11 +372,6 @@ impl TerminalMirror {
         self.emulator.title()
     }
 
-    /// True once when a BEL arrived since the last read.
-    pub fn take_bell(&mut self) -> bool {
-        self.emulator.take_bell()
-    }
-
     /// Re-baseline the journal on the current screen without feeding bytes: the
     /// next delta starts from here.
     pub fn resync(&mut self, seq: u64) {
@@ -709,13 +704,8 @@ mod tests {
         let mut m = mirror(20, 3);
         feed(&mut m, 1, b"\x1b]0;my title\x07");
         assert_eq!(m.title(), Some("my title"));
-        // The BEL that ends an OSC string is a terminator, not a bell: a real
-        // beep still has to arrive on its own.
-        assert!(!m.take_bell());
-        feed(&mut m, 2, b"\x07");
-        assert!(m.take_bell());
-        assert!(!m.take_bell());
-        assert_eq!(m.seq(), 2);
+        // The BEL that ends an OSC string is a terminator, not a bell.
+        assert_eq!(m.seq(), 1);
         assert_eq!(m.emulator().rows(), 3);
         assert_eq!(
             m.emulator().mouse_modes().protocol,
