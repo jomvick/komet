@@ -385,8 +385,7 @@ impl TerminalMirror {
 
     // ---- OSC 133 command blocks (pass-throughs onto the emulated grid) ----
     //
-    // The engine's `terminal_run` completion detection and `last_command` read
-    // speak these; the journal above stays the delta mechanism, blocks stay the
+    // The engine's `last_command` read speaks these; the journal above stays the delta mechanism, blocks stay the
     // boundary mechanism. Thin wrappers on purpose: the policy lives in
     // [`Emulator`], the mirror only owns the grid the engine picked.
 
@@ -405,16 +404,10 @@ impl TerminalMirror {
         self.emulator.block_lines(block)
     }
 
-    /// Did a valid OSC 133 marker ever arrive? Silence fallbacks should only
-    /// speak when it did not (see [`Emulator::saw_markers`]).
+    /// Did a valid OSC 133 marker ever arrive? Without one there is no honest
+    /// command boundary (see [`Emulator::saw_markers`]).
     pub fn saw_markers(&self) -> bool {
         self.emulator.saw_markers()
-    }
-
-    /// Close marker-free silence as one labelled-unknown block (see
-    /// [`Emulator::settle_silence`]); `true` when a block was created.
-    pub fn settle_silence(&mut self) -> bool {
-        self.emulator.settle_silence()
     }
 
     fn stamp(&mut self, seq: u64) {
@@ -737,7 +730,7 @@ mod tests {
         assert_send::<TextJournal>();
     }
 
-    /// The engine's `terminal_run`/`last_command` reads speak the blocks through
+    /// The engine's `last_command` read speaks the blocks through
     /// the mirror: one A→B→C→D cycle answers command, cwd, output and a NON-ZERO
     /// exit code, marker-backed.
     #[test]
@@ -762,19 +755,14 @@ mod tests {
         assert!(m.saw_markers());
     }
 
-    /// Without markers the fallback speaks: `settle_silence` closes the quiet
-    /// stretch as one unknown-command block, and `saw_markers` stays false.
+    /// Without markers there are no blocks: `saw_markers` stays false and
+    /// nothing is guessed from the prompt geometry.
     #[test]
-    fn mirror_falls_back_to_silence_when_no_markers_arrive() {
+    fn mirror_has_no_blocks_when_no_markers_arrive() {
         let mut m = mirror(40, 6);
         feed(&mut m, 1, b"$ sleep 2\r\ndone\r\n");
         assert!(!m.saw_markers());
-        assert!(m.command_blocks().is_empty(), "no boundary yet");
-        assert!(m.settle_silence(), "the quiet stretch becomes one block");
-        let block = m.last_command_block().expect("settled block");
-        assert!(!block.marker_backed);
-        assert_eq!(block.status, crate::BlockStatus::Settled);
-        assert_eq!(block.exit_code, None, "silence never invents an exit code");
-        assert!(!m.settle_silence(), "already settled: no second block");
+        assert!(m.command_blocks().is_empty(), "no boundary");
+        assert!(m.last_command_block().is_none());
     }
 }
