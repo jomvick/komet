@@ -724,11 +724,8 @@ impl SessionsEngine {
             tracing::warn!(chat = %chat_id, "internal MCP skipped: workspace not wired");
             return None;
         };
-        let mut catalog = McpCatalog::komet_default(Arc::new(EngineMcpHost::new(
-            self.clone(),
-            workspace,
-            run_id,
-        )));
+        let mut catalog =
+            McpCatalog::komet_default(Arc::new(EngineMcpHost::new(self.clone(), workspace)));
         match self.inner.mcp_secrets.composio_platform_api_key() {
             Ok(Some(api_key)) => {
                 let api = ComposioApi::new(api_key, self.inner.device_id.clone());
