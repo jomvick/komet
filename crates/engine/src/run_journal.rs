@@ -12,8 +12,9 @@
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use serde::{Deserialize, Serialize};
@@ -34,9 +35,22 @@ struct JournalLine {
     event: AgentEvent,
 }
 
+/// Borrowing twin of [`JournalLine`] for writes; identical JSON shape.
+#[derive(Serialize)]
+struct JournalLineRef<'a> {
+    seq: u64,
+    event: &'a AgentEvent,
+}
+
+/// Open-descriptor cap; the oldest-used entry is evicted past it.
+const OPEN_FILE_CAP: usize = 16;
+/// Initial tail window for recovering the last seq.
+const TAIL_CHUNK: u64 = 64 * 1024;
+
 struct ChatJournal {
     file: File,
     next_seq: u64,
+    last_used: u64,
     /// True when the file ends without a newline (torn write) — the next append
     /// starts with one so the torn line stays isolated.
     needs_newline: bool,
@@ -46,6 +60,7 @@ struct ChatJournal {
 pub struct RunJournal {
     dir: PathBuf,
     open_files: Mutex<HashMap<String, ChatJournal>>,
+    tick: AtomicU64,
 }
 
 impl RunJournal {
@@ -55,6 +70,7 @@ impl RunJournal {
         Ok(Self {
             dir,
             open_files: Mutex::new(HashMap::new()),
+            tick: AtomicU64::new(0),
         })
     }
 
@@ -100,13 +116,9 @@ impl RunJournal {
     pub fn append(&self, chat_id: &str, event: &AgentEvent) -> Result<u64, JournalError> {
         let mut files = self.lock();
         if !files.contains_key(chat_id) {
-            // Bound the open-fd set: entries were never removed, so every chat
-            // ever run held a descriptor for the process lifetime. Dropping is
-            // safe — the next append reopens and rescans the tail. The cap
-            // comfortably exceeds concurrent runs, so eviction stays rare.
-            const OPEN_FILE_CAP: usize = 16;
+            // Dropping a handle is safe: the next append reopens and reads the tail.
             if files.len() >= OPEN_FILE_CAP {
-                files.clear();
+                evict_oldest(&mut files);
             }
             let path = self.path_for(chat_id);
             let (next_seq, needs_newline) = scan_tail(&path)?;
@@ -116,6 +128,7 @@ impl RunJournal {
                 ChatJournal {
                     file,
                     next_seq,
+                    last_used: 0,
                     needs_newline,
                 },
             );
@@ -126,11 +139,9 @@ impl RunJournal {
                 "journal entry vanished under lock",
             )));
         };
+        journal.last_used = self.tick.fetch_add(1, Ordering::Relaxed);
         let seq = journal.next_seq;
-        let line = serde_json::to_string(&JournalLine {
-            seq,
-            event: event.clone(),
-        })?;
+        let line = serde_json::to_string(&JournalLineRef { seq, event })?;
         let mut buf = Vec::with_capacity(line.len() + 2);
         if journal.needs_newline {
             buf.push(b'\n');
@@ -167,7 +178,12 @@ impl RunJournal {
         if !path.exists() {
             return Ok(None);
         }
-        Ok(read_lines(&path)?.into_iter().next_back())
+        Ok(read_tail(&path)?.0)
+    }
+
+    /// Last valid seq (tail read only), `None` for a missing/empty journal.
+    pub fn last_seq(&self, chat_id: &str) -> Result<Option<u64>, JournalError> {
+        Ok(read_tail(&self.path_for(chat_id))?.0.map(|(seq, _)| seq))
     }
 
     /// Targeted lookup (issue #10): the `ToolCall` + `ToolResult` events for
@@ -373,19 +389,71 @@ fn read_lines(path: &Path) -> Result<Vec<(u64, AgentEvent)>, JournalError> {
     Ok(out)
 }
 
-/// Next seq (last valid seq + 1, starting at 1) and whether the file ends mid-line.
-fn scan_tail(path: &Path) -> Result<(u64, bool), JournalError> {
-    let bytes = match std::fs::read(path) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((1, false)),
+/// Remove the least recently used entry.
+fn evict_oldest(files: &mut HashMap<String, ChatJournal>) {
+    if let Some(victim) = files
+        .iter()
+        .min_by_key(|(_, j)| j.last_used)
+        .map(|(k, _)| k.clone())
+    {
+        files.remove(&victim);
+    }
+}
+
+/// Last valid line plus whether the file ends mid-line, reading only the end
+/// of the file (window doubles until a complete valid line is found).
+fn read_tail(path: &Path) -> Result<(Option<(u64, AgentEvent)>, bool), JournalError> {
+    read_tail_with(path, TAIL_CHUNK)
+}
+
+fn read_tail_with(
+    path: &Path,
+    chunk: u64,
+) -> Result<(Option<(u64, AgentEvent)>, bool), JournalError> {
+    let mut file = match File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((None, false)),
         Err(e) => return Err(e.into()),
     };
-    let needs_newline = bytes.last().is_some_and(|b| *b != b'\n');
-    let next_seq = read_lines(path)?
-        .last()
-        .map(|(seq, _)| seq + 1)
-        .unwrap_or(1);
-    Ok((next_seq, needs_newline))
+    let len = file.metadata()?.len();
+    let mut window = chunk.max(1);
+    let mut needs_newline = false;
+    loop {
+        let start = len.saturating_sub(window);
+        file.seek(SeekFrom::Start(start))?;
+        let mut buf = Vec::with_capacity((len - start) as usize);
+        (&mut file).take(len - start).read_to_end(&mut buf)?;
+        if start == len.saturating_sub(window) && window == chunk.max(1) {
+            needs_newline = buf.last().is_some_and(|b| *b != b'\n');
+        }
+        // A window that starts mid-file begins with a partial line: skip it.
+        let body = if start > 0 {
+            match buf.iter().position(|b| *b == b'\n') {
+                Some(i) => &buf[i + 1..],
+                None => &buf[buf.len()..],
+            }
+        } else {
+            &buf[..]
+        };
+        for raw in body.split(|b| *b == b'\n').rev() {
+            if raw.iter().all(u8::is_ascii_whitespace) {
+                continue;
+            }
+            if let Ok(parsed) = serde_json::from_slice::<JournalLine>(raw) {
+                return Ok((Some((parsed.seq, parsed.event)), needs_newline));
+            }
+        }
+        if start == 0 {
+            return Ok((None, needs_newline));
+        }
+        window = window.saturating_mul(2);
+    }
+}
+
+/// Next seq (last valid seq + 1, starting at 1) and whether the file ends mid-line.
+fn scan_tail(path: &Path) -> Result<(u64, bool), JournalError> {
+    let (last, needs_newline) = read_tail(path)?;
+    Ok((last.map_or(1, |(seq, _)| seq + 1), needs_newline))
 }
 
 /// Journal (`.jsonl`) and resume-budget (`.resume`) paths for `chat_id` under an
@@ -724,5 +792,49 @@ mod tests {
         assert_eq!(journal.resume_attempts("chat-1"), 0);
         assert!(journal.subagent_events("chat-1", "spawn-a").is_none());
         assert!(journal.replay("chat-1", 0).unwrap().is_empty());
+    }
+
+    fn line(seq: u64) -> String {
+        format!("{}\n", serde_json::to_string(&JournalLineRef { seq, event: &text("x") }).unwrap())
+    }
+
+    #[test]
+    fn tail_reader_handles_empty_partial_and_large_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.jsonl");
+        assert!(read_tail(&path).unwrap().0.is_none());
+        std::fs::write(&path, "").unwrap();
+        assert_eq!(read_tail(&path).unwrap(), (None, false));
+
+        std::fs::write(&path, format!("{}{}{{\"seq\":3,\"ev", line(1), line(2))).unwrap();
+        let (last, nl) = read_tail(&path).unwrap();
+        assert_eq!(last.unwrap().0, 2);
+        assert!(nl);
+
+        // Far larger than the chunk; a tiny chunk forces window growth past a long last line.
+        let body: String = (1..=500).map(line).collect();
+        std::fs::write(&path, &body).unwrap();
+        let (last, nl) = read_tail_with(&path, 16).unwrap();
+        assert_eq!(last.unwrap().0, 500);
+        assert!(!nl);
+        assert_eq!(read_tail(&path).unwrap().0.unwrap().0, 500);
+        assert_eq!(scan_tail(&path).unwrap(), (501, false));
+    }
+
+    #[test]
+    fn eviction_drops_a_single_least_recently_used_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = RunJournal::open(dir.path()).unwrap();
+        for i in 0..OPEN_FILE_CAP {
+            journal.append(&format!("c{i}"), &text("a")).unwrap();
+        }
+        journal.append("c0", &text("b")).unwrap();
+        journal.append("new", &text("a")).unwrap();
+        let files = journal.lock();
+        assert_eq!(files.len(), OPEN_FILE_CAP);
+        assert!(files.contains_key("c0") && files.contains_key("new"));
+        assert!(!files.contains_key("c1"));
+        drop(files);
+        assert_eq!(journal.append("c1", &text("c")).unwrap(), 2);
     }
 }
