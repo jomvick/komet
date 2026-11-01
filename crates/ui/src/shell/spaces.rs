@@ -1152,78 +1152,33 @@ impl Shell {
     /// The sidebar's Sessions list: every session (idle included) of the
     /// filter space — or all spaces under "All" — attention-sorted. Rows are
     /// keyed for the FLIP resort glide.
-    pub(super) fn render_active_rows(
+pub(super) fn render_active_rows(
         &mut self,
         theme: &Theme,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> Vec<(String, f32, AnyElement)> {
+    ) -> (Rc<FlatRows>, Vec<AnyElement>) {
         let now = Utc::now();
         let filter = self.settings.space_filter.clone();
-        let rows: Vec<(ChatIndicator, komet_proto::Chat, String, Option<String>)> = {
+        let flat = {
             let state = self.state.read(cx);
-            state
-                .overview_chats(now)
-                .into_iter()
-                .filter(|(_, chat)| match &filter {
-                    Some(space_id) => chat.space_id.as_deref() == Some(space_id.as_str()),
-                    None => true,
-                })
-                .map(|(status, chat)| {
-                    // Line 1 is "project @ device" (t3code's project row);
-                    // project-less sessions read as their home-dir cwd `~`.
-                    let space = state.space_for_chat(chat);
-                    let mut folder = match (space, chat.space_id.as_deref()) {
-                        (Some(space), _) => space.display_name().to_string(),
-                        (None, None) => "~".to_string(),
-                        (None, Some(_)) => "?".to_string(),
-                    };
-                    // Unknown device → no fragment, same as the archived list.
-                    if let Some(device) = state.device_name(&chat.device_id) {
-                        folder = format!("{folder} @ {device}");
-                    }
-                    // The branch shows whenever the engine has stamped one —
-                    // main-checkout sessions included, not just worktrees.
-                    let branch = chat
-                        .branch
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|b| !b.is_empty())
-                        .map(str::to_string);
-                    (status, chat.clone(), folder, branch)
-                })
-                .collect()
+            self.sidebar_memo.borrow_mut().flat(
+                state,
+                filter.as_deref(),
+                now,
+                super::CHAT_ROW_HEIGHT,
+            )
         };
         let selected = self.state.read(cx).selected_chat.clone();
-        rows.into_iter()
-            .map(|(status, chat, folder, branch)| {
-                let time_ago: SharedString =
-                    format_time_ago(chat.last_message_at.unwrap_or(chat.created_at), now).into();
-                let is_selected = selected.as_deref() == Some(chat.id.as_str());
-                let height = super::CHAT_ROW_HEIGHT;
-                let harness = chat.config.as_ref().map(|c| c.harness);
-                let element = self.render_chat_row(
-                    chat.id.clone(),
-                    transcript::single_line(
-                        &chat.title.clone().unwrap_or_else(|| "New session".into()),
-                    )
-                    .into(),
-                    time_ago,
-                    folder.into(),
-                    branch.map(SharedString::from),
-                    harness,
-                    status,
-                    is_selected,
-                    false,
-                    chat.pinned,
-                    theme,
-                    window,
-                    cx,
-                );
-                (format!("c:{}", chat.id), height, element)
-            })
-            .collect()
+        let elements = flat
+            .rows
+            .iter()
+            .map(|r| self.render_sidebar_row(r, selected.as_deref(), now, theme, window, cx))
+            .collect();
+        (flat, elements)
     }
+
+
 
     /// Builds one collapsible folder header for the "All projects" grouped
     /// view: `[📁 icon] [Project name] ── [N] [▶/▼] [+]`.
