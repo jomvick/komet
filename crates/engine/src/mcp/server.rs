@@ -428,28 +428,17 @@ fn get_status(state: &EndpointState) -> McpStatus {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
     use crate::mcp::catalog::McpCatalog;
     use crate::mcp::catalog::{McpHost, SessionSummary, SpaceSummary, TerminalAngle, TerminalRead};
     use crate::mcp::policy::McpPolicy;
-    use komet_proto::{TerminalInfo, TerminalRunResult};
+    use komet_proto::TerminalInfo;
 
-    /// A host that records EVERY terminal write it is asked for. The
-    /// permission tests below assert the counter stays at zero when the human
-    /// did not approve — the only way to prove a denied `tools/call` executed
-    /// nothing rather than "executed then reported a denial".
+    /// A host that records the tools the permission prompt was asked about.
     #[derive(Default)]
     struct FakeHost {
-        write_calls: AtomicUsize,
         asked_tools: Arc<Mutex<Vec<String>>>,
-    }
-
-    impl FakeHost {
-        fn writes(&self) -> usize {
-            self.write_calls.load(Ordering::Relaxed)
-        }
     }
 
     #[async_trait::async_trait]
@@ -478,30 +467,9 @@ mod tests {
             Err("terminal reads are not wired in this test host".to_string())
         }
 
-        fn open_terminal_for_agent(&self, _cwd: Option<String>) -> Result<TerminalInfo, String> {
-            self.write_calls.fetch_add(1, Ordering::Relaxed);
-            Err("no terminal openings in this test host".to_string())
-        }
 
-        fn close_terminal_for_agent(&self, _terminal_id: &str) -> Result<(), String> {
-            self.write_calls.fetch_add(1, Ordering::Relaxed);
-            Err("no terminal closings in this test host".to_string())
-        }
 
-        fn send_input_to_terminal(&self, _terminal_id: &str, _bytes: &[u8]) -> Result<(), String> {
-            self.write_calls.fetch_add(1, Ordering::Relaxed);
-            Err("no terminal input in this test host".to_string())
-        }
 
-        async fn run_in_terminal(
-            &self,
-            _terminal_id: &str,
-            _command: &str,
-            _wait_ms: u64,
-        ) -> Result<TerminalRunResult, String> {
-            self.write_calls.fetch_add(1, Ordering::Relaxed);
-            Err("no terminal runs in this test host".to_string())
-        }
     }
 
     /// An endpoint whose permission prompt answers `answer` for every tool and
@@ -580,137 +548,51 @@ mod tests {
         endpoint.shutdown();
     }
 
-    /// The end-to-end proof of the write door: an agent's `terminal_run` over
-    /// the wire reaches the PTY ONLY when a human said yes. Denied → the host
-    /// was asked for permission and executed NOTHING (write counter 0, error
-    /// text says denied). Approved → exactly one execution. Reads, in the same
-    /// test, never trigger the prompt at all — the two doors stay separate.
+    /// Agents read terminals but never write: reads never prompt a human, and
+    /// the former write tools are neither advertised nor callable.
     #[tokio::test]
-    async fn a_denied_write_tool_call_executes_nothing_and_an_approved_one_runs_once() {
-        for (answer, expected_writes) in [(AskDecision::Deny, 0), (AskDecision::Allow, 1)] {
-            let host = Arc::new(FakeHost::default());
-            let endpoint = start_endpoint_with(host.clone(), answer).await;
-            let token = endpoint.token_for_test_only().to_string();
-            let (status, body) = post(
-                &endpoint,
-                "tools/call",
-                serde_json::json!({
-                    "name": "terminal_run",
-                    "arguments": {"terminalId": "t-human", "command": "rm -rf /"},
-                }),
-                Some(&token),
-            )
-            .await;
-            assert_eq!(
-                status, 200,
-                "the denial is a tool result, not an HTTP failure"
-            );
-            let text = body["result"]["content"][0]["text"]
-                .as_str()
-                .expect("content text")
-                .to_string();
-            if expected_writes == 0 {
-                assert!(
-                    text.contains("tool denied by policy"),
-                    "a denial must be said out loud: {text}"
-                );
-                assert_eq!(body["result"]["isError"], serde_json::json!(true));
-                assert_eq!(
-                    host.writes(),
-                    0,
-                    "an unapproved write must not have touched the engine"
-                );
-                assert_eq!(
-                    *host.asked_tools.lock().unwrap(),
-                    vec!["terminal_run".to_string()],
-                    "the human was asked, once, before anything ran"
-                );
-            } else {
-                // Approved: the engine WAS consulted (the test host then
-                // refuses on its own; counting the consultation is the point).
-                assert_eq!(host.writes(), 1, "the approved call ran exactly once");
-                assert_eq!(
-                    *host.asked_tools.lock().unwrap(),
-                    vec!["terminal_run".to_string()]
-                );
-                assert!(text.contains("no terminal runs"), "{text}");
-            }
-            endpoint.shutdown();
-        }
-
-        // The read door: an auto-allowed read never asks a human, and never
-        // counts as a write.
+    async fn terminals_are_read_only_over_the_wire() {
         let host = Arc::new(FakeHost::default());
-        let endpoint = start_endpoint_with(host.clone(), AskDecision::Deny).await;
+        let endpoint = start_endpoint_with(host.clone(), AskDecision::Allow).await;
         let token = endpoint.token_for_test_only().to_string();
+
+        let (_, body) = post(&endpoint, "tools/list", serde_json::json!({}), Some(&token)).await;
+        let served: Vec<&str> = body["result"]["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .filter_map(|t| t["name"].as_str())
+            .filter(|name| name.starts_with("terminal_"))
+            .collect();
+        assert_eq!(served, vec!["terminal_list", "terminal_read"]);
+
         let (_, body) = post(
             &endpoint,
             "tools/call",
             serde_json::json!({
                 "name": "terminal_read",
-                "arguments": {"terminalId": "t-visible", "angle": "tail"},
+                "arguments": {"terminalId": "t-any", "angle": "tail"},
             }),
             Some(&token),
         )
         .await;
-        assert_eq!(
-            *host.asked_tools.lock().unwrap(),
-            Vec::<String>::new(),
-            "a readonly tool must not burn a human approval"
-        );
-        assert_eq!(host.writes(), 0);
         let text = body["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("not wired in this test host"), "{text}");
-        endpoint.shutdown();
-    }
+        assert!(
+            host.asked_tools.lock().unwrap().is_empty(),
+            "no terminal tool may reach the permission prompt"
+        );
 
-    /// Every write tool goes through the prompt: a policy that auto-allows
-    /// readonly tools must answer `Ask` for all four, so none can slip past a
-    /// human by being mislabelled.
-    #[tokio::test]
-    async fn every_write_tool_asks_before_running() {
-        let host = Arc::new(FakeHost::default());
-        let endpoint = start_endpoint_with(host.clone(), AskDecision::Deny).await;
-        let token = endpoint.token_for_test_only().to_string();
-        let calls = [
-            ("terminal_open", serde_json::json!({"cwd": "/tmp"})),
-            ("terminal_close", serde_json::json!({"terminalId": "t-1"})),
-            (
-                "terminal_send_input",
-                serde_json::json!({"terminalId": "t-1", "keys": "ctrl+c"}),
-            ),
-            (
-                "terminal_run",
-                serde_json::json!({"terminalId": "t-1", "command": "ls"}),
-            ),
-        ];
-        for (name, arguments) in calls {
-            let (status, body) = post(
+        for name in ["terminal_open", "terminal_close", "terminal_send_input", "terminal_run"] {
+            let (_, body) = post(
                 &endpoint,
                 "tools/call",
-                serde_json::json!({"name": name, "arguments": arguments}),
+                serde_json::json!({"name": name, "arguments": {"terminalId": "t-1", "command": "ls"}}),
                 Some(&token),
             )
             .await;
-            assert_eq!(status, 200);
-            let text = body["result"]["content"][0]["text"].as_str().unwrap();
-            assert_eq!(
-                text,
-                format!("tool denied by policy: {name}"),
-                "{name} must be denied before execution"
-            );
+            assert_eq!(body["result"]["isError"], serde_json::json!(true), "{name}");
         }
-        assert_eq!(
-            *host.asked_tools.lock().unwrap(),
-            vec![
-                "terminal_open",
-                "terminal_close",
-                "terminal_send_input",
-                "terminal_run"
-            ],
-            "each write tool is approved on its own call, in order"
-        );
-        assert_eq!(host.writes(), 0, "four denials, zero executions");
         endpoint.shutdown();
     }
 

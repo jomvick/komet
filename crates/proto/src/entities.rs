@@ -808,11 +808,8 @@ pub enum TerminalEvent {
 }
 
 /// One row of the `ListTerminals` reply: what a caller can address without
-/// reading the terminal itself. `agent_visible` is the human's grant that any
-/// agent read (RPC `ReadTerminal*` and the `terminal_read` MCP tool) checks
-/// before touching the mirror; `tracked` says whether the engine currently
-/// mirrors the output as text (making a terminal agent-visible switches
-/// tracking on, hiding it switches tracking back off).
+/// reading the terminal itself. `tracked` is true while the engine mirrors the
+/// output as text (always, for every terminal it opens).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TerminalInfo {
@@ -829,7 +826,6 @@ pub struct TerminalInfo {
     /// Newest output sequence number.
     pub seq: u64,
     pub tracked: bool,
-    pub agent_visible: bool,
     pub exited: bool,
 }
 
