@@ -90,7 +90,7 @@ impl MuseHarness {
             .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
             .map(|dir| dir.join("muse"))
             .collect::<Vec<_>>();
-        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        if let Some(home) = crate::platform::home_dir() {
             candidates.push(home.join(".local/bin/muse"));
         }
         candidates.extend([

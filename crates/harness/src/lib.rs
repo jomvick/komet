@@ -174,9 +174,7 @@ pub trait Harness: Send + Sync {
 /// The cwd a command probe should run in — the chat's project, else HOME.
 pub(crate) fn discovery_cwd(cwd: Option<&std::path::Path>) -> std::path::PathBuf {
     cwd.map(std::path::Path::to_path_buf).unwrap_or_else(|| {
-        std::env::var_os("HOME")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| std::path::PathBuf::from("/"))
+        crate::platform::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/"))
     })
 }
 
@@ -191,7 +189,7 @@ pub fn commands_buster(cwd: &std::path::Path, harness: HarnessId) -> u128 {
         HarnessId::Codex => &[".codex"],
         _ => &[],
     };
-    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let home = crate::platform::home_dir();
     let mut newest: u128 = 0;
     for base in std::iter::once(cwd.to_path_buf()).chain(home) {
         for dir in dirs {
@@ -219,6 +217,7 @@ pub mod errors;
 pub(crate) mod jsonrpc;
 pub mod mock;
 mod muse;
+pub mod platform;
 pub mod shell_env;
 
 /// Bin directories where npm-installed CLIs land under Node version managers.
@@ -227,7 +226,7 @@ pub mod shell_env;
 /// Dock/Finder-launched app never runs.
 pub(crate) fn node_version_manager_bins() -> Vec<std::path::PathBuf> {
     use std::path::PathBuf;
-    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let home = crate::platform::home_dir();
     let mut dirs: Vec<PathBuf> = Vec::new();
     // fnm: `aliases/default` is a stable symlink to the active default
     // installation (the multishell PATH entries are ephemeral, per-shell).
@@ -267,7 +266,7 @@ pub(crate) fn node_version_manager_bins() -> Vec<std::path::PathBuf> {
 pub fn find_cli_path(binary: &str) -> Option<std::path::PathBuf> {
     use std::path::PathBuf;
 
-    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let home = crate::platform::home_dir();
     let mut dirs = std::env::var_os("PATH")
         .into_iter()
         .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>());

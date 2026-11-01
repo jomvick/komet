@@ -194,9 +194,7 @@ pub fn read_claude_settings_models() -> Vec<Model> {
         }
     }
 
-    let home = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(std::path::PathBuf::from);
+    let home = crate::platform::home_dir();
 
     if let Some(home) = home {
         let claude_dir = home.join(".claude");

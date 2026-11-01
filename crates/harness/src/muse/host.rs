@@ -2,6 +2,7 @@
 //! and the host's own requests.
 use super::rpc::{Client, Failure, Inbound, Transport};
 use crate::HarnessError;
+use crate::platform::NoConsole as _;
 use serde_json::{Value, json};
 use std::{path::Path, process::Stdio, time::Duration};
 use tokio::{
@@ -66,6 +67,7 @@ impl Host {
         run_env: &std::collections::BTreeMap<String, String>,
     ) -> Result<Self, HarnessError> {
         let mut cmd = Command::new(exe);
+        cmd.no_console();
         crate::compose_child_path(&mut cmd, exe);
         // An inherited API key would silently replace the user's own Muse
         // login; a run's explicit one (a Cloud device's) still wins below.

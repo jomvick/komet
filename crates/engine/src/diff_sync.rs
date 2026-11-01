@@ -25,6 +25,7 @@
 //! and *latest turn* (vs a temp-index `write-tree` snapshot taken when a turn
 //! dispatches — see [`CheckoutDiffSync::note_turn_start`]).
 
+use komet_harness::platform::NoConsole as _;
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
@@ -627,6 +628,7 @@ struct Capture {
 /// the cap is hit, so an arbitrarily large repository diff never buffers fully.
 async fn capture_git(cwd: &Path, args: &[&str], max_bytes: usize) -> Result<Capture, EngineError> {
     let mut cmd = tokio::process::Command::new("git");
+    cmd.no_console();
     cmd.arg("-C").arg(cwd).args(args);
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::piped());
@@ -1236,6 +1238,7 @@ pub async fn snapshot_tree(root: &Path) -> Result<String, EngineError> {
     ));
     let run = |args: &[&str]| {
         let mut cmd = tokio::process::Command::new("git");
+        cmd.no_console();
         cmd.arg("-C").arg(root).args(args);
         cmd.env("GIT_INDEX_FILE", &index);
         cmd.stdin(std::process::Stdio::null());

@@ -42,6 +42,7 @@ pub mod opencode_perms;
 mod subagent;
 mod subagent_opencode;
 
+use crate::platform::NoConsole as _;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -232,6 +233,7 @@ fn opencode_sidecar_capable(exe: &std::path::Path) -> bool {
     // No cache lock held across the probe (a hung binary must not wedge the
     // harness): default capable=true on v1 (unchanged legacy behaviour).
     let capable = std::process::Command::new(exe)
+        .no_console()
         .args(["acp", "--help"])
         .output()
         .map(|o| {
@@ -311,7 +313,7 @@ fn npm_global_paths(exe: &'static str) -> fn() -> Vec<PathBuf> {
 
 fn npm_global_bins(exe: &str) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+    if let Some(home) = crate::platform::home_dir() {
         dirs.push(home.join(".local").join("bin").join(exe));
         dirs.push(home.join(".npm-global").join("bin").join(exe));
     }
@@ -322,7 +324,7 @@ fn npm_global_bins(exe: &str) -> Vec<PathBuf> {
 
 fn grok_install_paths() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+    if let Some(home) = crate::platform::home_dir() {
         dirs.push(home.join(".local").join("bin").join("grok"));
         dirs.push(home.join(".grok").join("bin").join("grok"));
         dirs.push(home.join(".npm-global").join("bin").join("grok"));
@@ -430,7 +432,7 @@ fn grok_spec() -> AcpAgentSpec {
 
 fn hermes_install_paths() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+    if let Some(home) = crate::platform::home_dir() {
         dirs.push(home.join(".local").join("bin").join("hermes"));
         dirs.push(home.join(".hermes").join("bin").join("hermes"));
     }
@@ -560,7 +562,7 @@ fn pi_spec() -> AcpAgentSpec {
 
 fn cline_install_paths() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+    if let Some(home) = crate::platform::home_dir() {
         dirs.push(home.join(".local").join("bin").join("cline"));
         dirs.push(home.join(".npm-global").join("bin").join("cline"));
     }
@@ -571,7 +573,7 @@ fn cline_install_paths() -> Vec<PathBuf> {
 
 fn devin_install_paths() -> Vec<PathBuf> {
     let mut paths = Vec::new();
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+    if let Some(home) = crate::platform::home_dir() {
         paths.push(home.join(".local").join("bin").join("devin"));
     }
     paths.push(PathBuf::from("/opt/homebrew/bin/devin"));
@@ -626,7 +628,7 @@ fn devin_spec() -> AcpAgentSpec {
 
 fn copilot_install_paths() -> Vec<PathBuf> {
     let mut paths = Vec::new();
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+    if let Some(home) = crate::platform::home_dir() {
         paths.push(home.join(".local").join("bin").join("copilot"));
         paths.push(home.join(".npm-global").join("bin").join("copilot"));
     }
@@ -743,7 +745,7 @@ fn cline_spec() -> AcpAgentSpec {
 
 fn qoder_install_paths() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+    if let Some(home) = crate::platform::home_dir() {
         dirs.push(home.join(".qoder").join("bin").join("qoder"));
         dirs.push(home.join(".local").join("bin").join("qoder"));
         dirs.push(home.join(".npm-global").join("bin").join("qoder"));
@@ -816,7 +818,7 @@ fn qoder_spec() -> AcpAgentSpec {
 
 fn opencode_install_paths() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+    if let Some(home) = crate::platform::home_dir() {
         dirs.push(home.join(".opencode").join("bin").join("opencode"));
         dirs.push(home.join(".local").join("bin").join("opencode"));
         dirs.push(home.join(".npm-global").join("bin").join("opencode"));
@@ -1257,6 +1259,7 @@ impl AcpHarness {
             args = grok_args_for_sandbox(level);
         }
         let mut cmd = Command::new(&exe);
+        cmd.no_console();
         cmd.args(args);
         cmd.args(extra_args);
         if self.spec.id == HarnessId::Copilot {
@@ -1415,7 +1418,9 @@ impl AcpHarness {
             client
                 .request("initialize", initialize_params(self.spec.id))
                 .await?;
-            let cwd = std::env::var("HOME").unwrap_or_else(|_| "/".into());
+            let cwd = crate::platform::home_dir()
+                .map(|h| h.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "/".into());
             let session = client
                 .request("session/new", build_acp_session_params(&cwd, None, vec![]))
                 .await?;
@@ -2565,7 +2570,7 @@ fn resolve_cline_data_dir(override_dir: Option<&PathBuf>) -> Option<PathBuf> {
     if cfg!(test) {
         return None;
     }
-    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cline").join("data"))
+    crate::platform::home_dir().map(|home| home.join(".cline").join("data"))
 }
 
 /// Cline's CLI config (`settings/providers.json` under [`cline_data_dir`]): the

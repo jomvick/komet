@@ -47,6 +47,7 @@
 //! PERMISSION_DENIED once the plan/quota is exhausted, which used to be
 //! mistaken for an expired token and rewrote the live keyring on every probe.
 
+use komet_harness::platform::NoConsole as _;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -1462,6 +1463,7 @@ impl AgentAccounts {
             .join(format!(".login-{login_id}"));
         std::fs::create_dir_all(&home)?;
         let mut cmd = tokio::process::Command::new("codex");
+        cmd.no_console();
         cmd.arg("login")
             .env("CODEX_HOME", &home)
             .stdin(std::process::Stdio::null())
@@ -1604,6 +1606,8 @@ impl AgentAccounts {
         set_directory_owner_only(&config_dir)?;
 
         let mut command = tokio::process::Command::new("gh");
+
+        command.no_console();
         command
             .args([
                 "auth",
@@ -2763,6 +2767,7 @@ impl AgentAccounts {
         output: Arc<Mutex<String>>,
     ) -> Result<AgentLoginPoll, EngineError> {
         let token_result = tokio::process::Command::new("gh")
+            .no_console()
             .args(["auth", "token", "--hostname", "github.com"])
             .env("GH_CONFIG_DIR", &config_dir)
             .env_remove("GH_TOKEN")

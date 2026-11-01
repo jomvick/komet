@@ -10,6 +10,7 @@
 //!
 //! All git access is via subprocess (`tokio::process`) — never libgit2.
 
+use komet_harness::platform::NoConsole as _;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -55,6 +56,7 @@ fn project_open_command(linux: &str, macos: &str, windows: &str) -> std::process
     #[cfg(target_os = "macos")]
     {
         let mut command = std::process::Command::new("open");
+        command.no_console();
         command.args(["-a", macos, "--args"]);
         command
     }
@@ -225,6 +227,7 @@ impl Repos {
     /// Run `git <args>` (optionally under `cwd`), returning trimmed stdout.
     async fn git(&self, args: &[&str], cwd: Option<&Path>) -> Result<String, EngineError> {
         let mut cmd = tokio::process::Command::new("git");
+        cmd.no_console();
         cmd.args(args);
         if let Some(cwd) = cwd {
             cmd.current_dir(cwd);
@@ -1499,6 +1502,7 @@ const GH_TIMEOUT: Duration = Duration::from_secs(8);
 /// out, offline, no PR, timeout) reads as "no pull request".
 async fn github_pull_request(repo_path: &Path, branch: Option<&str>) -> Option<GitHubPullRequest> {
     let mut cmd = tokio::process::Command::new("gh");
+    cmd.no_console();
     cmd.args(["pr", "view"]);
     if let Some(branch) = branch {
         cmd.arg(branch);

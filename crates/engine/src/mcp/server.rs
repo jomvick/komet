@@ -186,12 +186,29 @@ async fn handle_conn(
     semaphore: Arc<Semaphore>,
     ask: AskFn,
 ) -> anyhow::Result<()> {
-    let mut buf = vec![0u8; 8192];
-    let n = stream.read(&mut buf).await?;
-    if n == 0 {
-        return Ok(());
-    }
-    let req_str = String::from_utf8_lossy(&buf[..n]).to_string();
+    // Headers and body may arrive across several TCP segments: read until the
+    // blank line, then exactly Content-Length bytes, under one deadline.
+    const MAX_HEADER_BYTES: usize = 64 * 1024;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut buf: Vec<u8> = Vec::with_capacity(8192);
+    let mut chunk = [0u8; 8192];
+    let header_end = loop {
+        if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break i + 4;
+        }
+        if buf.len() > MAX_HEADER_BYTES {
+            return Ok(());
+        }
+        let n = match tokio::time::timeout_at(deadline, stream.read(&mut chunk)).await {
+            Ok(res) => res?,
+            Err(_) => return Ok(()),
+        };
+        if n == 0 {
+            return Ok(());
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    };
+    let req_str = String::from_utf8_lossy(&buf[..header_end]).to_string();
     // Parse request line and headers
     let mut lines = req_str.split("\r\n");
     let request_line = lines.next().unwrap_or("");
@@ -221,25 +238,16 @@ async fn handle_conn(
         Some((p, q)) => (p, Some(q)),
         None => (path_query, None),
     };
-    // Handle body – if content_length > already read body part, read more
-    let header_end = req_str.find("\r\n\r\n").map(|i| i + 4).unwrap_or(n);
-    let mut body = if n > header_end {
-        buf[header_end..n].to_vec()
-    } else {
-        Vec::new()
-    };
-    let remaining = content_length.saturating_sub(body.len());
-    if remaining > 0 {
-        let mut extra = vec![0u8; remaining];
-        // read with timeout
-        let read_n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut extra))
-            .await
-            .unwrap_or(Ok(0))
-            .unwrap_or(0);
-        body.extend_from_slice(&extra[..read_n]);
-        if body.len() > MAX_REQUEST_BYTES {
-            body.truncate(MAX_REQUEST_BYTES);
+    let mut body = buf[header_end..].to_vec();
+    if body.len() < content_length {
+        let mut extra = vec![0u8; content_length - body.len()];
+        match tokio::time::timeout_at(deadline, stream.read_exact(&mut extra)).await {
+            Ok(Ok(_)) => body.extend_from_slice(&extra),
+            _ => return Ok(()),
         }
+    }
+    if content_length > 0 {
+        body.truncate(content_length);
     }
     let body_str = String::from_utf8_lossy(&body).to_string();
 

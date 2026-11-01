@@ -38,8 +38,7 @@ const DRAIN_POLL: Duration = Duration::from_millis(200);
 
 /// The default grok sessions root (`~/.grok/sessions`).
 fn default_sessions_root() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
+    crate::platform::home_dir()
         .unwrap_or_default()
         .join(".grok")
         .join("sessions")

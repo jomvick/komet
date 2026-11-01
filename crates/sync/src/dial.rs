@@ -36,6 +36,8 @@ pub type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 /// WebSocket handshake on the winning stream. A success also broadcasts
 /// [`crate::wake::notify_online`] so sibling sockets waiting out a reconnect
 /// backoff redial immediately instead of sleeping through the recovery.
+// `WsError` is tungstenite's own error type, returned as-is to callers.
+#[allow(clippy::result_large_err)]
 pub async fn connect_ws(url: &str) -> Result<WsStream, WsError> {
     let request = url.into_client_request()?;
     let uri = request.uri();

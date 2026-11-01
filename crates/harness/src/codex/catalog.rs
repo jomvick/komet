@@ -7,7 +7,7 @@
 //! short-lived `codex app-server` + `model/list` pagination can later be
 //! spliced in (same call t3code's Codex provider makes).
 
-use komet_proto::{Model, ModelOption, ModelOptionChoice, ReasoningLevel, SandboxLevel};
+use komet_proto::{Model, ModelOption, ModelOptionChoice, ReasoningLevel};
 
 /// The unified reasoning ladder Codex accepts (`minimal` is offered but clamped
 /// on the wire — see [`to_effort`]).
@@ -60,40 +60,6 @@ pub(crate) fn to_effort(
         }
     }
     Some(mapped)
-}
-
-/// `thread/start`'s `sandbox` param (kebab-case wire words).
-#[allow(dead_code)]
-pub(crate) fn sandbox_mode(sandbox: SandboxLevel) -> &'static str {
-    match sandbox {
-        SandboxLevel::ReadOnly => "read-only",
-        SandboxLevel::WorkspaceWrite => "workspace-write",
-        SandboxLevel::DangerFullAccess => "danger-full-access",
-    }
-}
-
-/// `turn/start`'s `sandboxPolicy.type` (camelCase variant of the same policy).
-#[allow(dead_code)]
-pub(crate) fn sandbox_policy_type(sandbox: SandboxLevel) -> &'static str {
-    match sandbox {
-        SandboxLevel::ReadOnly => "readOnly",
-        SandboxLevel::WorkspaceWrite => "workspaceWrite",
-        SandboxLevel::DangerFullAccess => "dangerFullAccess",
-    }
-}
-
-/// `turn/start`'s full `sandboxPolicy` object. Workspace-write keeps network
-/// access: komet agents fetch deps and hit APIs unattended, and with the
-/// approval policy pinned to "never" a network-less sandbox would fail those
-/// commands with no escalation path.
-#[allow(dead_code)]
-pub(crate) fn sandbox_policy_value(sandbox: SandboxLevel) -> serde_json::Value {
-    let mut policy = serde_json::Map::new();
-    policy.insert("type".into(), sandbox_policy_type(sandbox).into());
-    if matches!(sandbox, SandboxLevel::WorkspaceWrite) {
-        policy.insert("networkAccess".into(), true.into());
-    }
-    serde_json::Value::Object(policy)
 }
 
 /// The service-tier select the app server reports per model (`serviceTiers` /
@@ -250,7 +216,7 @@ pub(crate) fn load_catalog() -> Vec<Model> {
     if let Some(home) = std::env::var_os("CODEX_HOME")
         .map(std::path::PathBuf::from)
         .filter(|p| !p.as_os_str().is_empty())
-        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".codex")))
+        .or_else(|| crate::platform::home_dir().map(|h| h.join(".codex")))
     {
         let cache = home.join("models_cache.json");
         if let Ok(text) = std::fs::read_to_string(&cache)

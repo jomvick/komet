@@ -40,6 +40,7 @@ pub(crate) mod catalog;
 mod normalize;
 pub(crate) mod permissions;
 
+use crate::platform::NoConsole as _;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -95,7 +96,7 @@ fn resolve_codex_executable() -> Option<PathBuf> {
                 .map(|d| d.join(exe)),
         );
     }
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+    if let Some(home) = crate::platform::home_dir() {
         candidates.push(home.join(".local").join("bin").join("codex"));
         candidates.push(home.join(".codex").join("bin").join("codex"));
         candidates.push(home.join(".npm-global").join("bin").join("codex"));
@@ -181,6 +182,7 @@ impl CodexHarness {
     async fn discover_commands(&self, cwd: &Path) -> Result<Vec<SlashCommand>, HarnessError> {
         let exe = self.resolve_executable()?;
         let mut cmd = Command::new(&exe);
+        cmd.no_console();
         cmd.arg("app-server");
         crate::compose_child_path(&mut cmd, &exe);
         cmd.stdin(Stdio::piped())
@@ -239,6 +241,7 @@ impl CodexHarness {
     pub(crate) async fn discover_live_models(&self) -> Result<Vec<Model>, HarnessError> {
         let exe = self.resolve_executable()?;
         let mut cmd = Command::new(&exe);
+        cmd.no_console();
         cmd.arg("app-server");
         crate::compose_child_path(&mut cmd, &exe);
         cmd.stdin(Stdio::piped())
@@ -490,6 +493,7 @@ impl Harness for CodexHarness {
             request.sandbox = komet_proto::SandboxLevel::DangerFullAccess;
         }
         let mut cmd = Command::new(&exe);
+        cmd.no_console();
         cmd.arg("app-server");
         crate::compose_child_path(&mut cmd, &exe);
         if !request.cwd.is_empty() {

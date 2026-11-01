@@ -117,7 +117,6 @@ unicode-segmentation = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 semver = "1"
 ignore = "0.4"
-nucleo-matcher = "0.3"
 
 [profile.release]
 # Distribution profile (scripts/package-linux.sh): thin LTO buys most of fat

@@ -5,7 +5,7 @@
 //! stats — and routes clicks to GitHub (browser) or the right pane's Git
 //! surfaces.
 
-use gpui::{InteractiveElement, prelude::*};
+use gpui::InteractiveElement;
 use komet_proto::{GitHistoryCommit, GitHubPullRequest, GitHubStatus};
 
 use super::*;
@@ -17,24 +17,8 @@ type GitHubKey = (String, Option<String>);
 /// overflows when the control is visible.
 pub(super) const GITHUB_BUTTON_WIDTH: f32 = 44.0;
 const GITHUB_RETRY_WIDTH: f32 = 78.0;
-const OPEN_PROJECT_BUTTON_WIDTH: f32 = 146.0;
-
-#[derive(Clone, Copy)]
-enum ProjectOpenChoice {
-    Cursor,
-    VsCode,
-    Files,
-}
-
-impl ProjectOpenChoice {
-    fn rpc_target(self) -> &'static str {
-        match self {
-            Self::Cursor => "cursor",
-            Self::VsCode => "vsCode",
-            Self::Files => "files",
-        }
-    }
-}
+/// The terminal toggle sitting right of the GitHub trigger.
+const TERMINAL_TOGGLE_WIDTH: f32 = 28.0;
 
 #[derive(Default)]
 pub(super) struct GitHubHeader {
@@ -88,9 +72,6 @@ impl Shell {
             self.github.checkout_branch = None;
             self.github.query_branch = None;
             self.github.open_project_error = None;
-            if self.project_open_menu.begin_close() {
-                popover::reap_popup(cx, |shell: &mut Self| &mut shell.project_open_menu);
-            }
             self.github.branches.clear();
             self.github.branches_key = None;
             self.github.branches_error = None;
@@ -238,30 +219,13 @@ impl Shell {
         cx.notify();
     }
 
-    fn close_project_open_menu(&mut self, cx: &mut Context<Self>) {
-        if self.project_open_menu.begin_close() {
-            popover::reap_popup(cx, |shell: &mut Self| &mut shell.project_open_menu);
-        }
-        cx.notify();
-    }
-
-    fn toggle_project_open_menu(&mut self, cx: &mut Context<Self>) {
-        if self.project_open_menu.take_press_was_open() || self.project_open_menu.is_open() {
-            self.close_project_open_menu(cx);
-        } else {
-            self.github.open_project_error = None;
-            self.project_open_menu.open(());
-        }
-        cx.notify();
-    }
-
-    fn request_open_project(&mut self, target: ProjectOpenChoice, cx: &mut Context<Self>) {
+    fn request_open_in_cursor(&mut self, cx: &mut Context<Self>) {
         let Some(key) = self.github_target(cx) else {
             return;
         };
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             self.github.open_project_error = Some("Engine is not available".into());
-            self.project_open_menu.open(());
+            self.github_menu.open(());
             cx.notify();
             return;
         };
@@ -272,7 +236,7 @@ impl Shell {
             if let Some(device_id) = key.1.clone() {
                 params.insert("targetDeviceId".into(), device_id.into());
             }
-            params.insert("target".into(), target.rpc_target().into());
+            params.insert("target".into(), "cursor".into());
             let result = engine
                 .client()
                 .call(
@@ -288,7 +252,7 @@ impl Shell {
                     tracing::warn!(%error, "could not open project in external app");
                     shell.github.open_project_error =
                         Some(format!("Could not open project: {error}").into());
-                    shell.project_open_menu.open(());
+                    shell.github_menu.open(());
                 }
                 cx.notify();
             }) {
@@ -296,136 +260,6 @@ impl Shell {
             }
         })
         .detach();
-    }
-
-    fn render_project_open_menu(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let options = [
-            (ProjectOpenChoice::Cursor, "Cursor", icons::CURSOR_MARK),
-            (ProjectOpenChoice::VsCode, "VS Code", icons::MONITOR),
-            (ProjectOpenChoice::Files, "Files", icons::FOLDER),
-        ];
-        let mut menu = div().w(px(188.0)).p(px(4.0)).flex().flex_col().gap(px(2.0));
-        for (index, (choice, label, glyph)) in options.into_iter().enumerate() {
-            menu = menu.child(
-                popover::menu_row(
-                    theme,
-                    false,
-                    format!("open-project-{label}"),
-                    cx.entity_id(),
-                )
-                .id(("open-project-option", index))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.close_project_open_menu(cx);
-                    this.request_open_project(choice, cx);
-                }))
-                .child(icon(glyph).size(px(15.0)).text_color(theme.text_muted))
-                .child(SharedString::from(label)),
-            );
-        }
-        if let Some(error) = &self.github.open_project_error {
-            menu = menu.child(
-                div()
-                    .px(px(8.0))
-                    .pt(px(5.0))
-                    .text_size(px(11.0))
-                    .text_color(theme.danger)
-                    .child(error.clone()),
-            );
-        }
-        menu.on_mouse_down_out(cx.listener(|this, _, _, cx| {
-            this.close_project_open_menu(cx);
-        }))
-        .into_any_element()
-    }
-
-    fn render_project_open_control(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let open = self.project_open_menu.get().is_some();
-        let fade = "open-project-menu-trigger";
-        let mut control = div()
-            .id("open-project-menu-trigger")
-            .relative()
-            .h(px(28.0))
-            .w(px(OPEN_PROJECT_BUTTON_WIDTH))
-            .flex_none()
-            .flex()
-            .items_center()
-            .rounded(px(8.0))
-            .border_1()
-            .border_color(crate::theme::hairline(if open { 0.18 } else { 0.10 }))
-            .bg(if open {
-                crate::theme::wash(0.12)
-            } else {
-                motion::hover_blend(fade, crate::theme::wash(0.03), crate::theme::wash(0.11))
-            })
-            .on_hover(motion::hover_listener(fade, cx.entity_id()))
-            .occlude()
-            .child(
-                div()
-                    .id("open-project-cursor")
-                    .h_full()
-                    .flex_1()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .gap(px(6.0))
-                    .cursor_pointer()
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        cx.stop_propagation();
-                        this.request_open_project(ProjectOpenChoice::Cursor, cx);
-                    }))
-                    .child(
-                        icon(icons::CURSOR_MARK)
-                            .size(px(15.0))
-                            .text_color(theme.text.opacity(0.9)),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(11.5))
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(theme.text.opacity(0.9))
-                            .child("Open in Cursor"),
-                    ),
-            )
-            .child(
-                div()
-                    .w(px(1.0))
-                    .h(px(16.0))
-                    .bg(crate::theme::hairline(0.12)),
-            )
-            .child(
-                div()
-                    .id("open-project-menu-chevron")
-                    .h_full()
-                    .w(px(28.0))
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .cursor_pointer()
-                    .on_mouse_down(
-                        gpui::MouseButton::Left,
-                        cx.listener(|this, _, window, _| {
-                            window.prevent_default();
-                            this.project_open_menu.note_trigger_press();
-                        }),
-                    )
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        cx.stop_propagation();
-                        this.toggle_project_open_menu(cx);
-                    }))
-                    .child(chevron(open, theme)),
-            );
-        if open {
-            let closing = self.project_open_menu.closing_since();
-            let menu = self.render_project_open_menu(theme, cx);
-            control = control.child(popover::anchored_menu_below_end(
-                "open-project-menu",
-                menu,
-                closing,
-                8.0,
-            ));
-        }
-        control.into_any_element()
     }
 
     fn toggle_github_menu(&mut self, cx: &mut Context<Self>) {
@@ -604,7 +438,7 @@ impl Shell {
             .child(terminal_toggle);
         Some((
             controls.into_any_element(),
-            width + 6.0 + OPEN_PROJECT_BUTTON_WIDTH,
+            width + 6.0 + TERMINAL_TOGGLE_WIDTH,
         ))
     }
 
@@ -732,7 +566,7 @@ impl Shell {
                 .on_click(cx.listener(|this, _, _, cx| {
                     cx.stop_propagation();
                     this.close_github_menu(cx);
-                    this.request_open_project(ProjectOpenChoice::Cursor, cx);
+                    this.request_open_in_cursor(cx);
                 }))
                 .child(
                     div()
@@ -752,6 +586,16 @@ impl Shell {
                 )
                 .child(SharedString::from("Open in Cursor")),
         );
+        if let Some(error) = &self.github.open_project_error {
+            body = body.child(
+                div()
+                    .px(px(12.0))
+                    .pb(px(4.0))
+                    .text_size(px(11.0))
+                    .text_color(theme.danger)
+                    .child(error.clone()),
+            );
+        }
 
         if self.github.branch_picker_open {
             body = body.child(self.github_branch_picker(status, theme, cx));

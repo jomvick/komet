@@ -2683,7 +2683,6 @@ impl Pickers {
                 )
                 .child(crate::context_usage::render_context_ring(
                     &context_stats,
-                    chat_harness,
                     &theme,
                 ));
             let mut overlay: Option<(PickerKind, AnyElement)> = if is_context_open {

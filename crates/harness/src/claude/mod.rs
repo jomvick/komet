@@ -38,6 +38,7 @@ pub mod permissions;
 mod tests_mcp;
 mod wire;
 
+use crate::platform::NoConsole as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -94,7 +95,7 @@ fn resolve_claude_executable() -> Option<PathBuf> {
                 .map(|d| d.join(exe)),
         );
     }
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+    if let Some(home) = crate::platform::home_dir() {
         candidates.push(home.join(".claude").join("local").join("claude"));
         candidates.push(home.join(".local").join("bin").join("claude"));
     }
@@ -183,6 +184,7 @@ impl ClaudeHarness {
 
     pub(crate) fn build_command(&self, exe: &PathBuf, request: &RunRequest) -> Command {
         let mut cmd = Command::new(exe);
+        cmd.no_console();
         crate::compose_child_path(&mut cmd, exe);
         cmd.args([
             "--print",
@@ -461,6 +463,7 @@ impl ClaudeHarness {
     async fn discover_commands(&self, cwd: &Path) -> Result<Vec<SlashCommand>, HarnessError> {
         let exe = self.resolve_executable()?;
         let mut cmd = Command::new(&exe);
+        cmd.no_console();
         crate::compose_child_path(&mut cmd, &exe);
         cmd.current_dir(cwd);
         cmd.args([
@@ -572,6 +575,7 @@ impl ClaudeHarness {
     pub(crate) async fn discover_live_models(&self) -> Result<Vec<Model>, HarnessError> {
         let exe = self.resolve_executable()?;
         let mut cmd = Command::new(&exe);
+        cmd.no_console();
         crate::compose_child_path(&mut cmd, &exe);
         cmd.args([
             "--print",
@@ -691,6 +695,7 @@ impl ClaudeHarness {
     pub async fn get_context_usage(&self) -> Result<komet_proto::ContextUsage, HarnessError> {
         let exe = self.resolve_executable()?;
         let mut cmd = Command::new(&exe);
+        cmd.no_console();
         crate::compose_child_path(&mut cmd, &exe);
         cmd.args([
             "--print",

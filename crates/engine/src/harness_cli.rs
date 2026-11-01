@@ -1,3 +1,4 @@
+use komet_harness::platform::NoConsole as _;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -441,6 +442,7 @@ async fn status(
 async fn version(harness: HarnessId) -> Option<String> {
     let path = komet_harness::find_cli_path(executable(harness))?;
     let mut command = tokio::process::Command::new(path);
+    command.no_console();
     command.arg("--version");
     komet_harness::compose_login_shell_path(&mut command);
     command.kill_on_drop(true);
@@ -632,6 +634,7 @@ async fn self_update(harness: HarnessId, args: &'static [&'static str]) -> Resul
         )
     })?;
     let mut command = tokio::process::Command::new(path);
+    command.no_console();
     command
         .args(args)
         // An updater that stops to ask must fail, not hang.
@@ -673,6 +676,7 @@ fn update_failure(stdout: &[u8], stderr: &[u8]) -> String {
 
 async fn install_npm(package: &str) -> Result<(), String> {
     let mut command = tokio::process::Command::new("npm");
+    command.no_console();
     command
         .args(["install", "--global", &format!("{package}@latest")])
         .kill_on_drop(true);
@@ -724,6 +728,7 @@ async fn install_shell_script(url: &str) -> Result<(), String> {
             "bash"
         };
         let mut command = tokio::process::Command::new(interpreter);
+        command.no_console();
         command
             .arg("-s")
             .stdin(std::process::Stdio::piped())
@@ -752,10 +757,11 @@ async fn install_shell_script(url: &str) -> Result<(), String> {
 
 async fn install_hermes() -> Result<(), String> {
     install_shell_script("https://hermes-agent.nousresearch.com/install.sh").await?;
-    let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
+    let Some(home) = komet_harness::platform::home_dir() else {
         return Err("The Hermes installer completed, but HOME is unavailable.".into());
     };
     let mut command = tokio::process::Command::new("uv");
+    command.no_console();
     command
         .args(["pip", "install", "-e", ".[acp]"])
         .current_dir(home.join(".hermes/hermes-agent"))
@@ -802,6 +808,7 @@ async fn install_cursor() -> Result<(), String> {
             return Err("The official Cursor installer had an unexpected format.".into());
         }
         let mut command = tokio::process::Command::new("bash");
+        command.no_console();
         command
             .arg("-s")
             .stdin(std::process::Stdio::piped())

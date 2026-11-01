@@ -256,9 +256,11 @@ mod tests {
                 .render_single_frame(&bytes, 1.0)
                 .unwrap_or_else(|error| panic!("failed to render {path}: {error}"));
             assert!(
-                image
-                    .as_bytes(0)
-                    .is_some_and(|pixels| pixels.chunks_exact(4).any(|pixel| pixel[3] > 0)),
+                image.as_bytes(0).is_some_and(|pixels| pixels
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .any(|pixel| pixel[3] > 0)),
                 "{path} rendered without visible pixels"
             );
         }

@@ -1071,7 +1071,6 @@ pub struct Shell {
     right_plus: popover::Popup<()>,
     /// Titlebar GitHub control: its dropdown + the checkout's status.
     github_menu: popover::Popup<()>,
-    project_open_menu: popover::Popup<()>,
     github: github::GitHubHeader,
     /// Diff surfaces by id — each tab its own [`Changes`] viewer with its own
     /// scope/base pick and diff watch (multiple diff panels, user request).
@@ -1415,7 +1414,6 @@ impl Shell {
             right_terminal_event_sub: None,
             right_plus: popover::Popup::default(),
             github_menu: popover::Popup::default(),
-            project_open_menu: popover::Popup::default(),
             github: github::GitHubHeader::default(),
             diffs: std::collections::HashMap::new(),
             diff_subs: std::collections::HashMap::new(),
@@ -1718,11 +1716,11 @@ impl Shell {
                 // over a remembered "no project" opt-out. Otherwise the last
                 // selected project stands, unless opted out.
                 let exists = |id: &String| state.read(cx).space_row(id).is_some();
-                let filter = self.settings.space_filter.clone().filter(&exists);
+                let filter = self.settings.space_filter.clone().filter(exists);
                 let target = match filter {
                     Some(filter) => Some(filter),
                     None if !state.read(cx).no_project => {
-                        self.settings.last_space_id.clone().filter(&exists)
+                        self.settings.last_space_id.clone().filter(exists)
                     }
                     None => None,
                 };

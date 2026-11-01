@@ -1434,22 +1434,27 @@ impl Shell {
             let state = self.state.read(cx);
             let spaces = state.spaces_sorted();
 
+            // Bucket chats by space in one pass (this runs on every Shell frame),
+            // most recent first; only the rows that are rendered get cloned.
+            let mut by_space: std::collections::HashMap<&str, Vec<&komet_proto::Chat>> =
+                std::collections::HashMap::new();
+            for chat in state.chats.iter().filter(|c| !c.archived) {
+                if let Some(space_id) = chat.space_id.as_deref() {
+                    by_space.entry(space_id).or_default().push(chat);
+                }
+            }
+            for chats in by_space.values_mut() {
+                chats.sort_by_key(|c| std::cmp::Reverse(c.last_message_at.unwrap_or(c.created_at)));
+            }
+
             // Build groups: one per space in alphabetical order.
             let space_groups: Vec<SpaceGroup> = spaces
                 .iter()
                 .map(|space| {
-                    let mut chats: Vec<komet_proto::Chat> = state
-                        .chats
-                        .iter()
-                        .filter(|c| !c.archived && c.space_id.as_deref() == Some(space.id.as_str()))
-                        .cloned()
-                        .collect();
-                    // Sort by recency (most recent first).
-                    chats.sort_by(|a, b| {
-                        let ta = a.last_message_at.unwrap_or(a.created_at);
-                        let tb = b.last_message_at.unwrap_or(b.created_at);
-                        tb.cmp(&ta)
-                    });
+                    let chats: Vec<komet_proto::Chat> = by_space
+                        .get(space.id.as_str())
+                        .map(|chats| chats.iter().map(|c| (*c).clone()).collect())
+                        .unwrap_or_default();
                     let sessions = chats
                         .into_iter()
                         .map(|chat| {
@@ -1476,24 +1481,20 @@ impl Shell {
                 .collect();
 
             // Project-less sessions (space_id = None, or dangling space).
-            let mut orphan_chats: Vec<komet_proto::Chat> = state
+            let mut orphan_chats: Vec<&komet_proto::Chat> = state
                 .chats
                 .iter()
                 .filter(|c| !c.archived && c.space_id.is_none())
-                .cloned()
                 .collect();
-            orphan_chats.sort_by(|a, b| {
-                let ta = a.last_message_at.unwrap_or(a.created_at);
-                let tb = b.last_message_at.unwrap_or(b.created_at);
-                tb.cmp(&ta)
-            });
+            orphan_chats
+                .sort_by_key(|c| std::cmp::Reverse(c.last_message_at.unwrap_or(c.created_at)));
+            let orphan_chats = orphan_chats.into_iter().cloned();
             let projectless_rows: Vec<(
                 komet_proto::ChatIndicator,
                 komet_proto::Chat,
                 String,
                 Option<String>,
             )> = orphan_chats
-                .into_iter()
                 .map(|chat| {
                     let status = state.display_status_for(&chat, now);
                     let mut folder = "~".to_string();

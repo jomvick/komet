@@ -34,6 +34,7 @@
 //! - Steering: turn-boundary — steers queue and become the next turn on the
 //!   parked session (parity with the previous ACP behavior).
 
+use crate::platform::NoConsole as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -63,7 +64,7 @@ const SHIM_SOURCE: &str = include_str!("shim.mjs");
 
 fn cursor_cli_paths() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+    if let Some(home) = crate::platform::home_dir() {
         dirs.push(home.join(".local").join("bin").join("cursor-agent"));
         dirs.push(home.join(".cursor").join("bin").join("cursor-agent"));
     }
@@ -125,6 +126,7 @@ impl CursorHarness {
         let exe = crate::acp::find_on_paths("cursor-agent", cursor_cli_paths())
             .ok_or_else(|| HarnessError::NotInstalled("cursor-agent".into()))?;
         let mut cmd = Command::new(&exe);
+        cmd.no_console();
         crate::compose_child_path(&mut cmd, &exe);
         cmd.arg("--list-models")
             .stdin(Stdio::null())
@@ -157,6 +159,7 @@ impl CursorHarness {
     async fn discover_sdk_models(&self) -> Result<Vec<Model>, HarnessError> {
         let (exe, args) = self.resolve_shim().await?;
         let mut cmd = Command::new(&exe);
+        cmd.no_console();
         cmd.args(&args);
         crate::compose_child_path(&mut cmd, &exe);
         cmd.arg("models")
@@ -245,6 +248,7 @@ impl CursorHarness {
 pub async fn login_command(store_path: &std::path::Path) -> Result<Command, HarnessError> {
     let (exe, args) = CursorHarness::default().resolve_shim().await?;
     let mut cmd = Command::new(&exe);
+    cmd.no_console();
     cmd.args(&args);
     crate::compose_child_path(&mut cmd, &exe);
     cmd.arg("login").arg(store_path);
@@ -318,6 +322,7 @@ impl Harness for CursorHarness {
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         let (exe, args) = self.resolve_shim().await?;
         let mut cmd = Command::new(&exe);
+        cmd.no_console();
         cmd.args(&args);
         crate::compose_child_path(&mut cmd, &exe);
         if !request.cwd.is_empty() {

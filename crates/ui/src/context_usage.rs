@@ -7,7 +7,7 @@
 
 use gpui::{
     AnyElement, App, IntoElement, ParentElement, PathBuilder, SharedString, Styled, Window, canvas,
-    div, hsla, point, prelude::*, px,
+    div, point, prelude::*, px,
 };
 use komet_proto::{ContextUsageSource, ContextUsageStats, HarnessId, format_tokens};
 
@@ -17,172 +17,6 @@ use crate::theme::Theme;
 const RING_DIAMETER: f32 = 20.0;
 const RING_STROKE: f32 = 1.75;
 const ARC_SEGMENTS: u32 = 64;
-
-/// Telemetry profile and branding identity for a specific CLI engine.
-///
-/// Only [`render_context_ring`] reads a paint color today — the popover itself
-/// (see [`render_context_popover`]) is deliberately unbranded, a plain "Context"
-/// card, per design reference 2026-09-01 (a prior branded/card redesign was
-/// reverted).
-#[allow(dead_code)]
-pub struct HarnessContextProfile {
-    pub display_name: &'static str,
-    pub protocol_badge: &'static str,
-    pub brand_icon: &'static str,
-    pub brand_color: gpui::Hsla,
-    pub telemetry_title: &'static str,
-    pub telemetry_description: &'static str,
-    pub caching_type: Option<&'static str>,
-    pub default_compaction_rule: &'static str,
-}
-
-impl HarnessContextProfile {
-    pub fn for_harness(harness: Option<HarnessId>, _theme: &Theme) -> Self {
-        match harness {
-            Some(HarnessId::ClaudeCode) => Self {
-                display_name: "Claude Code",
-                protocol_badge: "Native CLI",
-                brand_icon: crate::icons::CLAUDE_MARK,
-                brand_color: crate::icons::claude_brand(),
-                telemetry_title: "Anthropic Prompt Caching & Auto-Compact",
-                telemetry_description: "Uses 5-min ephemeral prompt caching. Auto-compaction triggers at ~75-80% context window.",
-                caching_type: Some("Anthropic Prompt Cache (5m TTL)"),
-                default_compaction_rule: "Auto-compact at 150k / 75%",
-            },
-            Some(HarnessId::Opencode) => Self {
-                display_name: "OpenCode",
-                protocol_badge: "Native ACP",
-                brand_icon: crate::icons::OPENCODE_MARK,
-                brand_color: hsla(158.0 / 360.0, 0.85, 0.44, 1.0),
-                telemetry_title: "OpenCode ACP Runtime Telemetry",
-                telemetry_description: "Native ACP protocol telemetry across subagents, tool executions, and multi-model context.",
-                caching_type: Some("ACP Turn Session Buffer"),
-                default_compaction_rule: "Turn boundary prune",
-            },
-            Some(HarnessId::Codex) => Self {
-                display_name: "Codex",
-                protocol_badge: "App Protocol",
-                brand_icon: crate::icons::OPENAI_MARK,
-                brand_color: hsla(160.0 / 360.0, 0.82, 0.35, 1.0),
-                telemetry_title: "OpenAI App Protocol & CoT Telemetry",
-                telemetry_description: "Direct thread token telemetry with granular tracking for reasoning output (o1/o3/gpt-4o) and turn delta.",
-                caching_type: Some("OpenAI Prefix Caching"),
-                default_compaction_rule: "Sliding turn context window",
-            },
-            Some(HarnessId::Cursor) => Self {
-                display_name: "Cursor",
-                protocol_badge: "Agent CLI",
-                brand_icon: crate::icons::CURSOR_MARK,
-                brand_color: hsla(217.0 / 360.0, 0.91, 0.60, 1.0),
-                telemetry_title: "Cursor Agent Telemetry",
-                telemetry_description: "Cursor workspace index and agent tool execution telemetry.",
-                caching_type: Some("Workspace Index Cache"),
-                default_compaction_rule: "Context window boundary",
-            },
-            Some(HarnessId::Grok) => Self {
-                display_name: "Grok",
-                protocol_badge: "xAI ACP",
-                brand_icon: crate::icons::GROK_MARK,
-                brand_color: hsla(350.0 / 360.0, 0.80, 0.55, 1.0),
-                telemetry_title: "xAI Grok Agent Runtime",
-                telemetry_description: "Grok ACP stdio agent context window tracking and tool execution telemetry.",
-                caching_type: None,
-                default_compaction_rule: "Model context limit",
-            },
-            Some(HarnessId::Hermes) => Self {
-                display_name: "Hermes",
-                protocol_badge: "Nous ACP",
-                brand_icon: crate::icons::HERMES_MARK,
-                brand_color: hsla(270.0 / 360.0, 0.80, 0.65, 1.0),
-                telemetry_title: "Nous Research Hermes Runtime",
-                telemetry_description: "Hermes ACP turn execution and tool calling context window metrics.",
-                caching_type: None,
-                default_compaction_rule: "Turn boundary prune",
-            },
-            Some(HarnessId::Pi) => Self {
-                display_name: "Pi",
-                protocol_badge: "Pi ACP",
-                brand_icon: crate::icons::PI_MARK,
-                brand_color: hsla(38.0 / 360.0, 0.92, 0.50, 1.0),
-                telemetry_title: "Pi.dev Coding Agent",
-                telemetry_description: "Pi ACP adapter telemetry with session memory management.",
-                caching_type: None,
-                default_compaction_rule: "Session limit",
-            },
-            Some(HarnessId::Antigravity) => Self {
-                display_name: "Antigravity",
-                protocol_badge: "Native Engine",
-                brand_icon: crate::icons::ANTIGRAVITY_MARK,
-                brand_color: hsla(217.0 / 360.0, 0.90, 0.60, 1.0),
-                telemetry_title: "Antigravity Controller Telemetry",
-                telemetry_description: "Native multi-agent controller telemetry and subagent thread metrics.",
-                caching_type: Some("Multi-turn state cache"),
-                default_compaction_rule: "Automatic context compaction",
-            },
-            Some(HarnessId::Devin) => Self {
-                display_name: "Devin",
-                protocol_badge: "ACP",
-                brand_icon: crate::icons::DEVIN_MARK,
-                brand_color: hsla(214.0 / 360.0, 0.72, 0.60, 1.0),
-                telemetry_title: "Devin ACP Telemetry",
-                telemetry_description: "Session metadata and command telemetry from the Devin ACP runner.",
-                caching_type: None,
-                default_compaction_rule: "Turn boundary prune",
-            },
-            Some(HarnessId::Muse) => Self {
-                display_name: "Muse",
-                protocol_badge: "MSP",
-                brand_icon: crate::icons::MUSE_MARK,
-                brand_color: hsla(282.0 / 360.0, 0.75, 0.62, 1.0),
-                telemetry_title: "Muse Session Telemetry",
-                telemetry_description: "Muse session tracking and per-turn context management.",
-                caching_type: None,
-                default_compaction_rule: "Session boundary prune",
-            },
-            Some(HarnessId::Copilot) => Self {
-                display_name: "GitHub Copilot",
-                protocol_badge: "ACP",
-                brand_icon: crate::icons::COPILOT_MARK,
-                brand_color: hsla(210.0 / 360.0, 0.78, 0.55, 1.0),
-                telemetry_title: "Copilot CLI Telemetry",
-                telemetry_description: "Official GitHub Copilot session and tool execution telemetry.",
-                caching_type: None,
-                default_compaction_rule: "Turn boundary prune",
-            },
-            Some(HarnessId::Qoder) => Self {
-                display_name: "Qoder",
-                protocol_badge: "ACP",
-                brand_icon: crate::icons::QODER_MARK,
-                brand_color: hsla(154.0 / 360.0, 0.62, 0.48, 1.0),
-                telemetry_title: "Qoder CLI Telemetry",
-                telemetry_description: "Qoder's native ACP runtime: model, mode and tool execution telemetry.",
-                caching_type: None,
-                default_compaction_rule: "Turn boundary prune",
-            },
-            Some(HarnessId::Cline) => Self {
-                display_name: "Cline",
-                protocol_badge: "Native ACP",
-                brand_icon: crate::icons::CLINE_MARK,
-                brand_color: hsla(14.0 / 360.0, 0.80, 0.55, 1.0),
-                telemetry_title: "Cline ACP Runtime Telemetry",
-                telemetry_description: "Cline's autonomous coding agent over ACP: provider/model \
-                    config options, tool execution telemetry and plan/act modes.",
-                caching_type: None,
-                default_compaction_rule: "Turn boundary prune",
-            },
-            _ => Self {
-                display_name: "Agent Session",
-                protocol_badge: "Session Telemetry",
-                brand_icon: crate::icons::KOMET_LOGO,
-                brand_color: hsla(215.0 / 360.0, 0.70, 0.55, 1.0),
-                telemetry_title: "Thread Context & Token Telemetry",
-                telemetry_description: "Cumulative provider-reported usage and context-window metrics.",
-                caching_type: None,
-                default_compaction_rule: "Auto threshold",
-            },
-        }
-    }
-}
 
 fn usage_fill(ratio: f32, theme: &Theme) -> gpui::Hsla {
     if ratio >= 0.90 {
@@ -258,16 +92,11 @@ fn paint_arc(
 /// Render the circular context usage ring indicator (trigger widget).
 /// Track + clockwise arc from 12 o'clock, with a faint inner wash so fill
 /// reads at 20px. Optional percent sits beside it for at-a-glance reading.
-pub fn render_context_ring(
-    stats: &ContextUsageStats,
-    harness: Option<HarnessId>,
-    theme: &Theme,
-) -> AnyElement {
+pub fn render_context_ring(stats: &ContextUsageStats, theme: &Theme) -> AnyElement {
     let _child = crate::perf::child_frame(crate::perf::ChildView::ContextUsage);
     let ratio = stats.context_ratio();
     let percent = stats.context_percent();
     let show_percent = stats.used() > 0;
-    let _ = HarnessContextProfile::for_harness(harness, theme);
 
     let ring = canvas(
         move |_bounds, _window, _cx| (),
@@ -643,41 +472,6 @@ fn plain_row(label: &'static str, value: String, theme: &Theme) -> impl IntoElem
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn profile_resolution_for_all_harnesses() {
-        let theme = Theme::dark();
-
-        let claude = HarnessContextProfile::for_harness(Some(HarnessId::ClaudeCode), &theme);
-        assert_eq!(claude.display_name, "Claude Code");
-        assert_eq!(claude.protocol_badge, "Native CLI");
-
-        let opencode = HarnessContextProfile::for_harness(Some(HarnessId::Opencode), &theme);
-        assert_eq!(opencode.display_name, "OpenCode");
-        assert_eq!(opencode.protocol_badge, "Native ACP");
-
-        let codex = HarnessContextProfile::for_harness(Some(HarnessId::Codex), &theme);
-        assert_eq!(codex.display_name, "Codex");
-        assert_eq!(codex.protocol_badge, "App Protocol");
-
-        let cursor = HarnessContextProfile::for_harness(Some(HarnessId::Cursor), &theme);
-        assert_eq!(cursor.display_name, "Cursor");
-
-        let grok = HarnessContextProfile::for_harness(Some(HarnessId::Grok), &theme);
-        assert_eq!(grok.display_name, "Grok");
-
-        let hermes = HarnessContextProfile::for_harness(Some(HarnessId::Hermes), &theme);
-        assert_eq!(hermes.display_name, "Hermes");
-
-        let pi = HarnessContextProfile::for_harness(Some(HarnessId::Pi), &theme);
-        assert_eq!(pi.display_name, "Pi");
-
-        let antigravity = HarnessContextProfile::for_harness(Some(HarnessId::Antigravity), &theme);
-        assert_eq!(antigravity.display_name, "Antigravity");
-
-        let default_profile = HarnessContextProfile::for_harness(None, &theme);
-        assert_eq!(default_profile.display_name, "Agent Session");
-    }
 
     #[test]
     fn usage_fill_follows_theme_tokens() {

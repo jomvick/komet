@@ -1782,10 +1782,12 @@ fn decode_hex(value: &str) -> Option<Vec<u8>> {
     }
     value
         .as_bytes()
-        .chunks_exact(2)
-        .map(|pair| {
-            let high = (pair[0] as char).to_digit(16)?;
-            let low = (pair[1] as char).to_digit(16)?;
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&[high, low]| {
+            let high = (high as char).to_digit(16)?;
+            let low = (low as char).to_digit(16)?;
             Some(((high << 4) | low) as u8)
         })
         .collect()

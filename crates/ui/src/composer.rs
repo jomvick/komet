@@ -3937,20 +3937,6 @@ fn mention_error_message(err: &RpcError) -> SharedString {
     }
 }
 
-/// A failed command discovery, translated for the popup.
-#[allow(dead_code)]
-fn slash_error_message(err: &RpcError) -> SharedString {
-    match err {
-        RpcError::UnknownMethod(_) => {
-            "The session's device runs an older Komet — update it to list commands".into()
-        }
-        RpcError::Transport(_) | RpcError::Closed => "The session's device is unreachable".into(),
-        RpcError::BadParams(_) | RpcError::Failed(_) => {
-            "Couldn't load this agent's commands".into()
-        }
-    }
-}
-
 /// A prompt held in the local UI queue while an agent turn is live.
 /// Drained automatically when the session transitions to Completed/Aborted.
 #[derive(Clone)]

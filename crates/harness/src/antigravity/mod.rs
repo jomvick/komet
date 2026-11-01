@@ -8,6 +8,7 @@
 pub mod catalog;
 pub mod normalize;
 
+use crate::platform::NoConsole as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
@@ -68,7 +69,7 @@ impl AntigravityHarness {
         if let Some(path) = crate::shell_env::login_shell_path() {
             paths.extend(std::env::split_paths(path).map(|dir| dir.join(executable)));
         }
-        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        if let Some(home) = crate::platform::home_dir() {
             paths.push(home.join(".local/bin").join(executable));
             paths.push(home.join(".gemini/antigravity/bin").join(executable));
             paths.push(home.join(".config/Antigravity/bin").join(executable));
@@ -165,6 +166,7 @@ impl Harness for AntigravityHarness {
             }
         }
         let mut cmd = Command::new(&executable);
+        cmd.no_console();
         crate::compose_child_path(&mut cmd, &executable);
         cmd.arg("models");
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -267,6 +269,7 @@ impl Harness for AntigravityHarness {
     {
         let executable = self.resolve_executable()?;
         let mut command = Command::new(&executable);
+        command.no_console();
         crate::compose_child_path(&mut command, &executable);
         command
             .arg("-p")

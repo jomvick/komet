@@ -132,7 +132,9 @@ pub struct Room {
 
 fn new_room(data_dir: &std::path::Path, room: &str) -> Room {
     let path = room_db_path(data_dir, room);
-    open_room_db(&path);
+    if let Err(err) = open_room_db(&path) {
+        tracing::warn!(room, %err, "could not initialise room database");
+    }
     let (tx, _) = broadcast::channel(1024);
     let (registry_tx, _) = broadcast::channel(1024);
     Room {
@@ -144,28 +146,54 @@ fn new_room(data_dir: &std::path::Path, room: &str) -> Room {
 }
 
 fn room_db_path(data_dir: &std::path::Path, room: &str) -> PathBuf {
+    let dir = data_dir.join("rooms");
+    let lossless = room
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if lossless && !room.is_empty() {
+        return dir.join(format!("{room}.db"));
+    }
+    // Sanitizing alone is lossy (`a/b`, `a.b`, `a_b` would share one file), so
+    // names that need it get a hash of the raw name. A pre-existing legacy file
+    // keeps being used so stored history is not orphaned.
     let safe: String = room
         .chars()
         .map(|c| {
-            if c.is_alphanumeric() || c == '-' || c == '_' {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
                 c
             } else {
                 '_'
             }
         })
         .collect();
-    data_dir.join("rooms").join(format!("{safe}.db"))
+    let legacy = dir.join(format!("{safe}.db"));
+    if legacy.exists() {
+        return legacy;
+    }
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(room.as_bytes());
+    let tag: String = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
+    dir.join(format!("{safe}-{tag}.db"))
 }
 
-fn open_room_db(path: &std::path::Path) -> rusqlite::Connection {
-    std::fs::create_dir_all(path.parent().unwrap()).ok();
-    let conn = rusqlite::Connection::open(path).unwrap();
-    conn.execute("CREATE TABLE IF NOT EXISTS frames (id INTEGER PRIMARY KEY AUTOINCREMENT, data BLOB NOT NULL)", []).ok();
-    conn
+fn open_room_db(path: &std::path::Path) -> rusqlite::Result<rusqlite::Connection> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let conn = rusqlite::Connection::open(path)?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS frames (id INTEGER PRIMARY KEY AUTOINCREMENT, data BLOB NOT NULL)",
+        [],
+    )?;
+    Ok(conn)
 }
 
-/// Validate the configured server token. Unset or blank tokens are refused, so
-/// a server can never run without authentication by accident.
+fn load_room_history(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<Vec<u8>>> {
+    let mut stmt = conn.prepare("SELECT data FROM frames ORDER BY id")?;
+    let rows = stmt.query_map([], |r| r.get::<_, Vec<u8>>(0))?;
+    rows.collect()
+}
+
 pub fn require_token(token: Option<String>) -> anyhow::Result<String> {
     let token = token.map(|t| t.trim().to_string()).unwrap_or_default();
     if token.is_empty() {
@@ -341,28 +369,44 @@ fn check_query_token(state: &AppState, query: Option<&str>) -> bool {
 }
 
 async fn handle_socket(state: AppState, room: String, socket: WebSocket) {
-    let (tx, history) = {
+    let (tx, db_path) = {
         let mut rooms = state.rooms.write().await;
         let entry = rooms
             .entry(room.clone())
             .or_insert_with(|| new_room(&state.data_dir, &room));
-        let conn = rusqlite::Connection::open(&entry.db_path).unwrap();
-        let mut stmt = conn.prepare("SELECT data FROM frames ORDER BY id").unwrap();
-        let rows = stmt.query_map([], |r| r.get::<_, Vec<u8>>(0)).unwrap();
-        let hist: Vec<Vec<u8>> = rows.filter_map(|r| r.ok()).collect();
-        (entry.tx.clone(), hist)
+        (entry.tx.clone(), entry.db_path.clone())
     };
+    // Subscribe before reading history: a frame persisted in between is then
+    // delivered twice (CRDT updates are idempotent) instead of being lost.
     let mut rx = tx.subscribe();
+    let opened = tokio::task::spawn_blocking(move || {
+        let conn = open_room_db(&db_path)?;
+        let history = load_room_history(&conn)?;
+        Ok::<_, rusqlite::Error>((conn, history))
+    })
+    .await;
+    let (conn, history) = match opened {
+        Ok(Ok(v)) => v,
+        Ok(Err(err)) => {
+            tracing::warn!(room, %err, "room database unavailable; closing socket");
+            return;
+        }
+        Err(err) => {
+            tracing::warn!(room, %err, "room history task failed; closing socket");
+            return;
+        }
+    };
+    let conn = Arc::new(std::sync::Mutex::new(conn));
     let (mut sender, mut receiver) = socket.split();
 
-    // replay history
     for frame in history {
-        let _ = sender.send(Message::Binary(frame)).await;
+        if sender.send(Message::Binary(frame)).await.is_err() {
+            return;
+        }
     }
 
     let tx2 = tx.clone();
     let room2 = room.clone();
-    let data_dir2 = state.data_dir.clone();
     // recv task: persist + broadcast
     let mut recv_task = tokio::spawn(async move {
         while let Some(Ok(msg)) = receiver.next().await {
@@ -372,10 +416,21 @@ async fn handle_socket(state: AppState, room: String, socket: WebSocket) {
                 Message::Close(_) => break,
                 _ => continue,
             };
-            // persist
-            let path = room_db_path(&data_dir2, &room2);
-            if let Ok(conn) = rusqlite::Connection::open(&path) {
-                let _ = conn.execute("INSERT INTO frames (data) VALUES (?1)", [&data]);
+            let conn = conn.clone();
+            let joined = tokio::task::spawn_blocking(move || {
+                let res = conn
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .execute("INSERT INTO frames (data) VALUES (?1)", [&data]);
+                (data, res)
+            })
+            .await;
+            let Ok((data, persisted)) = joined else {
+                break;
+            };
+            if let Err(err) = persisted {
+                // Still relayed so live peers converge; late joiners will miss it.
+                tracing::warn!(room = %room2, %err, "frame relayed but not persisted");
             }
             let _ = tx2.send(data);
         }

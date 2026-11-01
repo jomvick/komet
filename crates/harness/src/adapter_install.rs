@@ -17,6 +17,7 @@
 //! installers (two daemons, prewarm racing a run) converge on whichever
 //! rename won.
 
+use crate::platform::NoConsole as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -64,9 +65,7 @@ fn adapters_root() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("KOMET_ADAPTERS_DIR").filter(|d| !d.is_empty()) {
         return Some(PathBuf::from(dir));
     }
-    std::env::var_os("HOME")
-        .filter(|h| !h.is_empty())
-        .map(|h| PathBuf::from(h).join(".komet").join("adapters"))
+    crate::platform::home_dir().map(|h| h.join(".komet").join("adapters"))
 }
 
 fn install_dir(pin: &NpmPin) -> Option<PathBuf> {
@@ -330,6 +329,7 @@ async fn install_into(
         "installing ACP adapter"
     );
     let mut cmd = tokio::process::Command::new(npm);
+    cmd.no_console();
     cmd.args([
         "install",
         "--no-audit",
