@@ -30,7 +30,11 @@ impl Shell {
     /// Mirror prefs onto the panel that did NOT report the change (updating
     /// the emitter back into itself while it is mid-update would re-borrow
     /// the entity).
-    pub(super) fn push_terminal_prefs(&self, emitter: &Entity<TerminalPanel>, cx: &mut Context<Self>) {
+    pub(super) fn push_terminal_prefs(
+        &self,
+        emitter: &Entity<TerminalPanel>,
+        cx: &mut Context<Self>,
+    ) {
         let prefs = self.terminal_prefs();
         for panel in [&self.terminal, &self.right_terminal].into_iter().flatten() {
             if panel.entity_id() == emitter.entity_id() {

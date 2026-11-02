@@ -362,7 +362,11 @@ impl Shell {
     }
 
     /// Lazily create the entity for a settings section and return it renderable.
-    pub(super) fn settings_outlet(&mut self, section: SettingsSection, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn settings_outlet(
+        &mut self,
+        section: SettingsSection,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         match section {
             SettingsSection::Devices => {
                 if self.devices_page.is_none() {
@@ -574,5 +578,71 @@ impl Shell {
             }
         }
     }
+}
 
+/// Navigation memory: what the active device last looked at (session or new-task).
+impl Shell {
+    /// Record the current navigation for the active device (session or new-task).
+    pub(super) fn remember_current_navigation(&mut self, cx: &mut Context<Self>) {
+        let Some(device_id) = self.state.read(cx).local_device_id.clone() else {
+            return;
+        };
+        let nav = if self.active_chat.is_empty() {
+            let state = self.state.read(cx);
+            let project_id = if state.no_project {
+                None
+            } else {
+                state.selected_space.clone()
+            };
+            RememberedNavigation::NewTask { project_id }
+        } else {
+            RememberedNavigation::Session {
+                id: self.active_chat.clone(),
+            }
+        };
+        if self.settings.last_session_by_device.get(&device_id) != Some(&nav) {
+            self.settings.last_session_by_device.insert(device_id, nav);
+            self.schedule_save(cx);
+        }
+    }
+
+    /// Prune stale remembered entries (archived/deleted sessions, deleted projects)
+    /// — same rule as `open_tabs` pruning against the doc.
+    pub(super) fn prune_remembered_navigation(&mut self, cx: &mut Context<Self>) -> bool {
+        let mut to_remove = Vec::new();
+        for (device_id, nav) in &self.settings.last_session_by_device {
+            let keep = match nav {
+                RememberedNavigation::Session { id } => {
+                    let state = self.state.read(cx);
+                    let chat = state.chats.iter().find(|c| &c.id == id);
+                    match chat {
+                        Some(c) if !c.archived => match &c.space_id {
+                            Some(sid) => state.space_row(sid).is_some(),
+                            None => true,
+                        },
+                        _ => false,
+                    }
+                }
+                RememberedNavigation::NewTask { project_id } => match project_id {
+                    None => true,
+                    Some(pid) => self.state.read(cx).space_row(pid).is_some(),
+                },
+            };
+            if !keep {
+                to_remove.push(device_id.clone());
+            }
+        }
+        let pruned = !to_remove.is_empty();
+        for id in to_remove {
+            self.settings.last_session_by_device.remove(&id);
+        }
+        // Drop folder expansion state for deleted spaces (same rule as the
+        // remembered destinations above).
+        let before = self.settings.expanded_spaces.len();
+        let state = self.state.read(cx);
+        self.settings
+            .expanded_spaces
+            .retain(|id| state.space_row(id).is_some());
+        pruned || self.settings.expanded_spaces.len() != before
+    }
 }

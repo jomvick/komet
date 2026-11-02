@@ -187,7 +187,12 @@ impl Shell {
 
     /// Track the hovered drop slot mid-drag (the terminal drawer's
     /// `update_drag_over`, ported: epoch bumps restart the slide tween).
-    pub(super) fn update_right_tab_drag_over(&mut self, from: usize, over: usize, cx: &mut Context<Self>) {
+    pub(super) fn update_right_tab_drag_over(
+        &mut self,
+        from: usize,
+        over: usize,
+        cx: &mut Context<Self>,
+    ) {
         match &mut self.right_tab_drag {
             Some(drag) if drag.over != over => {
                 drag.prev_over = drag.over;
@@ -476,7 +481,11 @@ impl Shell {
         cx.notify();
     }
 
-    pub(super) fn set_files_editor_font_size(&mut self, editor_font_size: f32, cx: &mut Context<Self>) {
+    pub(super) fn set_files_editor_font_size(
+        &mut self,
+        editor_font_size: f32,
+        cx: &mut Context<Self>,
+    ) {
         self.settings.files_editor_font_size = editor_font_size;
         let surfaces = self
             .files
@@ -671,7 +680,11 @@ impl Shell {
         self.register_diff_surface(changes, cx);
     }
 
-    pub(super) fn register_diff_surface(&mut self, changes: Entity<Changes>, cx: &mut Context<Self>) {
+    pub(super) fn register_diff_surface(
+        &mut self,
+        changes: Entity<Changes>,
+        cx: &mut Context<Self>,
+    ) {
         self.diff_seq += 1;
         let id = self.diff_seq;
         let sub = cx.subscribe(&changes, |this: &mut Self, _, event, cx| match event {
