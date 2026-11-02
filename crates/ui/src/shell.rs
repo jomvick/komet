@@ -212,7 +212,6 @@ pub(super) struct RenameChatDialog {
     pub(super) _events: Subscription,
 }
 
-
 pub struct Shell {
     state: Entity<AppState>,
     transcript: Entity<Transcript>,
@@ -1096,8 +1095,6 @@ impl Shell {
         }
     }
 
-
-
     fn on_sidebar_drag(
         &mut self,
         event: &gpui::DragMoveEvent<SidebarResize>,
@@ -1158,8 +1155,6 @@ impl Shell {
         }));
     }
 
-
-
     // ---- render pieces ----
 
     /// Evaluate a width tween at "now" (manual drive — see [`WidthTween`]).
@@ -1198,7 +1193,6 @@ impl Shell {
             .child(inner)
             .into_any_element()
     }
-
 
     fn check_harness_updates(&mut self, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
@@ -1305,7 +1299,6 @@ impl Shell {
     }
 
 }
-
 
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
