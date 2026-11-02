@@ -1,6 +1,6 @@
 use gpui::{
-    AnyElement, Context, Empty, Entity, IntoElement, SharedString, Subscription, Task, Window,
-    div, prelude::*, px,
+    AnyElement, Context, Empty, Entity, IntoElement, SharedString, Subscription, Task, Window, div,
+    prelude::*, px,
 };
 use komet_proto::WorkspaceScope;
 use komet_rpc::methods;
@@ -137,7 +137,11 @@ impl Shell {
         cx.notify();
     }
 
-    pub(super) fn render_gate_card(&mut self, phase: &GatePhase, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_gate_card(
+        &mut self,
+        phase: &GatePhase,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let content: AnyElement = match phase {
             // Backend unreachable: quiet centered copy (komet Gate `Failed`),
@@ -278,7 +282,11 @@ impl Shell {
 
     /// Organization onboarding used by the synced gate and, for a local
     /// runtime, only after the user explicitly starts the sync opt-in.
-    pub(super) fn render_org_gate(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_org_gate(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         self.ensure_org_ui(cx);
         let theme = Theme::of(cx).clone();
         let local_setup = self.state.read(cx).workspace_scope == Some(WorkspaceScope::Local);

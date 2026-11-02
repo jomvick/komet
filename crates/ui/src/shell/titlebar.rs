@@ -83,7 +83,11 @@ impl Shell {
     /// The unified window titlebar: chat → the session tab strip; settings →
     /// the section label. Full-width on the glass shell; the traffic lights
     /// and control cluster overlay its left end.
-    pub(super) fn render_title_bar(&mut self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_title_bar(
+        &mut self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let (linux_left_controls, linux_right_controls) =
             self.linux_titlebar_controls_width(window, cx);
         match self.route {
@@ -249,7 +253,11 @@ impl Shell {
     /// titlebar. `WindowControlArea` maps these hit targets to HTMINBUTTON,
     /// HTMAXBUTTON, and HTCLOSE, so Windows owns their behavior (including
     /// Snap Layouts) while GPUI renders the system Segoe caption glyphs.
-    pub(super) fn render_windows_caption_controls(&self, window: &Window, cx: &App) -> Option<AnyElement> {
+    pub(super) fn render_windows_caption_controls(
+        &self,
+        window: &Window,
+        cx: &App,
+    ) -> Option<AnyElement> {
         if !cfg!(target_os = "windows") {
             return None;
         }
@@ -431,5 +439,4 @@ impl Shell {
             )
             .into_any_element()
     }
-
 }

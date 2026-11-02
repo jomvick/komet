@@ -1,6 +1,5 @@
 use gpui::{
-    AnyElement, Context, IntoElement, MouseButton, SharedString, Window, div,
-    prelude::*, px,
+    AnyElement, Context, IntoElement, MouseButton, SharedString, Window, div, prelude::*, px,
 };
 use komet_engine::environments::LOCAL_ENV_ID;
 use komet_proto::{ChatIndicator, WorkspaceScope};
@@ -20,7 +19,11 @@ pub struct SidebarSessionRow {
 }
 
 impl Shell {
-    pub(super) fn render_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_sidebar(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let inner: AnyElement = match self.route {
             Route::Settings(section) => self.render_settings_nav(section, &theme, cx),
@@ -447,7 +450,11 @@ impl Shell {
     /// and the one click that moves the whole column onto another device. Rows
     /// carry their reachability dot; pairing a new device happens in Settings →
     /// Sync, which the menu's footer opens.
-    pub(super) fn render_workspace_switcher(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_workspace_switcher(
+        &mut self,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let (label, status, rows, active_id) = {
             let state = self.state.read(cx);
             (
@@ -882,5 +889,4 @@ impl Shell {
             .child(div().p(px(Theme::SPACE_SM)).flex_none().child(user_menu))
             .into_any_element()
     }
-
 }

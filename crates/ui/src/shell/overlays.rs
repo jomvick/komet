@@ -4,8 +4,8 @@ use std::time::Duration;
 
 use chrono::Utc;
 use gpui::{
-    AnyElement, Context, IntoElement, MouseButton, Pixels, SharedString,
-    Window, div, prelude::*, px,
+    AnyElement, Context, IntoElement, MouseButton, Pixels, SharedString, Window, div, prelude::*,
+    px,
 };
 use gpui_tokio::Tokio;
 use komet_engine::harness_cli::HarnessCliStatus;
@@ -40,7 +40,11 @@ pub fn newly_detected_update(
         .map(str::to_owned)
 }
 
-pub fn update_notification_allowed(enabled: bool, background_only: bool, app_focused: bool) -> bool {
+pub fn update_notification_allowed(
+    enabled: bool,
+    background_only: bool,
+    app_focused: bool,
+) -> bool {
     enabled && !(background_only && app_focused)
 }
 
@@ -321,7 +325,10 @@ impl Shell {
 
     /// Floating notification for agent CLI updates. It remains visible across
     /// routes and active sessions, and stays dismissed after × for this run.
-    pub(super) fn render_harness_updates_card(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    pub(super) fn render_harness_updates_card(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
         if self.cli_updates.is_empty() || self.cli_updates_dismissed {
             return None;
         }
@@ -545,7 +552,11 @@ impl Shell {
     /// it drives the whole flow — click to download, then click to restart into
     /// the staged bundle. Elsewhere (managed/source installs) it is advisory
     /// (`komet update`); click dismisses it for that version.
-    pub(super) fn render_update_strip(&mut self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+    pub(super) fn render_update_strip(
+        &mut self,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
         let status = self.state.read(cx).update.clone()?;
         if !status.update_available {
             return None;
@@ -1276,5 +1287,4 @@ impl Shell {
 
         overlays
     }
-
 }

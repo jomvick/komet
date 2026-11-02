@@ -1,7 +1,7 @@
 use gpui::{App, KeyBinding, Keystroke};
 
 use super::{AddSpacePalette, NewSession, ToggleChanges, ToggleSidebar};
-use crate::settings::{platform_combo, KeymapConfig};
+use crate::settings::{KeymapConfig, platform_combo};
 use crate::terminal::panel::ToggleTerminal;
 
 /// (Re-)apply the whole app keymap: clears every binding, restores the composer

@@ -182,7 +182,10 @@ pub fn local_work_phrase(chats: usize, spaces: usize) -> Option<String> {
     }
 }
 
-pub fn account_menu_action(scope: Option<WorkspaceScope>, flow: SyncFlow) -> Option<AccountMenuAction> {
+pub fn account_menu_action(
+    scope: Option<WorkspaceScope>,
+    flow: SyncFlow,
+) -> Option<AccountMenuAction> {
     match scope {
         Some(WorkspaceScope::Local) => match flow {
             SyncFlow::Idle => None,
@@ -309,7 +312,11 @@ impl Shell {
         self.start_local_runtime_transition(true, cx);
     }
 
-    pub(super) fn start_local_runtime_transition(&mut self, sign_out: bool, cx: &mut Context<Self>) {
+    pub(super) fn start_local_runtime_transition(
+        &mut self,
+        sign_out: bool,
+        cx: &mut Context<Self>,
+    ) {
         if self.runtime_change_task.is_some() {
             return;
         }
