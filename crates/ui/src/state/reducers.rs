@@ -33,12 +33,24 @@ impl AppState {
         if let Some(selected) = &self.selected_chat
             && !self.chats.iter().any(|c| &c.id == selected)
         {
-            // Selected chat vanished (deleted elsewhere): drop selection + transcript.
-            self.selected_chat = None;
-            self.pending_access = None;
-            self.transcript.clear();
-            self.active_plan = None;
-            self.transcript_task = None;
+            // A minted chat whose CreateChat is still in flight lacks its
+            // row: keep the optimistic selection (the send runs under it).
+            // An expired/stale pending entry reads as truly vanished.
+            let pending_mint = self
+                .pending_sends
+                .get(selected)
+                .is_some_and(|p| {
+                    chrono::Utc::now().signed_duration_since(p.started).num_milliseconds()
+                        <= PENDING_SEND_TTL_MS
+                });
+            if !pending_mint {
+                // Selected chat vanished (deleted elsewhere): drop selection + transcript.
+                self.selected_chat = None;
+                self.pending_access = None;
+                self.transcript.clear();
+                self.active_plan = None;
+                self.transcript_task = None;
+            }
         }
         // The update may change the open chat's level from another device, or
         // remove the open chat, so recompute the level.

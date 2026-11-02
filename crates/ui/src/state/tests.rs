@@ -1199,6 +1199,24 @@ fn apply_chats_drops_vanished_selection() {
 }
 
 #[test]
+fn apply_chats_keeps_a_pending_minted_selection() {
+    // A fresh chat's optimistic selection must survive a chats-watch frame
+    // that arrives BEFORE its CreateChat returns from the host: treating it
+    // as "deleted elsewhere" dropped the selection + transcript and fell
+    // back to the new-session canvas mid-run (user report). Real vanished
+    // chats — no in-flight send under them — keep dropping as before.
+    let mut state = AppState::new();
+    state.apply_chats(vec![chat("b", 1, None)]);
+    state.selected_chat = Some("minted".into());
+    state.transcript = vec![user_entry("m1")];
+    state.begin_pending_send("minted", "m1", chrono::Utc::now());
+    // The snapshot the host took before minting the row reaches us first.
+    state.apply_chats(vec![chat("b", 1, None)]);
+    assert_eq!(state.selected_chat.as_deref(), Some("minted"));
+    assert_eq!(state.transcript.len(), 1);
+}
+
+#[test]
 fn apply_chat_config_stamps_the_row() {
     let mut state = AppState::new();
     state.apply_chats(vec![chat("a", 0, None), chat("b", 1, None)]);
