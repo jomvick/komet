@@ -1465,7 +1465,10 @@ impl Pickers {
                 }));
                 cx.notify();
             }
-            self.animate_close(cx);
+            // The picker stays open: the rail click re-scopes the viewed list
+            // (see the rail's doc comment) and the user picks a model right
+            // here — pick_model owns the close (user report: the menu closed
+            // on the tab click, before any model was pickable).
         }
         self.defaults.harness = Some(harness);
         self.save_defaults();
