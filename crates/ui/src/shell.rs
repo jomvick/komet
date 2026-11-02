@@ -18,10 +18,10 @@ use std::time::Duration;
 
 use chrono::Utc;
 use gpui::{
-    AnyElement, App, Context, Decorations, Empty, Entity, Focusable as _, IntoElement,
-    MouseButton, MouseDownEvent, MouseUpEvent, ObjectFit, Pixels, Point, Render,
-    ResizeEdge, SharedString, Size, StyleRefinement, StyledImage, Subscription, Task, Tiling,
-    Window, WindowButton, WindowButtonLayout, WindowControlArea, actions, div, img, prelude::*, px,
+    AnyElement, App, Context, Decorations, Empty, Entity, Focusable as _, IntoElement, MouseButton,
+    MouseDownEvent, MouseUpEvent, ObjectFit, Pixels, Point, Render, ResizeEdge, SharedString, Size,
+    StyleRefinement, StyledImage, Subscription, Task, Tiling, Window, WindowButton,
+    WindowButtonLayout, WindowControlArea, actions, div, img, prelude::*, px,
 };
 
 use komet_engine::harness_cli::HarnessCliStatus;
@@ -47,9 +47,8 @@ use crate::settings::shortcuts::{ShortcutsEvent, ShortcutsPage};
 use crate::settings::sync::{SyncEvent, SyncPage};
 use crate::settings::wallpaper;
 use crate::settings::{
-    RIGHT_PANE_DEFAULT, RIGHT_PANE_MAX, RIGHT_PANE_MIN, RememberedNavigation,
-    SAVE_DEBOUNCE_MS, SIDEBAR_DEFAULT, SIDEBAR_MAX, SIDEBAR_MIN, TERMINAL_DEFAULT_HEIGHT,
-    UiSettings,
+    RIGHT_PANE_DEFAULT, RIGHT_PANE_MAX, RIGHT_PANE_MIN, RememberedNavigation, SAVE_DEBOUNCE_MS,
+    SIDEBAR_DEFAULT, SIDEBAR_MAX, SIDEBAR_MIN, TERMINAL_DEFAULT_HEIGHT, UiSettings,
 };
 use crate::state::{
     AppState, ConnectionStatus, EngineBootConfig, EngineMode, GatePhase, Indicator,
@@ -87,15 +86,15 @@ mod keymap;
 pub use keymap::apply_keymap;
 mod titlebar;
 pub use titlebar::{
-    cluster_buttons_start, cluster_clearance, titlebar_cluster_start, titlebar_spacer_width,
-    CLUSTER_BUTTONS_WIDTH,
+    CLUSTER_BUTTONS_WIDTH, cluster_buttons_start, cluster_clearance, titlebar_cluster_start,
+    titlebar_spacer_width,
 };
 
 mod navigation;
 pub use navigation::{
-    CHAT_ROW_HEIGHT, ChatPanels, NavEntry, NavHistory, RESORT, RightSurface, Route, SessionPanels,
-    SettingsSection, SIDEBAR_GLASS_FADE_BAND, SIDEBAR_LIST_GAP, push_unique_right_surface,
-    resort_offsets, workspace_file_title,
+    CHAT_ROW_HEIGHT, ChatPanels, NavEntry, NavHistory, RESORT, RightSurface, Route,
+    SIDEBAR_GLASS_FADE_BAND, SIDEBAR_LIST_GAP, SessionPanels, SettingsSection,
+    push_unique_right_surface, resort_offsets, workspace_file_title,
 };
 
 mod gate;
@@ -1298,37 +1297,15 @@ impl Shell {
             )
     }
 
-}
-
-impl Render for Shell {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // `KOMET_WINDOW_STATS=1`: this is the window's only root render, so it
-        // runs exactly once per frame — the place to measure the frame budget
-        // (interval between passes, tree build and child renders; see
-        // `crate::perf`). Inactive windows are throttled to ~30 fps by gpui, so
-        // their intervals are excluded rather than scored as missed.
-        let _frame = crate::perf::frame(window.is_window_active());
-        if let Some((path, line)) = self.pending_workspace_file.take() {
-            if !self.right_pane_open(cx) {
-                self.toggle_right_pane(cx);
-            }
-            self.add_file_surface(path, line, window, cx);
-        }
-        if self.window_close_pending && self.all_file_edits_flushed(cx) {
-            self.window_close_pending = false;
-            window.defer(cx, |window, _| window.remove_window());
-        }
+    /// Build the application tree: wallpaper backdrop, the auth/org/error
+    /// gate switch and the platform caption chrome above it.
+    fn render_root(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
         let theme = Theme::of(cx);
-        // Sidebar and titlebar share one opaque shell tone; the workspace card
-        // uses the separate content tone. Keeping both explicit makes their
-        // reference colors identical across platforms and Settings.
         let (shell_surface, text, font) = (theme.surface, theme.text, theme.font_sans.clone());
-        let workspace_bg = theme.bg;
-        let (workspace_scope, auth) = {
-            let state = self.state.read(cx);
-            (state.workspace_scope, state.auth.clone())
-        };
-        self.sync_flow = sync_flow_after_auth(self.sync_flow, workspace_scope, auth.as_ref());
         let restart_required = self.sync_flow == SyncFlow::SignedOutRestartRequired;
         let gate = self
             .debug_gate
@@ -1488,176 +1465,7 @@ impl Render for Shell {
             gate.clone()
         };
         let root = match &render_gate {
-            GatePhase::Ready => {
-                // Focus is a sync signal: on the rising edge of window
-                // activation, nudge every open room to verify liveness — a
-                // broadcast-deaf socket (accepted writes, runtime pongs,
-                // nothing delivered; 2026-08-04 incident) then heals within
-                // seconds of the user looking at the app rather than waiting
-                // out the background probe cadence.
-                let window_active = window.is_window_active();
-                if window_active && !self.was_window_active {
-                    self.state.update(cx, |s, cx| s.probe_sync(cx));
-                }
-                self.was_window_active = window_active;
-                // A run finishing while you're LOOKING at the session must not
-                // badge "completed" until you leave and return — mark it seen
-                // live while the window is active (idempotent guard inside;
-                // one extra frame settles it).
-                if window_active {
-                    let unseen_selected = {
-                        let s = self.state.read(cx);
-                        s.selected_chat_row()
-                            .filter(|c| c.unseen())
-                            .map(|c| c.id.clone())
-                    };
-                    if let Some(chat_id) = unseen_selected {
-                        self.state
-                            .update(cx, |s, cx| s.mark_chat_seen(&chat_id, cx));
-                    }
-                }
-                // Capture knob: `KOMET_OPEN_DIALOG=model` pops the combined
-                // harness/model menu (needs `window`, so it fires here rather
-                // than in `on_state_changed`).
-                if self.debug_dialog.as_deref() == Some("model") {
-                    self.debug_dialog = None;
-                    self.composer
-                        .update(cx, |c, cx| c.debug_open_model_menu(window, cx));
-                }
-                // MessageRail width gate: hide below 48rem of main-panel width.
-                let viewport = f32::from(window.viewport_size().width);
-                // Stamped for `right_target` — the expanded changes panel
-                // sizes itself to the viewport.
-                self.viewport_width = viewport;
-                let main_width =
-                    (viewport - self.sidebar_target() - self.right_target(cx) - 10.0).max(0.0);
-                // Clearance excludes the terminal dock: the transcript
-                // viewport ends at the dock's top (see the underlay in
-                // `render_main`), so only the chrome above it overlaps.
-                let term_h = self.eval_tween(self.terminal_tween, self.terminal_target(cx));
-                let stack_h = (self.bottom_stack.get() - term_h).max(0.0);
-                self.transcript.update(cx, |t, cx| {
-                    t.set_rail_enabled(rail::rail_visible(main_width), cx);
-                    t.set_bottom_clearance(stack_h, cx);
-                });
-
-                let sidebar = self.render_sidebar(window, cx);
-                let sidebar_handle = self.resize_handle(
-                    "sidebar-resize",
-                    || SidebarResize,
-                    |shell, _| shell.settings.sidebar_width = SIDEBAR_DEFAULT,
-                    cx,
-                );
-                let main = self.render_main(window, cx);
-                // The Changes pane is chat-scoped chrome: the Settings route
-                // never renders it (komet __root.tsx `!isSettings && activeChat`
-                // around the diff column) — the per-session open flags stay
-                // intact for the return trip.
-                let on_chat = matches!(self.route, Route::Chat);
-                let right: AnyElement = if on_chat {
-                    self.render_right_pane(cx)
-                } else {
-                    Empty.into_any_element()
-                };
-                let overlays = self.render_overlays(window.viewport_size(), window, cx);
-                // Copied out (not held) — `render_title_bar` needs `cx` mutable.
-                let border_color = Theme::of(cx).border;
-                // The workspace is one inset surface: the transcript and any
-                // open side panel share its rounded boundary.
-                let panel_wallpaper = wallpaper::path(cx)
-                    .filter(|path| path.is_file())
-                    .and_then(|path| wallpaper::card_layer(path, wallpaper_scope, workspace_bg));
-                let workspace: AnyElement = div()
-                    .flex_1()
-                    .min_w_0()
-                    .mt(px(8.0))
-                    .mb(px(8.0))
-                    .ml(px(8.0))
-                    .mr(px(8.0))
-                    .flex()
-                    .flex_row()
-                    .overflow_hidden()
-                    .rounded(px(Theme::PANEL_RADIUS))
-                    .border_1()
-                    .border_color(border_color)
-                    .bg(workspace_bg)
-                    .children(panel_wallpaper)
-                    .child(main)
-                    .child(right)
-                    .into_any_element();
-                // The banner is a row ABOVE the workspace, not an overlay on it:
-                // the frame keeps painting and nothing has to be restored when
-                // the link comes back.
-                let card: AnyElement = match self.render_reconnect_banner(cx) {
-                    Some(banner) => div()
-                        .flex_1()
-                        .min_w_0()
-                        .flex()
-                        .flex_col()
-                        .child(banner)
-                        .child(workspace)
-                        .into_any_element(),
-                    None => workspace,
-                };
-                // The whole app page is one keyed `animate-in` entrance (komet
-                // App.tsx `<div key={phase} className="animate-in h-full">`):
-                // arriving from any gate fades the page in.
-                // The sidebar resize handle FLOATS over the sidebar/card seam
-                // (zero layout width, same idiom as the changes-pane grabber)
-                // so the sidebar's right gutter stays exactly as wide as its
-                // left one — a 5px flex child here read as lopsided spacing.
-                let sidebar_seam = div()
-                    .w(px(0.0))
-                    .h_full()
-                    .flex_none()
-                    .relative()
-                    .child(sidebar_handle.absolute().top_0().bottom_0().left(px(-2.0)));
-                let (linux_left_controls, _) = self.linux_titlebar_controls_width(window, cx);
-                let title_bar = self.render_title_bar(window, cx);
-                // The sidebar and titlebar share the shell surface. Its width
-                // rides the same tween as the sidebar, so the tone melts away
-                // with the collapse instead of vanishing in a frame.
-                let sidebar_now = self.eval_tween(self.sidebar_tween, self.sidebar_target());
-                // The sidebar and titlebar are one uninterrupted shell surface.
-                let sidebar_tone = div()
-                    .absolute()
-                    .top(px(Theme::TITLEBAR_HEIGHT))
-                    .bottom_0()
-                    .left_0()
-                    .w(px(sidebar_now))
-                    .bg(shell_surface);
-                let titlebar_tone = div()
-                    .absolute()
-                    .top_0()
-                    .left_0()
-                    .right_0()
-                    .h(px(Theme::TITLEBAR_HEIGHT))
-                    .bg(shell_surface);
-                // Start the content row below the unified titlebar. The
-                // sidebar stays flush with the shell; the workspace gets its
-                // own inset and rounded boundary.
-                let explorer: AnyElement = Empty.into_any_element();
-                let page = div()
-                    .size_full()
-                    .relative()
-                    .child(
-                        div()
-                            .size_full()
-                            .flex()
-                            .flex_row()
-                            .pt(px(Theme::TITLEBAR_HEIGHT))
-                            .child(sidebar)
-                            .child(sidebar_seam)
-                            .child(explorer)
-                            .child(card),
-                    )
-                    .child(div().absolute().top_0().left_0().right_0().child(title_bar))
-                    .child(self.render_titlebar_cluster(linux_left_controls, cx))
-                    .children(overlays);
-                root.child(sidebar_tone)
-                    .child(titlebar_tone)
-                    .child(motion::fade_in("phase-app", page))
-            }
+            GatePhase::Ready => self.render_ready_page(root, window, cx),
             // Only the sign-out restart lands here; a normal Connecting boot
             // renders the Ready page above.
             GatePhase::Loading => root,
@@ -1702,9 +1510,216 @@ impl Render for Shell {
                     .window_control_area(WindowControlArea::Drag),
             )
         };
-        let root = root
-            .children(self.render_windows_caption_controls(window, cx))
-            .children(self.render_linux_caption_controls(window, cx));
+        root.children(self.render_windows_caption_controls(window, cx))
+            .children(self.render_linux_caption_controls(window, cx))
+    }
+
+    /// The application page behind the Ready gate: titlebar, sidebar, workspace
+    /// card and overlays.
+    fn render_ready_page(
+        &mut self,
+        root: gpui::Stateful<gpui::Div>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let theme = Theme::of(cx);
+        let (shell_surface, workspace_bg) = (theme.surface, theme.bg);
+        let wallpaper_scope = wallpaper::scope(cx);
+        // Focus is a sync signal: on the rising edge of window
+        // activation, nudge every open room to verify liveness — a
+        // broadcast-deaf socket (accepted writes, runtime pongs,
+        // nothing delivered; 2026-08-04 incident) then heals within
+        // seconds of the user looking at the app rather than waiting
+        // out the background probe cadence.
+        let window_active = window.is_window_active();
+        if window_active && !self.was_window_active {
+            self.state.update(cx, |s, cx| s.probe_sync(cx));
+        }
+        self.was_window_active = window_active;
+        // A run finishing while you're LOOKING at the session must not
+        // badge "completed" until you leave and return — mark it seen
+        // live while the window is active (idempotent guard inside;
+        // one extra frame settles it).
+        if window_active {
+            let unseen_selected = {
+                let s = self.state.read(cx);
+                s.selected_chat_row()
+                    .filter(|c| c.unseen())
+                    .map(|c| c.id.clone())
+            };
+            if let Some(chat_id) = unseen_selected {
+                self.state
+                    .update(cx, |s, cx| s.mark_chat_seen(&chat_id, cx));
+            }
+        }
+        // Capture knob: `KOMET_OPEN_DIALOG=model` pops the combined
+        // harness/model menu (needs `window`, so it fires here rather
+        // than in `on_state_changed`).
+        if self.debug_dialog.as_deref() == Some("model") {
+            self.debug_dialog = None;
+            self.composer
+                .update(cx, |c, cx| c.debug_open_model_menu(window, cx));
+        }
+        // MessageRail width gate: hide below 48rem of main-panel width.
+        let viewport = f32::from(window.viewport_size().width);
+        // Stamped for `right_target` — the expanded changes panel
+        // sizes itself to the viewport.
+        self.viewport_width = viewport;
+        let main_width = (viewport - self.sidebar_target() - self.right_target(cx) - 10.0).max(0.0);
+        // Clearance excludes the terminal dock: the transcript
+        // viewport ends at the dock's top (see the underlay in
+        // `render_main`), so only the chrome above it overlaps.
+        let term_h = self.eval_tween(self.terminal_tween, self.terminal_target(cx));
+        let stack_h = (self.bottom_stack.get() - term_h).max(0.0);
+        self.transcript.update(cx, |t, cx| {
+            t.set_rail_enabled(rail::rail_visible(main_width), cx);
+            t.set_bottom_clearance(stack_h, cx);
+        });
+
+        let sidebar = self.render_sidebar(window, cx);
+        let sidebar_handle = self.resize_handle(
+            "sidebar-resize",
+            || SidebarResize,
+            |shell, _| shell.settings.sidebar_width = SIDEBAR_DEFAULT,
+            cx,
+        );
+        let main = self.render_main(window, cx);
+        // The Changes pane is chat-scoped chrome: the Settings route
+        // never renders it (komet __root.tsx `!isSettings && activeChat`
+        // around the diff column) — the per-session open flags stay
+        // intact for the return trip.
+        let on_chat = matches!(self.route, Route::Chat);
+        let right: AnyElement = if on_chat {
+            self.render_right_pane(cx)
+        } else {
+            Empty.into_any_element()
+        };
+        let overlays = self.render_overlays(window.viewport_size(), window, cx);
+        // Copied out (not held) — `render_title_bar` needs `cx` mutable.
+        let border_color = Theme::of(cx).border;
+        // The workspace is one inset surface: the transcript and any
+        // open side panel share its rounded boundary.
+        let panel_wallpaper = wallpaper::path(cx)
+            .filter(|path| path.is_file())
+            .and_then(|path| wallpaper::card_layer(path, wallpaper_scope, workspace_bg));
+        let workspace: AnyElement = div()
+            .flex_1()
+            .min_w_0()
+            .mt(px(8.0))
+            .mb(px(8.0))
+            .ml(px(8.0))
+            .mr(px(8.0))
+            .flex()
+            .flex_row()
+            .overflow_hidden()
+            .rounded(px(Theme::PANEL_RADIUS))
+            .border_1()
+            .border_color(border_color)
+            .bg(workspace_bg)
+            .children(panel_wallpaper)
+            .child(main)
+            .child(right)
+            .into_any_element();
+        // The banner is a row ABOVE the workspace, not an overlay on it:
+        // the frame keeps painting and nothing has to be restored when
+        // the link comes back.
+        let card: AnyElement = match self.render_reconnect_banner(cx) {
+            Some(banner) => div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .child(banner)
+                .child(workspace)
+                .into_any_element(),
+            None => workspace,
+        };
+        // The whole app page is one keyed `animate-in` entrance (komet
+        // App.tsx `<div key={phase} className="animate-in h-full">`):
+        // arriving from any gate fades the page in.
+        // The sidebar resize handle FLOATS over the sidebar/card seam
+        // (zero layout width, same idiom as the changes-pane grabber)
+        // so the sidebar's right gutter stays exactly as wide as its
+        // left one — a 5px flex child here read as lopsided spacing.
+        let sidebar_seam = div()
+            .w(px(0.0))
+            .h_full()
+            .flex_none()
+            .relative()
+            .child(sidebar_handle.absolute().top_0().bottom_0().left(px(-2.0)));
+        let (linux_left_controls, _) = self.linux_titlebar_controls_width(window, cx);
+        let title_bar = self.render_title_bar(window, cx);
+        // The sidebar and titlebar share the shell surface. Its width
+        // rides the same tween as the sidebar, so the tone melts away
+        // with the collapse instead of vanishing in a frame.
+        let sidebar_now = self.eval_tween(self.sidebar_tween, self.sidebar_target());
+        // The sidebar and titlebar are one uninterrupted shell surface.
+        let sidebar_tone = div()
+            .absolute()
+            .top(px(Theme::TITLEBAR_HEIGHT))
+            .bottom_0()
+            .left_0()
+            .w(px(sidebar_now))
+            .bg(shell_surface);
+        let titlebar_tone = div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .right_0()
+            .h(px(Theme::TITLEBAR_HEIGHT))
+            .bg(shell_surface);
+        // Start the content row below the unified titlebar. The
+        // sidebar stays flush with the shell; the workspace gets its
+        // own inset and rounded boundary.
+        let explorer: AnyElement = Empty.into_any_element();
+        let page = div()
+            .size_full()
+            .relative()
+            .child(
+                div()
+                    .size_full()
+                    .flex()
+                    .flex_row()
+                    .pt(px(Theme::TITLEBAR_HEIGHT))
+                    .child(sidebar)
+                    .child(sidebar_seam)
+                    .child(explorer)
+                    .child(card),
+            )
+            .child(div().absolute().top_0().left_0().right_0().child(title_bar))
+            .child(self.render_titlebar_cluster(linux_left_controls, cx))
+            .children(overlays);
+        root.child(sidebar_tone)
+            .child(titlebar_tone)
+            .child(motion::fade_in("phase-app", page))
+    }
+}
+
+impl Render for Shell {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // `KOMET_WINDOW_STATS=1`: this is the window's only root render, so it
+        // runs exactly once per frame — the place to measure the frame budget
+        // (interval between passes, tree build and child renders; see
+        // `crate::perf`). Inactive windows are throttled to ~30 fps by gpui, so
+        // their intervals are excluded rather than scored as missed.
+        let _frame = crate::perf::frame(window.is_window_active());
+        if let Some((path, line)) = self.pending_workspace_file.take() {
+            if !self.right_pane_open(cx) {
+                self.toggle_right_pane(cx);
+            }
+            self.add_file_surface(path, line, window, cx);
+        }
+        if self.window_close_pending && self.all_file_edits_flushed(cx) {
+            self.window_close_pending = false;
+            window.defer(cx, |window, _| window.remove_window());
+        }
+        let (workspace_scope, auth) = {
+            let state = self.state.read(cx);
+            (state.workspace_scope, state.auth.clone())
+        };
+        self.sync_flow = sync_flow_after_auth(self.sync_flow, workspace_scope, auth.as_ref());
+        let root = self.render_root(window, cx);
+
         if cfg!(target_os = "linux")
             && let Decorations::Client { tiling } = window.window_decorations()
         {
