@@ -21,6 +21,7 @@ pub mod blobatar;
 pub mod changes;
 pub mod comments;
 pub mod composer;
+pub mod composer_widgets;
 pub mod context_usage;
 pub mod edge_fade;
 pub mod files;
