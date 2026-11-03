@@ -767,6 +767,7 @@ impl Shell {
     pub(super) fn toggle_widgets(
         &mut self,
         kind: crate::composer_widgets::WidgetKind,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if self.widgets.open.take_press_was_open() {
@@ -777,6 +778,10 @@ impl Shell {
             self.close_widgets(cx);
         } else {
             self.widgets.open_popup(kind);
+            // The popup card claims the keyboard so Escape closes it.
+            if let Some(handle) = self.widgets.focus.clone() {
+                window.focus(&handle, cx);
+            }
             cx.notify();
         }
     }

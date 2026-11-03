@@ -87,11 +87,8 @@ impl Shell {
             let chip = self.render_widget_chip(kind, &content, open == Some(kind), &theme, cx);
             let chip = if overlay.as_ref().is_some_and(|(owned, _)| *owned == kind) {
                 let (_, element) = overlay.take().expect("matched just above");
-                chip.child(popover::anchored_menu_above(
-                    "widget-popup",
-                    element,
-                    closing,
-                ))
+                let popup_id = SharedString::from(format!("widget-popup-{kind:?}"));
+                chip.child(popover::anchored_menu_above(popup_id, element, closing))
             } else {
                 chip
             };
@@ -167,9 +164,9 @@ impl Shell {
                     }
                 }),
             )
-            .on_click(cx.listener(move |this, _, _, cx| match kind {
+            .on_click(cx.listener(move |this, _, window, cx| match kind {
                 WidgetKind::Changes => this.open_changes_widget(cx),
-                _ => this.toggle_widgets(kind, cx),
+                _ => this.toggle_widgets(kind, window, cx),
             }))
     }
 
@@ -184,8 +181,9 @@ impl Shell {
     ) -> AnyElement {
         use crate::composer_widgets::WidgetKind;
 
+        let id = SharedString::from(format!("widget-popup-{kind:?}"));
         let card = popover::popover_card(theme)
-            .id("widget-popup-card")
+            .id(id)
             .w(px(340.0))
             .max_h(px(320.0))
             .overflow_y_scroll()
