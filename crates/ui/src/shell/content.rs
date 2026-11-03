@@ -1136,30 +1136,6 @@ impl Shell {
                         self.render_surface_picker(cx)
                     }
                 }
-                RightSurface::AgentShell => {
-                    // Read at paint time: the panel is a projection of the
-                    // transcript (commands from the doc's `Exec` chips, output
-                    // from the ephemeral activity tails), so it holds no
-                    // entity, no subscription — and no path to a PTY.
-                    let log = self.transcript.read(cx).agent_shell_log();
-                    let harness = self
-                        .composer
-                        .read(cx)
-                        .pickers()
-                        .read(cx)
-                        .resolved(cx)
-                        .harness;
-                    let agent = harness.map(|id| id.display_name().to_string());
-                    let surface = harness.map_or(komet_proto::ProgressSurface::None, |id| {
-                        komet_harness::capabilities::interaction_surface(id).tool_progress
-                    });
-                    crate::agent_shell::render(
-                        &log,
-                        agent.as_deref().unwrap_or("The agent"),
-                        surface,
-                        &theme,
-                    )
-                }
                 _ => self.render_surface_picker(cx),
             };
             // Files browser companion: shown alongside File editor tabs
@@ -1348,14 +1324,6 @@ impl Shell {
                                         this.add_terminal_surface(cx);
                                     }),
                                 ),
-                            )
-                            // The agent's own shell, in read-only: no Komet PTY
-                            // is involved, so nothing here can be typed into.
-                            .child(
-                                row("surface-card-agent-shell", icons::TERMINAL, "Shell agent")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.add_agent_shell_surface(cx);
-                                    })),
                             )
                             .child(
                                 row("surface-card-files", icons::FOLDER_WITH_FILES, "Files")

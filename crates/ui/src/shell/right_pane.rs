@@ -159,14 +159,6 @@ impl Shell {
                     .subagent_tabs
                     .get(id)
                     .map(|panel| (*surface, panel.read(cx).tab_title(), false, None)),
-                RightSurface::AgentShell => Some((
-                    *surface,
-                    SharedString::from("Shell agent"),
-                    false,
-                    Some(SharedString::from(
-                        "Read-only view of the agent's own shell",
-                    )),
-                )),
             })
             .collect()
     }
@@ -259,10 +251,6 @@ impl Shell {
                 if let Some(panel) = self.subagent_tabs.get(&id).cloned() {
                     panel.update(cx, |panel, cx| panel.ensure_started(cx));
                 }
-            }
-            RightSurface::AgentShell => {
-                // Nothing to load or start: the surface reads the transcript
-                // at paint time and owns no subscription by design.
             }
             RightSurface::Picker => {}
         }
@@ -448,8 +436,7 @@ impl Shell {
             RightSurface::Diff(_)
             | RightSurface::Picker
             | RightSurface::Terminal(_)
-            | RightSurface::Subagent(_)
-            | RightSurface::AgentShell => {
+            | RightSurface::Subagent(_) => {
                 return None;
             }
         };
@@ -617,10 +604,6 @@ impl Shell {
                 // is closed is a feed nobody is watching.
                 self.subagent_tabs.remove(&id);
                 self.subagent_subs.remove(&id);
-            }
-            RightSurface::AgentShell => {
-                // Nothing to tear down: the read-only surface owns no entity,
-                // no subscription, and no PTY.
             }
             RightSurface::Picker => {}
         }
@@ -891,26 +874,6 @@ impl Shell {
             self.right_tween = Some(WidthTween::new(from, self.right_target(cx)));
         }
         self.set_right_active(surface, cx);
-    }
-
-    /// The picker's « Shell agent » card: the read-only log of the commands
-    /// the agent ran in its OWN shell (Claude/Codex keep that traffic out of
-    /// any Komet PTY). One tab per chat — it projects the transcript's tool
-    /// events, so a second tab would show the identical list.
-    pub(super) fn add_agent_shell_surface(&mut self, cx: &mut Context<Self>) {
-        let key = self.panel_key(cx);
-        push_unique_right_surface(
-            self.right_tabs.entry(key.clone()).or_default(),
-            RightSurface::AgentShell,
-        );
-        // Same rule as a spawn chip's tab: opening a surface the user cannot
-        // see reads as the click doing nothing.
-        if !self.right_pane_open(cx) {
-            let from = self.right_target(cx);
-            self.panels.update(&key, |p| p.changes_open = true);
-            self.right_tween = Some(WidthTween::new(from, self.right_target(cx)));
-        }
-        self.set_right_active(RightSurface::AgentShell, cx);
     }
 
     /// The picker's Terminal card / the `+` menu's Terminal row: every click
