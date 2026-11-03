@@ -5,6 +5,7 @@
 //! Pure helpers live here first; the gpui rendering is added in later tasks.
 
 use crate::changes::FileDiff;
+use gpui::SharedString;
 use std::time::{Duration, Instant};
 
 /// Visibility of one chip with a linger window: the chip appears the moment
@@ -62,6 +63,202 @@ impl LingerGate {
     }
 }
 
+/// Which composer widget a popup belongs to. The strip shares one popup, so
+/// the kind is the popup's payload (pickers' `Popup<PickerKind>` pattern).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WidgetKind {
+    Changes,
+    Subagents,
+    Processes,
+}
+
+/// Everything the strip renders from, gathered once per paint by the shell.
+#[derive(Debug, Default)]
+pub struct StripInput {
+    /// `None` = clean tree or no diff yet: the changes chip stays hidden.
+    pub widget_changes: Option<(usize, u32, u32)>,
+    pub subagent_rows: Vec<crate::transcript::SubagentRowData>,
+    pub process_entries: Vec<crate::transcript::AgentShellEntry>,
+    /// The harness declares a subagent surface at all.
+    pub subagents_allowed: bool,
+    /// The harness streams tool progress at all.
+    pub processes_allowed: bool,
+}
+
+/// One chip's rendered content, decided by pure code so the layout stays dumb.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChipContent {
+    pub visible: bool,
+    pub icon: &'static str,
+    pub label: SharedString,
+}
+
+/// A chip's label and visibility, from the current data and the harness
+/// capabilities. Hidden chips render nothing at all.
+pub fn chip_content(kind: WidgetKind, input: &StripInput) -> ChipContent {
+    let (visible, icon, label) = match kind {
+        WidgetKind::Changes => {
+            let Some((files, additions, deletions)) = input.widget_changes else {
+                return ChipContent {
+                    visible: false,
+                    icon: crate::icons::FILE_DIFF,
+                    label: SharedString::default(),
+                };
+            };
+            let file_word = if files == 1 { "file" } else { "files" };
+            (
+                true,
+                crate::icons::FILE_DIFF,
+                format!("{files} {file_word} +{additions} −{deletions}"),
+            )
+        }
+        WidgetKind::Subagents => {
+            let count = input.subagent_rows.len();
+            let word = if count == 1 { "agent" } else { "agents" };
+            (
+                input.subagents_allowed && count > 0,
+                crate::icons::WIDGET,
+                format!("{count} {word}"),
+            )
+        }
+        WidgetKind::Processes => {
+            let count = input.process_entries.len();
+            let word = if count == 1 { "process" } else { "processes" };
+            (
+                input.processes_allowed && count > 0,
+                crate::icons::TERMINAL,
+                format!("{count} {word}"),
+            )
+        }
+    };
+    ChipContent {
+        visible,
+        icon,
+        label: SharedString::from(label),
+    }
+}
+
+/// Cut in the middle so both the command name and its tail survive:
+/// `…` replaces the omitted run, and the result is exactly `max` chars.
+pub fn truncate_middle(s: &str, max: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max || max == 0 {
+        return s.to_string();
+    }
+    let keep = max.saturating_sub(1);
+    let head = keep / 2;
+    let tail = keep - head;
+    let mut out: String = chars[..head].iter().collect();
+    out.push('…');
+    out.extend(&chars[chars.len() - tail..]);
+    out
+}
+
+/// A process row: the command, cut for the popup, and the last thing it
+/// printed (skipping blank trailing lines). Commands run inside the agent's
+/// own shell — this view is read-only and has no stop control.
+pub fn process_row_lines(
+    entry: &crate::transcript::AgentShellEntry,
+) -> (String, Option<SharedString>) {
+    let command = truncate_middle(&entry.command, PROCESS_COMMAND_MAX);
+    let last = entry
+        .output
+        .iter()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .map(|line| SharedString::from(line.trim_end()));
+    (command, last)
+}
+
+/// Command column width before middle-truncation (a popup row, not a pager).
+const PROCESS_COMMAND_MAX: usize = 44;
+
+/// Timeline state of one process entry, for the row's dot.
+pub fn process_tint(
+    status: crate::transcript::AgentShellStatus,
+    theme: &crate::theme::Theme,
+) -> gpui::Hsla {
+    use crate::transcript::AgentShellStatus;
+    match status {
+        AgentShellStatus::Running => theme.busy,
+        AgentShellStatus::Done => theme.success,
+        AgentShellStatus::Failed => theme.danger,
+    }
+}
+
+/// The strip's state: one shared popup plus one visibility gate per chip.
+pub struct WidgetStrip {
+    pub open: crate::popover::Popup<WidgetKind>,
+    pub changes_gate: LingerGate,
+    pub subagents_gate: LingerGate,
+    pub processes_gate: LingerGate,
+}
+
+impl Default for WidgetStrip {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl WidgetStrip {
+    pub fn new() -> Self {
+        Self {
+            open: crate::popover::Popup::default(),
+            changes_gate: LingerGate::new(Duration::from_millis(600)),
+            subagents_gate: LingerGate::new(Duration::from_secs(6)),
+            processes_gate: LingerGate::new(Duration::from_secs(6)),
+        }
+    }
+
+    pub fn open_popup(&mut self, kind: WidgetKind) {
+        self.open.open(kind);
+    }
+
+    /// Chat switch: the popup and every linger belong to the old chat.
+    pub fn reset(&mut self) {
+        self.open = crate::popover::Popup::default();
+        self.changes_gate.reset();
+        self.subagents_gate.reset();
+        self.processes_gate.reset();
+    }
+
+    /// Advance the three gates; returns visibility in render order
+    /// (Changes, Subagents, Processes).
+    pub fn step(&mut self, input: &StripInput, now: Instant) -> [bool; 3] {
+        let failed = input
+            .process_entries
+            .iter()
+            .any(|entry| entry.status == crate::transcript::AgentShellStatus::Failed);
+        [
+            self.changes_gate
+                .step(input.widget_changes.is_some(), false, now),
+            self.subagents_gate.step(
+                input.subagents_allowed && !input.subagent_rows.is_empty(),
+                false,
+                now,
+            ),
+            self.processes_gate.step(
+                input.processes_allowed && !input.process_entries.is_empty(),
+                failed,
+                now,
+            ),
+        ]
+    }
+
+    /// Soonest gate deadline, for the shell's one-shot wake.
+    pub fn wake_in(&self, now: Instant) -> Option<Duration> {
+        [
+            self.changes_gate.wake_in(now),
+            self.subagents_gate.wake_in(now),
+            self.processes_gate.wake_in(now),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+    }
+}
+
+/// (`15190` → `15.2k`) so the pill stays short.
 /// A counter rendered in a chip: plain below a thousand, one decimal above
 /// (`15190` → `15.2k`) so the pill stays short.
 pub fn format_count(n: u32) -> String {
@@ -191,5 +388,184 @@ mod tests {
         gate.step(true, true, now);
         gate.reset();
         assert!(!gate.step(false, false, now));
+    }
+
+    fn subagent_row(id: &str) -> crate::transcript::SubagentRowData {
+        crate::transcript::SubagentRowData {
+            spawn: crate::subagent::SubagentSpawn {
+                parent_tool_use_id: id.into(),
+                title: "Agent: scan".into(),
+                model: None,
+                status: Some(komet_doc::SubagentStatus::Running),
+                duration_ms: None,
+                tool_count: None,
+            },
+            live: None,
+            target_device_id: None,
+        }
+    }
+
+    fn process_entry(
+        status: crate::transcript::AgentShellStatus,
+        output: &[&str],
+    ) -> crate::transcript::AgentShellEntry {
+        crate::transcript::AgentShellEntry {
+            id: "p".into(),
+            command: "cargo test".into(),
+            status,
+            output: output.iter().map(|line| (*line).into()).collect(),
+            truncated_by: 0,
+            output_live: true,
+        }
+    }
+
+    fn strip_input() -> StripInput {
+        StripInput {
+            widget_changes: None,
+            subagent_rows: Vec::new(),
+            process_entries: Vec::new(),
+            subagents_allowed: true,
+            processes_allowed: true,
+        }
+    }
+
+    #[test]
+    fn truncate_middle_keeps_short_and_exact_strings() {
+        assert_eq!(truncate_middle("cargo test", 44), "cargo test");
+        let exact = "x".repeat(44);
+        assert_eq!(truncate_middle(&exact, 44), exact);
+    }
+
+    #[test]
+    fn truncate_middle_cuts_the_middle() {
+        let long = format!("{}{}", "a".repeat(50), "b".repeat(50));
+        let cut = truncate_middle(&long, 10);
+        assert_eq!(cut.chars().count(), 10);
+        assert!(cut.starts_with("aaaa"));
+        assert!(cut.ends_with("bbbbb"));
+        assert!(cut.contains('…'));
+    }
+
+    #[test]
+    fn changes_chip_labels_files_and_lines() {
+        let mut input = strip_input();
+        input.widget_changes = Some((2, 5, 3));
+        let chip = chip_content(WidgetKind::Changes, &input);
+        assert!(chip.visible);
+        assert_eq!(chip.icon, crate::icons::FILE_DIFF);
+        assert_eq!(chip.label.as_ref(), "2 files +5 −3");
+
+        input.widget_changes = Some((1, 3, 1));
+        assert_eq!(
+            chip_content(WidgetKind::Changes, &input).label.as_ref(),
+            "1 file +3 −1"
+        );
+
+        input.widget_changes = None;
+        assert!(!chip_content(WidgetKind::Changes, &input).visible);
+    }
+
+    #[test]
+    fn subagent_and_process_chips_count_rows() {
+        let mut input = strip_input();
+        input.subagent_rows = vec![subagent_row("a")];
+        let chip = chip_content(WidgetKind::Subagents, &input);
+        assert!(chip.visible);
+        assert_eq!(chip.label.as_ref(), "1 agent");
+
+        input.subagent_rows.push(subagent_row("b"));
+        input.subagent_rows.push(subagent_row("c"));
+        assert_eq!(
+            chip_content(WidgetKind::Subagents, &input).label.as_ref(),
+            "3 agents"
+        );
+
+        let mut input = strip_input();
+        input.process_entries = vec![process_entry(
+            crate::transcript::AgentShellStatus::Running,
+            &[],
+        )];
+        assert_eq!(
+            chip_content(WidgetKind::Processes, &input).label.as_ref(),
+            "1 process"
+        );
+        input.process_entries.push(process_entry(
+            crate::transcript::AgentShellStatus::Done,
+            &[],
+        ));
+        assert_eq!(
+            chip_content(WidgetKind::Processes, &input).label.as_ref(),
+            "2 processes"
+        );
+    }
+
+    #[test]
+    fn capability_gating_hides_a_chip_even_with_data() {
+        let mut input = strip_input();
+        input.subagent_rows = vec![subagent_row("a")];
+        input.process_entries = vec![process_entry(
+            crate::transcript::AgentShellStatus::Running,
+            &[],
+        )];
+        input.subagents_allowed = false;
+        input.processes_allowed = false;
+        assert!(!chip_content(WidgetKind::Subagents, &input).visible);
+        assert!(!chip_content(WidgetKind::Processes, &input).visible);
+    }
+
+    #[test]
+    fn process_rows_keep_the_last_non_blank_output_line() {
+        let entry = process_entry(
+            crate::transcript::AgentShellStatus::Done,
+            &["first", "  ", "last line", ""],
+        );
+        let (command, last) = process_row_lines(&entry);
+        assert_eq!(command, "cargo test");
+        assert_eq!(last.as_deref(), Some("last line"));
+
+        let empty = process_entry(crate::transcript::AgentShellStatus::Running, &[]);
+        assert_eq!(process_row_lines(&empty).1, None);
+    }
+
+    #[test]
+    fn strip_gates_chips_and_resets_on_chat_switch() {
+        let now = Instant::now();
+        let mut strip = WidgetStrip::new();
+        let mut input = strip_input();
+        input.subagent_rows = vec![subagent_row("a")];
+        let visibility = strip.step(&input, now);
+        assert!(!visibility[0], "no diff, no changes chip");
+        assert!(visibility[1], "subagents chip appears immediately");
+        assert!(!visibility[2], "no command, no processes chip");
+        assert_eq!(
+            strip.wake_in(now),
+            None,
+            "nothing to hide, nothing to schedule"
+        );
+
+        input.subagent_rows.clear();
+        assert!(strip.step(&input, now)[1]);
+        assert_eq!(
+            strip.wake_in(now),
+            Some(Duration::from_secs(6)),
+            "a settled chip lingers"
+        );
+        strip.reset();
+        assert!(!strip.step(&input, now)[1]);
+        assert_eq!(strip.wake_in(now), None);
+    }
+
+    #[test]
+    fn failed_commands_pin_the_processes_chip() {
+        let now = Instant::now();
+        let mut strip = WidgetStrip::new();
+        let mut input = strip_input();
+        input.process_entries = vec![process_entry(
+            crate::transcript::AgentShellStatus::Failed,
+            &[],
+        )];
+        assert!(strip.step(&input, now)[2]);
+        input.process_entries.clear();
+        assert!(strip.step(&input, now)[2], "a failure holds the pill up");
     }
 }
