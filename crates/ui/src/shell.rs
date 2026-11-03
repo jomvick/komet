@@ -521,9 +521,12 @@ impl Shell {
                 }
                 // A Run chip's badge: the read-only processes popup above
                 // the composer (retargeted from the old right-pane surface).
+                // A chat with no commands shows no chip, so it opens nothing.
                 TranscriptEvent::OpenAgentShell => {
-                    crate::composer_widgets::retarget_agent_shell(&mut this.widgets);
-                    cx.notify();
+                    if !this.transcript.read(cx).agent_shell_log().is_empty() {
+                        crate::composer_widgets::retarget_agent_shell(&mut this.widgets);
+                        cx.notify();
+                    }
                 }
             },
         );
