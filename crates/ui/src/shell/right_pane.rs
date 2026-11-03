@@ -667,11 +667,149 @@ impl Shell {
     pub(super) fn add_diff_surface(&mut self, cx: &mut Context<Self>) {
         // The strip's headless entity (if any) becomes the tab, so the chip's
         // watch and the pane's are one watch.
-        let changes = self
-            .widget_changes
-            .take()
-            .unwrap_or_else(|| cx.new(|cx| Changes::new(self.state.clone(), cx)));
+        let changes = match self.widget_changes.clone() {
+            Some(changes) => changes,
+            None => {
+                let changes = cx.new(|cx| Changes::new(self.state.clone(), cx));
+                self.widget_changes = Some(changes.clone());
+                changes
+            }
+        };
+        // Already a tab (the strip kept the entity): focus it instead of
+        // opening a second pane onto the same watch.
+        if let Some(id) = self
+            .diffs
+            .iter()
+            .find(|(_, diff)| diff.entity_id() == changes.entity_id())
+            .map(|(id, _)| *id)
+        {
+            let key = self.panel_key(cx);
+            push_unique_right_surface(
+                self.right_tabs.entry(key).or_default(),
+                RightSurface::Diff(id),
+            );
+            self.reveal_right_pane(cx);
+            self.set_right_active(RightSurface::Diff(id), cx);
+            return;
+        }
         self.register_diff_surface(changes, cx);
+        self.reveal_right_pane(cx);
+    }
+
+    /// Make sure the right pane is visible — opening a tab the user cannot
+    /// see would read as the click doing nothing.
+    fn reveal_right_pane(&mut self, cx: &mut Context<Self>) {
+        if !self.right_pane_open(cx) {
+            let key = self.panel_key(cx);
+            let from = self.right_target(cx);
+            self.panels.update(&key, |p| p.changes_open = true);
+            self.right_tween = Some(WidthTween::new(from, self.right_target(cx)));
+        }
+    }
+
+    /// The Changes chip: open (or focus) the working-tree diff pane. Never
+    /// toggles the pane shut — the chip is an "open", not a switch.
+    pub(super) fn open_changes_widget(&mut self, cx: &mut Context<Self>) {
+        if self.right_pane_open(cx)
+            && matches!(self.resolved_right_active(cx), RightSurface::Diff(_))
+        {
+            return;
+        }
+        let key = self.panel_key(cx);
+        let existing = self.right_tabs.get(&key).and_then(|tabs| {
+            tabs.iter().find_map(|surface| match surface {
+                RightSurface::Diff(id) => Some(*id),
+                _ => None,
+            })
+        });
+        match existing {
+            Some(id) => {
+                self.reveal_right_pane(cx);
+                self.set_right_active(RightSurface::Diff(id), cx);
+            }
+            None => self.add_diff_surface(cx),
+        }
+    }
+
+    /// The subagents popup's row click: open the child's transcript tab.
+    pub(super) fn open_subagent_tab(
+        &mut self,
+        row: &crate::transcript::SubagentRowData,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(chat_id) = self
+            .state
+            .read(cx)
+            .selected_chat_row()
+            .map(|chat| SharedString::from(chat.id.clone()))
+        else {
+            return;
+        };
+        let open = SubagentOpen {
+            chat_id,
+            target_device_id: row.target_device_id.clone(),
+            spawn: row.spawn.clone(),
+        };
+        self.add_subagent_surface(open, cx);
+    }
+
+    /// The working-tree summary behind the Changes chip; creates the headless
+    /// entity on first use and keeps it for the pane to take over.
+    pub(super) fn widget_changes_summary(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Option<(usize, u32, u32)> {
+        let changes = match self.widget_changes.clone() {
+            Some(changes) => changes,
+            None => {
+                let changes = cx.new(|cx| Changes::new(self.state.clone(), cx));
+                changes.update(cx, |changes, cx| changes.ensure_content(cx));
+                self.widget_changes = Some(changes.clone());
+                changes
+            }
+        };
+        changes.read(cx).summary(cx)
+    }
+
+    /// Close the strip's popup with the shared exit animation.
+    pub(super) fn close_widgets(&mut self, cx: &mut Context<Self>) {
+        if self.widgets.open.begin_close() {
+            crate::popover::reap_popup(cx, |shell: &mut Self| &mut shell.widgets.open);
+        }
+        cx.notify();
+    }
+
+    /// A popup chip's click: dismiss when the same press opened it, else
+    /// switch/open the menu.
+    pub(super) fn toggle_widgets(
+        &mut self,
+        kind: crate::composer_widgets::WidgetKind,
+        cx: &mut Context<Self>,
+    ) {
+        if self.widgets.open.take_press_was_open() {
+            self.close_widgets(cx);
+            return;
+        }
+        if self.widgets.open.as_open() == Some(&kind) {
+            self.close_widgets(cx);
+        } else {
+            self.widgets.open_popup(kind);
+            cx.notify();
+        }
+    }
+
+    /// One-shot repaint for the soonest chip-hide deadline.
+    pub(super) fn arm_widgets_wake(&mut self, delay: std::time::Duration, cx: &mut Context<Self>) {
+        self.widgets_wake = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(delay + std::time::Duration::from_millis(10))
+                .await;
+            this.update(cx, |shell, cx| {
+                shell.widgets_wake = None;
+                cx.notify();
+            })
+            .ok();
+        }));
     }
 
     /// A History row click: the commit opens as its own pinned diff tab

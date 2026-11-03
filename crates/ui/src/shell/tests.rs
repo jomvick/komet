@@ -892,3 +892,65 @@ fn only_idle_or_failed_rows_are_updated_again() {
     // A harness with no row yet is idle.
     assert!(cli_row_pending(&rows, HarnessId::Grok));
 }
+
+#[test]
+fn widget_strip_resets_only_on_a_chat_switch() {
+    use crate::composer_widgets::{WidgetKind, WidgetStrip};
+
+    let mut strip = WidgetStrip::new();
+    strip.open_popup(WidgetKind::Processes);
+    strip.reset_checked(None, None);
+    assert!(strip.open.as_open().is_some(), "same (no) chat keeps it");
+
+    strip.reset_checked(Some("chat-b"), None);
+    assert!(
+        strip.open.as_open().is_none(),
+        "a chat switch closes the popup"
+    );
+
+    strip.open_popup(WidgetKind::Subagents);
+    strip.reset_checked(Some("chat-b"), Some("chat-b"));
+    assert!(strip.open.as_open().is_some(), "same chat keeps it");
+}
+
+#[test]
+fn chip_allowed_follows_the_capability_matrix() {
+    use crate::composer_widgets::{WidgetKind, chip_allowed};
+    use komet_proto::{ProgressSurface, SubagentSurface};
+
+    assert!(!chip_allowed(
+        SubagentSurface::None,
+        ProgressSurface::None,
+        WidgetKind::Subagents
+    ));
+    assert!(chip_allowed(
+        SubagentSurface::Tagged,
+        ProgressSurface::None,
+        WidgetKind::Subagents
+    ));
+    assert!(!chip_allowed(
+        SubagentSurface::None,
+        ProgressSurface::None,
+        WidgetKind::Processes
+    ));
+    assert!(chip_allowed(
+        SubagentSurface::None,
+        ProgressSurface::Final,
+        WidgetKind::Processes
+    ));
+    assert!(chip_allowed(
+        SubagentSurface::None,
+        ProgressSurface::None,
+        WidgetKind::Changes
+    ));
+}
+
+#[test]
+fn open_agent_shell_event_targets_the_processes_popup() {
+    use crate::composer_widgets::{WidgetKind, WidgetStrip, retarget_agent_shell};
+
+    let mut strip = WidgetStrip::new();
+    strip.open_popup(WidgetKind::Subagents);
+    retarget_agent_shell(&mut strip);
+    assert_eq!(strip.open.as_open(), Some(&WidgetKind::Processes));
+}

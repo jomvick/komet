@@ -186,12 +186,34 @@ pub fn process_tint(
     }
 }
 
+/// Whether the harness's declared capabilities allow this chip at all.
+/// Changes reads git, so it is never capability-gated.
+pub fn chip_allowed(
+    subagents: komet_proto::SubagentSurface,
+    tool_progress: komet_proto::ProgressSurface,
+    kind: WidgetKind,
+) -> bool {
+    match kind {
+        WidgetKind::Changes => true,
+        WidgetKind::Subagents => subagents != komet_proto::SubagentSurface::None,
+        WidgetKind::Processes => tool_progress != komet_proto::ProgressSurface::None,
+    }
+}
+
+/// The transcript's "see the commands" affordance opens the processes popup
+/// above the composer instead of a right-pane surface.
+pub fn retarget_agent_shell(strip: &mut WidgetStrip) {
+    strip.open_popup(WidgetKind::Processes);
+}
+
 /// The strip's state: one shared popup plus one visibility gate per chip.
 pub struct WidgetStrip {
     pub open: crate::popover::Popup<WidgetKind>,
     pub changes_gate: LingerGate,
     pub subagents_gate: LingerGate,
     pub processes_gate: LingerGate,
+    /// Claims the keyboard while a popup is open (Escape closes it).
+    pub focus: Option<gpui::FocusHandle>,
 }
 
 impl Default for WidgetStrip {
@@ -207,6 +229,7 @@ impl WidgetStrip {
             changes_gate: LingerGate::new(Duration::from_millis(600)),
             subagents_gate: LingerGate::new(Duration::from_secs(6)),
             processes_gate: LingerGate::new(Duration::from_secs(6)),
+            focus: None,
         }
     }
 
@@ -222,6 +245,13 @@ impl WidgetStrip {
         self.processes_gate.reset();
     }
 
+    /// Reset only when the selected chat actually changed.
+    pub fn reset_checked(&mut self, new_chat: Option<&str>, old_chat: Option<&str>) {
+        if new_chat != old_chat {
+            self.reset();
+        }
+    }
+
     /// Advance the three gates; returns visibility in render order
     /// (Changes, Subagents, Processes).
     pub fn step(&mut self, input: &StripInput, now: Instant) -> [bool; 3] {
@@ -229,16 +259,24 @@ impl WidgetStrip {
             .process_entries
             .iter()
             .any(|entry| entry.status == crate::transcript::AgentShellStatus::Failed);
+        // An open popup holds its own chip up, so a command that finishes
+        // while the user reads its row does not yank the menu away.
+        let open = self.open.get().copied();
         [
-            self.changes_gate
-                .step(input.widget_changes.is_some(), false, now),
+            self.changes_gate.step(
+                input.widget_changes.is_some() || open == Some(WidgetKind::Changes),
+                false,
+                now,
+            ),
             self.subagents_gate.step(
-                input.subagents_allowed && !input.subagent_rows.is_empty(),
+                input.subagents_allowed && !input.subagent_rows.is_empty()
+                    || open == Some(WidgetKind::Subagents),
                 false,
                 now,
             ),
             self.processes_gate.step(
-                input.processes_allowed && !input.process_entries.is_empty(),
+                input.processes_allowed && !input.process_entries.is_empty()
+                    || open == Some(WidgetKind::Processes),
                 failed,
                 now,
             ),
@@ -278,6 +316,27 @@ pub fn summarize_diff(files: &[FileDiff]) -> Option<(usize, u32, u32)> {
     let additions = files.iter().map(|file| file.additions).sum();
     let deletions = files.iter().map(|file| file.deletions).sum();
     Some((files.len(), additions, deletions))
+}
+
+/// Why a command row shows no output: the harness's own reporting limit, said
+/// plainly instead of leaving a blank row.
+pub fn no_output_note(
+    status: crate::transcript::AgentShellStatus,
+    surface: komet_proto::ProgressSurface,
+) -> &'static str {
+    use crate::transcript::AgentShellStatus;
+    use komet_proto::ProgressSurface;
+    match (status, surface) {
+        (AgentShellStatus::Running, ProgressSurface::Streaming) => {
+            "waiting for the command's output…"
+        }
+        (AgentShellStatus::Running, _) => "this agent reports nothing while the command runs",
+        (_, ProgressSurface::Streaming) => "the command printed nothing",
+        (_, ProgressSurface::Final) => {
+            "no print carried: this agent settles a command's status, not its output"
+        }
+        (_, ProgressSurface::None) => "no output transmitted by this agent",
+    }
 }
 
 #[cfg(test)]
