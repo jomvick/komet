@@ -650,6 +650,70 @@ pub struct AgentShellEntry {
 /// hundred lines, and this view exists to be read, not folded to two.
 const SHELL_ENTRY_MAX_LINES: usize = 240;
 
+/// One spawn chip as the composer's subagents popup shows it: the tab it
+/// opens, plus the host's live counters while the child runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubagentRowData {
+    pub spawn: subagent::SubagentSpawn,
+    pub live: Option<SubagentLive>,
+    /// The device whose journal backs the feed; `None` is this device.
+    pub target_device_id: Option<SharedString>,
+}
+
+impl SubagentRowData {
+    fn is_running(&self) -> bool {
+        matches!(
+            self.spawn
+                .status
+                .or(self.live.as_ref().map(|live| live.status)),
+            Some(komet_doc::SubagentStatus::Running)
+        )
+    }
+}
+
+/// Spawn chips in doc order, deduped by part id (the last write wins), newest
+/// first and running before settled, capped at five (a popup, not a log).
+pub fn subagent_row_data(
+    rows: &[Row],
+    live: &HashMap<SharedString, SubagentLive>,
+) -> Vec<SubagentRowData> {
+    let mut out: Vec<SubagentRowData> = Vec::new();
+    for row in rows {
+        let RowKind::ToolGroup { tools, .. } = &row.kind else {
+            continue;
+        };
+        for tool in tools.iter() {
+            let Some(status) = tool.subagent_status else {
+                continue;
+            };
+            let spawn = subagent::SubagentSpawn {
+                parent_tool_use_id: tool.part_id.clone(),
+                title: SharedString::from(tool.chip_label.to_string()),
+                model: tool.call.subagent_model().map(SharedString::from),
+                status: Some(status),
+                duration_ms: tool.subagent_duration_ms,
+                tool_count: tool.subagent_tool_count,
+            };
+            let data = SubagentRowData {
+                spawn,
+                live: live.get(&tool.part_id).cloned(),
+                target_device_id: None,
+            };
+            match out
+                .iter_mut()
+                .find(|row| row.spawn.parent_tool_use_id == tool.part_id)
+            {
+                Some(slot) => *slot = data,
+                None => out.push(data),
+            }
+        }
+    }
+    out.reverse();
+    out.sort_by_key(|row| !row.is_running());
+    out.truncate(5);
+    out
+}
+
 /// The agent's shell commands, in transcript order, from the doc's tool rows
 /// plus the ephemeral output tails. Pure so it is testable without a gpui
 /// context; a tool that is not an `Exec` call is simply not a shell command.
@@ -3678,6 +3742,19 @@ impl Transcript {
     /// owns no PTY, and offers no way to type into anything.
     pub fn agent_shell_log(&self) -> Vec<AgentShellEntry> {
         agent_shell_entries(&self.rows, &self.shell_tails)
+    }
+
+    /// Spawn chips for the composer's subagents popup, tagged with the chat's
+    /// own device so a row opens the right feed.
+    pub fn subagent_rows(&self, cx: &App) -> Vec<SubagentRowData> {
+        let target = self.remote_host(cx).map(SharedString::from);
+        subagent_row_data(&self.rows, &self.subagent_live)
+            .into_iter()
+            .map(|mut row| {
+                row.target_device_id = target.clone();
+                row
+            })
+            .collect()
     }
 
     /// Drop the live tool-output watch and clear its buffers. Render-local
@@ -6882,6 +6959,30 @@ mod tests {
         }
     }
 
+    fn spawn_tool_item(id: &str, status: komet_doc::SubagentStatus) -> ToolItem {
+        let call = ToolCall::Unknown {
+            name: "Agent: scan".into(),
+            input: None,
+        };
+        let (chip_label, chip_detail) = tool_chip_content(&call);
+        ToolItem {
+            part_id: SharedString::from(id),
+            call,
+            chip_label,
+            chip_detail: SharedString::from(chip_detail),
+            is_error: false,
+            resolved: true,
+            subagent_status: Some(status),
+            subagent_duration_ms: Some(1500),
+            subagent_tool_count: Some(2),
+            detail: None,
+            invocation: None,
+            output_ref: None,
+            output_bytes: None,
+            diff_ref: None,
+        }
+    }
+
     #[test]
     fn agent_shell_log_reads_commands_from_the_doc_and_output_from_the_stream() {
         let exec =
@@ -6986,6 +7087,119 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["b", "c"]
         );
+    }
+
+    #[test]
+    fn subagent_row_data_reads_spawn_chips_and_prefers_live() {
+        let spawn = |id: &str, status: komet_doc::SubagentStatus| MessagePart::Tool {
+            id: id.into(),
+            call: ToolCall::Unknown {
+                name: "Agent: scan".into(),
+                input: None,
+            },
+            is_error: false,
+            resolved: true,
+            output: None,
+            diff: None,
+            output_ref: None,
+            output_bytes: None,
+            diff_ref: None,
+            diff_stats: None,
+            subagent_ref: None,
+            subagent_status: Some(status),
+            subagent_tail: None,
+            subagent_duration_ms: Some(1500),
+            subagent_tool_count: Some(2),
+        };
+        let rows = rows_for_entry(
+            &assistant(
+                "m-rows",
+                MessageStatus::Complete,
+                vec![
+                    tool_part("plain-exec", "ls"),
+                    spawn("spawn-a", komet_doc::SubagentStatus::Running),
+                ],
+            ),
+            false,
+            &mut parse,
+        );
+        let out = subagent_row_data(&rows, &HashMap::new());
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].spawn.parent_tool_use_id.as_ref(), "spawn-a");
+        assert_eq!(out[0].spawn.duration_ms, Some(1500));
+        assert_eq!(out[0].spawn.tool_count, Some(2));
+        assert!(out[0].live.is_none());
+
+        let mut live = HashMap::new();
+        live.insert(
+            SharedString::from("spawn-a"),
+            SubagentLive {
+                status: komet_doc::SubagentStatus::Running,
+                tool_count: 4,
+                last_tool: None,
+                elapsed_ms: 900,
+            },
+        );
+        let out = subagent_row_data(&rows, &live);
+        assert_eq!(out[0].live.as_ref().map(|l| l.tool_count), Some(4));
+    }
+
+    #[test]
+    fn subagent_row_data_caps_at_five_with_running_first() {
+        let tools = (0..7)
+            .map(|ix| {
+                let status = if ix >= 5 {
+                    komet_doc::SubagentStatus::Running
+                } else {
+                    komet_doc::SubagentStatus::Done
+                };
+                spawn_tool_item(&format!("spawn-{ix}"), status)
+            })
+            .collect();
+        let row = Row {
+            id: "r".into(),
+            version: 0,
+            turn_start: false,
+            kind: RowKind::ToolGroup {
+                tools: Arc::new(tools),
+                summary: SharedString::from(""),
+                auto_open: false,
+            },
+            entry_id: "e".into(),
+            timestamp: None,
+        };
+        let out = subagent_row_data(&[row], &HashMap::new());
+        let ids: Vec<&str> = out
+            .iter()
+            .map(|row| row.spawn.parent_tool_use_id.as_ref())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["spawn-6", "spawn-5", "spawn-4", "spawn-3", "spawn-2"]
+        );
+    }
+
+    #[test]
+    fn subagent_row_data_keeps_one_row_per_spawn_and_the_last_state() {
+        let tools = vec![
+            spawn_tool_item("spawn-a", komet_doc::SubagentStatus::Running),
+            spawn_tool_item("spawn-a", komet_doc::SubagentStatus::Done),
+        ];
+        let row = Row {
+            id: "r".into(),
+            version: 0,
+            turn_start: false,
+            kind: RowKind::ToolGroup {
+                tools: Arc::new(tools),
+                summary: SharedString::from(""),
+                auto_open: false,
+            },
+            entry_id: "e".into(),
+            timestamp: None,
+        };
+        let out = subagent_row_data(&[row], &HashMap::new());
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].spawn.status, Some(komet_doc::SubagentStatus::Done));
     }
 
     #[test]
