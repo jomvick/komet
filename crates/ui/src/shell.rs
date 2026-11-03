@@ -262,6 +262,10 @@ pub struct Shell {
     /// Event hookups for [`Self::diffs`] (History rows opening commit tabs).
     diff_subs: std::collections::HashMap<u64, Subscription>,
     diff_seq: u64,
+    /// The headless [`Changes`] entity backing the composer's Changes chip.
+    /// Created lazily from the strip; `add_diff_surface` takes it over so the
+    /// chip and the opened pane share one watch.
+    widget_changes: Option<Entity<Changes>>,
     /// Subagent transcript surfaces by id — one per spawn chip clicked. The
     /// panel owns its own `WatchSubagent`/`WatchActivity` tasks, so closing the
     /// tab (dropping the entity) is what stops the subscription.
@@ -625,6 +629,7 @@ impl Shell {
             diffs: std::collections::HashMap::new(),
             diff_subs: std::collections::HashMap::new(),
             diff_seq: 0,
+            widget_changes: None,
             subagent_tabs: std::collections::HashMap::new(),
             subagent_subs: std::collections::HashMap::new(),
             subagent_seq: 0,

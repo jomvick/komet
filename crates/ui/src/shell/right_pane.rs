@@ -665,7 +665,12 @@ impl Shell {
             .all(|surface| !surface.read(cx).has_unsaved_changes())
     }
     pub(super) fn add_diff_surface(&mut self, cx: &mut Context<Self>) {
-        let changes = cx.new(|cx| Changes::new(self.state.clone(), cx));
+        // The strip's headless entity (if any) becomes the tab, so the chip's
+        // watch and the pane's are one watch.
+        let changes = self
+            .widget_changes
+            .take()
+            .unwrap_or_else(|| cx.new(|cx| Changes::new(self.state.clone(), cx)));
         self.register_diff_surface(changes, cx);
     }
 
