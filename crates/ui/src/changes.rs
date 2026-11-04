@@ -484,6 +484,16 @@ pub fn diff_phase(resolved: Option<&CheckoutDiff>) -> DiffPhase {
     }
 }
 
+/// The composer chip's numbers: files, additions, deletions — `None` when the
+/// tree is clean or no diff has arrived (a chip never reports an error).
+pub fn diff_summary(diff: Option<&CheckoutDiff>) -> Option<(usize, u32, u32)> {
+    let diff = diff?;
+    if diff.files.is_empty() {
+        return None;
+    }
+    Some((diff.files.len(), diff.additions, diff.deletions))
+}
+
 /// Header label: "N Uncommitted change(s)".
 pub fn uncommitted_label(count: usize) -> String {
     if count == 1 {
@@ -1181,6 +1191,12 @@ impl Changes {
         let state = self.state.read(cx);
         let chat = state.selected_chat_row()?;
         resolve_diff(&self.diffs, chat).cloned()
+    }
+
+    /// The composer's Changes chip: the working-tree diff's totals, `None`
+    /// when clean, erroring or not yet loaded.
+    pub fn summary(&self, cx: &App) -> Option<(usize, u32, u32)> {
+        diff_summary(self.resolved(cx).as_ref())
     }
 
     /// The checkout root the scoped RPCs address: the watch-resolved diff's
@@ -3312,6 +3328,28 @@ rename to new_name.rs
             body_height(added),
             NOTICE_HEIGHT + HUNK_HEADER_HEIGHT + 3.0 * DIFF_LINE_HEIGHT + BODY_BOTTOM_PAD
         );
+    }
+
+    #[test]
+    fn diff_summary_reports_files_and_lines_only_when_dirty() {
+        assert_eq!(diff_summary(None), None);
+
+        let mut d = diff("c1", "d1", "/w", "");
+        assert_eq!(diff_summary(Some(&d)), None, "clean tree has no chip");
+
+        let file = |path: &str, additions, deletions| komet_proto::DiffFileSummary {
+            path: path.into(),
+            old_path: None,
+            status: "M".into(),
+            additions,
+            deletions,
+            binary: false,
+        };
+        d.files = vec![file("a.rs", 3, 2), file("b.rs", 2, 1)];
+        d.additions = 5;
+        d.deletions = 3;
+        d.patch = "diff --git a/a.rs b/a.rs".into();
+        assert_eq!(diff_summary(Some(&d)), Some((2, 5, 3)));
     }
 
     fn diff(checkout: &str, device: &str, cwd: &str, patch: &str) -> CheckoutDiff {

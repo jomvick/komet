@@ -75,7 +75,7 @@ pub enum Route {
 
 /// One right-pane surface tab: a workspace browser, an individual workspace
 /// file editor, a git-diff page, an embedded terminal, a subagent transcript,
-/// or the agent's own shell (read-only). `Picker` is the empty surface chooser.
+/// `Picker` is the empty surface chooser.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RightSurface {
     #[default]
@@ -87,10 +87,6 @@ pub enum RightSurface {
     /// A subagent's transcript, read-only (per-subagent viz) — the handle
     /// keys [`Shell::subagent_tabs`].
     Subagent(u64),
-    /// The agent's own shell commands, read-only (« Shell agent »). One per
-    /// chat, not per handle: it is a view of the transcript's tool events, not
-    /// a terminal Komet owns — so there is nothing here to close or to type in.
-    AgentShell,
 }
 
 pub fn push_unique_right_surface(tabs: &mut Vec<RightSurface>, surface: RightSurface) -> bool {

@@ -369,6 +369,61 @@ impl RegistryDoc {
         self.pending.len()
     }
 
+    /// Collapse the unsynced queue to one op per touched row.
+    ///
+    /// `pending` is a sync outbox: every local write sits there until a server
+    /// acks it. A device that never joins a room accumulates one op per write
+    /// forever — a real store reached 42k ops / 16 MB over a few months of
+    /// session-status churn — and every boot, save, and read paid for it.
+    ///
+    /// The net effect of a run of ops on one row is a single row state with its
+    /// original per-field clocks, and `row_to_seed_op` re-emits exactly that
+    /// (the same shape the re-seed path already pushes). Lossless: the server
+    /// converges on the same values. Ops that were local no-ops ("never invent
+    /// rows") are kept verbatim — they could still land server-side.
+    pub fn compact_pending(&mut self) -> usize {
+        // A batch already on the wire may still be acked: rewriting it would
+        // lose that ack and race its replay.
+        if self.pending.is_empty() || self.pending.iter().any(|b| b.in_flight) {
+            return 0;
+        }
+        let ops = {
+            let mut net: HashMap<(&str, &str), Option<RegistryRow>> = HashMap::new();
+            let mut order: Vec<(&str, &str)> = Vec::new();
+            for batch in &self.pending {
+                for op in &batch.ops {
+                    let key = (op.kind.as_str(), op.id.as_str());
+                    let slot = net.entry(key).or_insert_with(|| {
+                        order.push(key);
+                        self.authoritative
+                            .get(&op.kind)
+                            .and_then(|m| m.get(&op.id))
+                            .cloned()
+                    });
+                    *slot = apply_op(slot.as_ref(), op).0;
+                }
+            }
+            let mut ops: Vec<RowOp> = Vec::new();
+            for key in &order {
+                match net.get(key) {
+                    Some(Some(row)) => ops.push(row_to_seed_op(row)),
+                    _ => ops.extend(
+                        self.pending
+                            .iter()
+                            .flat_map(|b| b.ops.iter())
+                            .filter(|op| op.kind == key.0 && op.id == key.1)
+                            .cloned(),
+                    ),
+                }
+            }
+            ops
+        };
+        self.pending.clear();
+        let len = ops.len();
+        self.enqueue_ops(ops);
+        len
+    }
+
     // ── persistence ─────────────────────────────────────────────────────────
 
     pub fn to_bytes(&self) -> Result<Vec<u8>, DocError> {
@@ -622,23 +677,29 @@ impl RegistryDoc {
         row.filter(|r| !r.deleted)
     }
 
-    /// All live rows of `kind`, overlay applied.
+    /// All live rows of `kind`, overlay applied. One pass over the pending
+    /// ops, keyed by id: the per-id form re-scanned every batch for every row,
+    /// which is quadratic in a backlog (1.5 s per call at 42k unsynced ops).
     fn overlay_rows(&self, kind: &str) -> Vec<RegistryRow> {
-        let mut ids: Vec<String> = self
+        let mut rows: HashMap<&str, RegistryRow> = self
             .authoritative
             .get(kind)
-            .map(|m| m.keys().cloned().collect())
+            .map(|m| {
+                m.iter()
+                    .map(|(id, row)| (id.as_str(), row.clone()))
+                    .collect()
+            })
             .unwrap_or_default();
         for batch in &self.pending {
             for op in &batch.ops {
-                if op.kind == kind && !ids.iter().any(|id| id == &op.id) {
-                    ids.push(op.id.clone());
+                if op.kind == kind
+                    && let (Some(next), _) = apply_op(rows.get(op.id.as_str()), op)
+                {
+                    rows.insert(op.id.as_str(), next);
                 }
             }
         }
-        ids.iter()
-            .filter_map(|id| self.overlay_row(kind, id))
-            .collect()
+        rows.into_values().filter(|row| !row.deleted).collect()
     }
 
     fn read_kind<T: serde::de::DeserializeOwned>(&self, kind: &str) -> Vec<T> {

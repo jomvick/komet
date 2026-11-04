@@ -262,6 +262,16 @@ pub struct Shell {
     /// Event hookups for [`Self::diffs`] (History rows opening commit tabs).
     diff_subs: std::collections::HashMap<u64, Subscription>,
     diff_seq: u64,
+    /// The headless [`Changes`] entity backing the composer's Changes chip.
+    /// Created lazily from the strip; `add_diff_surface` takes it over so the
+    /// chip and the opened pane share one watch.
+    widget_changes: Option<Entity<Changes>>,
+    /// The composer widget strip (Changes / subagents / processes chips).
+    widgets: crate::composer_widgets::WidgetStrip,
+    /// One-shot repaint armed for the soonest chip-hide deadline.
+    widgets_wake: Option<Task<()>>,
+    /// The chat the strip currently describes; a change resets popup + gates.
+    widgets_chat: Option<String>,
     /// Subagent transcript surfaces by id — one per spawn chip clicked. The
     /// panel owns its own `WatchSubagent`/`WatchActivity` tasks, so closing the
     /// tab (dropping the entity) is what stops the subscription.
@@ -509,9 +519,14 @@ impl Shell {
                     };
                     this.add_subagent_surface(open, cx);
                 }
-                // A Run chip's badge: the read-only shell log of this chat.
+                // A Run chip's badge: the read-only processes popup above
+                // the composer (retargeted from the old right-pane surface).
+                // A chat with no commands shows no chip, so it opens nothing.
                 TranscriptEvent::OpenAgentShell => {
-                    this.add_agent_shell_surface(cx);
+                    if !this.transcript.read(cx).agent_shell_log().is_empty() {
+                        crate::composer_widgets::retarget_agent_shell(&mut this.widgets);
+                        cx.notify();
+                    }
                 }
             },
         );
@@ -625,6 +640,10 @@ impl Shell {
             diffs: std::collections::HashMap::new(),
             diff_subs: std::collections::HashMap::new(),
             diff_seq: 0,
+            widget_changes: None,
+            widgets: crate::composer_widgets::WidgetStrip::new(),
+            widgets_wake: None,
+            widgets_chat: None,
             subagent_tabs: std::collections::HashMap::new(),
             subagent_subs: std::collections::HashMap::new(),
             subagent_seq: 0,

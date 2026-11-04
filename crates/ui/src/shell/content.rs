@@ -3,6 +3,347 @@
 use super::*;
 
 impl Shell {
+    /// The composer widget strip: Changes / subagents / processes chips over
+    /// the prompt, each reading data the shell already has. Hidden chips
+    /// render nothing; an open popup holds its chip up.
+    pub(super) fn render_widget_strip(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        use crate::composer_widgets::{StripInput, WidgetKind, chip_allowed, chip_content};
+
+        let chat_id = self
+            .state
+            .read(cx)
+            .selected_chat_row()
+            .map(|row| row.id.clone());
+        self.widgets
+            .reset_checked(chat_id.as_deref(), self.widgets_chat.as_deref());
+        self.widgets_chat = chat_id.clone();
+        let Some(_) = chat_id else {
+            return div().into_any_element();
+        };
+
+        let theme = Theme::of(cx).clone();
+        let harness = self
+            .composer
+            .read(cx)
+            .pickers()
+            .read(cx)
+            .resolved(cx)
+            .harness;
+        let surface = harness.map_or_else(
+            komet_proto::HarnessInteractionSurface::none,
+            komet_harness::capabilities::interaction_surface,
+        );
+        let input = StripInput {
+            widget_changes: self.widget_changes_summary(cx),
+            subagent_rows: self.transcript.read(cx).subagent_rows(cx),
+            process_entries: self.transcript.read(cx).agent_shell_log(),
+            subagents_allowed: chip_allowed(
+                surface.subagents,
+                surface.tool_progress,
+                WidgetKind::Subagents,
+            ),
+            processes_allowed: chip_allowed(
+                surface.subagents,
+                surface.tool_progress,
+                WidgetKind::Processes,
+            ),
+        };
+
+        let now = std::time::Instant::now();
+        let visible = self.widgets.step(&input, now);
+        if self.widgets_wake.is_none()
+            && let Some(delay) = self.widgets.wake_in(now)
+        {
+            self.arm_widgets_wake(delay, cx);
+        }
+
+        let focus = self
+            .widgets
+            .focus
+            .get_or_insert_with(|| cx.focus_handle())
+            .clone();
+        let open = self.widgets.open.get().copied();
+        let closing = self.widgets.open.closing_since();
+        let mut overlay: Option<(WidgetKind, AnyElement)> = open.map(|kind| {
+            (
+                kind,
+                self.widget_popup(kind, &input, surface.tool_progress, &theme, &focus, cx),
+            )
+        });
+
+        let mut row = div().w_full().flex().flex_row().items_center().gap(px(4.0));
+        for (ix, kind) in [
+            WidgetKind::Changes,
+            WidgetKind::Subagents,
+            WidgetKind::Processes,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if !visible[ix] {
+                continue;
+            }
+            let content = chip_content(kind, &input);
+            let chip = self.render_widget_chip(kind, &content, open == Some(kind), &theme, cx);
+            let chip = if overlay.as_ref().is_some_and(|(owned, _)| *owned == kind) {
+                let (_, element) = overlay.take().expect("matched just above");
+                let popup_id = SharedString::from(format!("widget-popup-{kind:?}"));
+                chip.child(popover::anchored_menu_above(popup_id, element, closing))
+            } else {
+                chip
+            };
+            row = row.child(chip);
+        }
+
+        div()
+            .w_full()
+            .max_w(px(768.0))
+            .mx_auto()
+            .px(px(Theme::SPACE_LG))
+            .pb(px(6.0))
+            .child(row)
+            .into_any_element()
+    }
+
+    fn render_widget_chip(
+        &mut self,
+        kind: crate::composer_widgets::WidgetKind,
+        content: &crate::composer_widgets::ChipContent,
+        open: bool,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        use crate::composer_widgets::WidgetKind;
+
+        let id = match kind {
+            WidgetKind::Changes => "widget-changes",
+            WidgetKind::Subagents => "widget-subagents",
+            WidgetKind::Processes => "widget-processes",
+        };
+        let has_menu = kind != WidgetKind::Changes;
+        div()
+            .id(id)
+            .h(px(24.0))
+            .rounded(px(12.0))
+            .border_1()
+            .border_color(theme.border)
+            .px(px(9.0))
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(px(6.0))
+            .text_size(px(11.5))
+            .text_color(theme.text_muted)
+            .bg(if open {
+                crate::theme::ink(0.10)
+            } else {
+                crate::theme::ink(0.04)
+            })
+            .when(!open, |el| el.hover(|s| s.bg(crate::theme::ink(0.07))))
+            .cursor_pointer()
+            .child(
+                icon(content.icon)
+                    .size(px(14.0))
+                    .text_color(theme.text_muted),
+            )
+            .child(div().min_w_0().truncate().child(content.label.clone()))
+            .when(has_menu, |el| {
+                el.child(
+                    icon(icons::ALT_ARROW_DOWN)
+                        .size(px(12.0))
+                        .text_color(theme.text_faint),
+                )
+            })
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, _| {
+                    if has_menu {
+                        this.widgets
+                            .open
+                            .note_trigger_press_matching(|open| *open == kind);
+                    }
+                }),
+            )
+            .on_click(cx.listener(move |this, _, window, cx| match kind {
+                WidgetKind::Changes => this.open_changes_widget(cx),
+                _ => this.toggle_widgets(kind, window, cx),
+            }))
+    }
+
+    fn widget_popup(
+        &mut self,
+        kind: crate::composer_widgets::WidgetKind,
+        input: &crate::composer_widgets::StripInput,
+        progress: komet_proto::ProgressSurface,
+        theme: &Theme,
+        focus: &gpui::FocusHandle,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        use crate::composer_widgets::WidgetKind;
+
+        let id = SharedString::from(format!("widget-popup-{kind:?}"));
+        let card = popover::popover_card(theme)
+            .id(id)
+            .w(px(340.0))
+            .max_h(px(320.0))
+            .overflow_y_scroll()
+            .track_focus(focus)
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                if event.keystroke.key == "escape" {
+                    this.close_widgets(cx);
+                }
+            }))
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_widgets(cx)))
+            .flex()
+            .flex_col()
+            .gap(px(2.0));
+        let card = match kind {
+            WidgetKind::Subagents => input.subagent_rows.iter().cloned().fold(card, |card, row| {
+                card.child(self.subagent_popup_row(row, theme, cx))
+            }),
+            WidgetKind::Processes => input
+                .process_entries
+                .iter()
+                .cloned()
+                .fold(card, |card, entry| {
+                    card.child(self.process_popup_row(entry, progress, theme))
+                }),
+            WidgetKind::Changes => card,
+        };
+        card.into_any_element()
+    }
+
+    fn subagent_popup_row(
+        &mut self,
+        row: crate::transcript::SubagentRowData,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        use komet_doc::SubagentStatus;
+
+        let status = row
+            .spawn
+            .status
+            .or(row.live.as_ref().map(|live| live.status));
+        let tint = match status {
+            Some(SubagentStatus::Running) => theme.busy,
+            Some(SubagentStatus::Done) => theme.success,
+            Some(SubagentStatus::Failed) => theme.danger,
+            None => theme.text_muted,
+        };
+        let label = crate::subagent::subagent_status_label(
+            row.spawn.status,
+            row.live.as_ref(),
+            row.spawn.duration_ms,
+            row.spawn.tool_count,
+        )
+        .unwrap_or_default();
+        let title = row.spawn.title.clone();
+        let model = row.spawn.model.clone();
+        let id = SharedString::from(format!("subagent-row-{}", row.spawn.parent_tool_use_id));
+        div()
+            .id(id)
+            .px(px(8.0))
+            .py(px(6.0))
+            .rounded(px(6.0))
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .cursor_pointer()
+            .hover(|s| s.bg(theme.element_hover))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.open_subagent_tab(&row, cx);
+                this.close_widgets(cx);
+            }))
+            .child(div().flex_none().size(px(6.0)).rounded(px(3.0)).bg(tint))
+            .child(
+                div()
+                    .min_w_0()
+                    .flex_1()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .truncate()
+                            .text_size(px(12.0))
+                            .text_color(theme.text)
+                            .child(title),
+                    )
+                    .when_some(model, |el, model| {
+                        el.child(
+                            div()
+                                .truncate()
+                                .text_size(px(10.5))
+                                .text_color(theme.text_muted)
+                                .child(model),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .text_size(px(10.5))
+                    .text_color(tint)
+                    .child(label),
+            )
+            .into_any_element()
+    }
+
+    fn process_popup_row(
+        &mut self,
+        entry: crate::transcript::AgentShellEntry,
+        progress: komet_proto::ProgressSurface,
+        theme: &Theme,
+    ) -> AnyElement {
+        let tint = crate::composer_widgets::process_tint(entry.status, theme);
+        let (command, last) = crate::composer_widgets::process_row_lines(&entry);
+        let note = crate::composer_widgets::no_output_note(entry.status, progress);
+        div()
+            .px(px(8.0))
+            .py(px(6.0))
+            .rounded(px(6.0))
+            .flex()
+            .items_start()
+            .gap(px(8.0))
+            .child(
+                div()
+                    .flex_none()
+                    .mt(px(5.0))
+                    .size(px(6.0))
+                    .rounded(px(3.0))
+                    .bg(tint),
+            )
+            .child(
+                div()
+                    .min_w_0()
+                    .flex_1()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .child(
+                        div()
+                            .truncate()
+                            .font_family("monospace")
+                            .text_size(px(11.5))
+                            .text_color(theme.text)
+                            .child(command),
+                    )
+                    .child(match last {
+                        Some(line) => div()
+                            .truncate()
+                            .text_size(px(10.5))
+                            .text_color(theme.text_muted)
+                            .child(line),
+                        None => div()
+                            .truncate()
+                            .text_size(px(10.5))
+                            .text_color(theme.text_muted.opacity(0.75))
+                            .child(note),
+                    }),
+            )
+            .into_any_element()
+    }
+
     pub(super) fn render_main(
         &mut self,
         window: &mut Window,
@@ -153,6 +494,7 @@ impl Shell {
                                         }),
                                 )
                                 .child(div().h(px(12.0)).flex_none())
+                                .child(self.render_widget_strip(cx))
                                 .child(self.composer.clone()),
                         ),
                 ))
@@ -356,6 +698,7 @@ impl Shell {
                     .when(has_selection, |el| el.child(status))
                     .when(has_spaces && has_selection, |el| {
                         el.when_some(self.render_plan_card(cx), |el, card| el.child(card))
+                            .child(self.render_widget_strip(cx))
                             .child(self.composer.clone())
                     })
                     .child(self.render_terminal_container(cx))
@@ -791,30 +1134,6 @@ impl Shell {
                         self.render_surface_picker(cx)
                     }
                 }
-                RightSurface::AgentShell => {
-                    // Read at paint time: the panel is a projection of the
-                    // transcript (commands from the doc's `Exec` chips, output
-                    // from the ephemeral activity tails), so it holds no
-                    // entity, no subscription — and no path to a PTY.
-                    let log = self.transcript.read(cx).agent_shell_log();
-                    let harness = self
-                        .composer
-                        .read(cx)
-                        .pickers()
-                        .read(cx)
-                        .resolved(cx)
-                        .harness;
-                    let agent = harness.map(|id| id.display_name().to_string());
-                    let surface = harness.map_or(komet_proto::ProgressSurface::None, |id| {
-                        komet_harness::capabilities::interaction_surface(id).tool_progress
-                    });
-                    crate::agent_shell::render(
-                        &log,
-                        agent.as_deref().unwrap_or("The agent"),
-                        surface,
-                        &theme,
-                    )
-                }
                 _ => self.render_surface_picker(cx),
             };
             // Files browser companion: shown alongside File editor tabs
@@ -1003,14 +1322,6 @@ impl Shell {
                                         this.add_terminal_surface(cx);
                                     }),
                                 ),
-                            )
-                            // The agent's own shell, in read-only: no Komet PTY
-                            // is involved, so nothing here can be typed into.
-                            .child(
-                                row("surface-card-agent-shell", icons::TERMINAL, "Shell agent")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.add_agent_shell_surface(cx);
-                                    })),
                             )
                             .child(
                                 row("surface-card-files", icons::FOLDER_WITH_FILES, "Files")

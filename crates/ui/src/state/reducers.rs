@@ -36,13 +36,12 @@ impl AppState {
             // A minted chat whose CreateChat is still in flight lacks its
             // row: keep the optimistic selection (the send runs under it).
             // An expired/stale pending entry reads as truly vanished.
-            let pending_mint = self
-                .pending_sends
-                .get(selected)
-                .is_some_and(|p| {
-                    chrono::Utc::now().signed_duration_since(p.started).num_milliseconds()
-                        <= PENDING_SEND_TTL_MS
-                });
+            let pending_mint = self.pending_sends.get(selected).is_some_and(|p| {
+                chrono::Utc::now()
+                    .signed_duration_since(p.started)
+                    .num_milliseconds()
+                    <= PENDING_SEND_TTL_MS
+            });
             if !pending_mint {
                 // Selected chat vanished (deleted elsewhere): drop selection + transcript.
                 self.selected_chat = None;

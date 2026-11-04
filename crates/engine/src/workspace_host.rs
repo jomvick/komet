@@ -241,6 +241,15 @@ impl WorkspaceHost {
         // Destructive-break hygiene: the pre-spaces row stays unreachable.
         store.delete_snapshot(LEGACY_WORKSPACE_DOC_ID).ok();
 
+        // Collapse the persisted outbox before the first read and save: a
+        // profile that never joins a room grows it without bound, and this is
+        // the only place that sees the whole backlog for free (no batch of it
+        // is in flight yet).
+        let compacted = doc.compact_pending();
+        if compacted > 0 {
+            tracing::info!(ops = compacted, "compacted the registry outbox");
+        }
+
         // Boot: upsert our own device row. A user-set name (RenameDevice is LWW from
         // any device) survives restarts. The old fallback sentinel is repaired with
         // the platform-resolved name because it was never a user-selected name.
@@ -1157,7 +1166,13 @@ impl WorkspaceHostInner {
     }
 
     fn save_snapshot(&self) {
-        let bytes = lock(&self.reg).to_bytes();
+        let bytes = {
+            let mut reg = lock(&self.reg);
+            // Collapse the outbox to one op per row before writing: a long-lived
+            // local profile otherwise persists one op per write, forever.
+            reg.compact_pending();
+            reg.to_bytes()
+        };
         match bytes {
             Ok(bytes) => {
                 if let Err(err) = self.store.save_snapshot(REGISTRY_DOC_ID, &bytes) {

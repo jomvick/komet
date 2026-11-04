@@ -12,7 +12,6 @@
 //! - [`shell`] — sidebar + main panel + right-pane scaffold + gate;
 //! - [`loaders`] — komet pulse loader and gradient spinner.
 
-pub mod agent_shell;
 pub mod app_menus;
 pub mod appearance;
 pub mod attachments;
@@ -21,6 +20,7 @@ pub mod blobatar;
 pub mod changes;
 pub mod comments;
 pub mod composer;
+pub mod composer_widgets;
 pub mod context_usage;
 pub mod edge_fade;
 pub mod files;
