@@ -743,7 +743,15 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> Option<(usize, u32, u32)> {
         let changes = match self.widget_changes.clone() {
-            Some(changes) => changes,
+            Some(changes) => {
+                // The watch is started once, at creation; a boot-deferred start
+                // (engine not up yet) or a remote-device retarget never retried
+                // on its own, so a chat that already existed when the app booted
+                // kept a hidden Changes chip forever. Idempotent when the target
+                // is unchanged.
+                changes.update(cx, |changes, cx| changes.ensure_watch(cx));
+                changes
+            }
             None => {
                 let changes = cx.new(|cx| Changes::new(self.state.clone(), cx));
                 changes.update(cx, |changes, cx| changes.ensure_content(cx));
