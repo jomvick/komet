@@ -201,7 +201,15 @@ jobs:
           if-no-files-found: error
 
   publish:
-    if: startsWith(github.ref, 'refs/tags/v')
+    # macOS is optional by design (see the `macos` job): a runner that is never
+    # acquired cancels that job, and a plain `if` would then skip this one and
+    # ship nothing (v1.3.2: Linux + Windows green, macOS cancelled after 15 min
+    # of queueing, release never published). Still publish, but only when the
+    # artifact sets that must exist did build — a failed Linux or Windows build
+    # stays a failed release.
+    if: >-
+      startsWith(github.ref, 'refs/tags/v') && !cancelled()
+      && needs.linux.result == 'success' && needs.windows.result == 'success'
     needs: [linux, macos, windows]
     runs-on: ubuntu-latest
     permissions:
