@@ -414,6 +414,59 @@ fn delete_chat_tombstones_row_and_session() {
 }
 
 #[test]
+fn compact_pending_keeps_the_visible_state_and_the_pushed_values() {
+    let mut ws = RegistryDoc::new("dev-a");
+    ws.upsert_device(&device("dev-a", "laptop")).unwrap();
+    ws.upsert_chat(&chat("chat-1", "dev-a")).unwrap();
+    ws.upsert_chat(&chat("chat-2", "dev-a")).unwrap();
+    ws.upsert_session(&session("chat-1", "dev-a", SessionStatus::Working))
+        .unwrap();
+    ws.upsert_session(&session("chat-1", "dev-a", SessionStatus::Idle))
+        .unwrap();
+    let mut pinned = chat("chat-1", "dev-a");
+    pinned.pinned = true;
+    ws.upsert_chat(&pinned).unwrap();
+    ws.delete_chat("chat-2").unwrap();
+
+    let sorted = |mut state: WorkspaceState| {
+        state.chats.sort_by(|a, b| a.id.cmp(&b.id));
+        state.sessions.sort_by(|a, b| a.chat_id.cmp(&b.chat_id));
+        state
+    };
+    let before = sorted(ws.read_all().unwrap());
+    // delete_chat tombstones the row and the session.
+    assert_eq!(ws.pending_len(), 7); // batches; the delete carries two ops
+
+    // One op per touched row: the device, chat-1, chat-1's session, and the two
+    // tombstones chat-2 left behind.
+    assert_eq!(ws.compact_pending(), 5);
+    assert_eq!(ws.pending_len(), 1);
+    assert_eq!(
+        ws.compact_pending(),
+        5,
+        "an already compact queue stays one op per row"
+    );
+    assert_eq!(sorted(ws.read_all().unwrap()), before);
+
+    // The outbox is the only copy of those writes: the compacted ops must
+    // survive a save/reload and still read back the same state.
+    let bytes = ws.to_bytes().unwrap();
+    let reloaded = RegistryDoc::from_bytes(&bytes, "dev-a").unwrap();
+    assert_eq!(sorted(reloaded.read_all().unwrap()), before);
+    // …and still push the same values to a server.
+    let mut peer = RegistryDoc::new("dev-b");
+    for batch in &reloaded.pending {
+        for op in &batch.ops {
+            let row = peer.authoritative.get(&op.kind).and_then(|m| m.get(&op.id));
+            if let (Some(next), _) = apply_op(row, op) {
+                peer.put_authoritative(next);
+            }
+        }
+    }
+    assert_eq!(sorted(peer.read_all().unwrap()), before);
+}
+
+#[test]
 fn spaces_round_trip_and_mutate() {
     let mut ws = RegistryDoc::new("dev-a");
     ws.upsert_space(&space("sp-1", "dev-a", "/home/u/project"))
