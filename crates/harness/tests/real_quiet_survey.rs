@@ -73,6 +73,7 @@ async fn probe_once(harness: AcpHarness) -> ProbeOutcome {
         auto_approve: true,
         attachments: Vec::new(),
         permission_timeout_ms: None,
+        use_mcp: false,
         worktree: None,
         resume: None,
         mcp: None,
@@ -248,4 +249,71 @@ async fn real_all_harnesses_quiet_survey() {
         }
     }
     assert!(failures.is_empty(), "{failures:#?}");
+}
+
+#[tokio::test]
+#[ignore = "requires an installed, authenticated OpenCode CLI; sends one minimal prompt"]
+async fn live_opencode_returns_a_text_response() {
+    let (controls, _steer, _token) = controls();
+    let models = AcpHarness::opencode()
+        .models()
+        .await
+        .expect("OpenCode model discovery succeeds");
+    let model = models
+        .first()
+        .expect("OpenCode advertises at least one model")
+        .id
+        .clone();
+    let request = RunRequest {
+        prompt: "Reply with exactly the word OK. Do not use tools.".into(),
+        harness: None,
+        model: Some(model),
+        reasoning: None,
+        model_options: serde_json::Map::new(),
+        cwd: "/tmp".into(),
+        sandbox: SandboxLevel::ReadOnly,
+        sandbox_options: None,
+        auto_approve: true,
+        attachments: Vec::new(),
+        permission_timeout_ms: None,
+        use_mcp: false,
+        worktree: None,
+        resume: None,
+        mcp: None,
+        mcp_external: Vec::new(),
+    };
+    let mut stream = AcpHarness::opencode()
+        .run(request, controls)
+        .await
+        .expect("OpenCode ACP run starts");
+    let events = tokio::time::timeout(Duration::from_secs(180), async {
+        let mut events = Vec::new();
+        while let Some(event) = stream.next().await {
+            let event = event.expect("OpenCode ACP event");
+            let done = matches!(event, AgentEvent::Done { .. });
+            events.push(event);
+            if done {
+                break;
+            }
+        }
+        events
+    })
+    .await
+    .expect("OpenCode ACP turn settles");
+    let text = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::TextDelta { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<String>();
+    let dones = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::Done { status, error, .. } => Some((*status, error.clone())),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(dones, vec![(DoneStatus::Completed, None)], "{events:#?}");
+    assert!(!text.trim().is_empty(), "{events:#?}");
 }

@@ -35,8 +35,8 @@ use std::time::{Duration, Instant};
 use gpui::{
     AnyElement, App, BorderStyle, ClipboardItem, Context, Entity, EventEmitter, Focusable as _,
     ListAlignment, ListOffset, ListScrollEvent, ListState, MouseButton, ObjectFit, SharedString,
-    StyledImage as _, StyledText, Subscription, Task, TextRun, WeakEntity, Window, actions, canvas,
-    div, img, list, prelude::*, px, quad,
+    StyleRefinement, StyledImage as _, StyledText, Subscription, Task, TextRun, WeakEntity, Window,
+    actions, canvas, div, img, list, prelude::*, px, quad,
 };
 
 use komet_doc::{MessagePart, MessageRole, MessageStatus, SessionMessageEntry};
@@ -88,6 +88,9 @@ const FOLD_TWEEN_WINDOW: std::time::Duration = std::time::Duration::from_millis(
 pub const ATT_THUMB_W: f32 = 112.0;
 pub const ATT_THUMB_H: f32 = 80.0;
 pub const ATT_STRIP_H: f32 = ATT_THUMB_H + 10.0;
+/// Working-trailer orb size. Cached views are laid out from their style, not
+/// measured, so this must also be passed to `.cached(..)`.
+const WORKING_ORB_PX: f32 = 20.0;
 
 // ---------------------------------------------------------------------------
 // Stick-to-bottom spring (mugen §1e — same constants as its DEFAULT_SPRING,
@@ -2161,6 +2164,8 @@ pub struct Transcript {
     /// `None` is the ordinary state, and the trailer then reads its flavour
     /// word as it did before the frames existed.
     run_phase: Option<komet_proto::RunPhase>,
+    /// Dedicated cached view: its pulse ticks should not rebuild the transcript.
+    working_orb: Entity<crate::loaders::WorkingOrb>,
     /// The chat the live-output watch belongs to (`None` = no watch running).
     activity_chat: Option<String>,
     activity_task: Option<Task<()>>,
@@ -2294,6 +2299,9 @@ impl Transcript {
         // FollowMode stays Normal: the tail pin is ours (a per-frame spring),
         // not the list's per-layout hard snap.
         let list = ListState::new(0, ListAlignment::Bottom, px(OVERDRAW_PX));
+        let working_orb = cx.new(|_| {
+            crate::loaders::WorkingOrb::new(crate::thinking_orbs::OrbState::Working, WORKING_ORB_PX)
+        });
         let weak = cx.weak_entity();
         list.set_scroll_handler(move |event: &ListScrollEvent, _window, cx| {
             weak.update(cx, |this: &mut Transcript, cx| {
@@ -2352,6 +2360,7 @@ impl Transcript {
             shell_tails: Vec::new(),
             subagent_live: HashMap::new(),
             run_phase: None,
+            working_orb,
             activity_chat: None,
             activity_task: None,
             reasoning_expanded: false,
@@ -4228,11 +4237,7 @@ impl Transcript {
     /// — user request), so it reads as part of the streaming reply and
     /// scrolls away with it. The spinner drives this entity's frames, which
     /// keeps the elapsed timer ticking through delta-quiet tool runs.
-    fn render_working_trailer(
-        &self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
+    fn render_working_trailer(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let chat_id = self.chat_id.clone()?;
         let now = chrono::Utc::now();
         let (sending, elapsed_secs) = {
@@ -4261,6 +4266,9 @@ impl Transcript {
                 flavour_word(flavour_seed(&chat_id), elapsed_secs)
             },
         );
+        self.working_orb.update(cx, |orb, cx| {
+            orb.set_state(orb_state, cx);
+        });
         let theme = Theme::of(cx).clone();
         Some(
             div()
@@ -4271,9 +4279,11 @@ impl Transcript {
                 .pt(px(10.0))
                 .text_size(px(11.0))
                 .child(
-                    crate::thinking_orbs::ThinkingOrb::new(orb_state, 20.0)
-                        .speed(1.25)
-                        .driven(cx.entity_id(), window, cx),
+                    self.working_orb.clone().cached(
+                        StyleRefinement::default()
+                            .flex_none()
+                            .size(px(WORKING_ORB_PX)),
+                    ),
                 )
                 .child(
                     div()
@@ -4395,7 +4405,7 @@ impl Transcript {
         // Live-run loader rides under the LAST row's content (above its
         // clearance pad), so it sits right beneath the working reply.
         let trailer = (ix + 1 == self.rows.len())
-            .then(|| self.render_working_trailer(window, cx))
+            .then(|| self.render_working_trailer(cx))
             .flatten();
         // Live reasoning (issue #31) rides just above the loader: muted,
         // italic, gone at Done. Render-local state — never doc-derived.

@@ -478,21 +478,25 @@ pub fn parse_workspace_file_reference(value: &str) -> Option<(String, Option<u32
                 .and_then(|(path, line)| parse_line(path, line))
         });
     let (path, line) = line_reference.unwrap_or((value, None));
-    let root_manifest = matches!(path, "Cargo.toml" | "README.md" | "ARCHITECTURE.md");
-    let has_extension = path.rsplit('/').next().is_some_and(|name| {
-        name.rsplit_once('.').is_some_and(|(_, extension)| {
-            extension.starts_with(|c: char| c.is_ascii_alphabetic())
-                && (path.contains('/')
-                    || [
-                        "c", "cc", "cpp", "css", "csv", "go", "h", "hpp", "html", "java", "js",
-                        "json", "jsx", "kt", "lock", "md", "mdx", "mjs", "mts", "php", "py", "rb",
-                        "rs", "sass", "scala", "scss", "sh", "sql", "svelte", "swift", "toml",
-                        "ts", "tsx", "txt", "vue", "xml", "yaml", "yml",
-                    ]
-                    .iter()
-                    .any(|known| extension.eq_ignore_ascii_case(known)))
-        })
-    });
+    let root_file = matches!(
+        path,
+        "AGENTS.md"
+            | "ARCHITECTURE.md"
+            | "Cargo.lock"
+            | "Cargo.toml"
+            | "CONTRIBUTING.md"
+            | "README.md"
+            | "package-lock.json"
+            | "package.json"
+            | "pnpm-lock.yaml"
+            | "yarn.lock"
+    );
+    let has_extension = path.contains('/')
+        && path.rsplit('/').next().is_some_and(|name| {
+            name.rsplit_once('.').is_some_and(|(_, extension)| {
+                extension.starts_with(|c: char| c.is_ascii_alphabetic())
+            })
+        });
     let safe = !path.is_empty()
         && !path.starts_with('/')
         && !path.contains('\\')
@@ -501,7 +505,7 @@ pub fn parse_workspace_file_reference(value: &str) -> Option<(String, Option<u32
         && path
             .split('/')
             .all(|part| !part.is_empty() && part != "." && part != "..");
-    (safe && (has_extension || root_manifest)).then(|| (path.to_string(), line))
+    (safe && (has_extension || root_file)).then(|| (path.to_string(), line))
 }
 
 fn parse_inline_event(cur: &mut Cursor, runs: &mut Vec<InlineRun>, style: &InlineStyle) {
@@ -1089,6 +1093,21 @@ mod tests {
         assert_eq!(
             only_link("Open src/main.rs: \n"),
             Some(("src/main.rs".into(), "komet-file:src/main.rs".into()))
+        );
+        assert_eq!(
+            parse_workspace_file_reference("sessions.rs"),
+            None,
+            "a bare filename has no unambiguous workspace location"
+        );
+        assert_eq!(
+            only_link("The earlier change was in sessions.rs.\n"),
+            None,
+            "bare filenames must remain ordinary text, not broken workspace links"
+        );
+        assert_eq!(
+            parse_workspace_file_reference("Cargo.toml"),
+            Some(("Cargo.toml".into(), None)),
+            "known root files remain clickable"
         );
         assert_eq!(
             only_link("Open .src/é.rsé\n"),

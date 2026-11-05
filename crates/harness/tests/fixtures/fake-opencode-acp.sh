@@ -60,6 +60,20 @@ pid=$(rid "$promptline")
 
 case "$promptline" in
 
+  *scenario:prompt-stall*)
+    sleep 2
+    ;;
+
+  *scenario:user-echo-stall*)
+    update '{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"prompt echo"}}'
+    sleep 2
+    ;;
+
+  *scenario:quiet-stall*)
+    update '{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"thinking"}}'
+    sleep 2
+    ;;
+
   *scenario:happy*)
     update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Hello from opencode"}}'
     emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
@@ -122,6 +136,16 @@ case "$promptline" in
     fi
     if [ -n "$cfg" ] && printf '%s' "$cfg" | grep -q '"\*":"ask"' && printf '%s' "$cfg" | grep -q '"permission"'; then
       update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"overlay ok"}}'
+      emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
+    else
+      emit "{\"id\":$pid,\"result\":{\"stopReason\":\"refusal\"}}"
+    fi
+    ;;
+
+  *scenario:native-mcp-disabled*)
+    cfg="$OPENCODE_CONFIG_CONTENT"
+    if printf '%s' "$cfg" | grep -q '"supabase":{"disabled":true}'; then
+      update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"native MCP disabled"}}'
       emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
     else
       emit "{\"id\":$pid,\"result\":{\"stopReason\":\"refusal\"}}"

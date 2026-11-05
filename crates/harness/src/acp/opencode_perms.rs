@@ -93,12 +93,52 @@ pub fn permission_config(perms: &OpenCodePerms) -> String {
 /// `sandbox.json` is written to the workspace by the harness (see
 /// `sandbox_runtime_config`).
 pub fn opencode_config_document(perms: &OpenCodePerms) -> String {
+    opencode_config_document_with_disabled_mcp(perms, &[])
+}
+
+/// Permission overlay plus per-process disabling for MCP servers configured
+/// outside Komet. The ACP `mcpServers` list does not suppress these configs.
+pub fn opencode_config_document_with_disabled_mcp(
+    perms: &OpenCodePerms,
+    disabled_mcp: &[String],
+) -> String {
     let perm = permission_config(perms);
-    if perms.opencode_sandbox_runtime == Some(true) {
-        format!("{{\"permission\":{perm},\"plugin\":[\"opencode-sandbox\"]}}")
+    let mut document = if perms.opencode_sandbox_runtime == Some(true) {
+        format!("{{\"permission\":{perm},\"plugin\":[\"opencode-sandbox\"]")
     } else {
-        format!("{{\"permission\":{perm}}}")
+        format!("{{\"permission\":{perm}")
+    };
+    if !disabled_mcp.is_empty() {
+        document.push_str(",\"mcp\":{\"servers\":{");
+        for (index, name) in disabled_mcp.iter().enumerate() {
+            if index > 0 {
+                document.push(',');
+            }
+            document
+                .push_str(&serde_json::to_string(name).expect("serializing a string cannot fail"));
+            document.push_str(":{\"disabled\":true}");
+        }
+        document.push_str("}}");
     }
+    document.push('}');
+    document
+}
+
+/// MCP-only overlay for Devin, which reads the OpenCode user config too.
+pub fn opencode_mcp_disable_document(disabled_mcp: &[String]) -> Option<String> {
+    if disabled_mcp.is_empty() {
+        return None;
+    }
+    let mut document = String::from("{\"mcp\":{\"servers\":{");
+    for (index, name) in disabled_mcp.iter().enumerate() {
+        if index > 0 {
+            document.push(',');
+        }
+        document.push_str(&serde_json::to_string(name).expect("serializing a string cannot fail"));
+        document.push_str(":{\"disabled\":true}");
+    }
+    document.push_str("}}}");
+    Some(document)
 }
 
 /// Content for `.opencode/sandbox.json` consumed by
@@ -240,6 +280,24 @@ mod tests {
         assert_eq!(
             opencode_config_document(&p),
             r#"{"permission":{"bash":{"*":"ask"}}}"#
+        );
+    }
+
+    #[test]
+    fn document_disables_native_mcp_without_affecting_explicit_config() {
+        let p = perms(vec![("*", Perm::Ask)], vec![]);
+        let document = opencode_config_document_with_disabled_mcp(
+            &p,
+            &["supabase".to_owned(), "convex".to_owned()],
+        );
+        let value: serde_json::Value = serde_json::from_str(&document).expect("valid overlay");
+        assert_eq!(value["permission"]["bash"]["*"], "ask");
+        assert_eq!(value["mcp"]["servers"]["supabase"]["disabled"], true);
+        assert_eq!(value["mcp"]["servers"]["convex"]["disabled"], true);
+        assert_eq!(
+            opencode_mcp_disable_document(&[]),
+            None,
+            "an empty native MCP config needs no overlay"
         );
     }
     #[test]

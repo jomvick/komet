@@ -123,6 +123,7 @@ fn request_opencode(prompt: &str, model: Option<&str>) -> RunRequest {
         auto_approve: true,
         attachments: Vec::new(),
         permission_timeout_ms: None,
+        use_mcp: false,
         resume: None,
         worktree: None,
         mcp: None,
@@ -143,6 +144,7 @@ fn request(prompt: &str) -> RunRequest {
         auto_approve: true,
         attachments: Vec::new(),
         permission_timeout_ms: None,
+        use_mcp: false,
         resume: None,
         worktree: None,
         mcp: None,
@@ -1241,6 +1243,25 @@ async fn opencode_launches_with_acp_args_and_runs_the_happy_path() {
 }
 
 #[tokio::test]
+async fn opencode_disables_native_mcp_for_a_komet_run() {
+    let (mut controls, _steer, _token) = controls();
+    controls.env.push((
+        "OPENCODE_CONFIG_CONTENT".into(),
+        r#"{"mcp":{"servers":{"supabase":{"type":"remote","url":"https://example.test"}}}}"#.into(),
+    ));
+    let events = run_to_end(
+        &opencode_harness(),
+        request_opencode("scenario:native-mcp-disabled", None),
+        controls,
+    )
+    .await;
+    assert!(events.contains(&AgentEvent::TextDelta {
+        text: "native MCP disabled".into()
+    }));
+    assert_eq!(dones(&events), vec![(DoneStatus::Completed, None)]);
+}
+
+#[tokio::test]
 async fn opencode_sets_only_the_requested_model() {
     // The requested model differs from the session's currentValue, so the
     // harness sends one `session/set_config_option` for it; the fixture
@@ -1591,6 +1612,7 @@ fn sandbox_surface_declares_a_native_first_branch_per_harness() {
             auto_approve: true,
             attachments: Vec::new(),
             permission_timeout_ms: None,
+            use_mcp: false,
             resume: None,
             worktree: None,
             mcp: None,

@@ -2526,6 +2526,7 @@ impl DocHost {
             // even if we wanted to.
             worktree: None,
             permission_timeout_ms: None,
+            use_mcp: false,
             mcp: None,
             mcp_external: Vec::new(),
         })

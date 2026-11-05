@@ -41,6 +41,7 @@ fn run_request(prompt: &str) -> RunRequest {
         worktree: None,
         resume: None,
         permission_timeout_ms: None,
+        use_mcp: false,
         mcp: None,
         mcp_external: Vec::new(),
     }

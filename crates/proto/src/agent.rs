@@ -1256,6 +1256,10 @@ pub struct RunRequest {
     pub worktree: Option<WorktreeSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_timeout_ms: Option<u64>,
+    /// Opt in to Komet and configured external MCP servers for this prompt.
+    /// Defaults off so MCP startup never adds latency unless explicitly requested.
+    #[serde(default)]
+    pub use_mcp: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp: Option<McpInjection>,
     /// External MCP servers resolved for this run (secrets included ONLY for harness launch).
@@ -1753,10 +1757,10 @@ pub enum DoneStatus {
     Errored,
 }
 
-/// WHY a run settled — set by the ENGINE on synthesized endings so the UI can
-/// tell a user-requested stop apart from an engine-restart recovery (neither
-/// should render as a crash). Absent ([`None`], never serialized) means the
-/// harness produced its own natural `Done`.
+/// WHY a run settled. The engine sets reasons on its synthesized endings; ACP
+/// harnesses also set them to identify whether the prompt response, an
+/// explicit missing-turn signal, a stall, or child exit ended the run.
+/// Absent ([`None`], never serialized) means the producer did not classify it.
 ///
 /// Wire-compat: additive optional field — older peers parse a Done carrying a
 /// `reason` fine only once they know the field (deny_unknown_fields is NOT set
@@ -1770,6 +1774,14 @@ pub enum DoneReason {
     /// Synthesized by boot recovery (`recover_stale`): the previous engine
     /// process died mid-run and the journal was closed on its behalf.
     EngineRestart,
+    /// The ACP `session/prompt` response completed.
+    PromptResponse,
+    /// ACP explicitly reported that no turn was running for an outstanding prompt.
+    NoRunningTurn,
+    /// The ACP prompt-stall watchdog closed an unresponsive run.
+    PromptStall,
+    /// The ACP child exited before settling the prompt.
+    ChildExit,
 }
 
 /// Machine-readable class of a CLI-side failure, carried on
@@ -2027,7 +2039,7 @@ pub enum AgentEvent {
         result: Option<String>,
         error: Option<String>,
         session_id: Option<String>,
-        /// Set only on engine-synthesized endings (see [`DoneReason`]).
+        /// Optional classification of why the producer closed the run.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<DoneReason>,
     },
@@ -2410,17 +2422,20 @@ mod tests {
         let old = r#"{"prompt":"p","model":null,"reasoning":null,"cwd":".","sandbox":"workspace-write","resume":null}"#;
         let req: RunRequest = serde_json::from_str(old).unwrap();
         assert!(req.attachments.is_empty());
+        assert!(!req.use_mcp);
         // …and an empty list serializes away (old readers never see it).
         let json = serde_json::to_value(&req).unwrap();
         assert!(json.get("attachments").is_none());
-        // Populated lists round-trip.
+        // Populated lists and the explicit MCP opt-in round-trip.
         let req = RunRequest {
             attachments: vec!["/tmp/a.png".into()],
+            use_mcp: true,
             ..req
         };
         let round: RunRequest =
             serde_json::from_value(serde_json::to_value(&req).unwrap()).unwrap();
         assert_eq!(round.attachments, vec!["/tmp/a.png".to_string()]);
+        assert!(round.use_mcp);
     }
 
     #[test]
@@ -2810,6 +2825,7 @@ mod tests {
             worktree: None,
             resume: None,
             permission_timeout_ms: None,
+            use_mcp: false,
             mcp: None,
             mcp_external: Vec::new(),
             sandbox_options: Some(SandboxOptions {
@@ -2859,6 +2875,7 @@ mod tests {
             worktree: None,
             resume: None,
             permission_timeout_ms: None,
+            use_mcp: false,
             mcp: None,
             mcp_external: Vec::new(),
         }

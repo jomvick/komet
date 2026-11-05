@@ -310,6 +310,7 @@ async fn target_device_id_routes_over_the_relay() {
             auto_approve: true,
             attachments: Vec::new(),
             permission_timeout_ms: None,
+            use_mcp: false,
             worktree: None,
             resume: None,
             mcp: None,

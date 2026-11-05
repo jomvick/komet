@@ -19,6 +19,7 @@ fn run_request(prompt: &str) -> RunRequest {
         auto_approve: true,
         attachments: Vec::new(),
         permission_timeout_ms: None,
+        use_mcp: false,
         worktree: None,
         resume: None,
         mcp: None,
@@ -150,7 +151,8 @@ async fn run_does_not_store_secrets_in_journal() {
 
     // Register mock harness for this test's registry (already default mock)
     // Dispatch through sessions engine directly
-    let harness_req = run_request("do the thing");
+    let mut harness_req = run_request("do the thing");
+    harness_req.use_mcp = true;
     // Dispatch a run; external MCP is injected only in-memory and secrets
     // must still stay out of the journal / last_request.
     let run_id = core

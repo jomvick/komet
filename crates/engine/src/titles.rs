@@ -187,6 +187,7 @@ impl TitleGenerator {
                 // worktree.
                 worktree: None,
                 permission_timeout_ms: None,
+                use_mcp: false,
                 mcp: None,
                 mcp_external: Vec::new(),
             };

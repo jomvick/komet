@@ -38,6 +38,7 @@ fn run_request(prompt: &str) -> RunRequest {
         auto_approve: true,
         attachments: Vec::new(),
         permission_timeout_ms: None,
+        use_mcp: false,
         worktree: None,
         resume: None,
         mcp: None,

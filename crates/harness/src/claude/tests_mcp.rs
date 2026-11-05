@@ -61,6 +61,7 @@ fn base_request_with_mcp(externals: Vec<ResolvedMcpServer>) -> RunRequest {
         permission_timeout_ms: None,
         worktree: None,
         resume: None,
+        use_mcp: true,
         mcp: Some(McpInjection {
             server_name: "komet".into(),
             url: "http://127.0.0.1:9/mcp".into(),
@@ -178,6 +179,15 @@ fn capability_matrix_reports_codex_status() {
             "Ce provider ne supporte pas l'injection MCP dynamique"
         )
     );
+    for harness in [HarnessId::Devin, HarnessId::Copilot, HarnessId::Muse] {
+        assert_eq!(
+            supports_dynamic_mcp(harness),
+            (
+                false,
+                "Ce provider ne supporte pas l'injection MCP dynamique"
+            )
+        );
+    }
 }
 
 #[test]

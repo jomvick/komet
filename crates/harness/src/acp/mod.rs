@@ -43,7 +43,7 @@ mod subagent;
 mod subagent_opencode;
 
 use crate::platform::NoConsole as _;
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -58,7 +58,7 @@ use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 
 use komet_proto::{
-    AgentEvent, CommandSource, DoneStatus, ErrorKind, HarnessId, Model, ModelOption,
+    AgentEvent, CommandSource, DoneReason, DoneStatus, ErrorKind, HarnessId, Model, ModelOption,
     ModelOptionChoice, ReasoningLevel, RunRequest, SandboxLevel, SlashCommand, SteeringMode,
     UserInputAnswer, UserInputQuestion,
 };
@@ -174,12 +174,11 @@ struct AcpAgentSpec {
     /// a dead update check) — surface a visible error chip instead of
     /// indefinite Working.
     prompt_stall: Option<Duration>,
-    /// Blanket dropped-reply settle window (see `run_session`): a turn that
-    /// streamed content, has no open tool, and then goes quiet past this
-    /// window is settled with a synthesized Done. `None` disables it for
-    /// agents whose wire goes LEGITIMATELY silent mid-turn (Qoder runs tool
-    /// loops without emitting `session/update`; a 30s window closed its
-    /// turns minutes early). `KOMET_ACP_QUIET_SETTLE_MS` overrides; 0 disables.
+    /// Quiet-turn diagnostic window (see `run_session`): after output and with
+    /// no open tool, log when the stream goes quiet but keep the prompt future
+    /// alive. `None` disables it for agents whose wire goes legitimately
+    /// silent mid-turn (Qoder runs tool loops without emitting `session/update`).
+    /// Defaults to 120s; `KOMET_ACP_QUIET_SETTLE_MS` overrides; 0 disables.
     quiet_settle: Option<Duration>,
     /// Agent-specific advice appended to the stall error chip: what a wedge
     /// usually means for THIS agent and what the user can check.
@@ -201,6 +200,168 @@ fn free_localhost_port() -> Option<u16> {
         .and_then(|l| l.local_addr())
         .map(|a| a.port())
         .ok()
+}
+
+fn opencode_native_mcp_names(
+    cwd: &str,
+    extra_env: &[(String, String)],
+    explicitly_enabled: &BTreeSet<String>,
+) -> Result<Vec<String>, HarnessError> {
+    let mut paths = BTreeSet::new();
+    let custom_config = extra_env
+        .iter()
+        .find(|(key, _)| key == "OPENCODE_CONFIG")
+        .map(|(_, value)| value.clone())
+        .or_else(|| std::env::var("OPENCODE_CONFIG").ok());
+    if let Some(path) = custom_config {
+        let path = PathBuf::from(path);
+        paths.insert(if path.is_absolute() {
+            path
+        } else {
+            Path::new(cwd).join(path)
+        });
+    }
+
+    if let Some(home) = crate::platform::home_dir() {
+        let config_home = std::env::var_os("XDG_CONFIG_HOME")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".config"));
+        for root in [config_home.join("opencode"), home.join(".opencode")] {
+            for name in ["opencode.json", "opencode.jsonc"] {
+                paths.insert(root.join(name));
+            }
+        }
+    }
+    let mut directory = Some(Path::new(cwd));
+    while let Some(current) = directory {
+        for root in [current.to_path_buf(), current.join(".opencode")] {
+            for name in ["opencode.json", "opencode.jsonc"] {
+                paths.insert(root.join(name));
+            }
+        }
+        directory = current.parent();
+    }
+
+    let mut names = BTreeSet::new();
+    for path in paths {
+        if !path.is_file() {
+            continue;
+        }
+        let contents = std::fs::read_to_string(&path).map_err(HarnessError::Io)?;
+        collect_opencode_mcp_names(&contents, &path.display().to_string(), &mut names)?;
+    }
+    for (key, contents) in [
+        (
+            "OPENCODE_CONFIG_CONTENT",
+            std::env::var("OPENCODE_CONFIG_CONTENT").ok(),
+        ),
+        (
+            "OPENCODE_CONFIG_CONTENT",
+            extra_env
+                .iter()
+                .find(|(key, _)| key == "OPENCODE_CONFIG_CONTENT")
+                .map(|(_, value)| value.clone()),
+        ),
+    ] {
+        if let Some(contents) = contents {
+            collect_opencode_mcp_names(&contents, key, &mut names)?;
+        }
+    }
+    Ok(opencode_mcp_names_to_disable(names, explicitly_enabled))
+}
+
+fn opencode_mcp_names_to_disable(
+    mut configured: BTreeSet<String>,
+    explicitly_enabled: &BTreeSet<String>,
+) -> Vec<String> {
+    configured.retain(|name| !explicitly_enabled.contains(name));
+    configured.into_iter().collect()
+}
+
+fn collect_opencode_mcp_names(
+    contents: &str,
+    source: &str,
+    names: &mut BTreeSet<String>,
+) -> Result<(), HarnessError> {
+    let config: Value = json5::from_str(contents).map_err(|error| {
+        HarnessError::Protocol(format!(
+            "could not parse OpenCode config from {source}: {error}"
+        ))
+    })?;
+    let Some(mcp) = config.get("mcp").and_then(Value::as_object) else {
+        return Ok(());
+    };
+    if let Some(servers) = mcp.get("servers").and_then(Value::as_object) {
+        names.extend(servers.keys().cloned());
+    }
+    for (name, value) in mcp {
+        if !matches!(name.as_str(), "servers" | "timeout" | "enabled") && value.is_object() {
+            names.insert(name.clone());
+        }
+    }
+    Ok(())
+}
+
+fn copilot_home_without_native_mcp() -> Result<Option<tempfile::TempDir>, std::io::Error> {
+    let source = std::env::var_os("COPILOT_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| crate::platform::home_dir().map(|home| home.join(".copilot")));
+    let Some(source) = source else {
+        return Ok(None);
+    };
+    let source = if source.is_absolute() {
+        source
+    } else {
+        std::env::current_dir()?.join(source)
+    };
+    copilot_home_without_native_mcp_from(&source)
+}
+
+fn copilot_home_without_native_mcp_from(
+    source: &Path,
+) -> Result<Option<tempfile::TempDir>, std::io::Error> {
+    if !source.join("mcp-config.json").is_file() {
+        return Ok(None);
+    }
+
+    let isolated = tempfile::tempdir()?;
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        if entry.file_name() == "mcp-config.json" {
+            continue;
+        }
+        let target = isolated.path().join(entry.file_name());
+        let is_dir = std::fs::metadata(entry.path())?.is_dir();
+        symlink_path(&entry.path(), &target, is_dir)?;
+    }
+    if let Some(home) = crate::platform::home_dir() {
+        let shared_skills = home.join(".agents").join("skills");
+        let target = isolated.path().join("skills");
+        if shared_skills.is_dir() && !target.exists() {
+            symlink_path(&shared_skills, &target, true)?;
+        }
+    }
+    std::fs::write(
+        isolated.path().join("mcp-config.json"),
+        r#"{"mcpServers":{}}"#,
+    )?;
+    Ok(Some(isolated))
+}
+
+#[cfg(unix)]
+fn symlink_path(source: &Path, target: &Path, _is_dir: bool) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(source, target)
+}
+
+#[cfg(windows)]
+fn symlink_path(source: &Path, target: &Path, is_dir: bool) -> std::io::Result<()> {
+    if is_dir {
+        std::os::windows::fs::symlink_dir(source, target)
+    } else {
+        std::os::windows::fs::symlink_file(source, target)
+    }
 }
 
 /// Whether the installed opencode binary still accepts the v1 `acp --port`
@@ -422,7 +583,7 @@ fn grok_spec() -> AcpAgentSpec {
         // `_meta.promptId`, just ahead of the RPC response.
         prompt_complete_extension: true,
         prompt_stall: Some(Duration::from_secs(30)),
-        quiet_settle: Some(Duration::from_secs(30)),
+        quiet_settle: Some(Duration::from_secs(120)),
         stall_hint: "The agent process is likely wedged — a stale shared leader \
              process or a hung startup check; komet launches it with --no-leader \
              and --no-auto-update to avoid both.",
@@ -491,7 +652,7 @@ fn hermes_spec() -> AcpAgentSpec {
         ladder_extras: &[],
         prompt_complete_extension: false,
         prompt_stall: Some(Duration::from_secs(45)),
-        quiet_settle: Some(Duration::from_secs(30)),
+        quiet_settle: Some(Duration::from_secs(120)),
         stall_hint: "The agent process is likely wedged \\
              - a stale Python/uv environment or a hung provider auth check. \\
              Try running `hermes acp` once in a terminal to see the raw error.",
@@ -551,7 +712,7 @@ fn pi_spec() -> AcpAgentSpec {
         ladder_extras: &[],
         prompt_complete_extension: false,
         prompt_stall: Some(Duration::from_secs(45)),
-        quiet_settle: Some(Duration::from_secs(30)),
+        quiet_settle: Some(Duration::from_secs(120)),
         stall_hint: "The agent process is likely wedged \
              \u{2014} a stale pi-acp adapter process or a hung provider call in \
              pi's own config (~/.pi). Try running `pi` once in a terminal to \
@@ -620,7 +781,7 @@ fn devin_spec() -> AcpAgentSpec {
         ladder_extras: &[],
         prompt_complete_extension: false,
         prompt_stall: Some(Duration::from_secs(60)),
-        quiet_settle: Some(Duration::from_secs(30)),
+        quiet_settle: Some(Duration::from_secs(120)),
         stall_hint: "Check Devin CLI authentication with `devin auth login`.",
         http_sidecar: false,
     }
@@ -666,7 +827,7 @@ fn copilot_spec() -> AcpAgentSpec {
         ladder_extras: &[],
         prompt_complete_extension: false,
         prompt_stall: Some(Duration::from_secs(60)),
-        quiet_settle: Some(Duration::from_secs(30)),
+        quiet_settle: Some(Duration::from_secs(120)),
         stall_hint: "Check Copilot CLI authentication with `copilot login`.",
         http_sidecar: false,
     }
@@ -733,7 +894,7 @@ fn cline_spec() -> AcpAgentSpec {
         // wire activity. Total silence past this is a wedge (a dead provider
         // auth check) — surface a visible error chip instead of Working.
         prompt_stall: Some(Duration::from_secs(60)),
-        quiet_settle: Some(Duration::from_secs(30)),
+        quiet_settle: Some(Duration::from_secs(120)),
         stall_hint: "The agent process is likely wedged — a stale provider auth \
              check in Cline's own config (~/.cline) or a hung model call. Try \
              running `cline --acp` once in a terminal to see the raw error.",
@@ -896,7 +1057,7 @@ fn opencode_spec() -> AcpAgentSpec {
         // silence past the bound means the retry loop, so the watchdog is
         // the only way the user ever learns.
         prompt_stall: Some(Duration::from_secs(60)),
-        quiet_settle: Some(Duration::from_secs(30)),
+        quiet_settle: Some(Duration::from_secs(120)),
         stall_hint: "The model provider is likely unreachable or rejecting \
              requests — opencode retries these silently and never reports the \
              failure. Check the model/provider setup (`opencode auth list`, \
@@ -1014,6 +1175,7 @@ struct SpawnAgentOptions<'a> {
     sidecar_port: Option<u16>,
     extra_args: &'a [String],
     opencode_config_overlay: Option<&'a std::path::Path>,
+    enabled_mcp_names: &'a [String],
     sandbox: Option<SandboxLevel>,
     extra_env: &'a [(String, String)],
 }
@@ -1242,16 +1404,22 @@ impl AcpHarness {
     async fn spawn_agent(
         &self,
         options: SpawnAgentOptions<'_>,
-    ) -> Result<(Child, crate::StderrTail), HarnessError> {
+    ) -> Result<(Child, crate::StderrTail, Option<tempfile::TempDir>), HarnessError> {
         let SpawnAgentOptions {
             cwd,
             block_on_install,
             sidecar_port,
             extra_args,
             opencode_config_overlay,
+            enabled_mcp_names,
             sandbox,
             extra_env,
         } = options;
+        let copilot_home = if self.spec.id == HarnessId::Copilot {
+            copilot_home_without_native_mcp().map_err(HarnessError::Io)?
+        } else {
+            None
+        };
         let (exe, mut args) = self.resolve_program(block_on_install).await?;
         if self.spec.id == HarnessId::Grok
             && let Some(level) = sandbox
@@ -1268,6 +1436,9 @@ impl AcpHarness {
                 .env_remove("GH_ENTERPRISE_TOKEN");
         }
         cmd.envs(extra_env.iter().map(|(key, value)| (key, value)));
+        if let Some(home) = &copilot_home {
+            cmd.env("COPILOT_HOME", home.path());
+        }
         if let Some(port) = sidecar_port {
             cmd.env("PORT", port.to_string());
             cmd.env("OPENCODE_PORT", port.to_string());
@@ -1284,6 +1455,16 @@ impl AcpHarness {
             } else {
                 // Fallback to file path if content read fails
                 cmd.env("OPENCODE_CONFIG", overlay);
+            }
+        } else if matches!(self.spec.id, HarnessId::Opencode | HarnessId::Devin) {
+            let cwd = match cwd {
+                Some(cwd) => PathBuf::from(cwd),
+                None => std::env::current_dir().map_err(HarnessError::Io)?,
+            };
+            let enabled: BTreeSet<String> = enabled_mcp_names.iter().cloned().collect();
+            let disabled = opencode_native_mcp_names(&cwd.to_string_lossy(), extra_env, &enabled)?;
+            if let Some(content) = opencode_perms::opencode_mcp_disable_document(&disabled) {
+                cmd.env("OPENCODE_CONFIG_CONTENT", content);
             }
         }
         cmd.stdin(Stdio::piped())
@@ -1308,7 +1489,7 @@ impl AcpHarness {
                 }
             });
         }
-        Ok((child, stderr_tail))
+        Ok((child, stderr_tail, copilot_home))
     }
 
     /// Short-lived discovery run for [`Harness::commands`]: initialize, scan
@@ -1317,13 +1498,14 @@ impl AcpHarness {
     /// refuses sessions before login still surfaces whatever the handshake
     /// advertised.
     async fn discover_commands(&self, cwd: &Path) -> Result<Vec<SlashCommand>, HarnessError> {
-        let (mut child, _stderr) = self
+        let (mut child, _stderr, _copilot_home_dir) = self
             .spawn_agent(SpawnAgentOptions {
                 cwd: None,
                 block_on_install: false,
                 sidecar_port: None,
                 extra_args: &[],
                 opencode_config_overlay: None,
+                enabled_mcp_names: &[],
                 sandbox: None,
                 extra_env: &[],
             })
@@ -1396,13 +1578,14 @@ impl AcpHarness {
     /// wire is the source of truth — the spec's static catalog only enriches
     /// matching entries and names the pick when the agent advertises nothing.
     async fn discover_models(&self) -> Result<Vec<Model>, HarnessError> {
-        let (mut child, stderr_tail) = self
+        let (mut child, stderr_tail, _copilot_home_dir) = self
             .spawn_agent(SpawnAgentOptions {
                 cwd: None,
                 block_on_install: false,
                 sidecar_port: None,
                 extra_args: &[],
                 opencode_config_overlay: None,
+                enabled_mcp_names: &[],
                 sandbox: None,
                 extra_env: &[],
             })
@@ -2114,52 +2297,85 @@ impl Harness for AcpHarness {
         } else {
             (None, Vec::new())
         };
-        // OpenCode permission overlay: write temp opencode.json and point OPENCODE_CONFIG at it.
-        // The file must outlive the child, so we leak its TempPath into a owned PathBuf kept alive
-        // until the child exits (the Session owns the TempDir via _opencode_overlay_dir).
-        let (_opencode_overlay_dir, opencode_overlay_path) = if self.spec.id == HarnessId::Opencode
+        let enabled_mcp_names: Vec<String> = if request.use_mcp {
+            request
+                .mcp
+                .iter()
+                .map(|mcp| mcp.server_name.clone())
+                .chain(request.mcp_external.iter().map(|mcp| mcp.config.id.clone()))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let enabled_mcp_set: BTreeSet<String> = enabled_mcp_names.iter().cloned().collect();
+        let disabled_native_mcp = if matches!(self.spec.id, HarnessId::Opencode | HarnessId::Devin)
         {
-            let resolved_perms = request
-                .sandbox_options
-                .as_ref()
-                .and_then(|opts| opts.opencode.clone())
-                .or_else(|| komet_proto::SandboxOptions::from_level(request.sandbox).opencode);
-            if let Some(perms) = resolved_perms.as_ref() {
-                let dir = tempfile::tempdir().map_err(HarnessError::Io)?;
-                let path = dir.path().join("opencode.json");
-                let doc = opencode_perms::opencode_config_document(perms);
-                std::fs::write(&path, doc).map_err(HarnessError::Io)?;
-                // C1: opt-in sandbox-runtime — write sandbox.json alongside overlay
-                if let Some(cfg) = opencode_perms::sandbox_runtime_config(perms, &request.cwd) {
-                    let sandbox_path = dir.path().join("sandbox.json");
-                    std::fs::write(&sandbox_path, cfg).map_err(HarnessError::Io)?;
-                    // Best-effort: also materialise into <cwd>/.opencode/sandbox.json so the
-                    // plugin (which reads from cwd, not OPENCODE_CONFIG_CONTENT) sees it.
-                    // Overlay dir is temp; cwd copy is additive and never overwrites user file
-                    // without explicit opt-in — we only write if the file doesn't exist.
-                    let cwd_sandbox =
-                        std::path::Path::new(&request.cwd).join(".opencode/sandbox.json");
-                    if cwd_sandbox.parent().is_some_and(|p| p.exists()) && !cwd_sandbox.exists() {
-                        let _ = std::fs::write(
-                            &cwd_sandbox,
-                            std::fs::read(&sandbox_path).unwrap_or_default(),
-                        );
+            opencode_native_mcp_names(&request.cwd, &controls.env, &enabled_mcp_set)?
+        } else {
+            Vec::new()
+        };
+
+        // The per-run overlay preserves OpenCode permissions and disables MCP
+        // servers from native configs without changing those files. Devin also
+        // reads the OpenCode user config, so it gets the MCP-only overlay.
+        let (_runtime_overlay_dir, opencode_overlay_path) =
+            if matches!(self.spec.id, HarnessId::Opencode | HarnessId::Devin) {
+                let resolved_perms = request
+                    .sandbox_options
+                    .as_ref()
+                    .and_then(|opts| opts.opencode.clone())
+                    .or_else(|| komet_proto::SandboxOptions::from_level(request.sandbox).opencode);
+                if self.spec.id == HarnessId::Opencode
+                    && let Some(perms) = resolved_perms.as_ref()
+                {
+                    let dir = tempfile::tempdir().map_err(HarnessError::Io)?;
+                    let path = dir.path().join("opencode.json");
+                    let doc = opencode_perms::opencode_config_document_with_disabled_mcp(
+                        perms,
+                        &disabled_native_mcp,
+                    );
+                    std::fs::write(&path, doc).map_err(HarnessError::Io)?;
+                    // C1: opt-in sandbox-runtime — write sandbox.json alongside overlay
+                    if let Some(cfg) = opencode_perms::sandbox_runtime_config(perms, &request.cwd) {
+                        let sandbox_path = dir.path().join("sandbox.json");
+                        std::fs::write(&sandbox_path, cfg).map_err(HarnessError::Io)?;
+                        // Best-effort: also materialise into <cwd>/.opencode/sandbox.json so the
+                        // plugin (which reads from cwd, not OPENCODE_CONFIG_CONTENT) sees it.
+                        // Overlay dir is temp; cwd copy is additive and never overwrites user file
+                        // without explicit opt-in — we only write if the file doesn't exist.
+                        let cwd_sandbox =
+                            std::path::Path::new(&request.cwd).join(".opencode/sandbox.json");
+                        if cwd_sandbox.parent().is_some_and(|p| p.exists()) && !cwd_sandbox.exists()
+                        {
+                            let _ = std::fs::write(
+                                &cwd_sandbox,
+                                std::fs::read(&sandbox_path).unwrap_or_default(),
+                            );
+                        }
                     }
+                    (Some(dir), Some(path))
+                } else if self.spec.id == HarnessId::Devin
+                    && let Some(doc) =
+                        opencode_perms::opencode_mcp_disable_document(&disabled_native_mcp)
+                {
+                    let dir = tempfile::tempdir().map_err(HarnessError::Io)?;
+                    let path = dir.path().join("opencode.json");
+                    std::fs::write(&path, doc).map_err(HarnessError::Io)?;
+                    (Some(dir), Some(path))
+                } else {
+                    (None, None)
                 }
-                (Some(dir), Some(path))
             } else {
                 (None, None)
-            }
-        } else {
-            (None, None)
-        };
-        let (mut child, stderr_tail) = self
+            };
+        let (mut child, stderr_tail, copilot_home_dir) = self
             .spawn_agent(SpawnAgentOptions {
                 cwd: Some(&request.cwd),
                 block_on_install: true,
                 sidecar_port,
                 extra_args: &extra_args,
                 opencode_config_overlay: opencode_overlay_path.as_deref(),
+                enabled_mcp_names: &enabled_mcp_names,
                 sandbox: Some(request.sandbox),
                 extra_env: &controls.env,
             })
@@ -2175,7 +2391,8 @@ impl Harness for AcpHarness {
         let (client, incoming) = RpcClient::new(stdin, stdout);
         let (event_tx, event_rx) = mpsc::channel::<Result<AgentEvent, HarnessError>>(256);
         tokio::spawn(run_session(Session {
-            _opencode_overlay_dir,
+            _opencode_overlay_dir: _runtime_overlay_dir,
+            _copilot_home_dir: copilot_home_dir,
             child,
             client,
             incoming,
@@ -2213,6 +2430,7 @@ impl Harness for AcpHarness {
 
 struct Session {
     _opencode_overlay_dir: Option<tempfile::TempDir>,
+    _copilot_home_dir: Option<tempfile::TempDir>,
     child: Child,
     client: RpcClient,
     incoming: mpsc::Receiver<Incoming>,
@@ -3142,6 +3360,25 @@ async fn emit_grok_session_info(
     true
 }
 
+/// Whether the child process is gone.
+///
+/// A closed stdout is what fails an outstanding request, and the reader clears
+/// the pending map just before it sends `Incoming::Eof` — so the select can
+/// wake the prompt arm with a transport failure whose child has not been
+/// reaped yet. `try_wait` is non-blocking, so give the reap a few short beats
+/// before calling the child alive.
+async fn child_exited(child: &mut tokio::process::Child) -> bool {
+    for beat in 0..4 {
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return true;
+        }
+        if beat + 1 < 4 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+    false
+}
+
 /// Map a finished `session/prompt` result to the run's terminal status.
 ///
 /// The third element is a NON-BLOCKING error chip: `max_tokens` /
@@ -3715,16 +3952,20 @@ fn prompt_like_request(
     Box::pin(async move { client.request(method, params).await })
 }
 
-/// Track the liveness signals the blanket quiet-settle keys on: content
-/// proves the turn produced something; an open tool call or a pending
-/// question proves silence is legitimate.
+/// Track the liveness signals the blanket quiet-settle keys on: text or
+/// reasoning proves the turn produced something; an open tool call or a
+/// pending question proves silence is legitimate.
 fn track_turn_signals(
     ev: &AgentEvent,
     content_seen: &mut bool,
     open_tools: &mut std::collections::HashSet<String>,
 ) {
     match ev {
-        AgentEvent::TextDelta { text } if !text.is_empty() => *content_seen = true,
+        AgentEvent::TextDelta { text } | AgentEvent::ReasoningDelta { text }
+            if !text.is_empty() =>
+        {
+            *content_seen = true;
+        }
         AgentEvent::ToolCall { id, .. } => {
             *content_seen = true;
             open_tools.insert(id.clone());
@@ -3779,6 +4020,7 @@ async fn run_session(session: Session) {
         cli_sync,
         cline_data_dir,
         _opencode_overlay_dir: _overlay_dir,
+        _copilot_home_dir,
     } = session;
     let RunControls {
         request_input,
@@ -4013,81 +4255,91 @@ async fn run_session(session: Session) {
         ))
     };
     let (session_id, steer_ext, init_commands) = tokio::select! {
-            res = tokio::time::timeout(handshake_timeout, setup) => {
-                let res = res.unwrap_or_else(|_| {
-                    // A hung handshake (agent waiting on a login it can never
-                    // get, a wedged adapter) used to spin "Working" forever —
-                    // the false "thinking for 2+ minutes then nothing" class of
-                    // report. Bound it and say what was reached.
-                    Err(HarnessError::Protocol(format!(
-                        "{agent_name} did not complete the ACP handshake within {}s \
-                         (the agent may be waiting for a login — try running it once \
-                         in a terminal)",
-                        handshake_timeout.as_secs()
-                    )))
-                });
-                match res {
-                    Ok(v) => v,
-                    Err(e) => {
-                        // A child that dies before the handshake used to surface only
-                        // the RPC-side symptom ("transport closed") — its exit status
-                        // and stderr, both already in hand, were dropped, leaving
-                        // startup crashes undiagnosable (user report). When the child
-                        // is already gone, give the reader task a beat to drain the
-                        // pipe, then append the crash text; the Done carrying it is
-                        // journaled, so the cause survives for later inspection. A
-                        // still-live child (the timeout) contributes its stderr tail.
-                        let error = match child.try_wait() {
-                            Ok(Some(status)) => {
-                                tokio::time::sleep(Duration::from_millis(200)).await;
-                                format!(
-                                    "{e}; {}",
-                                    crate::crash_message(agent_name, Some(status), &stderr_tail)
-                                )
-                            }
-                            _ => match stderr_tail.snapshot() {
-                                Some(tail) => format!("{e}; stderr: {tail}"),
-                                None => e.to_string(),
-                            },
-                        };
-                        tracing::warn!(target: "komet_harness::acp", %error, "agent setup failed");
-                        let _ = send(
-                            &event_tx,
-                            typed_error(
-                                error.clone(),
-                                None,
-                                tail_detail(stderr_tail.snapshot()),
-                            ),
-                        )
-                        .await;
-                        let _ = event_tx
-                            .send(Ok(AgentEvent::Done {
-                                status: DoneStatus::Errored,
-                                result: None,
-                                error: Some(error),
-                                session_id: None,
-    reason: None,
-                            }))
-                            .await;
-                        shutdown_child(&mut child, kill_grace).await;
-                        return;
-                    }
-                }
-            },
-            _ = interrupt.cancelled() => {
-                let _ = event_tx
-                    .send(Ok(AgentEvent::Done {
-                        status: DoneStatus::Interrupted,
-                        result: None,
-                        error: None,
-                        session_id: None,
-    reason: None,
-                    }))
+        res = tokio::time::timeout(handshake_timeout, setup) => {
+            let res = res.unwrap_or_else(|_| {
+                // A hung handshake (agent waiting on a login it can never
+                // get, a wedged adapter) used to spin "Working" forever —
+                // the false "thinking for 2+ minutes then nothing" class of
+                // report. Bound it and say what was reached.
+                Err(HarnessError::Protocol(format!(
+                    "{agent_name} did not complete the ACP handshake within {}s \
+                     (the agent may be waiting for a login — try running it once \
+                     in a terminal)",
+                    handshake_timeout.as_secs()
+                )))
+            });
+            match res {
+                Ok(v) => v,
+                Err(e) => {
+                    // A child that dies before the handshake used to surface only
+                    // the RPC-side symptom ("transport closed") — its exit status
+                    // and stderr, both already in hand, were dropped, leaving
+                    // startup crashes undiagnosable (user report). When the child
+                    // is already gone, give the reader task a beat to drain the
+                    // pipe, then append the crash text; the Done carrying it is
+                    // journaled, so the cause survives for later inspection. A
+                    // still-live child (the timeout) contributes its stderr tail.
+                    let error = match child.try_wait() {
+                        Ok(Some(status)) => {
+                            tokio::time::sleep(Duration::from_millis(200)).await;
+                            format!(
+                                "{e}; {}",
+                                crate::crash_message(agent_name, Some(status), &stderr_tail)
+                            )
+                        }
+                        _ => match stderr_tail.snapshot() {
+                            Some(tail) => format!("{e}; stderr: {tail}"),
+                            None => e.to_string(),
+                        },
+                    };
+                    tracing::warn!(target: "komet_harness::acp", %error, "agent setup failed");
+                    let _ = send(
+                        &event_tx,
+                        typed_error(
+                            error.clone(),
+                            None,
+                            tail_detail(stderr_tail.snapshot()),
+                        ),
+                    )
                     .await;
-                shutdown_child(&mut child, kill_grace).await;
-                return;
+                    tracing::warn!(
+                        target: "komet_harness::acp",
+                        done_origin = "child_exit",
+                        "ACP child failed before session startup completed"
+                    );
+                    let _ = event_tx
+                        .send(Ok(AgentEvent::Done {
+                            status: DoneStatus::Errored,
+                            result: None,
+                            error: Some(error),
+                            session_id: None,
+                            reason: Some(DoneReason::ChildExit),
+                        }))
+                        .await;
+                    shutdown_child(&mut child, kill_grace).await;
+                    return;
+                }
             }
-        };
+        },
+        _ = interrupt.cancelled() => {
+            tracing::info!(
+                target: "komet_harness::acp",
+                done_origin = "interrupt",
+                "ACP run interrupted during startup"
+            );
+            let _ = event_tx
+                .send(Ok(AgentEvent::Done {
+                    status: DoneStatus::Interrupted,
+                    result: None,
+                    error: None,
+                    session_id: None,
+                    reason: Some(DoneReason::UserRequested),
+                }))
+                .await;
+            shutdown_child(&mut child, kill_grace).await;
+            return;
+        }
+    };
 
     let mut assistant_message_id = new_message_id();
     // Startup line: one info per run (harness, provider, model, session) so a
@@ -4208,22 +4460,16 @@ async fn run_session(session: Session) {
     // the queued steer is promoted to a fresh turn.
     const STARVE_GRACE: Duration = Duration::from_secs(2);
     let mut starve_deadline: Option<tokio::time::Instant> = None;
-    // BLANKET dropped-reply settle, adapter-agnostic: any ACP agent whose
-    // prompt response goes missing must not strand the turn. Signals that
-    // exist in core ACP stand in for the adapter-specific cost frame: once
-    // the turn has streamed content, every tool call it opened has resolved,
-    // no permission/question round-trip is pending, and the stream has been
-    // quiet past the window, the turn is settled through the same recovery
-    // arm. A false settle is only PARTLY recoverable: the engine folds any
-    // later output as a self-continued segment and re-arms Working, but the
-    // turn is orphaned — the real response resolves a closed channel, no
-    // Done ever comes, and the session strands Working until the engine's
-    // quiesce watchdog parks it.
+    // Quiet-turn diagnostic, not a turn boundary: a silent provider may still
+    // be reasoning or retrying. Keep the session/prompt future alive so its
+    // eventual response remains attached to this turn. If the response is
+    // genuinely lost, the engine's recoverable turn-quiesce watchdog parks
+    // the session without dropping this future.
     //
-    // `KOMET_ACP_QUIET_SETTLE_MS` overrides the adapter's default; 0 disables.
-    // The default is per-spec because silence means different things per
-    // adapter: most agents acknowledge tool work on the wire, but Qoder's
-    // tool loops leave it silent for minutes (`quiet_settle: None` there).
+    // `KOMET_ACP_QUIET_SETTLE_MS` overrides the adapter's diagnostic window;
+    // 0 disables it. The 120s default is deliberately tolerant of long
+    // reasoning/provider pauses. Qoder disables it because its tool loops can
+    // leave the wire silent for minutes.
     let quiet_settle: Option<Duration> = match std::env::var("KOMET_ACP_QUIET_SETTLE_MS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
@@ -4234,6 +4480,7 @@ async fn run_session(session: Session) {
     };
     let mut last_update_at = tokio::time::Instant::now();
     let mut turn_content_seen = false;
+    let mut quiet_settle_warned = false;
     // A steering injection makes the cost hint unsafe for the REST of the
     // turn: the adapter emits a cost-bearing usage_update for the injected
     // message itself, mid-turn, indistinguishable in shape from the
@@ -4258,69 +4505,549 @@ async fn run_session(session: Session) {
 
     'main: loop {
         tokio::select! {
-                    res = async { turn.as_mut().expect("guarded by if").await }, if turn.is_some() => {
-                        turn = None;
-                        starve_deadline = None;
-                        prompt_stall_deadline = None;
-                        if let Some(id) = current_prompt_id.take() {
-                            completed_prompts.push_back(id);
-                            while completed_prompts.len() > 32 {
-                                completed_prompts.pop_front();
-                            }
+            res = async { turn.as_mut().expect("guarded by if").await }, if turn.is_some() => {
+                turn = None;
+                starve_deadline = None;
+                prompt_stall_deadline = None;
+                if let Some(id) = current_prompt_id.take() {
+                    completed_prompts.push_back(id);
+                    while completed_prompts.len() > 32 {
+                        completed_prompts.pop_front();
+                    }
+                }
+                // Settle an in-flight `_session/steering` call BEFORE closing
+                // the turn: its response rides the same stdout as the prompt
+                // response, so by now it is (nearly always) already parsed —
+                // the select just hadn't polled it yet. Deciding it here keeps
+                // the ordering deterministic: an injection that landed in this
+                // turn emits its Steered boundary now, ahead of the drained
+                // tail and the Done (a Steered AFTER Done re-armed the
+                // consumer with no next turn — the stranded-Working bug); a
+                // rejected/unsettled call redelivers as the next turn. The
+                // timeout guards the flooded-incoming edge (reader blocked on
+                // a full channel never parses the response): past it the call
+                // is abandoned and the steer redelivered.
+                if let Some((text, mut fut)) = steering_call.take() {
+                    let outcome = match tokio::time::timeout(
+                        Duration::from_millis(1000),
+                        &mut fut,
+                    )
+                    .await
+                    {
+                        Ok(Ok(resp)) => resp
+                            .get("outcome")
+                            .and_then(Value::as_str)
+                            .unwrap_or("injected")
+                            .to_owned(),
+                        Ok(Err(_)) | Err(_) => "promptRequired".to_owned(),
+                    };
+                    if interrupted {
+                        // Winding down; abandoned like any queued steer.
+                    } else if outcome != "promptRequired" {
+                        let (prev, next) = rotate(&mut assistant_message_id);
+                        if !send(
+                            &event_tx,
+                            AgentEvent::Steered {
+                                assistant_message_id: Some(prev),
+                                next_assistant_message_id: Some(next),
+                            },
+                        )
+                        .await
+                        {
+                            break 'main;
                         }
-                        // Settle an in-flight `_session/steering` call BEFORE closing
-                        // the turn: its response rides the same stdout as the prompt
-                        // response, so by now it is (nearly always) already parsed —
-                        // the select just hadn't polled it yet. Deciding it here keeps
-                        // the ordering deterministic: an injection that landed in this
-                        // turn emits its Steered boundary now, ahead of the drained
-                        // tail and the Done (a Steered AFTER Done re-armed the
-                        // consumer with no next turn — the stranded-Working bug); a
-                        // rejected/unsettled call redelivers as the next turn. The
-                        // timeout guards the flooded-incoming edge (reader blocked on
-                        // a full channel never parses the response): past it the call
-                        // is abandoned and the steer redelivered.
-                        if let Some((text, mut fut)) = steering_call.take() {
-                            let outcome = match tokio::time::timeout(
-                                Duration::from_millis(1000),
-                                &mut fut,
-                            )
-                            .await
-                            {
-                                Ok(Ok(resp)) => resp
-                                    .get("outcome")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("injected")
-                                    .to_owned(),
-                                Ok(Err(_)) | Err(_) => "promptRequired".to_owned(),
-                            };
-                            if interrupted {
-                                // Winding down; abandoned like any queued steer.
-                            } else if outcome != "promptRequired" {
-                                let (prev, next) = rotate(&mut assistant_message_id);
-                                if !send(
-                                    &event_tx,
-                                    AgentEvent::Steered {
-                                        assistant_message_id: Some(prev),
-                                        next_assistant_message_id: Some(next),
-                                    },
-                                )
-                                .await
-                                {
-                                    break 'main;
+                    } else {
+                        queued_steers.push_back(text);
+                    }
+                    // Followers waiting on the settled call have no live turn
+                    // to inject into anymore: boundary delivery.
+                    while let Some(next_text) = steer_backlog.pop_front() {
+                        queued_steers.push_back(next_text);
+                    }
+                }
+                // Updates streamed before the prompt response are already
+                // queued in stdout order — fold them into the turn before
+                // closing it (responses bypass the incoming queue).
+                let mut consumer_gone = false;
+                while let Ok(inc) = incoming.try_recv() {
+                    match inc {
+                        Incoming::Notification { method, params } => {
+                            let events =
+                                session_update_events(&method, &params, &session_id, &mut subagents);
+                            for ev in events {
+                                track_turn_signals(
+                                    &ev,
+                                    &mut turn_content_seen,
+                                    &mut open_tools,
+                                );
+                                if !send(&event_tx, ev).await {
+                                    consumer_gone = true;
+                                    break;
                                 }
-                            } else {
-                                queued_steers.push_back(text);
-                            }
-                            // Followers waiting on the settled call have no live turn
-                            // to inject into anymore: boundary delivery.
-                            while let Some(next_text) = steer_backlog.pop_front() {
-                                queued_steers.push_back(next_text);
                             }
                         }
-                        // Updates streamed before the prompt response are already
-                        // queued in stdout order — fold them into the turn before
-                        // closing it (responses bypass the incoming queue).
+                        Incoming::Request { id, method, params } => {
+                            for ev in handle_server_request_live(
+                                &client,
+                                id,
+                                &method,
+                                &params,
+                                &request_input,
+                                &request_permission,
+                                &open_questions,
+                                request.sandbox,
+                                elicitation,
+                            ) {
+                                if !send(&event_tx, ev).await {
+                                    consumer_gone = true;
+                                    break;
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                    if consumer_gone {
+                        break;
+                    }
+                }
+                if consumer_gone {
+                    break 'main;
+                }
+                let (prev, _next) = rotate(&mut assistant_message_id);
+                if !send(
+                    &event_tx,
+                    AgentEvent::AssistantMessageCompleted { assistant_message_id: prev },
+                )
+                .await
+                {
+                    break 'main;
+                }
+                // Per-turn billed tokens (popover) + Grok's native
+                // occupancy probe. Billed input is not the ring fill.
+                if !emit_usage_events(&event_tx, &res).await {
+                    break 'main;
+                }
+                if !emit_grok_session_info(&event_tx, &client, &session_id, harness).await {
+                    break 'main;
+                }
+                let (mut status, mut error, truncated) =
+                    stop_outcome(&res, interrupted);
+                if let Some(chip) = truncated {
+                    let _ = send(&event_tx, chip).await;
+                }
+                // An empty turn must not journal as success. Cline's
+                // real cause lives in its session file, never on the
+                // wire; a clean session file keeps Completed (nothing
+                // failed). Every other harness has no cause source —
+                // an empty turn there is never a real answer, so the
+                // generic guard errors it instead of staying silent.
+                if status == DoneStatus::Completed
+                    && res.is_ok()
+                    && !turn_content_seen
+                    && open_tools.is_empty()
+                {
+                    let empty = if harness == HarnessId::Cline {
+                        cline_empty_turn_error(
+                            &session_id,
+                            turn_content_seen,
+                            open_tools.len(),
+                            cline_data_dir.clone(),
+                        )
+                        .await
+                    } else {
+                        None
+                    };
+                    match empty {
+                        Some(cause) => {
+                            let _ = send(
+                                &event_tx,
+                                typed_error(cause.clone(), None, None),
+                            )
+                            .await;
+                            status = DoneStatus::Errored;
+                            error = Some(cause);
+                        }
+                        None if harness != HarnessId::Cline => {
+                            let message = empty_turn_message(agent_name);
+                            let _ = send(
+                                &event_tx,
+                                AgentEvent::Error {
+                                    message: message.clone(),
+                                    kind: ErrorKind::Unknown,
+                                    detail: None,
+                                    retryable: true,
+                                },
+                            )
+                            .await;
+                            status = DoneStatus::Errored;
+                            error = Some(message);
+                        }
+                        None => {}
+                    }
+                }
+                done_current = true;
+                if interrupted {
+                    done_after_interrupt = true;
+                }
+                // RPC/wire failures carry no guard pair (the guard only
+                // fires on Completed+ok): join the stderr tail here so
+                // every errored Done still lands one detailed chip
+                // (fold dedupes the identical pair).
+                if res.is_err()
+                    && status == DoneStatus::Errored
+                    && let Some(msg) = &error
+                {
+                    let _ = send(
+                        &event_tx,
+                        typed_error(
+                            msg.clone(),
+                            None,
+                            tail_detail(stderr_tail.snapshot()),
+                        ),
+                    )
+                    .await;
+                }
+                // A prompt the reader failed because stdout closed never got a
+                // response: the child exit is what ended the turn. Attributing
+                // it to `PromptResponse` would journal a dropped reply as a
+                // settled one (test: acp_quiet dropped-reply). An interrupted
+                // run keeps its own cause.
+                let child_exit = res.is_err() && !interrupted && child_exited(&mut child).await;
+                let reason = if child_exit {
+                    DoneReason::ChildExit
+                } else {
+                    DoneReason::PromptResponse
+                };
+                tracing::info!(
+                    target: "komet_harness::acp",
+                    done_origin = if child_exit { "child_exit" } else { "real" },
+                    ?status,
+                    "ACP prompt arm settled the turn"
+                );
+                if !send(
+                    &event_tx,
+                    AgentEvent::Done {
+                        status,
+                        result: None,
+                        error,
+                        session_id: Some(session_id.clone()),
+                        reason: Some(reason),
+                    },
+                )
+                .await
+                {
+                    break 'main;
+                }
+                if interrupted || res.is_err() || status == DoneStatus::Errored {
+                    break 'main;
+                }
+                // Persistent session: a queued steer becomes the next turn;
+                // otherwise stay alive for the mailbox — the caller owns
+                // teardown (mirrors the codex harness).
+                if let Some(text) = queued_steers.pop_front() {
+                    let (prev, next) = rotate(&mut assistant_message_id);
+                    if !send(
+                        &event_tx,
+                        AgentEvent::Steered {
+                            assistant_message_id: Some(prev),
+                            next_assistant_message_id: Some(next),
+                        },
+                    )
+                    .await
+                    {
+                        break 'main;
+                    }
+                    done_current = false;
+                    turn_content_seen = false;
+                    open_tools.clear();
+                    last_update_at = tokio::time::Instant::now();
+                    prompt_seq += 1;
+                    current_prompt_id =
+                        prompt_complete_extension.then(|| format!("komet-p{prompt_seq}"));
+                    prompt_stall_deadline =
+                        prompt_stall.map(|d| tokio::time::Instant::now() + d);
+                    turn = Some(prompt_turn(
+                        client.clone(),
+                        session_id.clone(),
+                        text,
+                        current_prompt_id.clone(),
+                    ));
+                } else if !steering_open {
+                    break 'main;
+                }
+            },
+
+            inc = incoming.recv() => match inc {
+                Some(Incoming::Notification { method, params }) => {
+                    last_update_at = tokio::time::Instant::now();
+                    quiet_settle_warned = false;
+                    // Wire traffic is a sign of life for the prompt-stall
+                    // watchdog — EXCEPT session boilerplate. OpenCode also
+                    // echoes user_message_chunk after a prompt; that is not
+                    // provider progress and must not hide a stalled response.
+                    let boilerplate = method == "session/update"
+                        && matches!(
+                            params
+                                .get("update")
+                                .and_then(|u| u.get("sessionUpdate"))
+                                .and_then(Value::as_str),
+                            Some("available_commands_update")
+                                | Some("config_option_update")
+                                | Some("current_mode_update")
+                        );
+                    let opencode_progress = method == "session/update"
+                        && matches!(
+                            params
+                                .get("update")
+                                .and_then(|u| u.get("sessionUpdate"))
+                                .and_then(Value::as_str),
+                            Some("agent_message_chunk")
+                                | Some("agent_thought_chunk")
+                                | Some("tool_call")
+                                | Some("tool_call_update")
+                                | Some("plan")
+                        );
+                    let prompt_progress = if harness == HarnessId::Opencode {
+                        opencode_progress
+                    } else {
+                        !boilerplate
+                    };
+                    if prompt_progress {
+                        prompt_stall_deadline = None;
+                    }
+                    // `_x.ai/session/prompt_complete` — the AUTHORITATIVE
+                    // turn end for agents advertising it (grok): the
+                    // `session/prompt` RPC can hang after the turn really
+                    // finished. Settle through the SAME response arm by
+                    // swapping the in-flight future for the synthesized
+                    // response; the abandoned RPC future drains in the
+                    // background and its late result is discarded. Guards:
+                    // session match, an outstanding prompt, and an exact
+                    // prompt-id match (a stale replay of an already-settled
+                    // prompt must never settle a newer turn; grok echoes the
+                    // `_meta.promptId` we mint — verified live, 1.0.4).
+                    if prompt_complete_extension
+                        && method == "_x.ai/session/prompt_complete"
+                        && !interrupted
+                        && turn.is_some()
+                        && params.get("sessionId").and_then(Value::as_str)
+                            == Some(session_id.as_str())
+                    {
+                        let pid = params
+                            .get("promptId")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned);
+                        let stale = pid.as_deref().is_some_and(|p| {
+                            completed_prompts.iter().any(|c| c == p)
+                        }) || (pid.is_some() && pid != current_prompt_id);
+                        if !stale {
+                            let stop = params
+                                .get("stopReason")
+                                .and_then(Value::as_str)
+                                .unwrap_or("end_turn")
+                                .to_owned();
+                            if let Some(old) = turn.take() {
+                                tokio::spawn(async move {
+                                    let _ = old.await;
+                                });
+                            }
+                            turn = Some(Box::pin(async move {
+                                Ok(json!({ "stopReason": stop }))
+                            }));
+                        }
+                    }
+                    // Other notifications (other sessions, agent noise) are
+                    // tolerated by design.
+                    let events =
+                        session_update_events(&method, &params, &session_id, &mut subagents);
+                    for ev in events {
+                        track_turn_signals(&ev, &mut turn_content_seen, &mut open_tools);
+                        if !send(&event_tx, ev).await {
+                            break 'main;
+                        }
+                    }
+                }
+                Some(Incoming::Request { id, method, params }) => {
+                    prompt_stall_deadline = None;
+                    for ev in handle_server_request_live(
+                        &client,
+                        id,
+                        &method,
+                        &params,
+                        &request_input,
+                        &request_permission,
+                        &open_questions,
+                        request.sandbox,
+                        elicitation,
+                    ) {
+                        if !send(&event_tx, ev).await {
+                            break 'main;
+                        }
+                    }
+                }
+                Some(Incoming::Eof) | None => {
+                    // The turn ends via a request RESPONSE, which races EOF
+                    // through a different channel than notifications: an agent
+                    // exiting right after its final response must read as a
+                    // clean finish, not a crash. The response (if any) is
+                    // already resolved by the reader before it sends Eof.
+                    // Only a RESOLVED response is a clean finish; a request
+                    // failed by the reader's EOF cleanup falls through to the
+                    // crash-message bookkeeping below (stderr tail intact).
+                    if let Some(mut fut) = turn.take()
+                        && let Ok(res @ Ok(_)) =
+                            tokio::time::timeout(Duration::from_millis(50), &mut fut).await
+                    {
+                        let (prev, _next) = rotate(&mut assistant_message_id);
+                        let _ = send(
+                            &event_tx,
+                            AgentEvent::AssistantMessageCompleted { assistant_message_id: prev },
+                        )
+                        .await;
+                        let _ = emit_usage_events(&event_tx, &res).await;
+                        let _ =
+                            emit_grok_session_info(&event_tx, &client, &session_id, harness)
+                                .await;
+                let (mut status, mut error, truncated) =
+                    stop_outcome(&res, interrupted);
+                if let Some(chip) = truncated {
+                    let _ = send(&event_tx, chip).await;
+                }
+                // An empty turn must not journal as success. Cline's
+                // real cause lives in its session file, never on the
+                // wire; a clean session file keeps Completed (nothing
+                // failed). Every other harness has no cause source —
+                // an empty turn there is never a real answer, so the
+                // generic guard errors it instead of staying silent.
+                if status == DoneStatus::Completed
+                    && res.is_ok()
+                    && !turn_content_seen
+                    && open_tools.is_empty()
+                {
+                    let empty = if harness == HarnessId::Cline {
+                        cline_empty_turn_error(
+                            &session_id,
+                            turn_content_seen,
+                            open_tools.len(),
+                            cline_data_dir.clone(),
+                        )
+                        .await
+                    } else {
+                        None
+                    };
+                    match empty {
+                        Some(cause) => {
+                            let _ = send(
+                                &event_tx,
+                                typed_error(cause.clone(), None, None),
+                            )
+                            .await;
+                            status = DoneStatus::Errored;
+                            error = Some(cause);
+                        }
+                        None if harness != HarnessId::Cline => {
+                            let message = empty_turn_message(agent_name);
+                            let _ = send(
+                                &event_tx,
+                                AgentEvent::Error {
+                                    message: message.clone(),
+                                    kind: ErrorKind::Unknown,
+                                    detail: None,
+                                    retryable: true,
+                                },
+                            )
+                            .await;
+                            status = DoneStatus::Errored;
+                            error = Some(message);
+                        }
+                        None => {}
+                    }
+                }
+                        done_current = true;
+                        if interrupted {
+                            done_after_interrupt = true;
+                        }
+                        // RPC/wire failures carry no guard pair (the guard only
+                        // fires on Completed+ok): join the stderr tail here so
+                        // every errored Done still lands one detailed chip
+                        // (fold dedupes the identical pair).
+                        if res.is_err()
+                            && status == DoneStatus::Errored
+                            && let Some(msg) = &error
+                        {
+                            let _ = send(
+                                &event_tx,
+                                typed_error(
+                                    msg.clone(),
+                                    None,
+                                    tail_detail(stderr_tail.snapshot()),
+                                ),
+                            )
+                            .await;
+                        }
+                        tracing::info!(
+                            target: "komet_harness::acp",
+                            done_origin = "real",
+                            ?status,
+                            "ACP prompt response settled the turn before child exit"
+                        );
+                        let _ = send(
+                            &event_tx,
+                            AgentEvent::Done {
+                                status,
+                                result: None,
+                                error,
+                                session_id: Some(session_id.clone()),
+                            reason: Some(DoneReason::PromptResponse),
+                            },
+                        )
+                        .await;
+                    }
+                    break 'main;
+                }
+            },
+
+            res = async { steering_call.as_mut().expect("guarded by if").1.as_mut().await },
+                if steering_call.is_some() =>
+            {
+                let (text, _) = steering_call.take().expect("guarded by if");
+                let outcome = match &res {
+                    Ok(resp) => resp
+                        .get("outcome")
+                        .and_then(Value::as_str)
+                        .unwrap_or("injected")
+                        .to_owned(),
+                    Err(e) => {
+                        tracing::debug!(
+                            target: "komet_harness::acp",
+                            "_session/steering failed (redelivering): {e}"
+                        );
+                        // Failed calls redeliver like a lost turn-end race.
+                        "promptRequired".to_owned()
+                    }
+                };
+                if interrupted {
+                    // The run is winding down; the steer is abandoned like
+                    // any queued steer at interrupt.
+                } else if outcome != "promptRequired" {
+                    // Injected into a live turn → a Steered boundary. But if
+                    // the turn ended while the call was in flight, the
+                    // injection was consumed by THAT turn — its output
+                    // already streamed and the turn's Done already closed the
+                    // segment. Emitting Steered after that Done re-armed the
+                    // consumer (parked session → Working) with no next turn
+                    // and no Done ever coming — the stranded-Working /
+                    // eternal-timer bug. Post-turn: nothing left to do.
+                    if turn.is_some() {
+                        // The injection proves the turn is LIVE: any settle
+                        // deadline armed off a cost frame that raced this
+                        // response is invalid evidence.
+                        starve_deadline = None;
+                        // Pre-injection updates can still sit in `incoming`
+                        // (responses bypass that queue): drain them into the
+                        // CURRENT segment first, or text the agent streamed
+                        // before the injection landed folds after the split —
+                        // the transcript attributes it to the reply-to-steer.
                         let mut consumer_gone = false;
                         while let Ok(inc) = incoming.try_recv() {
                             match inc {
@@ -4349,7 +5076,7 @@ async fn run_session(session: Session) {
                                         &request_permission,
                                         &open_questions,
                                         request.sandbox,
-                                        elicitation,
+                                elicitation,
                                     ) {
                                         if !send(&event_tx, ev).await {
                                             consumer_gone = true;
@@ -4366,864 +5093,474 @@ async fn run_session(session: Session) {
                         if consumer_gone {
                             break 'main;
                         }
-                        let (prev, _next) = rotate(&mut assistant_message_id);
+                        let (prev, next) = rotate(&mut assistant_message_id);
                         if !send(
                             &event_tx,
-                            AgentEvent::AssistantMessageCompleted { assistant_message_id: prev },
-                        )
-                        .await
-                        {
-                            break 'main;
-                        }
-                        // Per-turn billed tokens (popover) + Grok's native
-                        // occupancy probe. Billed input is not the ring fill.
-                        if !emit_usage_events(&event_tx, &res).await {
-                            break 'main;
-                        }
-                        if !emit_grok_session_info(&event_tx, &client, &session_id, harness).await {
-                            break 'main;
-                        }
-                        let (mut status, mut error, truncated) =
-                            stop_outcome(&res, interrupted);
-                        if let Some(chip) = truncated {
-                            let _ = send(&event_tx, chip).await;
-                        }
-                        // An empty turn must not journal as success. Cline's
-                        // real cause lives in its session file, never on the
-                        // wire; a clean session file keeps Completed (nothing
-                        // failed). Every other harness has no cause source —
-                        // an empty turn there is never a real answer, so the
-                        // generic guard errors it instead of staying silent.
-                        if status == DoneStatus::Completed
-                            && res.is_ok()
-                            && !turn_content_seen
-                            && open_tools.is_empty()
-                        {
-                            let empty = if harness == HarnessId::Cline {
-                                cline_empty_turn_error(
-                                    &session_id,
-                                    turn_content_seen,
-                                    open_tools.len(),
-                                    cline_data_dir.clone(),
-                                )
-                                .await
-                            } else {
-                                None
-                            };
-                            match empty {
-                                Some(cause) => {
-                                    let _ = send(
-                                        &event_tx,
-                                        typed_error(cause.clone(), None, None),
-                                    )
-                                    .await;
-                                    status = DoneStatus::Errored;
-                                    error = Some(cause);
-                                }
-                                None if harness != HarnessId::Cline => {
-                                    let message = empty_turn_message(agent_name);
-                                    let _ = send(
-                                        &event_tx,
-                                        AgentEvent::Error {
-                                            message: message.clone(),
-                                            kind: ErrorKind::Unknown,
-                                            detail: None,
-                                            retryable: true,
-                                        },
-                                    )
-                                    .await;
-                                    status = DoneStatus::Errored;
-                                    error = Some(message);
-                                }
-                                None => {}
-                            }
-                        }
-                        done_current = true;
-                        if interrupted {
-                            done_after_interrupt = true;
-                        }
-                        // RPC/wire failures carry no guard pair (the guard only
-                        // fires on Completed+ok): join the stderr tail here so
-                        // every errored Done still lands one detailed chip
-                        // (fold dedupes the identical pair).
-                        if res.is_err()
-                            && status == DoneStatus::Errored
-                            && let Some(msg) = &error
-                        {
-                            let _ = send(
-                                &event_tx,
-                                typed_error(
-                                    msg.clone(),
-                                    None,
-                                    tail_detail(stderr_tail.snapshot()),
-                                ),
-                            )
-                            .await;
-                        }
-                        if !send(
-                            &event_tx,
-                            AgentEvent::Done {
-                                status,
-                                result: None,
-                                error,
-                                session_id: Some(session_id.clone()),
-        reason: None,
+                            AgentEvent::Steered {
+                                assistant_message_id: Some(prev),
+                                next_assistant_message_id: Some(next),
                             },
                         )
                         .await
                         {
                             break 'main;
                         }
-                        if interrupted || res.is_err() || status == DoneStatus::Errored {
-                            break 'main;
-                        }
-                        // Persistent session: a queued steer becomes the next turn;
-                        // otherwise stay alive for the mailbox — the caller owns
-                        // teardown (mirrors the codex harness).
-                        if let Some(text) = queued_steers.pop_front() {
-                            let (prev, next) = rotate(&mut assistant_message_id);
-                            if !send(
-                                &event_tx,
-                                AgentEvent::Steered {
-                                    assistant_message_id: Some(prev),
-                                    next_assistant_message_id: Some(next),
-                                },
-                            )
-                            .await
-                            {
-                                break 'main;
-                            }
-                            done_current = false;
-                            turn_content_seen = false;
-                            open_tools.clear();
-                            last_update_at = tokio::time::Instant::now();
-                            prompt_seq += 1;
-                            current_prompt_id =
-                                prompt_complete_extension.then(|| format!("komet-p{prompt_seq}"));
-                            prompt_stall_deadline =
-                                prompt_stall.map(|d| tokio::time::Instant::now() + d);
-                            turn = Some(prompt_turn(
-                                client.clone(),
-                                session_id.clone(),
-                                text,
-                                current_prompt_id.clone(),
-                            ));
-                        } else if !steering_open {
-                            break 'main;
-                        }
-                    },
-
-                    inc = incoming.recv() => match inc {
-                        Some(Incoming::Notification { method, params }) => {
-                            last_update_at = tokio::time::Instant::now();
-                            // Wire traffic is a sign of life for the prompt-stall
-                            // watchdog — EXCEPT session boilerplate: opencode emits
-                            // available_commands_update right after session/new on
-                            // every session, including ones whose provider is down
-                            // (where it then retries the provider stream forever
-                            // with nothing further on the wire — verified live,
-                            // 1.18.18). One such frame must not disarm the watchdog
-                            // for the whole turn; only turn progress counts.
-                            let boilerplate = method == "session/update"
-                                && matches!(
-                                    params
-                                        .get("update")
-                                        .and_then(|u| u.get("sessionUpdate"))
-                                        .and_then(Value::as_str),
-                                    Some("available_commands_update")
-                                        | Some("config_option_update")
-                                        | Some("current_mode_update")
-                                );
-                            if !boilerplate {
-                                prompt_stall_deadline = None;
-                            }
-                            // `_x.ai/session/prompt_complete` — the AUTHORITATIVE
-                            // turn end for agents advertising it (grok): the
-                            // `session/prompt` RPC can hang after the turn really
-                            // finished. Settle through the SAME response arm by
-                            // swapping the in-flight future for the synthesized
-                            // response; the abandoned RPC future drains in the
-                            // background and its late result is discarded. Guards:
-                            // session match, an outstanding prompt, and an exact
-                            // prompt-id match (a stale replay of an already-settled
-                            // prompt must never settle a newer turn; grok echoes the
-                            // `_meta.promptId` we mint — verified live, 1.0.4).
-                            if prompt_complete_extension
-                                && method == "_x.ai/session/prompt_complete"
-                                && !interrupted
-                                && turn.is_some()
-                                && params.get("sessionId").and_then(Value::as_str)
-                                    == Some(session_id.as_str())
-                            {
-                                let pid = params
-                                    .get("promptId")
-                                    .and_then(Value::as_str)
-                                    .map(str::to_owned);
-                                let stale = pid.as_deref().is_some_and(|p| {
-                                    completed_prompts.iter().any(|c| c == p)
-                                }) || (pid.is_some() && pid != current_prompt_id);
-                                if !stale {
-                                    let stop = params
-                                        .get("stopReason")
-                                        .and_then(Value::as_str)
-                                        .unwrap_or("end_turn")
-                                        .to_owned();
-                                    if let Some(old) = turn.take() {
-                                        tokio::spawn(async move {
-                                            let _ = old.await;
-                                        });
-                                    }
-                                    turn = Some(Box::pin(async move {
-                                        Ok(json!({ "stopReason": stop }))
-                                    }));
-                                }
-                            }
-                            // Other notifications (other sessions, agent noise) are
-                            // tolerated by design.
-                            let events =
-                                session_update_events(&method, &params, &session_id, &mut subagents);
-                            for ev in events {
-                                track_turn_signals(&ev, &mut turn_content_seen, &mut open_tools);
-                                if !send(&event_tx, ev).await {
-                                    break 'main;
-                                }
-                            }
-                        }
-                        Some(Incoming::Request { id, method, params }) => {
-                            prompt_stall_deadline = None;
-                            for ev in handle_server_request_live(
-                                &client,
-                                id,
-                                &method,
-                                &params,
-                                &request_input,
-                                &request_permission,
-                                &open_questions,
-                                request.sandbox,
-                                elicitation,
-                            ) {
-                                if !send(&event_tx, ev).await {
-                                    break 'main;
-                                }
-                            }
-                        }
-                        Some(Incoming::Eof) | None => {
-                            // The turn ends via a request RESPONSE, which races EOF
-                            // through a different channel than notifications: an agent
-                            // exiting right after its final response must read as a
-                            // clean finish, not a crash. The response (if any) is
-                            // already resolved by the reader before it sends Eof.
-                            // Only a RESOLVED response is a clean finish; a request
-                            // failed by the reader's EOF cleanup falls through to the
-                            // crash-message bookkeeping below (stderr tail intact).
-                            if let Some(mut fut) = turn.take()
-                                && let Ok(res @ Ok(_)) =
-                                    tokio::time::timeout(Duration::from_millis(50), &mut fut).await
-                            {
-                                let (prev, _next) = rotate(&mut assistant_message_id);
-                                let _ = send(
-                                    &event_tx,
-                                    AgentEvent::AssistantMessageCompleted { assistant_message_id: prev },
-                                )
-                                .await;
-                                let _ = emit_usage_events(&event_tx, &res).await;
-                                let _ =
-                                    emit_grok_session_info(&event_tx, &client, &session_id, harness)
-                                        .await;
-                        let (mut status, mut error, truncated) =
-                            stop_outcome(&res, interrupted);
-                        if let Some(chip) = truncated {
-                            let _ = send(&event_tx, chip).await;
-                        }
-                        // An empty turn must not journal as success. Cline's
-                        // real cause lives in its session file, never on the
-                        // wire; a clean session file keeps Completed (nothing
-                        // failed). Every other harness has no cause source —
-                        // an empty turn there is never a real answer, so the
-                        // generic guard errors it instead of staying silent.
-                        if status == DoneStatus::Completed
-                            && res.is_ok()
-                            && !turn_content_seen
-                            && open_tools.is_empty()
-                        {
-                            let empty = if harness == HarnessId::Cline {
-                                cline_empty_turn_error(
-                                    &session_id,
-                                    turn_content_seen,
-                                    open_tools.len(),
-                                    cline_data_dir.clone(),
-                                )
-                                .await
-                            } else {
-                                None
-                            };
-                            match empty {
-                                Some(cause) => {
-                                    let _ = send(
-                                        &event_tx,
-                                        typed_error(cause.clone(), None, None),
-                                    )
-                                    .await;
-                                    status = DoneStatus::Errored;
-                                    error = Some(cause);
-                                }
-                                None if harness != HarnessId::Cline => {
-                                    let message = empty_turn_message(agent_name);
-                                    let _ = send(
-                                        &event_tx,
-                                        AgentEvent::Error {
-                                            message: message.clone(),
-                                            kind: ErrorKind::Unknown,
-                                            detail: None,
-                                            retryable: true,
-                                        },
-                                    )
-                                    .await;
-                                    status = DoneStatus::Errored;
-                                    error = Some(message);
-                                }
-                                None => {}
-                            }
-                        }
-                                done_current = true;
-                                if interrupted {
-                                    done_after_interrupt = true;
-                                }
-                                // RPC/wire failures carry no guard pair (the guard only
-                                // fires on Completed+ok): join the stderr tail here so
-                                // every errored Done still lands one detailed chip
-                                // (fold dedupes the identical pair).
-                                if res.is_err()
-                                    && status == DoneStatus::Errored
-                                    && let Some(msg) = &error
-                                {
-                                    let _ = send(
-                                        &event_tx,
-                                        typed_error(
-                                            msg.clone(),
-                                            None,
-                                            tail_detail(stderr_tail.snapshot()),
-                                        ),
-                                    )
-                                    .await;
-                                }
-                                let _ = send(
-                                    &event_tx,
-                                    AgentEvent::Done {
-                                        status,
-                                        result: None,
-                                        error,
-                                        session_id: Some(session_id.clone()),
-        reason: None,
-                                    },
-                                )
-                                .await;
-                            }
-                            break 'main;
-                        }
-                    },
-
-                    res = async { steering_call.as_mut().expect("guarded by if").1.as_mut().await },
-                        if steering_call.is_some() =>
-                    {
-                        let (text, _) = steering_call.take().expect("guarded by if");
-                        let outcome = match &res {
-                            Ok(resp) => resp
-                                .get("outcome")
-                                .and_then(Value::as_str)
-                                .unwrap_or("injected")
-                                .to_owned(),
-                            Err(e) => {
-                                tracing::debug!(
-                                    target: "komet_harness::acp",
-                                    "_session/steering failed (redelivering): {e}"
-                                );
-                                // Failed calls redeliver like a lost turn-end race.
-                                "promptRequired".to_owned()
-                            }
-                        };
-                        if interrupted {
-                            // The run is winding down; the steer is abandoned like
-                            // any queued steer at interrupt.
-                        } else if outcome != "promptRequired" {
-                            // Injected into a live turn → a Steered boundary. But if
-                            // the turn ended while the call was in flight, the
-                            // injection was consumed by THAT turn — its output
-                            // already streamed and the turn's Done already closed the
-                            // segment. Emitting Steered after that Done re-armed the
-                            // consumer (parked session → Working) with no next turn
-                            // and no Done ever coming — the stranded-Working /
-                            // eternal-timer bug. Post-turn: nothing left to do.
-                            if turn.is_some() {
-                                // The injection proves the turn is LIVE: any settle
-                                // deadline armed off a cost frame that raced this
-                                // response is invalid evidence.
-                                starve_deadline = None;
-                                // Pre-injection updates can still sit in `incoming`
-                                // (responses bypass that queue): drain them into the
-                                // CURRENT segment first, or text the agent streamed
-                                // before the injection landed folds after the split —
-                                // the transcript attributes it to the reply-to-steer.
-                                let mut consumer_gone = false;
-                                while let Ok(inc) = incoming.try_recv() {
-                                    match inc {
-                                        Incoming::Notification { method, params } => {
-                                            let events =
-                                                session_update_events(&method, &params, &session_id, &mut subagents);
-                                            for ev in events {
-                                                track_turn_signals(
-                                                    &ev,
-                                                    &mut turn_content_seen,
-                                                    &mut open_tools,
-                                                );
-                                                if !send(&event_tx, ev).await {
-                                                    consumer_gone = true;
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                        Incoming::Request { id, method, params } => {
-                                            for ev in handle_server_request_live(
-                                                &client,
-                                                id,
-                                                &method,
-                                                &params,
-                                                &request_input,
-                                                &request_permission,
-                                                &open_questions,
-                                                request.sandbox,
-                                        elicitation,
-                                            ) {
-                                                if !send(&event_tx, ev).await {
-                                                    consumer_gone = true;
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                        _ => {}
-                                    }
-                                    if consumer_gone {
-                                        break;
-                                    }
-                                }
-                                if consumer_gone {
-                                    break 'main;
-                                }
-                                let (prev, next) = rotate(&mut assistant_message_id);
-                                if !send(
-                                    &event_tx,
-                                    AgentEvent::Steered {
-                                        assistant_message_id: Some(prev),
-                                        next_assistant_message_id: Some(next),
-                                    },
-                                )
-                                .await
-                                {
-                                    break 'main;
-                                }
-                            }
-                        } else if turn.is_some() {
-                            // Raced the turn end: redeliver at the boundary the
-                            // loop is about to hit. `noRunningTurn` is stronger —
-                            // the adapter says nothing is running while our prompt
-                            // is still outstanding: the starved-turn signature. Arm
-                            // the grace deadline; if the prompt's response does not
-                            // land first, the recovery arm below settles the dead
-                            // turn and promotes this steer.
-                            if res
-                                .as_ref()
-                                .ok()
-                                .and_then(|r| r.get("reason"))
-                                .and_then(Value::as_str)
-                                == Some("noRunningTurn")
-                            {
-                                tracing::warn!(
-                                    target: "komet_harness::acp",
-                                    "steering answered noRunningTurn with a prompt \
-                                     outstanding; arming starved-turn recovery"
-                                );
-                                starve_deadline =
-                                    Some(tokio::time::Instant::now() + STARVE_GRACE);
-                            }
-                            queued_steers.push_back(text);
-                        } else {
-                            // The turn ended while the call was in flight and its
-                            // boundary already passed — the steer becomes the next
-                            // turn directly.
-                            let (prev, next) = rotate(&mut assistant_message_id);
-                            if !send(
-                                &event_tx,
-                                AgentEvent::Steered {
-                                    assistant_message_id: Some(prev),
-                                    next_assistant_message_id: Some(next),
-                                },
-                            )
-                            .await
-                            {
-                                break 'main;
-                            }
-                            done_current = false;
-                            turn_content_seen = false;
-                            open_tools.clear();
-                            last_update_at = tokio::time::Instant::now();
-                            prompt_seq += 1;
-                            current_prompt_id =
-                                prompt_complete_extension.then(|| format!("komet-p{prompt_seq}"));
-                            prompt_stall_deadline =
-                                prompt_stall.map(|d| tokio::time::Instant::now() + d);
-                            turn = Some(prompt_turn(
-                                client.clone(),
-                                session_id.clone(),
-                                text,
-                                current_prompt_id.clone(),
-                            ));
-                        }
-                        while let Some(next_text) = steer_backlog.pop_front() {
-                            if turn.is_some() && !interrupted {
-                                let fut = steering_call_future(&client, &session_id, &next_text);
-                                steering_call = Some((next_text, fut));
-                                break;
-                            }
-                            // No live turn to inject into: boundary delivery.
-                            queued_steers.push_back(next_text);
-                        }
-                    },
-
-                    // Busy-session cancel flushed (see BUSY_RECENT/CANCEL_FLUSH
-                    // above): the unowned self-continued turn had its cancel and a
-                    // drain window; the queued steer becomes a fresh prompt on a
-                    // now-idle agent.
-                    _ = tokio::time::sleep_until(
-                        cancel_flush_deadline.unwrap_or_else(tokio::time::Instant::now)
-                    ), if cancel_flush_deadline.is_some() && !interrupted => {
-                        cancel_flush_deadline = None;
-                        if turn.is_none()
-                            && let Some(text) = queued_steers.pop_front()
-                        {
-                            let (prev, next) = rotate(&mut assistant_message_id);
-                            if !send(
-                                &event_tx,
-                                AgentEvent::Steered {
-                                    assistant_message_id: Some(prev),
-                                    next_assistant_message_id: Some(next),
-                                },
-                            )
-                            .await
-                            {
-                                break 'main;
-                            }
-                            done_current = false;
-                            turn_content_seen = false;
-                            open_tools.clear();
-                            last_update_at = tokio::time::Instant::now();
-                            prompt_seq += 1;
-                            current_prompt_id =
-                                prompt_complete_extension.then(|| format!("komet-p{prompt_seq}"));
-                            prompt_stall_deadline =
-                                prompt_stall.map(|d| tokio::time::Instant::now() + d);
-                            turn = Some(prompt_turn(
-                                client.clone(),
-                                session_id.clone(),
-                                text,
-                                current_prompt_id.clone(),
-                            ));
-                        } else if turn.is_none() && !steering_open {
-                            // Mailbox closed while the flush waited: nothing left.
-                            break 'main;
-                        }
-                    },
-
-                    // BLANKET quiet settle (see `quiet_settle` above), adapter-
-                    // agnostic: content streamed, every tool resolved, no question
-                    // pending, stream quiet past the window with the prompt still
-                    // unsettled. Feeds the recovery arm below by expiring its
-                    // deadline — one settle path for all three evidence sources.
-                    _ = tokio::time::sleep_until(
-                        last_update_at + quiet_settle.unwrap_or_default()
-                    ), if quiet_settle.is_some()
-                        && starve_deadline.is_none()
-                        && turn.is_some()
-                        && !interrupted
-                        && turn_content_seen
-                        && open_tools.is_empty()
-                        && open_questions.load(std::sync::atomic::Ordering::SeqCst) == 0 =>
+                    }
+                } else if turn.is_some() {
+                    // Raced the turn end: redeliver at the boundary the
+                    // loop is about to hit. `noRunningTurn` is stronger —
+                    // the adapter says nothing is running while our prompt
+                    // is still outstanding: the starved-turn signature. Arm
+                    // the grace deadline; if the prompt's response does not
+                    // land first, the recovery arm below settles the dead
+                    // turn and promotes this steer.
+                    if res
+                        .as_ref()
+                        .ok()
+                        .and_then(|r| r.get("reason"))
+                        .and_then(Value::as_str)
+                        == Some("noRunningTurn")
                     {
                         tracing::warn!(
                             target: "komet_harness::acp",
-                            quiet_ms = quiet_settle.unwrap_or_default().as_millis() as u64,
-                            "turn quiet past the settle window with completed output; \
-                             treating the prompt response as dropped"
+                            "steering answered noRunningTurn with a prompt \
+                             outstanding; arming starved-turn recovery"
                         );
-                        starve_deadline = Some(tokio::time::Instant::now());
-                    },
-
-                    // Starved-turn recovery: the grace elapsed with the prompt still
-                    // unsettled after turn-end evidence — the turn's terminal cost
-                    // frame (COST_HINT_GRACE, ~immediate), a steering call answered
-                    // noRunningTurn (STARVE_GRACE), or the blanket quiet settle
-                    // above. Close the dead turn out
-                    // with a Done — its output already streamed as session/updates
-                    // and its text was delivered via the CLI's own queue — then
-                    // promote any queued steer to a fresh prompt, which settles
-                    // normally on a now-idle agent (verified against the real
-                    // adapter).
-                    _ = tokio::time::sleep_until(
-                        starve_deadline.unwrap_or_else(tokio::time::Instant::now)
-                    ), if starve_deadline.is_some() && turn.is_some() && !interrupted => {
-                        starve_deadline = None;
-                        tracing::warn!(
-                            target: "komet_harness::acp",
-                            "prompt response missing past turn-end evidence; settling \
-                             the dead turn (and promoting any queued steer)"
-                        );
-                        // Drop the dead future: a response that somehow arrives later
-                        // resolves a closed channel harmlessly.
-                        turn = None;
-                        let (prev, _next) = rotate(&mut assistant_message_id);
-                        if !send(
-                            &event_tx,
-                            AgentEvent::AssistantMessageCompleted { assistant_message_id: prev },
-                        )
-                        .await
-                        {
-                            break 'main;
-                        }
-                        done_current = true;
-                        if !send(
-                            &event_tx,
-                            AgentEvent::Done {
-                                status: DoneStatus::Completed,
-                                result: None,
-                                error: None,
-                                session_id: Some(session_id.clone()),
-        reason: None,
-                            },
-                        )
-                        .await
-                        {
-                            break 'main;
-                        }
-                        if let Some(text) = queued_steers.pop_front() {
-                            let (prev, next) = rotate(&mut assistant_message_id);
-                            if !send(
-                                &event_tx,
-                                AgentEvent::Steered {
-                                    assistant_message_id: Some(prev),
-                                    next_assistant_message_id: Some(next),
-                                },
-                            )
-                            .await
-                            {
-                                break 'main;
-                            }
-                            done_current = false;
-                            turn_content_seen = false;
-                            open_tools.clear();
-                            last_update_at = tokio::time::Instant::now();
-                            prompt_seq += 1;
-                            current_prompt_id =
-                                prompt_complete_extension.then(|| format!("komet-p{prompt_seq}"));
-                            prompt_stall_deadline =
-                                prompt_stall.map(|d| tokio::time::Instant::now() + d);
-                            turn = Some(prompt_turn(
-                                client.clone(),
-                                session_id.clone(),
-                                text,
-                                current_prompt_id.clone(),
-                            ));
-                        } else if !steering_open {
-                            // Mirror the normal turn-settled exit: mailbox closed
-                            // and nothing left to run — the session is over.
-                            break 'main;
-                        }
-                    },
-
-                    steer = steering.recv(), if steering_open && !interrupted => match steer {
-                        Some(msg) => {
-                            // Same transform as the initial prompt: Claude's
-                            // Ultrathink prefix rides every steer too.
-                            let text = prompt_transform(request.reasoning, &msg.prompt);
-                            if turn.is_none() && cancel_flush_deadline.is_some() {
-                                // A busy-session cancel is already in flight: this
-                                // steer lines up behind it and dispatches at flush.
-                                queued_steers.push_back(text);
-                            } else if turn.is_none()
-                                && (!open_tools.is_empty()
-                                    || last_update_at.elapsed() < BUSY_RECENT)
-                            {
-                                // Mid self-continued turn (see BUSY_RECENT above):
-                                // cancel it rather than prompt into the starve.
-                                //
-                                // Claude skips this branch ON PURPOSE and prompts
-                                // straight in — its NATIVE semantics: the CLI queues
-                                // the message and folds it into the running turn (no
-                                // work lost, verified from live session data). The
-                                // adapter drops that prompt's reply, and the
-                                // cost-frame settle reconstructs it ~1s after the
-                                // merged turn really ends. Only adapters with no
-                                // verified turn-end frame pay the cancel.
-                                tracing::info!(
-                                    target: "komet_harness::acp",
-                                    "steer into a self-continuing session; cancelling \
-                                     the unowned turn before prompting"
-                                );
-                                client.notify(
-                                    "session/cancel",
-                                    Some(json!({ "sessionId": session_id })),
-                                );
-                                queued_steers.push_back(text);
-                                cancel_flush_deadline =
-                                    Some(tokio::time::Instant::now() + CANCEL_FLUSH);
-                            } else if turn.is_none() {
-                                // Idle between turns: a steer is simply the next turn.
-                                let (prev, next) = rotate(&mut assistant_message_id);
-                                if !send(
-                                    &event_tx,
-                                    AgentEvent::Steered {
-                                        assistant_message_id: Some(prev),
-                                        next_assistant_message_id: Some(next),
-                                    },
-                                )
-                                .await
-                                {
-                                    break 'main;
-                                }
-                                done_current = false;
-                                turn_content_seen = false;
-                                open_tools.clear();
-                                last_update_at = tokio::time::Instant::now();
-                                prompt_seq += 1;
-                            current_prompt_id =
-                                prompt_complete_extension.then(|| format!("komet-p{prompt_seq}"));
-                            prompt_stall_deadline =
-                                prompt_stall.map(|d| tokio::time::Instant::now() + d);
-                            turn = Some(prompt_turn(
-                                client.clone(),
-                                session_id.clone(),
-                                text,
-                                current_prompt_id.clone(),
-                            ));
-                            } else if steer_ext {
-                                // Mid-turn injection via the `_session/steering`
-                                // extension: start the call, resolved by its own
-                                // select branch. One call in flight at a time;
-                                // followers wait in the backlog.
-                                if steering_call.is_some() {
-                                    steer_backlog.push_back(text);
-                                } else {
-                                    let fut = steering_call_future(&client, &session_id, &text);
-                                    steering_call = Some((text, fut));
-                                }
-                            } else {
-                                // No extension (Grok today): turn-boundary delivery.
-                                queued_steers.push_back(text);
-                            }
-                        }
-                        None => {
-                            steering_open = false;
-                            if turn.is_none() && queued_steers.is_empty() {
-                                break 'main;
-                            }
-                        }
-                    },
-
-                    _ = interrupt.cancelled(), if !interrupt_sent => {
-                        interrupt_sent = true;
-                        interrupted = true;
-                        if turn.is_some() {
-                            client.notify("session/cancel", Some(json!({ "sessionId": session_id })));
-                            // Escalate if the agent doesn't wind down (stopReason
-                            // "cancelled") within the grace periods.
-                            if let Some(pid) = child.id() {
-                                escalation = Some(tokio::spawn(async move {
-                                    tokio::time::sleep(interrupt_grace).await;
-                                    send_signal(pid, Signal::Term);
-                                    tokio::time::sleep(kill_grace).await;
-                                    send_signal(pid, Signal::Kill);
-                                }));
-                            }
-                        } else {
-                            // Idle between turns: nothing to cancel — the terminal
-                            // bookkeeping below still guarantees Done { Interrupted }.
-                            break 'main;
-                        }
-                    },
-
-                    // Prompt-stall watchdog: a prompt was sent and NOTHING has come
-                    // back on the wire at all — no queue bookkeeping, no updates, no
-                    // requests. Healthy grok acknowledges within milliseconds; total
-                    // silence past the bound is a wedged agent (stale shared leader,
-                    // launch-time update check). Surface a visible error instead of
-                    // indefinite Working.
-                    _ = tokio::time::sleep_until(
-                        prompt_stall_deadline.unwrap_or_else(tokio::time::Instant::now),
-                    ), if prompt_stall_deadline.is_some() && turn.is_some() && !interrupted => {
-                        let mut stall_message = format!(
-                            "{agent_name} did not respond to the prompt at all \
-                             (no wire activity for {}s). {}",
-                            prompt_stall.map(|d| d.as_secs()).unwrap_or(0),
-                            stall_hint,
-                        );
-                        if let Some(tail) = stderr_tail.snapshot() {
-                            stall_message.push_str("; stderr: ");
-                            stall_message.push_str(&tail);
-                        }
-                        let _ = send(
-                            &event_tx,
-                            typed_error(
-                                stall_message,
-                                None,
-                                tail_detail(stderr_tail.snapshot()),
-                            ),
-                        )
-                        .await;
-                        done_current = true;
-                        let done_message = format!(
-                            "{agent_name} is unresponsive — the run was closed."
-                        );
-                        let _ = send(
-                            &event_tx,
-                            typed_error(
-                                done_message.clone(),
-                                None,
-                                tail_detail(stderr_tail.snapshot()),
-                            ),
-                        )
-                        .await;
-                        let _ = send(
-                            &event_tx,
-                            AgentEvent::Done {
-                                status: DoneStatus::Errored,
-                                result: None,
-                                error: Some(done_message),
-                                session_id: Some(session_id.clone()),
-        reason: None,
-                            },
-                        )
-                        .await;
+                        starve_deadline =
+                            Some(tokio::time::Instant::now() + STARVE_GRACE);
+                    }
+                    queued_steers.push_back(text);
+                } else {
+                    // The turn ended while the call was in flight and its
+                    // boundary already passed — the steer becomes the next
+                    // turn directly.
+                    let (prev, next) = rotate(&mut assistant_message_id);
+                    if !send(
+                        &event_tx,
+                        AgentEvent::Steered {
+                            assistant_message_id: Some(prev),
+                            next_assistant_message_id: Some(next),
+                        },
+                    )
+                    .await
+                    {
                         break 'main;
-                    },
-
-                    _ = event_tx.closed() => break 'main,
+                    }
+                    done_current = false;
+                    turn_content_seen = false;
+                    open_tools.clear();
+                    last_update_at = tokio::time::Instant::now();
+                    prompt_seq += 1;
+                    current_prompt_id =
+                        prompt_complete_extension.then(|| format!("komet-p{prompt_seq}"));
+                    prompt_stall_deadline =
+                        prompt_stall.map(|d| tokio::time::Instant::now() + d);
+                    turn = Some(prompt_turn(
+                        client.clone(),
+                        session_id.clone(),
+                        text,
+                        current_prompt_id.clone(),
+                    ));
                 }
+                while let Some(next_text) = steer_backlog.pop_front() {
+                    if turn.is_some() && !interrupted {
+                        let fut = steering_call_future(&client, &session_id, &next_text);
+                        steering_call = Some((next_text, fut));
+                        break;
+                    }
+                    // No live turn to inject into: boundary delivery.
+                    queued_steers.push_back(next_text);
+                }
+            },
+
+            // Busy-session cancel flushed (see BUSY_RECENT/CANCEL_FLUSH
+            // above): the unowned self-continued turn had its cancel and a
+            // drain window; the queued steer becomes a fresh prompt on a
+            // now-idle agent.
+            _ = tokio::time::sleep_until(
+                cancel_flush_deadline.unwrap_or_else(tokio::time::Instant::now)
+            ), if cancel_flush_deadline.is_some() && !interrupted => {
+                cancel_flush_deadline = None;
+                if turn.is_none()
+                    && let Some(text) = queued_steers.pop_front()
+                {
+                    let (prev, next) = rotate(&mut assistant_message_id);
+                    if !send(
+                        &event_tx,
+                        AgentEvent::Steered {
+                            assistant_message_id: Some(prev),
+                            next_assistant_message_id: Some(next),
+                        },
+                    )
+                    .await
+                    {
+                        break 'main;
+                    }
+                    done_current = false;
+                    turn_content_seen = false;
+                    open_tools.clear();
+                    last_update_at = tokio::time::Instant::now();
+                    prompt_seq += 1;
+                    current_prompt_id =
+                        prompt_complete_extension.then(|| format!("komet-p{prompt_seq}"));
+                    prompt_stall_deadline =
+                        prompt_stall.map(|d| tokio::time::Instant::now() + d);
+                    turn = Some(prompt_turn(
+                        client.clone(),
+                        session_id.clone(),
+                        text,
+                        current_prompt_id.clone(),
+                    ));
+                } else if turn.is_none() && !steering_open {
+                    // Mailbox closed while the flush waited: nothing left.
+                    break 'main;
+                }
+            },
+
+            // Quiet-turn diagnostic (see `quiet_settle` above). Silence
+            // alone is not evidence that the prompt has completed; keep
+            // its future alive and let a later response settle normally.
+            _ = tokio::time::sleep_until(
+                last_update_at + quiet_settle.unwrap_or_default()
+            ), if quiet_settle.is_some()
+                && !quiet_settle_warned
+                && turn.is_some()
+                && !interrupted
+                && turn_content_seen
+                && open_tools.is_empty()
+                && open_questions.load(std::sync::atomic::Ordering::SeqCst) == 0 =>
+            {
+                quiet_settle_warned = true;
+                if harness == HarnessId::Opencode {
+                    let mut message = format!(
+                        "{agent_name} stopped responding after starting the turn. \
+                         The model provider may be retrying silently. {}",
+                        stall_hint,
+                    );
+                    if let Some(tail) = stderr_tail.snapshot() {
+                        message.push_str("; stderr: ");
+                        message.push_str(&tail);
+                    }
+                    let _ = send(
+                        &event_tx,
+                        typed_error(
+                            message.clone(),
+                            None,
+                            tail_detail(stderr_tail.snapshot()),
+                        ),
+                    )
+                    .await;
+                    let _ = send(
+                        &event_tx,
+                        AgentEvent::Done {
+                            status: DoneStatus::Errored,
+                            result: None,
+                            error: Some(message),
+                            session_id: Some(session_id.clone()),
+                            reason: Some(DoneReason::PromptStall),
+                        },
+                    )
+                    .await;
+                    tracing::error!(
+                        target: "komet_harness::acp",
+                        done_origin = "opencode_quiet_stall",
+                        "closing OpenCode turn after prolonged silence"
+                    );
+                    break 'main;
+                }
+                tracing::warn!(
+                    target: "komet_harness::acp",
+                    watchdog = "quiet_settle",
+                    action = "keep_prompt_in_flight",
+                    quiet_ms = quiet_settle.unwrap_or_default().as_millis() as u64,
+                    "turn quiet past the diagnostic window; prompt is still \
+                     in flight"
+                );
+            },
+
+            // Starved-turn recovery: the grace elapsed with the prompt still
+            // unsettled after explicit protocol evidence that the adapter
+            // has no running turn (`noRunningTurn`). Silence never arms
+            // this recovery because the prompt may still be working.
+            _ = tokio::time::sleep_until(
+                starve_deadline.unwrap_or_else(tokio::time::Instant::now)
+            ), if starve_deadline.is_some() && turn.is_some() && !interrupted => {
+                starve_deadline = None;
+                tracing::warn!(
+                    target: "komet_harness::acp",
+                    done_origin = "no_running_turn",
+                    "prompt response missing past turn-end evidence; settling \
+                     the dead turn (and promoting any queued steer)"
+                );
+                // Drop the dead future: a response that somehow arrives later
+                // resolves a closed channel harmlessly.
+                turn = None;
+                let (prev, _next) = rotate(&mut assistant_message_id);
+                if !send(
+                    &event_tx,
+                    AgentEvent::AssistantMessageCompleted { assistant_message_id: prev },
+                )
+                .await
+                {
+                    break 'main;
+                }
+                done_current = true;
+                tracing::warn!(
+                    target: "komet_harness::acp",
+                    done_origin = "no_running_turn",
+                    "closing prompt after explicit noRunningTurn evidence"
+                );
+                if !send(
+                    &event_tx,
+                    AgentEvent::Done {
+                        status: DoneStatus::Completed,
+                        result: None,
+                        error: None,
+                        session_id: Some(session_id.clone()),
+                        reason: Some(DoneReason::NoRunningTurn),
+                    },
+                )
+                .await
+                {
+                    break 'main;
+                }
+                if let Some(text) = queued_steers.pop_front() {
+                    let (prev, next) = rotate(&mut assistant_message_id);
+                    if !send(
+                        &event_tx,
+                        AgentEvent::Steered {
+                            assistant_message_id: Some(prev),
+                            next_assistant_message_id: Some(next),
+                        },
+                    )
+                    .await
+                    {
+                        break 'main;
+                    }
+                    done_current = false;
+                    turn_content_seen = false;
+                    open_tools.clear();
+                    last_update_at = tokio::time::Instant::now();
+                    prompt_seq += 1;
+                    current_prompt_id =
+                        prompt_complete_extension.then(|| format!("komet-p{prompt_seq}"));
+                    prompt_stall_deadline =
+                        prompt_stall.map(|d| tokio::time::Instant::now() + d);
+                    turn = Some(prompt_turn(
+                        client.clone(),
+                        session_id.clone(),
+                        text,
+                        current_prompt_id.clone(),
+                    ));
+                } else if !steering_open {
+                    // Mirror the normal turn-settled exit: mailbox closed
+                    // and nothing left to run — the session is over.
+                    break 'main;
+                }
+            },
+
+            steer = steering.recv(), if steering_open && !interrupted => match steer {
+                Some(msg) => {
+                    // Same transform as the initial prompt: Claude's
+                    // Ultrathink prefix rides every steer too.
+                    let text = prompt_transform(request.reasoning, &msg.prompt);
+                    if turn.is_none() && cancel_flush_deadline.is_some() {
+                        // A busy-session cancel is already in flight: this
+                        // steer lines up behind it and dispatches at flush.
+                        queued_steers.push_back(text);
+                    } else if turn.is_none()
+                        && (!open_tools.is_empty()
+                            || last_update_at.elapsed() < BUSY_RECENT)
+                    {
+                        // Mid self-continued turn (see BUSY_RECENT above):
+                        // cancel it rather than prompt into the starve.
+                        //
+                        // Claude skips this branch ON PURPOSE and prompts
+                        // straight in — its NATIVE semantics: the CLI queues
+                        // the message and folds it into the running turn (no
+                        // work lost, verified from live session data). The
+                        // adapter drops that prompt's reply, and the
+                        // cost-frame settle reconstructs it ~1s after the
+                        // merged turn really ends. Only adapters with no
+                        // verified turn-end frame pay the cancel.
+                        tracing::info!(
+                            target: "komet_harness::acp",
+                            "steer into a self-continuing session; cancelling \
+                             the unowned turn before prompting"
+                        );
+                        client.notify(
+                            "session/cancel",
+                            Some(json!({ "sessionId": session_id })),
+                        );
+                        queued_steers.push_back(text);
+                        cancel_flush_deadline =
+                            Some(tokio::time::Instant::now() + CANCEL_FLUSH);
+                    } else if turn.is_none() {
+                        // Idle between turns: a steer is simply the next turn.
+                        let (prev, next) = rotate(&mut assistant_message_id);
+                        if !send(
+                            &event_tx,
+                            AgentEvent::Steered {
+                                assistant_message_id: Some(prev),
+                                next_assistant_message_id: Some(next),
+                            },
+                        )
+                        .await
+                        {
+                            break 'main;
+                        }
+                        done_current = false;
+                        turn_content_seen = false;
+                        open_tools.clear();
+                        last_update_at = tokio::time::Instant::now();
+                        prompt_seq += 1;
+                    current_prompt_id =
+                        prompt_complete_extension.then(|| format!("komet-p{prompt_seq}"));
+                    prompt_stall_deadline =
+                        prompt_stall.map(|d| tokio::time::Instant::now() + d);
+                    turn = Some(prompt_turn(
+                        client.clone(),
+                        session_id.clone(),
+                        text,
+                        current_prompt_id.clone(),
+                    ));
+                    } else if steer_ext {
+                        // Mid-turn injection via the `_session/steering`
+                        // extension: start the call, resolved by its own
+                        // select branch. One call in flight at a time;
+                        // followers wait in the backlog.
+                        if steering_call.is_some() {
+                            steer_backlog.push_back(text);
+                        } else {
+                            let fut = steering_call_future(&client, &session_id, &text);
+                            steering_call = Some((text, fut));
+                        }
+                    } else {
+                        // No extension (Grok today): turn-boundary delivery.
+                        queued_steers.push_back(text);
+                    }
+                }
+                None => {
+                    steering_open = false;
+                    if turn.is_none() && queued_steers.is_empty() {
+                        break 'main;
+                    }
+                }
+            },
+
+            _ = interrupt.cancelled(), if !interrupt_sent => {
+                interrupt_sent = true;
+                interrupted = true;
+                if turn.is_some() {
+                    client.notify("session/cancel", Some(json!({ "sessionId": session_id })));
+                    // Escalate if the agent doesn't wind down (stopReason
+                    // "cancelled") within the grace periods.
+                    if let Some(pid) = child.id() {
+                        escalation = Some(tokio::spawn(async move {
+                            tokio::time::sleep(interrupt_grace).await;
+                            send_signal(pid, Signal::Term);
+                            tokio::time::sleep(kill_grace).await;
+                            send_signal(pid, Signal::Kill);
+                        }));
+                    }
+                } else {
+                    // Idle between turns: nothing to cancel — the terminal
+                    // bookkeeping below still guarantees Done { Interrupted }.
+                    break 'main;
+                }
+            },
+
+            // Prompt-stall watchdog: a prompt was sent and NOTHING has come
+            // back on the wire at all — no queue bookkeeping, no updates, no
+            // requests. Healthy grok acknowledges within milliseconds; total
+            // silence past the bound is a wedged agent (stale shared leader,
+            // launch-time update check). Surface a visible error instead of
+            // indefinite Working.
+            _ = tokio::time::sleep_until(
+                prompt_stall_deadline.unwrap_or_else(tokio::time::Instant::now),
+            ), if prompt_stall_deadline.is_some() && turn.is_some() && !interrupted => {
+                let mut stall_message = format!(
+                    "{agent_name} did not respond to the prompt at all \
+                     (no wire activity for {}s). {}",
+                    prompt_stall.map(|d| d.as_secs()).unwrap_or(0),
+                    stall_hint,
+                );
+                if let Some(tail) = stderr_tail.snapshot() {
+                    stall_message.push_str("; stderr: ");
+                    stall_message.push_str(&tail);
+                }
+                let _ = send(
+                    &event_tx,
+                    typed_error(
+                        stall_message,
+                        None,
+                        tail_detail(stderr_tail.snapshot()),
+                    ),
+                )
+                .await;
+                done_current = true;
+                tracing::error!(
+                    target: "komet_harness::acp",
+                    done_origin = "prompt_stall",
+                    "closing prompt after the no-wire-activity watchdog"
+                );
+                let done_message = format!(
+                    "{agent_name} is unresponsive — the run was closed."
+                );
+                let _ = send(
+                    &event_tx,
+                    typed_error(
+                        done_message.clone(),
+                        None,
+                        tail_detail(stderr_tail.snapshot()),
+                    ),
+                )
+                .await;
+                let _ = send(
+                    &event_tx,
+                    AgentEvent::Done {
+                        status: DoneStatus::Errored,
+                        result: None,
+                        error: Some(done_message),
+                        session_id: Some(session_id.clone()),
+                        reason: Some(DoneReason::PromptStall),
+                    },
+                )
+                .await;
+                break 'main;
+            },
+
+            _ = event_tx.closed() => break 'main,
+        }
     }
 
     // Terminal bookkeeping: never end the stream without a Done unless the
     // consumer already hung up.
     if !event_tx.is_closed() {
         if interrupted && !done_after_interrupt {
+            tracing::info!(
+                target: "komet_harness::acp",
+                done_origin = "interrupt",
+                "ACP run ended after interrupt"
+            );
             let _ = event_tx
                 .send(Ok(AgentEvent::Done {
                     status: DoneStatus::Interrupted,
                     result: None,
                     error: None,
                     session_id: Some(session_id.clone()),
-                    reason: None,
+                    reason: Some(DoneReason::UserRequested),
                 }))
                 .await;
         } else if !interrupted && !done_current {
             // A child killed mid-turn must not read as a silent success.
             let status = child.try_wait().ok().flatten();
+            tracing::error!(
+                target: "komet_harness::acp",
+                done_origin = "child_exit",
+                child_status = ?status,
+                "ACP child exited without settling the prompt"
+            );
             let crash = crate::crash_message(agent_name, status, &stderr_tail);
             let _ = send(
                 &event_tx,
@@ -5236,7 +5573,7 @@ async fn run_session(session: Session) {
                     result: None,
                     error: Some(crash),
                     session_id: Some(session_id.clone()),
-                    reason: None,
+                    reason: Some(DoneReason::ChildExit),
                 }))
                 .await;
         }
@@ -5278,7 +5615,7 @@ mod tests {
     }
 
     #[test]
-    fn qoder_disables_the_blanket_quiet_settle() {
+    fn qoder_disables_quiet_diagnostics_and_other_agents_use_tolerant_window() {
         // Qoder runs tool loops without emitting `session/update`, so a
         // silence window closed its turns minutes before the CLI finished
         // (2026-10-30). Every other ACP agent keeps the dropped-reply
@@ -5295,8 +5632,8 @@ mod tests {
         ] {
             assert_eq!(
                 spec.quiet_settle,
-                Some(Duration::from_secs(30)),
-                "{:?} dropped the quiet-settle backstop",
+                Some(Duration::from_secs(120)),
+                "{:?} has the wrong quiet diagnostic window",
                 spec.id
             );
         }
@@ -5351,6 +5688,57 @@ mod tests {
             servers[0]["headers"],
             json!([{ "name": "Authorization", "value": "Bearer secret-token" }])
         );
+    }
+
+    #[test]
+    fn opencode_native_mcp_configs_are_read_as_json5_and_all_server_names_are_found() {
+        let mut names = BTreeSet::new();
+        collect_opencode_mcp_names(
+            r#"{
+                // Current OpenCode config shape.
+                mcp: { servers: { supabase: { type: "remote", url: "https://example.test" } } },
+            }"#,
+            "test config",
+            &mut names,
+        )
+        .expect("valid JSON5 config");
+        collect_opencode_mcp_names(
+            r#"{"mcp":{"legacy-server":{"command":["mcp"]}}}"#,
+            "legacy config",
+            &mut names,
+        )
+        .expect("valid legacy config");
+        assert_eq!(
+            opencode_mcp_names_to_disable(names, &BTreeSet::from(["supabase".to_owned()])),
+            vec!["legacy-server".to_owned()]
+        );
+    }
+
+    #[test]
+    fn copilot_mcp_isolated_home_keeps_other_config_but_not_native_servers() {
+        let source = tempfile::tempdir().expect("source config");
+        std::fs::write(
+            source.path().join("mcp-config.json"),
+            r#"{"mcpServers":{"supabase":{"command":"server"}}}"#,
+        )
+        .expect("write native MCP config");
+        std::fs::write(source.path().join("settings.json"), r#"{"theme":"dark"}"#)
+            .expect("write other setting");
+
+        let isolated = copilot_home_without_native_mcp_from(source.path())
+            .expect("isolate config")
+            .expect("native MCP config exists");
+        let mcp: Value = serde_json::from_slice(
+            &std::fs::read(isolated.path().join("mcp-config.json")).expect("read isolated MCP"),
+        )
+        .expect("valid empty MCP config");
+        assert_eq!(mcp, json!({"mcpServers": {}}));
+        assert_eq!(
+            std::fs::read_to_string(isolated.path().join("settings.json"))
+                .expect("read preserved settings"),
+            r#"{"theme":"dark"}"#
+        );
+        assert!(source.path().join("mcp-config.json").is_file());
     }
 
     #[test]

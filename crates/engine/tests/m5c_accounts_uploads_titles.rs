@@ -29,6 +29,7 @@ use komet_rpc::methods;
 fn test_accounts(root: &Path) -> (AgentAccounts, AgentAccountsConfig) {
     let config = AgentAccountsConfig {
         data_dir: root.join("data"),
+        gh_cli: None,
         claude_config_dir: root.join("claude"),
         claude_config_file: root.join("claude.json"),
         codex_home: root.join("codex"),
@@ -613,6 +614,7 @@ async fn titling_e2e_names_chat_and_renames_worktree_branch() {
         auto_approve: true,
         attachments: Vec::new(),
         permission_timeout_ms: None,
+        use_mcp: false,
         worktree: None,
         resume: None,
         mcp: None,
@@ -661,6 +663,7 @@ async fn titling_e2e_names_chat_and_renames_worktree_branch() {
         auto_approve: true,
         attachments: Vec::new(),
         permission_timeout_ms: None,
+        use_mcp: false,
         worktree: None,
         resume: None,
         mcp: None,

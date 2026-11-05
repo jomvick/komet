@@ -475,7 +475,7 @@ impl AppState {
     /// immediately-preceding entry for the same chat are refused: a user
     /// pressing Return twice in a row while nothing visibly happened must not
     /// queue the same paragraph twice.
-    pub fn queue_send(&mut self, chat_key: String, text: String) -> String {
+    pub fn queue_send(&mut self, chat_key: String, text: String, use_mcp: bool) -> String {
         let reason = self.send_block_reason().unwrap_or_default();
         if self
             .queued_sends
@@ -488,6 +488,7 @@ impl AppState {
             chat_key,
             text,
             reason,
+            use_mcp,
         });
         self.queued_sends.last().unwrap().reason.clone()
     }
@@ -502,12 +503,12 @@ impl AppState {
     /// guarantee: the texts are out of the state before the first send runs,
     /// so a link that dies mid-drain has `send()` re-park that one text once —
     /// nothing replays, nothing is lost.
-    pub fn take_queued_sends_for(&mut self, chat_key: &str) -> Vec<String> {
+    pub fn take_queued_sends_for(&mut self, chat_key: &str) -> Vec<QueuedSend> {
         let (mine, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut self.queued_sends)
             .into_iter()
             .partition(|queued| queued.chat_key == chat_key);
         self.queued_sends = rest;
-        mine.into_iter().map(|queued| queued.text).collect()
+        mine
     }
 
     /// The status the shell narrates: the engine link, or — while a paired

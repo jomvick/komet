@@ -10,8 +10,8 @@
 //! cell to its rest state automatically (gpui `reduce_motion`).
 
 use gpui::{
-    AnyElement, App, EntityId, IntoElement, ParentElement, PathBuilder, SharedString, Styled,
-    Window, canvas, div, point, px,
+    AnyElement, App, Context, EntityId, IntoElement, ParentElement, PathBuilder, Render,
+    SharedString, Styled, Window, canvas, div, point, px,
 };
 
 use crate::motion::{self, GRADIENT_SPIN, KOMET_PULSE, PULSE_STAGGER};
@@ -109,17 +109,38 @@ pub fn komet_loader(
 
 pub use komet_proto::motion::{GSPIN_DIM, GSPIN_ROW_TINTS};
 
-/// The gradient matrix spinner (WorkingIndicator), ported from komet's
-/// gradient-spin.tsx: a 3×3 grid of round cells tinted per row from the
-/// sunrise gradient. Each cell pulses opacity once per 750ms period; the
-/// per-cell phase follows the "arrow-up" pattern (the pulse enters at the
-/// bottom edge and converges toward the top-center cell), so the wave reads
-/// as travelling upward.
 pub use crate::thinking_orbs::{Dot, Line, OrbFrame, OrbState, ThinkingOrb, thinking_orb};
 
 /// Inline mini thinking orb for status-dot / session row slots.
 pub fn mini_thinking_orb(state: OrbState, size_px: f32) -> ThinkingOrb {
     ThinkingOrb::new(state, size_px)
+}
+
+/// Cached rich orb view whose animation does not rebuild its owning transcript.
+pub struct WorkingOrb {
+    state: OrbState,
+    size_px: f32,
+}
+
+impl WorkingOrb {
+    pub fn new(state: OrbState, size_px: f32) -> Self {
+        Self { state, size_px }
+    }
+
+    pub fn set_state(&mut self, state: OrbState, cx: &mut Context<Self>) {
+        if self.state != state {
+            self.state = state;
+            cx.notify();
+        }
+    }
+}
+
+impl Render for WorkingOrb {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        ThinkingOrb::new(self.state, self.size_px)
+            .speed(1.25)
+            .driven(cx.entity_id(), window, cx)
+    }
 }
 
 /// The gradient matrix spinner / ThinkingOrb loader (WorkingIndicator).

@@ -255,6 +255,7 @@ pub struct QueuedSend {
     pub chat_key: String,
     pub text: String,
     pub reason: String,
+    pub use_mcp: bool,
 }
 
 impl Default for AppState {

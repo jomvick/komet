@@ -66,6 +66,7 @@ fn request(dir: &Path) -> RunRequest {
         attachments: vec![],
         worktree: None,
         permission_timeout_ms: None,
+        use_mcp: false,
         mcp: None,
         mcp_external: vec![],
     }

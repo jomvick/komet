@@ -24,6 +24,7 @@ fn run_request(prompt: &str) -> RunRequest {
         auto_approve: true,
         attachments: Vec::new(),
         permission_timeout_ms: None,
+        use_mcp: false,
         worktree: None,
         resume: None,
         mcp: None,
@@ -44,7 +45,7 @@ async fn engine_with_github() -> (EngineCore, TempDir, String) {
         url: None,
         headers: HashMap::from([("Authorization".into(), "placeholder".into())]),
         env: HashMap::new(),
-        always_load: false,
+        always_load: true,
     })
     .unwrap();
     McpSecretStore::new(dir.path().join("mcp-secrets.json"))
@@ -70,7 +71,7 @@ async fn engine_with_github() -> (EngineCore, TempDir, String) {
                 reasoning: None,
                 model_options: Default::default(),
                 sandbox: SandboxLevel::WorkspaceWrite,
-                mcp_server_ids: vec!["gh".into()],
+                mcp_server_ids: Vec::new(),
             }),
             Some("/tmp".into()),
         )
@@ -81,13 +82,10 @@ async fn engine_with_github() -> (EngineCore, TempDir, String) {
 #[tokio::test]
 async fn dispatch_injects_assigned_external_mcp_for_compatible_harnesses() {
     let (core, _dir, chat_id) = engine_with_github().await;
+    let mut request = run_request("list issues");
+    request.use_mcp = true;
     core.sessions
-        .dispatch(
-            &chat_id,
-            HarnessId::Mock,
-            run_request("list issues"),
-            Some("msg-1".into()),
-        )
+        .dispatch(&chat_id, HarnessId::Mock, request, Some("msg-1".into()))
         .await
         .unwrap();
     let req = core.sessions.last_request(&chat_id).expect("dispatched");
@@ -96,6 +94,24 @@ async fn dispatch_injects_assigned_external_mcp_for_compatible_harnesses() {
     assert_eq!(server.config.id, "gh");
     assert_eq!(server.resolved_headers["Authorization"], SECRET);
     assert!(!format!("{req:?}").contains(SECRET));
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn dispatch_does_not_start_or_inject_mcp_by_default() {
+    let (core, _dir, chat_id) = engine_with_github().await;
+    core.sessions
+        .dispatch(
+            &chat_id,
+            HarnessId::Mock,
+            run_request("ordinary prompt"),
+            Some("msg-no-mcp".into()),
+        )
+        .await
+        .unwrap();
+    let request = core.sessions.last_request(&chat_id).expect("dispatched");
+    assert!(request.mcp_external.is_empty());
+    assert!(request.mcp.is_none());
     core.shutdown().await;
 }
 
@@ -126,11 +142,13 @@ async fn dispatch_injects_internal_komet_mcp() {
             Some("/tmp".into()),
         )
         .unwrap();
+    let mut request = run_request("hello");
+    request.use_mcp = true;
     core.sessions
         .dispatch(
             &chat_id,
             HarnessId::Mock,
-            run_request("hello"),
+            request,
             Some("msg-internal".into()),
         )
         .await

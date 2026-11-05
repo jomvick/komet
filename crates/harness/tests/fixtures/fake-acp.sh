@@ -451,10 +451,9 @@ case "$promptline" in
   ;;
 
 *scenario:quiet-starve*)
-  # Blanket dropped-reply settle, no adapter-specific evidence: content
-  # streamed, no open tool, then silence — the response never comes. The
-  # harness must settle off the generic quiet window (tests set
-  # KOMET_ACP_QUIET_SETTLE_MS small), well before this stream's 8s EOF.
+  # Dropped prompt response: content streamed, no open tool, then silence.
+  # The diagnostic window must not settle the turn; keep the process alive
+  # until EOF so the test can assert that child exit, not quiet, closes it.
   update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"working"}}'
   sleep 8
   exit 0

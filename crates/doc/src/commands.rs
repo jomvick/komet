@@ -329,6 +329,7 @@ mod tests {
             auto_approve: false,
             attachments: Vec::new(),
             permission_timeout_ms: None,
+            use_mcp: false,
             resume: None,
             worktree: None,
             mcp: None,

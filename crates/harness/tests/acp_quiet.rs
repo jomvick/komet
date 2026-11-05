@@ -1,8 +1,6 @@
-//! Blanket dropped-reply settle (`KOMET_ACP_QUIET_SETTLE_MS`), tested with
-//! the GROK spec so no adapter-specific evidence (Claude's cost frame,
-//! `noRunningTurn` steering reasons) is in play — this is the path every ACP
-//! agent gets. Own test binary: the env knob is process-global, and every
-//! test here shares the one value.
+//! Quiet-turn diagnostics (`KOMET_ACP_QUIET_SETTLE_MS`), tested with the GROK
+//! spec so no adapter-specific evidence is in play. Own test binary: the env
+//! knob is process-global, and every test here shares the one value.
 
 use std::path::PathBuf;
 use std::sync::Once;
@@ -13,7 +11,8 @@ use tokio::sync::{mpsc, oneshot};
 
 use komet_harness::{AcpHarness, CancellationToken, Harness, RunControls, SteerMessage};
 use komet_proto::{
-    AgentEvent, DoneStatus, RunRequest, SandboxLevel, UserInputAnswer, UserInputQuestion,
+    AgentEvent, DoneReason, DoneStatus, RunRequest, SandboxLevel, UserInputAnswer,
+    UserInputQuestion,
 };
 
 const QUIET_MS: u64 = 1200;
@@ -53,6 +52,7 @@ fn request(prompt: &str) -> RunRequest {
         auto_approve: true,
         attachments: Vec::new(),
         permission_timeout_ms: None,
+        use_mcp: false,
         worktree: None,
         resume: None,
         mcp: None,
@@ -118,11 +118,21 @@ fn dones(events: &[(std::time::Instant, AgentEvent)]) -> Vec<(DoneStatus, Option
         .collect()
 }
 
+fn done_reasons(events: &[(std::time::Instant, AgentEvent)]) -> Vec<Option<DoneReason>> {
+    events
+        .iter()
+        .filter_map(|(_, event)| match event {
+            AgentEvent::Done { reason, .. } => Some(*reason),
+            _ => None,
+        })
+        .collect()
+}
+
 /// A generic agent whose prompt response is dropped: content streamed, no
-/// open tool, then silence. The blanket settle must produce a clean Done off
-/// the quiet window, well before the fixture's held-open stream ends.
+/// open tool, then silence. Quiet is not proof of completion; the harness
+/// keeps the future alive and reports the missing response when the child exits.
 #[tokio::test]
-async fn generic_dropped_reply_settles_off_the_quiet_window() {
+async fn generic_dropped_reply_is_not_settled_off_the_quiet_window() {
     init_env();
     let started = std::time::Instant::now();
     let events = run_and_collect(
@@ -131,22 +141,73 @@ async fn generic_dropped_reply_settles_off_the_quiet_window() {
         Duration::from_secs(20),
     )
     .await;
+    let done = events
+        .iter()
+        .find(|(_, e)| matches!(e, AgentEvent::Done { .. }))
+        .expect("child exit must close the unresolved prompt");
+    assert!(
+        matches!(
+            &done.1,
+            AgentEvent::Done {
+                status: DoneStatus::Errored,
+                ..
+            }
+        ),
+        "{events:?}"
+    );
+    let done_at = done.0.duration_since(started);
+    // The diagnostic window is 1.2s; the fixture stays alive for 8s. No
+    // synthetic Done may be emitted just because the stream went quiet.
+    assert!(
+        done_at > Duration::from_secs(6),
+        "Done at {done_at:?} — should wait for child exit, not the \
+         {QUIET_MS}ms quiet window"
+    );
+    assert_eq!(dones(&events).len(), 1, "{events:?}");
+    assert_eq!(done_reasons(&events), vec![Some(DoneReason::ChildExit)]);
+}
+
+/// A resolved tool is followed by a quiet reasoning interval longer than the
+/// diagnostic window, then a late response to the original prompt. It must
+/// remain the same turn and settle exactly once from that real response.
+#[tokio::test]
+async fn late_prompt_response_after_tool_result_survives_quiet_window() {
+    init_env();
+    let events = run_and_collect(
+        AcpHarness::grok(),
+        "scenario:quiet-thinking",
+        Duration::from_secs(20),
+    )
+    .await;
     assert_eq!(
         dones(&events),
         vec![(DoneStatus::Completed, None)],
         "{events:?}"
     );
-    let done_at = events
+    assert_eq!(
+        done_reasons(&events),
+        vec![Some(DoneReason::PromptResponse)]
+    );
+    let working = events
         .iter()
-        .find(|(_, e)| matches!(e, AgentEvent::Done { .. }))
-        .map(|(t, _)| t.duration_since(started))
+        .position(|(_, e)| matches!(e, AgentEvent::TextDelta { text } if text == "working"))
+        .expect("initial response text should be streamed");
+    let finished = events
+        .iter()
+        .position(|(_, e)| matches!(e, AgentEvent::TextDelta { text } if text == "finished"))
+        .expect("late response text should be streamed in the same turn");
+    let done = events
+        .iter()
+        .position(|(_, e)| matches!(e, AgentEvent::Done { .. }))
         .expect("done asserted above");
-    // Window is 1.2s; the fixture holds the stream open for 8s. The Done
-    // must come from the settle, not EOF (margin sized for suite load).
     assert!(
-        done_at < Duration::from_secs(6),
-        "Done at {done_at:?} — should ride the {QUIET_MS}ms quiet window, \
-         not the 8s stream EOF"
+        working < finished && finished < done,
+        "the quiet interval must not split the turn: {events:?}"
+    );
+    let quiet_interval = events[finished].0.duration_since(events[working].0);
+    assert!(
+        quiet_interval > Duration::from_millis(QUIET_MS),
+        "fixture's quiet interval {quiet_interval:?} must exceed {QUIET_MS}ms"
     );
 }
 

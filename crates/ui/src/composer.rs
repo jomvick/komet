@@ -3784,7 +3784,7 @@ fn parse_komet_command(text: &str) -> Option<(&str, Option<&str>)> {
         .filter(|value| !value.is_empty());
     matches!(
         command,
-        "new" | "worktree" | "prompt" | "attach" | "model" | "sandbox"
+        "new" | "worktree" | "prompt" | "attach" | "model" | "sandbox" | "mcp"
     )
     .then_some((command, argument))
 }
@@ -3850,6 +3850,11 @@ fn with_komet_commands(
         ("attach", "Attach files", None),
         ("model", "Choose the chat model", Some("[name]")),
         ("sandbox", "Change access mode", Some("[level]")),
+        (
+            "mcp",
+            "Send one prompt with Komet MCP enabled",
+            Some("<prompt>"),
+        ),
     ] {
         if !commands.iter().any(|command| command.name == name) {
             commands.push(SlashCommand {
@@ -3944,6 +3949,7 @@ struct QueuedPrompt {
     text: String,
     steer: bool,
     staged: Vec<StagedAttachment>,
+    use_mcp: bool,
 }
 
 pub struct Composer {
@@ -3985,6 +3991,9 @@ pub struct Composer {
     slash_cache: HashMap<SlashCacheKey, Vec<SlashCommand>>,
     current_key: String,
     sending: bool,
+    /// MCP servers are injected only for the next prompt when explicitly armed.
+    use_mcp_next_prompt: bool,
+    last_sent_used_mcp: bool,
     failure: Option<SharedString>,
     wizard: Option<Wizard>,
     wizard_focus: FocusHandle,
@@ -4111,7 +4120,7 @@ impl Composer {
         }
         // The text was handed in, not typed: a draft in the input is not its
         // owner, so the send must leave the input and its files alone.
-        self.send(text, false, false, cx);
+        self.send(text, false, false, false, cx);
     }
 
     /// Resubmit the last full-turn prompt verbatim (the error chip's
@@ -4119,7 +4128,7 @@ impl Composer {
     /// re-applies the sending/blocked guards.
     pub fn resubmit_last(&mut self, cx: &mut Context<Self>) {
         if let Some(text) = self.last_sent.clone() {
-            self.submit_text(text, cx);
+            self.send(text, false, false, self.last_sent_used_mcp, cx);
         }
     }
 
@@ -4232,6 +4241,8 @@ impl Composer {
             slash_cache: HashMap::new(),
             current_key,
             sending: false,
+            use_mcp_next_prompt: false,
+            last_sent_used_mcp: false,
             failure: None,
             wizard: None,
             wizard_focus: cx.focus_handle(),
@@ -5327,6 +5338,7 @@ impl Composer {
             let draft = self.drafts.get(&key).cloned().unwrap_or_default();
             self.current_key = key;
             self.failure = None;
+            self.use_mcp_next_prompt = false;
             self.wizard = None;
             // Discard any queued prompts for the old chat — they were meant for
             // that session's context and would be confusing on a different chat.
@@ -5489,13 +5501,21 @@ impl Composer {
         if self.handle_komet_command(&text, cx) {
             return;
         }
+        let use_mcp = self.use_mcp_next_prompt;
         match self.button_mode(cx) {
             SendButtonMode::Stop => self.interrupt(cx),
             _ if text.is_empty() && self.staged().is_empty() => {}
             _ if self.send_blocked(cx) => {}
-            SendButtonMode::Queue => self.enqueue_prompt(text, false, cx),
-            SendButtonMode::Send => self.send(text, false, true, cx),
-            SendButtonMode::Steer => self.send(text, true, true, cx),
+            SendButtonMode::Queue => self.enqueue_prompt(text, false, use_mcp, cx),
+            SendButtonMode::Send => {
+                self.send(text, false, true, use_mcp, cx);
+                self.use_mcp_next_prompt = false;
+            }
+            SendButtonMode::Steer if use_mcp => self.enqueue_prompt(text, false, use_mcp, cx),
+            SendButtonMode::Steer => {
+                self.send(text, true, true, false, cx);
+                self.use_mcp_next_prompt = false;
+            }
         }
         // Send is a hand-off, not an exit: the keyboard stays on the prompt.
         self.refocus_input_pending = true;
@@ -5540,6 +5560,20 @@ impl Composer {
                     self.cycle_access_mode(cx);
                 }
                 self.input.update(cx, |input, cx| input.set_text("", cx));
+                true
+            }
+            "mcp" => {
+                let Some(prompt) = argument else {
+                    self.failure = Some("Usage : /mcp <prompt>".into());
+                    cx.notify();
+                    return true;
+                };
+                if self.run_live(cx) {
+                    self.enqueue_prompt(prompt.to_owned(), false, true, cx);
+                } else {
+                    self.send(prompt.to_owned(), false, true, true, cx);
+                }
+                self.refocus_input_pending = true;
                 true
             }
             "prompt" => {
@@ -5604,7 +5638,7 @@ impl Composer {
     /// staged attachments are cleared immediately (same as a real send), and the
     /// bandeau « N queued » appears. The queue drains automatically when the
     /// session becomes idle.
-    fn enqueue_prompt(&mut self, text: String, steer: bool, cx: &mut Context<Self>) {
+    fn enqueue_prompt(&mut self, text: String, steer: bool, use_mcp: bool, cx: &mut Context<Self>) {
         // Snapshot staged attachments for this queued item.
         let staged = self
             .attachments
@@ -5615,7 +5649,9 @@ impl Composer {
             text,
             steer,
             staged,
+            use_mcp,
         });
+        self.use_mcp_next_prompt = false;
         // Clear the input right away, exactly like a real send.
         self.input.update(cx, |input, cx| input.set_text("", cx));
         self.drafts.remove(&self.current_key);
@@ -5635,7 +5671,7 @@ impl Composer {
                     .or_default()
                     .extend(item.staged);
             }
-            self.send(item.text, item.steer, false, cx);
+            self.send(item.text, item.steer, false, item.use_mcp, cx);
         }
     }
 
@@ -5656,7 +5692,7 @@ impl Composer {
         if queued.is_empty() {
             return;
         }
-        for text in queued {
+        for queued in queued {
             // The first send puts the composer back into `sending`, so the rest
             // normally ride the local prompt queue, which drains itself at the
             // next idle turn. Either route keeps the text alive exactly once.
@@ -5664,15 +5700,16 @@ impl Composer {
                 && !self.send_blocked(cx)
                 && self.state.read(cx).send_block_reason().is_none();
             if sendable {
-                self.submit_text(text, cx);
+                self.send(queued.text, false, false, queued.use_mcp, cx);
             } else {
                 // Re-park without the input-clearing path: the text already
                 // left the input when it was queued, and the draft staged
                 // since then is not this message's to take.
                 self.prompt_queue.push_back(QueuedPrompt {
-                    text,
+                    text: queued.text,
                     steer: false,
                     staged: Vec::new(),
+                    use_mcp: queued.use_mcp,
                 });
             }
         }
@@ -5706,6 +5743,7 @@ impl Composer {
         text: String,
         reason: String,
         from_input: bool,
+        use_mcp: bool,
         cx: &mut Context<Self>,
     ) {
         // The outbox is text-only: a text-only copy would silently drop the
@@ -5735,7 +5773,7 @@ impl Composer {
         }
         let chat_key = self.current_key.clone();
         self.state.update(cx, |state, _| {
-            state.queue_send(chat_key, text);
+            state.queue_send(chat_key, text, use_mcp);
         });
         if from_input {
             self.input.update(cx, |input, cx| input.set_text("", cx));
@@ -5753,15 +5791,23 @@ impl Composer {
     /// only then do the input, the draft cache and the staged files follow it
     /// out. A replayed text (outbox drain, prompt queue) must leave the draft
     /// the user prepared in the meantime alone.
-    fn send(&mut self, text: String, steer: bool, from_input: bool, cx: &mut Context<Self>) {
+    fn send(
+        &mut self,
+        text: String,
+        steer: bool,
+        from_input: bool,
+        use_mcp: bool,
+        cx: &mut Context<Self>,
+    ) {
         if !steer && !text.trim().is_empty() {
             self.last_sent = Some(text.clone());
+            self.last_sent_used_mcp = use_mcp;
         }
         // A downed link is not a dead button: park the text in the state outbox
         // and say why (transparency plan Task 10). `send_block` also covers a
         // vanished engine handle, which the status frame reports late.
         if let Some(reason) = self.send_block(cx) {
-            self.hold_send(text, reason, from_input, cx);
+            self.hold_send(text, reason, from_input, use_mcp, cx);
             return;
         }
         let Some(engine) = self.state.read(cx).engine().cloned() else {
@@ -6136,6 +6182,7 @@ impl Composer {
                             attachments: attachment_paths,
                             worktree: None,
                             permission_timeout_ms: None,
+                            use_mcp,
                             mcp: None, mcp_external: Vec::new(),
                         },
                         message_id: message_id.clone(),
@@ -6331,6 +6378,7 @@ impl Composer {
                         attachments: Vec::new(),
                         worktree: None,
                         permission_timeout_ms: None,
+                        use_mcp: false,
                         mcp: None,
                         mcp_external: Vec::new(),
                     },
@@ -8324,6 +8372,10 @@ mod tests {
             parse_komet_command("/prompt review"),
             Some(("prompt", Some("review")))
         );
+        assert_eq!(
+            parse_komet_command("/mcp use the configured Supabase tools"),
+            Some(("mcp", Some("use the configured Supabase tools")))
+        );
         assert_eq!(parse_komet_command("/sandbox"), Some(("sandbox", None)));
         assert!(parse_komet_command("/prompt review extra").is_some());
         assert!(parse_komet_command("please /prompt review").is_none());
@@ -8374,6 +8426,7 @@ mod tests {
             "prompt",
             "attach",
             "sandbox",
+            "mcp",
             "prompt review",
         ] {
             assert!(
@@ -9581,9 +9634,9 @@ mod tests {
             "the reason must name the link state: {reason}"
         );
 
-        let shown = state.queue_send("chat-a".into(), "fix the test".into());
+        let shown = state.queue_send("chat-a".into(), "fix the test".into(), true);
         assert_eq!(shown, reason, "the row shows the reason it stored");
-        state.queue_send("chat-a".into(), "fix the test".into());
+        state.queue_send("chat-a".into(), "fix the test".into(), true);
         assert_eq!(
             state.queued_sends().len(),
             1,
@@ -9596,10 +9649,15 @@ mod tests {
         );
 
         // Another chat's text is not this chat's to send.
-        state.queue_send("chat-b".into(), "elsewhere".into());
+        state.queue_send("chat-b".into(), "elsewhere".into(), false);
         assert_eq!(
             state.take_queued_sends_for("chat-a"),
-            vec!["fix the test".to_string()]
+            vec![QueuedSend {
+                chat_key: "chat-a".into(),
+                text: "fix the test".into(),
+                reason: reason.clone(),
+                use_mcp: true,
+            }]
         );
         assert_eq!(
             state.queued_sends().len(),
@@ -9612,7 +9670,12 @@ mod tests {
         );
         assert_eq!(
             state.take_queued_sends_for("chat-b"),
-            vec!["elsewhere".to_string()]
+            vec![QueuedSend {
+                chat_key: "chat-b".into(),
+                text: "elsewhere".into(),
+                reason,
+                use_mcp: false,
+            }]
         );
         assert!(
             state.queued_sends().is_empty(),

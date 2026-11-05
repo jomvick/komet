@@ -34,7 +34,9 @@ use komet_doc::{
     ProviderSessionMark, STREAM_COMMIT_MS, SegmentWriter, SessionDoc, SubagentStatus,
     fold_event_into_parts_with, sanitize_tool_call,
 };
-use komet_harness::{CancellationToken, Harness, RunControls, SteerMessage};
+use komet_harness::{
+    CancellationToken, Harness, RunControls, SteerMessage, capabilities::supports_dynamic_mcp_bool,
+};
 use komet_proto::{
     AgentEvent, CompactionStatus, ContextUsageSource, DoneReason, DoneStatus, ErrorKind, HarnessId,
     RunPhase, RunRequest, Session, SessionStatus, UserInputAnswer, UserInputQuestion,
@@ -964,15 +966,19 @@ impl SessionsEngine {
         mut message_id: Option<String>,
         startup_retry: bool,
     ) -> Result<String, EngineError> {
-        // External server secrets are resolved on the host immediately before
-        // launch. Composio is handled by Komet's own MCP bridge so tool calls
-        // can pass through the permission panel instead of reaching it directly.
-        request.mcp_external = self
-            .prepare_mcp_for_run(chat_id)
-            .into_iter()
-            .filter(|server| server.config.id != "composio")
-            .map(resolved_mcp_to_proto)
-            .collect();
+        // MCP is opt-in per prompt and only injected into providers with a
+        // real dynamic-MCP path.
+        let mcp_supported = request.use_mcp && supports_dynamic_mcp_bool(harness_id);
+        request.mcp_external = if mcp_supported {
+            self.prepare_mcp_for_run(chat_id)
+                .into_iter()
+                .filter(|server| server.config.id != crate::mcp::config::COMPOSIO_SERVER_ID)
+                .map(resolved_mcp_to_proto)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        request.mcp = None;
         // Project-less chats store cwd `~` (the creating device can't know the
         // host's home); expand it here, on the host, where the run spawns.
         request.cwd = expand_home(&request.cwd);
@@ -1411,7 +1417,11 @@ impl SessionsEngine {
                 })
             })
         };
-        let internal_mcp = self.start_internal_mcp(chat_id, &run_id, mcp_ask).await;
+        let internal_mcp = if mcp_supported {
+            self.start_internal_mcp(chat_id, &run_id, mcp_ask).await
+        } else {
+            None
+        };
         if let Some(endpoint) = internal_mcp.as_ref() {
             request.mcp = Some(komet_proto::McpInjection {
                 server_name: "komet".into(),
@@ -1735,9 +1745,18 @@ impl SessionsEngine {
     pub fn recover_stale(&self) -> Result<usize, EngineError> {
         const MAX_AUTO_RESUME: u32 = 3;
         const RESUME_FRESH_MS: i64 = 12 * 60 * 60 * 1000;
+        // Each revived run spawns a full agent CLI (plus its MCP servers), so
+        // resuming N crashed chats at once turns boot into a process storm.
+        // Stagger the dispatches; `KOMET_RESUME_STAGGER_MS=0` restores the old
+        // all-at-once behavior.
+        let stagger_ms = std::env::var("KOMET_RESUME_STAGGER_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(4_000);
 
         let stale = self.inner.journal.stale_sessions()?;
         let mut recovered = 0usize;
+        let mut resume_slot = 0u64;
         for chat_id in stale {
             if lock(&self.inner.runs).contains_key(&chat_id) {
                 continue; // a live run owns this journal
@@ -1819,7 +1838,12 @@ impl SessionsEngine {
             let attempt = self.inner.journal.note_resume_attempt(&chat_id);
             let (user_id, prompt_text) = prompt.expect("gated by will_resume");
             let sessions = self.clone();
+            let delay = resume_slot * stagger_ms;
+            resume_slot += 1;
             tokio::spawn(async move {
+                if delay > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                }
                 let Some(host) = sessions.inner.doc_host() else {
                     return;
                 };
@@ -1848,6 +1872,7 @@ impl SessionsEngine {
                             // that already has one (or doesn't need one).
                             worktree: None,
                             permission_timeout_ms: None,
+                            use_mcp: false,
                             mcp: None,
                             mcp_external: Vec::new(),
                         })
@@ -4125,6 +4150,7 @@ mod tests {
             attachments: Vec::new(),
             worktree: None,
             permission_timeout_ms: None,
+            use_mcp: false,
             mcp: None,
             mcp_external: Vec::new(),
         }

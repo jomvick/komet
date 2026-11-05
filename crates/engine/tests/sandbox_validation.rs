@@ -30,6 +30,7 @@ fn base_request() -> RunRequest {
         auto_approve: false,
         attachments: vec![],
         permission_timeout_ms: None,
+        use_mcp: false,
         worktree: None,
         resume: None,
         mcp: None,

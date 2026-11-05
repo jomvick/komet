@@ -180,6 +180,10 @@ fn radius_scale(size: f32, rs_pow: f32) -> f32 {
     (size / 300.0).powf(rs_pow)
 }
 
+fn minimum_dot_radius(size: f32) -> f32 {
+    (size / 64.0).clamp(0.55, 1.0)
+}
+
 fn finalize_frame(mut dots: Vec<Dot>, lines: Vec<Line>, r_min: f32) -> OrbFrame {
     dots.retain(|d| d.a >= 0.02);
     for d in &mut dots {
@@ -348,7 +352,7 @@ fn frame_orbits(size: f32, t: f32, speed_mul: f32, count_mul: f32, size_mul: f32
             });
         }
     }
-    finalize_frame(dots, Vec::new(), 0.3)
+    finalize_frame(dots, Vec::new(), minimum_dot_radius(size))
 }
 
 // 2. Globe (searching)
@@ -405,7 +409,7 @@ fn frame_globe(size: f32, t: f32, speed_mul: f32, count_mul: f32, size_mul: f32)
             });
         }
     }
-    finalize_frame(dots, Vec::new(), 0.3)
+    finalize_frame(dots, Vec::new(), minimum_dot_radius(size))
 }
 
 // 3. Rubik (solving)
@@ -554,7 +558,7 @@ fn frame_rubik(size: f32, t: f32, speed_mul: f32, count_mul: f32, size_mul: f32)
             });
         }
     }
-    finalize_frame(dots, Vec::new(), 0.3)
+    finalize_frame(dots, Vec::new(), minimum_dot_radius(size))
 }
 
 // 4. Wave (listening)
@@ -606,7 +610,7 @@ fn frame_wave(size: f32, t: f32, speed_mul: f32, count_mul: f32, size_mul: f32) 
             });
         }
     }
-    finalize_frame(dots, Vec::new(), 0.3)
+    finalize_frame(dots, Vec::new(), minimum_dot_radius(size))
 }
 
 // 5. Web (connecting)
@@ -699,7 +703,7 @@ fn frame_web(size: f32, t: f32, speed_mul: f32, count_mul: f32, size_mul: f32) -
         });
     }
 
-    finalize_frame(dots, lines, 0.3)
+    finalize_frame(dots, lines, minimum_dot_radius(size))
 }
 
 // 6. Braid (weaving)
@@ -771,7 +775,7 @@ fn frame_braid(size: f32, t: f32, speed_mul: f32, count_mul: f32, size_mul: f32)
         }
     }
 
-    finalize_frame(dots, Vec::new(), 0.3)
+    finalize_frame(dots, Vec::new(), minimum_dot_radius(size))
 }
 
 // 7. Ribbon (composing)
@@ -848,7 +852,7 @@ fn frame_ribbon(size: f32, t: f32, speed_mul: f32, count_mul: f32, size_mul: f32
         }
     }
 
-    finalize_frame(dots, Vec::new(), 0.3)
+    finalize_frame(dots, Vec::new(), minimum_dot_radius(size))
 }
 
 // 8. Ring (breathing)
@@ -912,7 +916,7 @@ fn frame_ring(size: f32, t: f32, speed_mul: f32, count_mul: f32, size_mul: f32) 
         }
     }
 
-    finalize_frame(dots, Vec::new(), 0.3)
+    finalize_frame(dots, Vec::new(), minimum_dot_radius(size))
 }
 
 // 9. Morph (shaping)
@@ -1008,7 +1012,7 @@ fn frame_morph(size: f32, t: f32, speed_mul: f32, count_mul: f32, size_mul: f32)
         });
     }
 
-    finalize_frame(dots, Vec::new(), 0.3)
+    finalize_frame(dots, Vec::new(), minimum_dot_radius(size))
 }
 
 // ---------------------------------------------------------------------------
@@ -1189,4 +1193,37 @@ impl IntoElement for ThinkingOrb {
 /// Convenience helper to create a ThinkingOrb element.
 pub fn thinking_orb(state: OrbState, size_px: f32) -> ThinkingOrb {
     ThinkingOrb::new(state, size_px)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn small_orbs_keep_dots_large_enough_to_render_cleanly() {
+        let states = [
+            OrbState::Working,
+            OrbState::Searching,
+            OrbState::Solving,
+            OrbState::Listening,
+            OrbState::Connecting,
+            OrbState::Weaving,
+            OrbState::Composing,
+            OrbState::Breathing,
+            OrbState::Shaping,
+        ];
+
+        for size in [14.0, 20.0, 64.0] {
+            for state in states {
+                let frame = generate_frame(state, size, 1.0, 1.0);
+                assert!(
+                    frame
+                        .dots
+                        .iter()
+                        .all(|dot| dot.r >= minimum_dot_radius(size)),
+                    "{state:?} has subpixel dots at {size}px"
+                );
+            }
+        }
+    }
 }
