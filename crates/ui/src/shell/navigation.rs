@@ -305,8 +305,16 @@ impl Shell {
 
     pub(super) fn open_settings(&mut self, section: SettingsSection, cx: &mut Context<Self>) {
         // Recreate per visit: the page's ListHarnesses load re-probes which
-        // CLIs are installed, so installing one shows up on the next open.
-        if section == SettingsSection::Providers {
+        // CLIs are installed, so installing one shows up on the next open. Not
+        // while a sign-in is running — the browser-wait poll lives on that page,
+        // and dropping it stopped the only thing that noticed the login landing,
+        // leaving the authorized account unsaved.
+        if section == SettingsSection::Providers
+            && !self
+                .providers_page
+                .as_ref()
+                .is_some_and(|page| page.read(cx).has_login_in_flight())
+        {
             self.providers_page = None;
         }
         self.route = Route::Settings(section);

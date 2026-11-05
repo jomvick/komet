@@ -117,6 +117,9 @@ const KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
 const USAGE_TTL: Duration = Duration::from_secs(60);
 /// An abandoned login flow (dialog dismissed without Cancel) is reaped past this.
 const FLOW_TTL: Duration = Duration::from_secs(15 * 60);
+/// A CLI sign-in still pending this long after it started is reported as an
+/// error instead of leaving the dialog spinning until `FLOW_TTL` reaps it.
+const CLI_LOGIN_STALL: Duration = Duration::from_secs(5 * 60);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// Credential stores owned by the CLI-managed providers that have an in-app
@@ -169,6 +172,9 @@ impl CliProviderFiles {
 pub struct AgentAccountsConfig {
     /// Engine data dir; slots live under `{data_dir}/agent-accounts/`.
     pub data_dir: PathBuf,
+    /// GitHub CLI used to discover externally-authenticated Copilot accounts.
+    /// `None` disables this integration (used by hermetic account-store tests).
+    pub gh_cli: Option<PathBuf>,
     /// Claude config dir (`$CLAUDE_CONFIG_DIR` or `~/.claude`) — holds `.credentials.json`.
     pub claude_config_dir: PathBuf,
     /// Claude identity file (`~/.claude.json`, or `$CLAUDE_CONFIG_DIR/.claude.json`).
@@ -199,6 +205,7 @@ impl AgentAccountsConfig {
         };
         Self {
             data_dir: data_dir.to_path_buf(),
+            gh_cli: Some(PathBuf::from("gh")),
             claude_config_dir: claude_dir.unwrap_or_else(|| home_dir().join(".claude")),
             claude_config_file,
             codex_home: env_dir("CODEX_HOME").unwrap_or_else(|| home_dir().join(".codex")),
@@ -244,6 +251,12 @@ impl AgentAccountsConfig {
 
     fn copilot_active_file(&self) -> PathBuf {
         self.root_dir().join("copilot-active")
+    }
+
+    /// Id of the selected Qoder slot (the Copilot pattern: Qoder's own login file
+    /// carries no identity we can read, so the selection is tracked here).
+    fn qoder_active_file(&self) -> PathBuf {
+        self.root_dir().join("qoder-active")
     }
 }
 
@@ -555,6 +568,102 @@ mod usage_mode_tests {
     }
 
     #[test]
+    fn github_cli_accounts_include_active_and_secondary_users() {
+        let output = "\
+github.com
+  ✓ Logged in to github.com account second-user (keyring)
+  - Active account: true
+  ✓ Logged in to github.com account first-user (keyring)
+  - Active account: false
+";
+        assert_eq!(
+            parse_github_cli_accounts(output),
+            vec![("second-user".into(), true), ("first-user".into(), false)]
+        );
+    }
+
+    #[test]
+    fn gh_hosts_file_yields_the_login_for_both_token_shapes() {
+        // gh >= 2.4: the token is nested under its own user.
+        let nested = "\
+github.com:
+    users:
+        octocat:
+            oauth_token: gho_nestedvalue
+            git_protocol: https
+    user: octocat
+";
+        assert_eq!(
+            parse_gh_hosts_file(nested),
+            Some(("octocat".into(), "gho_nestedvalue".into()))
+        );
+        // Single-account/older: the token hangs off the host key, `user:` names it.
+        let host_level = "\
+github.com:
+    oauth_token: gho_hostvalue
+    git_protocol: https
+    user: mona
+";
+        assert_eq!(
+            parse_gh_hosts_file(host_level),
+            Some(("mona".into(), "gho_hostvalue".into()))
+        );
+    }
+
+    #[test]
+    fn gh_hosts_file_without_a_plaintext_token_adopts_nothing() {
+        // Keyring-backed storage keeps the secret out of hosts.yml: there is
+        // nothing to adopt, and a slot without credentials would be worse than none.
+        let keyring = "\
+github.com:
+    git_protocol: https
+    users:
+        octocat:
+    user: octocat
+";
+        assert_eq!(parse_gh_hosts_file(keyring), None);
+        assert_eq!(parse_gh_hosts_file(""), None);
+    }
+
+    #[test]
+    fn read_gh_hosts_login_reads_a_finished_login_throwaway_dir() {
+        let dir = std::env::temp_dir().join(format!("komet-gh-hosts-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::fs::write(
+            dir.join("hosts.yml"),
+            "github.com:\n    oauth_token: gho_x\n    user: octocat\n",
+        )
+        .expect("hosts.yml");
+        assert_eq!(
+            read_gh_hosts_login(&dir),
+            Some(("octocat".into(), "gho_x".into()))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn copilot_slot_degrades_to_a_label_instead_of_losing_the_account() {
+        let user = serde_json::json!({
+            "login": "OctoCat",
+            "email": "octocat@example.com",
+            "name": "The Octocat",
+        });
+        let resolved = github_copilot_slot("OctoCat", "gho_x", Some(&user));
+        assert_eq!(resolved.account_key, "octocat");
+        assert_eq!(resolved.profile.email, "octocat@example.com");
+        assert_eq!(
+            resolved.profile.display_name.as_deref(),
+            Some("The Octocat")
+        );
+
+        // `/user` unreachable (offline, slow link): the browser step still
+        // authorized this login, so keep the account under a placeholder label.
+        let degraded = github_copilot_slot("OctoCat", "gho_x", None);
+        assert_eq!(degraded.id, resolved.id);
+        assert_eq!(degraded.profile.email, "@OctoCat");
+    }
+
+    #[test]
     fn copilot_billing_report_shows_official_amount_without_inventing_a_quota() {
         let windows = parse_copilot_usage_report(&serde_json::json!({
             "usageItems": [
@@ -579,6 +688,7 @@ mod usage_mode_tests {
         ));
         let accounts = AgentAccounts::new(AgentAccountsConfig {
             data_dir: dir.join("data"),
+            gh_cli: None,
             claude_config_dir: dir.join("claude"),
             claude_config_file: dir.join("claude.json"),
             codex_home: dir.join("codex"),
@@ -672,6 +782,7 @@ mod usage_mode_tests {
         ));
         let config = AgentAccountsConfig {
             data_dir: dir.join("data"),
+            gh_cli: None,
             claude_config_dir: dir.join("claude"),
             claude_config_file: dir.join("claude.json"),
             codex_home: dir.join("codex"),
@@ -878,6 +989,121 @@ fn scan_github_device_code(output: &str) -> Option<String> {
         .map(|code| String::from_utf8_lossy(code).to_string())
 }
 
+fn parse_github_cli_accounts(output: &str) -> Vec<(String, bool)> {
+    let mut accounts: Vec<(String, bool)> = Vec::new();
+    let mut current = None;
+    for line in output.lines() {
+        if let Some((_, account)) = line.split_once("Logged in to github.com account ") {
+            let username = account.split_whitespace().next().unwrap_or_default();
+            if username.is_empty() {
+                current = None;
+                continue;
+            }
+            accounts.push((username.to_owned(), false));
+            current = Some(accounts.len() - 1);
+        } else if line.contains("Active account: true")
+            && let Some(index) = current
+        {
+            accounts[index].1 = true;
+        }
+    }
+    accounts
+}
+
+/// The one login inside a throwaway `GH_CONFIG_DIR`, as `(username, token)`.
+///
+/// `--insecure-storage` is what makes this readable: a keyring-backed `gh` leaves
+/// `hosts.yml` with no token at all, and this correctly returns `None`.
+fn read_gh_hosts_login(dir: &Path) -> Option<(String, String)> {
+    let raw = std::fs::read_to_string(dir.join("hosts.yml")).ok()?;
+    parse_gh_hosts_file(&raw)
+}
+
+/// Read a `gh` `hosts.yml`.
+///
+/// Parsed by indentation rather than as YAML because only two shapes matter and
+/// both are line-regular: the token nested under its own user
+/// (`users: { <login>: { oauth_token: … } }`, gh ≥ 2.4) and the token at host
+/// level beside `user:` (single-account/older). The token's nearest enclosing key
+/// names the account; a token already at host level (indent 0 parent = the host
+/// key itself) has no user to hang from, so `user:` decides.
+fn parse_gh_hosts_file(text: &str) -> Option<(String, String)> {
+    struct Entry {
+        indent: usize,
+        key: String,
+        value: Option<String>,
+    }
+    let mut entries: Vec<Entry> = Vec::new();
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let value = value.trim();
+        entries.push(Entry {
+            indent: raw.len() - raw.trim_start().len(),
+            key: key.trim().to_string(),
+            value: (!value.is_empty()).then(|| value.to_string()),
+        });
+    }
+    let at = entries
+        .iter()
+        .position(|entry| entry.key == "oauth_token")?;
+    let token = entries[at].value.clone().filter(|t| !t.is_empty())?;
+    let parent = entries[..at]
+        .iter()
+        .rev()
+        .find(|entry| entry.indent < entries[at].indent)?;
+    let username = if parent.indent > 0 {
+        parent.key.clone()
+    } else {
+        entries
+            .iter()
+            .find(|entry| entry.key == "user")?
+            .value
+            .clone()?
+    };
+    Some((username, token))
+}
+
+/// Copilot slot for a GitHub token. `user` is GitHub's `/user` payload; when it
+/// did not answer the login is still usable, so the label degrades to `@login`
+/// rather than dropping the account.
+fn github_copilot_slot(username: &str, token: &str, user: Option<&serde_json::Value>) -> Slot {
+    let account_key = username.to_lowercase();
+    Slot {
+        id: slot_id_for(HarnessId::Copilot, &account_key),
+        harness: HarnessId::Copilot,
+        account_key,
+        profile: SlotProfile {
+            email: user
+                .and_then(|u| u.get("email"))
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("@{username}")),
+            display_name: user
+                .and_then(|u| u.get("name"))
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
+            organization: None,
+            plan: None,
+            auth_kind: AgentAuthKind::Oauth,
+        },
+        credentials: serde_json::json!({
+            "githubToken": token,
+            "username": username,
+        }),
+        claude_config: None,
+        saved_at: now_ms(),
+        created_at: None,
+    }
+}
+
 /// The PATH a login child needs: engine PATH first, then the user's login
 /// shell snapshot (npm shims find their `node`, and `qoder`'s `~/.qoder/entry`
 /// only exists there on some installs).
@@ -1011,12 +1237,26 @@ impl AgentAccounts {
             HarnessId::Grok,
             HarnessId::Muse,
             HarnessId::Cline,
-            HarnessId::Qoder,
         ] {
             if let Some(detected) = self.detect_cli_provider(harness) {
                 active_keys.insert(harness, detected.account_key.clone());
                 self.snapshot_detected(harness, &detected)?;
             }
+        }
+        // Qoder is multi-account: one slot per saved login file (see
+        // `sync_qoder_accounts`), not one fixed slot.
+        if let Some(key) = self.sync_qoder_accounts()? {
+            active_keys.insert(HarnessId::Qoder, key);
+        }
+        // Land any GitHub login whose dialog died mid-flow before anything reads
+        // the list — the `gh` import below only knows the user's own config, not
+        // the token a finished in-app login left in its throwaway dir.
+        self.adopt_finished_github_logins(mode).await;
+        if let Some(message) = self.sync_copilot_gh_accounts().await {
+            warnings.push(AgentAccountWarning {
+                harness: HarnessId::Copilot,
+                message,
+            });
         }
         if let Some(active_id) = self.read_copilot_active_id()
             && let Some(slot) = self
@@ -1145,6 +1385,174 @@ impl AgentAccounts {
         Ok(AgentAccountsSnapshot { accounts, warnings })
     }
 
+    /// Import every public GitHub account available to `gh`, so accounts
+    /// authenticated from a terminal appear beside Komet's in-app logins.
+    async fn sync_copilot_gh_accounts(&self) -> Option<String> {
+        let gh_cli = self.inner.config.gh_cli.as_ref()?;
+        let output = match tokio::time::timeout(
+            Duration::from_secs(3),
+            tokio::process::Command::new(gh_cli)
+                .no_console()
+                .args(["auth", "status", "--hostname", "github.com"])
+                .env_remove("GH_TOKEN")
+                .env_remove("GITHUB_TOKEN")
+                .env_remove("GH_ENTERPRISE_TOKEN")
+                .stdin(std::process::Stdio::null())
+                .output(),
+        )
+        .await
+        {
+            Ok(Ok(output)) => output,
+            Ok(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => return None,
+            Ok(Err(_)) | Err(_) => {
+                return Some(
+                    "Could not check GitHub CLI accounts; verify `gh auth status` and refresh."
+                        .into(),
+                );
+            }
+        };
+        let status_text = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let gh_accounts = parse_github_cli_accounts(&status_text);
+        if gh_accounts.is_empty() {
+            return None;
+        }
+
+        let mut warning = false;
+        let mut preferred_active_id = None;
+        for (username, active) in gh_accounts {
+            let token_output = match tokio::time::timeout(
+                Duration::from_secs(3),
+                tokio::process::Command::new(gh_cli)
+                    .no_console()
+                    .args([
+                        "auth",
+                        "token",
+                        "--hostname",
+                        "github.com",
+                        "--user",
+                        &username,
+                    ])
+                    .env_remove("GH_TOKEN")
+                    .env_remove("GITHUB_TOKEN")
+                    .env_remove("GH_ENTERPRISE_TOKEN")
+                    .stdin(std::process::Stdio::null())
+                    .output(),
+            )
+            .await
+            {
+                Ok(Ok(output)) if output.status.success() => output,
+                _ => {
+                    warning = true;
+                    continue;
+                }
+            };
+            let token = String::from_utf8_lossy(&token_output.stdout)
+                .trim()
+                .to_owned();
+            if token.is_empty() {
+                warning = true;
+                continue;
+            }
+
+            let response = match tokio::time::timeout(
+                HTTP_TIMEOUT,
+                self.inner
+                    .http
+                    .get("https://api.github.com/user")
+                    .bearer_auth(&token)
+                    .header("Accept", "application/vnd.github+json")
+                    .header("X-GitHub-Api-Version", "2022-11-28")
+                    .header("User-Agent", "Komet")
+                    .send(),
+            )
+            .await
+            {
+                Ok(Ok(response)) if response.status().is_success() => response,
+                _ => {
+                    warning = true;
+                    continue;
+                }
+            };
+            let user = match response.json::<serde_json::Value>().await {
+                Ok(user) => user,
+                Err(_) => {
+                    warning = true;
+                    continue;
+                }
+            };
+            let Some(actual_username) = user.get("login").and_then(|v| v.as_str()) else {
+                warning = true;
+                continue;
+            };
+            if !actual_username.eq_ignore_ascii_case(&username) {
+                warning = true;
+                continue;
+            }
+
+            let account_key = actual_username.to_lowercase();
+            let slot = Slot {
+                id: slot_id_for(HarnessId::Copilot, &account_key),
+                harness: HarnessId::Copilot,
+                account_key: account_key.clone(),
+                profile: SlotProfile {
+                    email: user
+                        .get("email")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| format!("@{actual_username}")),
+                    display_name: user
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned),
+                    organization: None,
+                    plan: None,
+                    auth_kind: AgentAuthKind::Oauth,
+                },
+                credentials: serde_json::json!({
+                    "githubToken": token,
+                    "username": actual_username,
+                }),
+                claude_config: None,
+                saved_at: now_ms(),
+                created_at: None,
+            };
+            if self.write_slot(&slot).is_err() {
+                warning = true;
+                continue;
+            }
+            if active {
+                preferred_active_id = Some(slot.id.clone());
+            }
+        }
+
+        let active_exists = self.read_copilot_active_id().is_some_and(|active_id| {
+            self.read_slots(HarnessId::Copilot)
+                .iter()
+                .any(|slot| slot.id == active_id)
+        });
+        if !active_exists
+            && let Some(id) = preferred_active_id
+            && let Some(slot) = self
+                .read_slots(HarnessId::Copilot)
+                .into_iter()
+                .find(|slot| slot.id == id)
+            && self.activate_copilot(&slot).is_err()
+        {
+            warning = true;
+        }
+
+        warning.then(|| {
+            "Some GitHub CLI accounts could not be imported; verify `gh auth status` and refresh."
+                .into()
+        })
+    }
+
     // ── swap ────────────────────────────────────────────────────────────────
 
     /// Swap the CLI's live login to a saved slot. Detection runs first, so the
@@ -1195,6 +1603,7 @@ impl AgentAccounts {
             HarnessId::Antigravity => self.activate_antigravity(&slot).await?,
             HarnessId::Cursor => self.activate_cursor(&slot)?,
             HarnessId::Copilot => self.activate_copilot(&slot)?,
+            HarnessId::Qoder => self.activate_qoder(&slot)?,
             other => {
                 return Err(EngineError::Other(format!(
                     "agent accounts are not supported for {other:?}"
@@ -1233,6 +1642,154 @@ impl AgentAccounts {
                 )
             })?;
         Ok(Some(token.to_string()))
+    }
+
+    fn read_qoder_active_id(&self) -> Option<String> {
+        std::fs::read_to_string(self.inner.config.qoder_active_file())
+            .ok()
+            .map(|id| id.trim().to_string())
+            .filter(|id| !id.is_empty())
+    }
+
+    fn new_qoder_slot(&self, bytes: &[u8], existing_count: usize) -> Slot {
+        let account_key = format!("qoder-{}", new_id());
+        let email = if existing_count == 0 {
+            "Qoder account".to_string()
+        } else {
+            format!("Qoder account {}", existing_count + 1)
+        };
+        Slot {
+            id: slot_id_for(HarnessId::Qoder, &account_key),
+            harness: HarnessId::Qoder,
+            account_key,
+            profile: SlotProfile {
+                email,
+                display_name: None,
+                organization: None,
+                plan: None,
+                auth_kind: AgentAuthKind::Oauth,
+            },
+            credentials: qoder_credentials(bytes),
+            claude_config: None,
+            saved_at: now_ms(),
+            created_at: None,
+        }
+    }
+
+    /// Qoder keeps ONE opaque (non-JSON) login file, so there is no identity to key
+    /// a slot by. Each slot is keyed by a Komet-minted id and holds a verbatim copy
+    /// of that file; the selected slot is tracked in `qoder-active`. On every list
+    /// the live file is re-snapshotted into the selected slot, so a token the CLI
+    /// refreshed is never lost, and a live file identical to a saved slot simply
+    /// selects it. Returns the selected slot's `account_key`.
+    fn sync_qoder_accounts(&self) -> Result<Option<String>, EngineError> {
+        let auth_file = self.inner.config.cli_files.qoder_auth.clone();
+        let slots = self.read_slots(HarnessId::Qoder);
+        let active_slot = self
+            .read_qoder_active_id()
+            .and_then(|id| slots.iter().find(|s| s.id == id).cloned());
+        let live = match std::fs::read(&auth_file) {
+            Ok(bytes) if !bytes.is_empty() => bytes,
+            // Signed out (or caught mid-rewrite): nothing live to snapshot.
+            _ => return Ok(None),
+        };
+        // A live file identical to a saved slot IS that slot.
+        if let Some(matching) = slots
+            .iter()
+            .find(|s| qoder_auth_bytes(&s.credentials).is_some_and(|saved| saved == live))
+        {
+            if active_slot.as_ref().map(|s| &s.id) != Some(&matching.id) {
+                write_file_atomic(
+                    &self.inner.config.qoder_active_file(),
+                    matching.id.as_bytes(),
+                    true,
+                )?;
+            }
+            return Ok(Some(matching.account_key.clone()));
+        }
+        // A sign-in started from Komet is mid-flight: the new file belongs to the
+        // flow's own adoption, never to the selected slot (it would overwrite the
+        // previous account's saved login).
+        let signing_in = lock(&self.inner.flows).values().any(|flow| {
+            matches!(
+                flow,
+                LoginFlow::Cli {
+                    harness: HarnessId::Qoder,
+                    ..
+                }
+            )
+        });
+        if signing_in {
+            return Ok(active_slot.map(|s| s.account_key));
+        }
+        // Otherwise the file changed under the selected slot (a token refresh), or
+        // nothing is selected yet (first run, or the pre-multi-account single slot).
+        let target =
+            active_slot.or_else(|| slots.iter().find(|s| s.account_key == "qoder").cloned());
+        let slot = match target {
+            Some(existing) => Slot {
+                credentials: qoder_credentials(&live),
+                saved_at: now_ms(),
+                ..existing
+            },
+            None => self.new_qoder_slot(&live, slots.len()),
+        };
+        self.write_slot(&slot)?;
+        write_file_atomic(
+            &self.inner.config.qoder_active_file(),
+            slot.id.as_bytes(),
+            true,
+        )?;
+        Ok(Some(slot.account_key))
+    }
+
+    /// A freshly signed-in Qoder login becomes a NEW slot and the selected account,
+    /// unless the file is byte-identical to a saved slot (nothing new landed — the
+    /// same login again), in which case that slot is selected.
+    fn adopt_qoder_login(&self) -> Result<(), EngineError> {
+        let bytes = std::fs::read(&self.inner.config.cli_files.qoder_auth)?;
+        if bytes.is_empty() {
+            return Err(EngineError::Other(
+                "Qoder signed in but its login file is empty.".into(),
+            ));
+        }
+        let slots = self.read_slots(HarnessId::Qoder);
+        let selected_id = match slots
+            .iter()
+            .find(|s| qoder_auth_bytes(&s.credentials).is_some_and(|saved| saved == bytes))
+        {
+            Some(existing) => existing.id.clone(),
+            None => {
+                let slot = self.new_qoder_slot(&bytes, slots.len());
+                self.write_slot(&slot)?;
+                slot.id
+            }
+        };
+        write_file_atomic(
+            &self.inner.config.qoder_active_file(),
+            selected_id.as_bytes(),
+            true,
+        )
+    }
+
+    /// Switch Qoder to a saved login. `activate` lists first, which snapshots the
+    /// live file into the selected slot, so the login being replaced is kept.
+    fn activate_qoder(&self, slot: &Slot) -> Result<(), EngineError> {
+        let Some(bytes) = qoder_auth_bytes(&slot.credentials) else {
+            return Err(EngineError::Other(
+                "This Qoder account has no saved login — sign in to it again.".into(),
+            ));
+        };
+        let file = self.inner.config.cli_files.qoder_auth.clone();
+        if let Some(parent) = file.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        write_file_atomic(&file, &bytes, true)?;
+        write_file_atomic(
+            &self.inner.config.qoder_active_file(),
+            slot.id.as_bytes(),
+            true,
+        )
     }
 
     fn read_copilot_active_id(&self) -> Option<String> {
@@ -1919,6 +2476,11 @@ impl AgentAccounts {
             ));
         };
 
+        // Persist the live Qoder login into its slot BEFORE the CLI can overwrite it.
+        if harness == HarnessId::Qoder {
+            self.sync_qoder_accounts()?;
+        }
+
         let login_id = new_id();
         let pair = portable_pty::native_pty_system()
             .openpty(portable_pty::PtySize {
@@ -2408,11 +2970,16 @@ impl AgentAccounts {
             .cli_auth_file(harness)
             .ok_or_else(|| EngineError::Other("This provider has no in-app sign-in flow.".into()))?
             .to_path_buf();
+        let code_sent = Instant::now();
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
-            if file_digest(&auth_file) != initial_digest
-                && let Some(detected) = self.detect_cli_provider(harness)
-            {
+            if let Some(detected) = self.cli_login_landed(
+                harness,
+                &auth_file,
+                &initial_digest,
+                code_sent.elapsed(),
+                &output,
+            ) {
                 self.finish_cli_login(login_id, harness, &detected)?;
                 return self.list(UsageMode::Offline).await;
             }
@@ -2435,6 +3002,31 @@ impl AgentAccounts {
         }
     }
 
+    /// The login a CLI-managed provider's sign-in produced, once it has landed.
+    ///
+    /// A changed store digest is not the only way a login lands: re-signing in
+    /// to the account the CLI already holds may rewrite the store with identical
+    /// bytes (or leave it untouched), and some CLIs keep running afterwards. So a
+    /// store modified since the flow started, or the CLI's own success line, also
+    /// counts — in every case only when the store is actually readable.
+    fn cli_login_landed(
+        &self,
+        harness: HarnessId,
+        auth_file: &Path,
+        initial_digest: &Option<String>,
+        elapsed: Duration,
+        output: &Arc<Mutex<String>>,
+    ) -> Option<Detected> {
+        let landed = file_digest(auth_file) != *initial_digest
+            || file_rewritten_since(auth_file, elapsed)
+            || scan_cli_login_success(&lock(output));
+        if landed {
+            self.detect_cli_provider(harness)
+        } else {
+            None
+        }
+    }
+
     /// Persist a CLI-managed provider's freshly-written login, then stop its
     /// CLI (nothing is restored: the store IS the new account).
     fn finish_cli_login(
@@ -2443,7 +3035,11 @@ impl AgentAccounts {
         harness: HarnessId,
         detected: &Detected,
     ) -> Result<(), EngineError> {
-        self.snapshot_detected(harness, detected)?;
+        if harness == HarnessId::Qoder {
+            self.adopt_qoder_login()?;
+        } else {
+            self.snapshot_detected(harness, detected)?;
+        }
         self.cancel_login(login_id);
         Ok(())
     }
@@ -2719,8 +3315,14 @@ impl AgentAccounts {
             .cli_auth_file(harness)
             .ok_or_else(|| EngineError::Other("This provider has no in-app sign-in flow.".into()))?
             .to_path_buf();
-        if file_digest(&auth_file) != initial_digest
-            && let Some(detected) = self.detect_cli_provider(harness)
+        // Time since the flow started, for the "store rewritten since" signal
+        // and the stall timeout. A reaped flow reads as zero.
+        let elapsed = lock(&self.inner.flows)
+            .get(login_id)
+            .map(|flow| flow.started_at().elapsed())
+            .unwrap_or_default();
+        if let Some(detected) =
+            self.cli_login_landed(harness, &auth_file, &initial_digest, elapsed, &output)
         {
             self.finish_cli_login(login_id, harness, &detected)?;
             return Ok(AgentLoginPoll {
@@ -2730,8 +3332,10 @@ impl AgentAccounts {
         }
         if let Some(status) = *lock(&exit) {
             let output_snapshot = lock(&output).clone();
-            // The store write can land a hair before the exit is observed.
-            if file_digest(&auth_file) != initial_digest
+            // The store write can land a hair before the exit is observed, and a
+            // clean exit with a readable store is a login that landed without
+            // changing it (the same account signed in again).
+            if (file_digest(&auth_file) != initial_digest || status == Some(0))
                 && let Some(detected) = self.detect_cli_provider(harness)
             {
                 self.finish_cli_login(login_id, harness, &detected)?;
@@ -2753,10 +3357,153 @@ impl AgentAccounts {
                 message: Some(message),
             });
         }
+        if elapsed > CLI_LOGIN_STALL {
+            self.cancel_login(login_id);
+            return Ok(AgentLoginPoll {
+                status: AgentLoginStatus::Error,
+                message: Some(
+                    "Sign-in timed out — the CLI never reported the login. Try again, and finish \
+                     the browser step within a few minutes."
+                        .to_string(),
+                ),
+            });
+        }
         Ok(AgentLoginPoll {
             status: AgentLoginStatus::Pending,
             message: None,
         })
+    }
+
+    /// GitHub identity for a token, or `None` when `/user` did not answer.
+    async fn fetch_github_user(&self, token: &str) -> Option<serde_json::Value> {
+        let response = self
+            .inner
+            .http
+            .get("https://api.github.com/user")
+            .bearer_auth(token)
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .header("User-Agent", "Komet")
+            .send()
+            .await
+            .ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        response.json::<serde_json::Value>().await.ok()
+    }
+
+    /// Persist a Copilot slot. Two guards: the `@login` placeholder written by an
+    /// offline adoption must never downgrade an identity we already resolved, and
+    /// the active selection is only claimed while nothing is active — adding an
+    /// account must not switch the one a run is using.
+    fn store_copilot_slot(&self, slot: &mut Slot) -> Result<(), EngineError> {
+        if let Some(existing) = self
+            .read_slots(HarnessId::Copilot)
+            .into_iter()
+            .find(|saved| saved.id == slot.id)
+            && slot.profile.email.starts_with('@')
+            && !existing.profile.email.starts_with('@')
+        {
+            slot.profile = existing.profile;
+        }
+        self.write_slot(slot)?;
+        let active_exists = self.read_copilot_active_id().is_some_and(|active_id| {
+            self.read_slots(HarnessId::Copilot)
+                .iter()
+                .any(|saved| saved.id == active_id)
+        });
+        if !active_exists {
+            self.activate_copilot(slot)?;
+        }
+        Ok(())
+    }
+
+    /// Save a GitHub login read from a throwaway config dir. The identity comes
+    /// from `/user` when it answers; an unreachable API is no reason to lose a
+    /// token the browser already authorized.
+    async fn save_github_login(&self, username: &str, token: &str) -> Result<Slot, EngineError> {
+        let user = self.fetch_github_user(token).await;
+        self.store_github_slot(username, token, user.as_ref())
+    }
+
+    fn store_github_slot(
+        &self,
+        username: &str,
+        token: &str,
+        user: Option<&serde_json::Value>,
+    ) -> Result<Slot, EngineError> {
+        let mut slot = github_copilot_slot(username, token, user);
+        self.store_copilot_slot(&mut slot)?;
+        Ok(slot)
+    }
+
+    /// Tear down a finished GitHub flow WITHOUT adopting it — the token has
+    /// already been saved, so deleting the throwaway dir is the point here.
+    fn abandon_github_flow(&self, login_id: &str) {
+        let is_github = lock(&self.inner.flows)
+            .get(login_id)
+            .is_some_and(|flow| matches!(flow, LoginFlow::GithubCli { .. }));
+        if !is_github {
+            return;
+        }
+        let Some(LoginFlow::GithubCli {
+            child, config_dir, ..
+        }) = lock(&self.inner.flows).remove(login_id)
+        else {
+            return;
+        };
+        if let Some(c) = lock(&child).as_mut() {
+            let _ = c.start_kill();
+        }
+        let _ = std::fs::remove_dir_all(&config_dir);
+    }
+
+    /// Adopt GitHub logins that completed in the browser but never reached a slot.
+    ///
+    /// The dialog is not the flow's owner: closing it, re-clicking Add account, or
+    /// leaving Providers stops the poll (it exits as soon as its page has no
+    /// dialog), and nothing else was left to notice the token sitting in the
+    /// throwaway dir — which every cancel path then deleted. Running this on every
+    /// account list means the next Refresh lands the account.
+    async fn adopt_finished_github_logins(&self, mode: UsageMode) {
+        let pending: Vec<(String, PathBuf)> = lock(&self.inner.flows)
+            .iter()
+            .filter_map(|(login_id, flow)| match flow {
+                LoginFlow::GithubCli { config_dir, .. } => {
+                    Some((login_id.clone(), config_dir.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        for (login_id, config_dir) in pending {
+            let Some((username, token)) = read_gh_hosts_login(&config_dir) else {
+                continue;
+            };
+            // An offline list stays offline: the token is worth keeping even with
+            // no identity to label it, and `store_copilot_slot` preserves a real
+            // email it already knows instead of letting the placeholder win.
+            let user = if mode.probes() {
+                self.fetch_github_user(&token).await
+            } else {
+                None
+            };
+            match self.store_github_slot(&username, &token, user.as_ref()) {
+                Ok(slot) => {
+                    tracing::info!(
+                        login_id = %login_id,
+                        account = %slot.profile.email,
+                        "agent-accounts: adopted a GitHub login whose dialog closed before the poll noticed"
+                    );
+                    self.abandon_github_flow(&login_id);
+                }
+                Err(err) => tracing::warn!(
+                    login_id = %login_id,
+                    error = %err,
+                    "agent-accounts: could not adopt GitHub login; the flow stays open to retry"
+                ),
+            }
+        }
     }
 
     async fn poll_github_cli_login(
@@ -2766,6 +3513,23 @@ impl AgentAccounts {
         exit: Arc<Mutex<Option<Option<i32>>>>,
         output: Arc<Mutex<String>>,
     ) -> Result<AgentLoginPoll, EngineError> {
+        // Never leave the dialog spinning: a GitHub sign-in that has not produced
+        // an account within CLI_LOGIN_STALL (browser step abandoned, or the profile
+        // request keeps failing on a slow link) is reported as an error.
+        let stalled = lock(&self.inner.flows)
+            .get(login_id)
+            .is_some_and(|flow| flow.started_at().elapsed() > CLI_LOGIN_STALL);
+        if stalled {
+            self.cancel_login(login_id);
+            return Ok(AgentLoginPoll {
+                status: AgentLoginStatus::Error,
+                message: Some(
+                    "GitHub sign-in timed out — no account was retrieved. Check your connection \
+                     and try again."
+                        .to_string(),
+                ),
+            });
+        }
         let token_result = tokio::process::Command::new("gh")
             .no_console()
             .args(["auth", "token", "--hostname", "github.com"])
@@ -2781,61 +3545,15 @@ impl AgentAccounts {
         {
             let token = String::from_utf8_lossy(&result.stdout).trim().to_string();
             if !token.is_empty() {
-                let response = self
-                    .inner
-                    .http
-                    .get("https://api.github.com/user")
-                    .bearer_auth(&token)
-                    .header("Accept", "application/vnd.github+json")
-                    .header("X-GitHub-Api-Version", "2022-11-28")
-                    .header("User-Agent", "Komet")
-                    .send()
-                    .await;
-                if let Ok(response) = response
-                    && response.status().is_success()
-                    && let Ok(user) = response.json::<serde_json::Value>().await
-                    && let Some(username) = user.get("login").and_then(|v| v.as_str())
-                    && !username.is_empty()
+                let user = self.fetch_github_user(&token).await;
+                if let Some(username) = user
+                    .as_ref()
+                    .and_then(|u| u.get("login"))
+                    .and_then(|v| v.as_str())
+                    .filter(|login| !login.is_empty())
                 {
-                    let account_key = username.to_lowercase();
-                    let slot = Slot {
-                        id: slot_id_for(HarnessId::Copilot, &account_key),
-                        harness: HarnessId::Copilot,
-                        account_key,
-                        profile: SlotProfile {
-                            email: user
-                                .get("email")
-                                .and_then(|v| v.as_str())
-                                .filter(|s| !s.is_empty())
-                                .map(str::to_string)
-                                .unwrap_or_else(|| format!("@{username}")),
-                            display_name: user
-                                .get("name")
-                                .and_then(|v| v.as_str())
-                                .filter(|s| !s.is_empty())
-                                .map(str::to_string),
-                            organization: None,
-                            plan: None,
-                            auth_kind: AgentAuthKind::Oauth,
-                        },
-                        credentials: serde_json::json!({
-                            "githubToken": token,
-                            "username": username,
-                        }),
-                        claude_config: None,
-                        saved_at: now_ms(),
-                        created_at: None,
-                    };
-                    self.write_slot(&slot)?;
-                    let active_exists = self.read_copilot_active_id().is_some_and(|active_id| {
-                        self.read_slots(HarnessId::Copilot)
-                            .iter()
-                            .any(|saved| saved.id == active_id)
-                    });
-                    if !active_exists {
-                        self.activate_copilot(&slot)?;
-                    }
-                    self.cancel_login(login_id);
+                    self.store_github_slot(username, &token, user.as_ref())?;
+                    self.abandon_github_flow(login_id);
                     return Ok(AgentLoginPoll {
                         status: AgentLoginStatus::Done,
                         message: None,
@@ -2919,10 +3637,36 @@ impl AgentAccounts {
             Some(LoginFlow::GithubCli {
                 child, config_dir, ..
             }) => {
+                // Adopt-on-cancel, for the same reason as Codex below: the browser
+                // step routinely finishes after the dialog is gone (closed early,
+                // page recreated, stall or TTL sweep), and the throwaway dir holds
+                // the only copy of a token the user already earned.
+                let adopted = read_gh_hosts_login(&config_dir);
                 if let Some(c) = lock(&child).as_mut() {
                     let _ = c.start_kill();
                 }
                 let _ = std::fs::remove_dir_all(&config_dir);
+                match adopted {
+                    Some((username, token)) if tokio::runtime::Handle::try_current().is_ok() => {
+                        let this = self.clone();
+                        tokio::spawn(async move {
+                            match this.save_github_login(&username, &token).await {
+                                Ok(slot) => tracing::info!(
+                                    account = %slot.profile.email,
+                                    "agent-accounts: adopt-on-cancel saved a GitHub login closed before the poll noticed"
+                                ),
+                                Err(err) => tracing::warn!(
+                                    error = %err,
+                                    "agent-accounts: adopt-on-cancel could not save the GitHub login"
+                                ),
+                            }
+                        });
+                    }
+                    Some(_) => tracing::warn!(
+                        "agent-accounts: GitHub login finished with no runtime to adopt it (shutdown outside a tokio context)"
+                    ),
+                    None => {}
+                }
             }
             Some(LoginFlow::Antigravity {
                 killer, initial, ..
@@ -4608,6 +5352,7 @@ fn supports_switching(harness: HarnessId) -> bool {
             | HarnessId::Antigravity
             | HarnessId::Cursor
             | HarnessId::Copilot
+            | HarnessId::Qoder
     )
 }
 
@@ -5129,6 +5874,43 @@ fn parse_qoder_auth(path: &Path) -> Option<Detected> {
         },
         credentials: Some(serde_json::json!({ "managedBy": "qoder" })),
         claude_config: None,
+    })
+}
+
+/// Slot credentials for a Qoder login: the verbatim bytes of its opaque login
+/// file (not JSON), base64-encoded.
+fn qoder_credentials(bytes: &[u8]) -> serde_json::Value {
+    serde_json::json!({ "managedBy": "qoder", "auth": BASE64.encode(bytes) })
+}
+
+fn qoder_auth_bytes(credentials: &serde_json::Value) -> Option<Vec<u8>> {
+    credentials
+        .get("auth")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|encoded| BASE64.decode(encoded).ok())
+        .filter(|bytes| !bytes.is_empty())
+}
+
+/// True when `path` was modified after a flow that started `elapsed` ago.
+fn file_rewritten_since(path: &Path, elapsed: Duration) -> bool {
+    let Ok(modified) = std::fs::metadata(path).and_then(|m| m.modified()) else {
+        return false;
+    };
+    std::time::SystemTime::now()
+        .checked_sub(elapsed)
+        .is_some_and(|started| modified >= started)
+}
+
+/// The CLI's own "it worked" line. Deliberately narrow: lines carrying a URL,
+/// a failure word or a negation never count ("not logged in", "error: …").
+fn scan_cli_login_success(output: &str) -> bool {
+    output.lines().any(|line| {
+        let line = line.to_ascii_lowercase();
+        line.contains("success")
+            && !line.contains("http")
+            && !line.contains("fail")
+            && !line.contains("error")
+            && !line.contains("not ")
     })
 }
 
@@ -5797,6 +6579,7 @@ mod tests {
         ));
         let config = AgentAccountsConfig {
             data_dir: root.join("data"),
+            gh_cli: None,
             claude_config_dir: root.join("claude"),
             claude_config_file: root.join("claude.json"),
             codex_home: root.join("codex"),
@@ -5834,6 +6617,7 @@ mod tests {
         ));
         let config = AgentAccountsConfig {
             data_dir: root.join("data"),
+            gh_cli: None,
             claude_config_dir: root.join("claude"),
             claude_config_file: root.join("claude.json"),
             codex_home: root.join("codex"),
@@ -5864,6 +6648,7 @@ mod tests {
     fn cursor_test_config(root: &std::path::Path) -> AgentAccountsConfig {
         AgentAccountsConfig {
             data_dir: root.join("data"),
+            gh_cli: None,
             claude_config_dir: root.join("claude"),
             claude_config_file: root.join("claude.json"),
             codex_home: root.join("codex"),
@@ -6036,6 +6821,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("komet-agy-snapshot-{}", std::process::id()));
         let config = AgentAccountsConfig {
             data_dir: root.join("data"),
+            gh_cli: None,
             claude_config_dir: root.join("claude"),
             claude_config_file: root.join("claude.json"),
             codex_home: root.join("codex"),
@@ -6121,6 +6907,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("komet-agy-live-{}", std::process::id()));
         let config = AgentAccountsConfig {
             data_dir: root.join("data"),
+            gh_cli: None,
             claude_config_dir: root.join("claude"),
             claude_config_file: root.join("claude.json"),
             codex_home: root.join("codex"),
@@ -6381,6 +7168,122 @@ mod tests {
     }
 
     #[test]
+    fn qoder_auth_bytes_round_trips_opaque_files() {
+        let raw = b"KYy2\x00\xff opaque";
+        let creds = qoder_credentials(raw);
+        assert_eq!(qoder_auth_bytes(&creds).as_deref(), Some(&raw[..]));
+        // A legacy slot (no copy of the file) has nothing to restore.
+        assert!(qoder_auth_bytes(&serde_json::json!({ "managedBy": "qoder" })).is_none());
+    }
+
+    #[tokio::test]
+    async fn qoder_accounts_can_be_added_switched_and_forgotten() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = AgentAccountsConfig {
+            data_dir: dir.path().join("data"),
+            gh_cli: None,
+            claude_config_dir: dir.path().join("claude"),
+            claude_config_file: dir.path().join("claude.json"),
+            codex_home: dir.path().join("codex"),
+            antigravity_home: dir.path().join("antigravity"),
+            cursor_auth_file: dir.path().join("cursor/auth.json"),
+            cli_files: CliProviderFiles::under(dir.path()),
+        };
+        std::fs::create_dir_all(
+            config
+                .cli_files
+                .qoder_auth
+                .parent()
+                .expect("Qoder auth parent"),
+        )
+        .expect("Qoder auth directory");
+        let accounts = AgentAccounts::new(config.clone());
+
+        std::fs::write(&config.cli_files.qoder_auth, b"opaque account one").expect("first login");
+        let first = accounts
+            .list(UsageMode::Offline)
+            .await
+            .expect("list first account")
+            .accounts
+            .into_iter()
+            .find(|account| account.harness == HarnessId::Qoder)
+            .expect("first Qoder account");
+
+        std::fs::write(&config.cli_files.qoder_auth, b"opaque account two").expect("second login");
+        accounts
+            .adopt_qoder_login()
+            .expect("adopt second Qoder login");
+        let snapshot = accounts
+            .list(UsageMode::Offline)
+            .await
+            .expect("list both accounts");
+        let qoder_accounts: Vec<_> = snapshot
+            .accounts
+            .iter()
+            .filter(|account| account.harness == HarnessId::Qoder)
+            .collect();
+        assert_eq!(qoder_accounts.len(), 2);
+        let second = qoder_accounts
+            .iter()
+            .find(|account| account.active)
+            .expect("second account is active");
+        let second_id = second.id.clone();
+        assert_ne!(first.id, second_id);
+
+        let snapshot = accounts
+            .activate(HarnessId::Qoder, &first.id)
+            .await
+            .expect("switch back to first account");
+        assert_eq!(
+            std::fs::read(&config.cli_files.qoder_auth).expect("restored Qoder login"),
+            b"opaque account one"
+        );
+        assert!(
+            snapshot
+                .accounts
+                .iter()
+                .any(|account| account.id == first.id && account.active)
+        );
+        let snapshot = accounts
+            .forget(HarnessId::Qoder, &second_id)
+            .await
+            .expect("forget inactive account");
+        assert_eq!(
+            snapshot
+                .accounts
+                .iter()
+                .filter(|account| account.harness == HarnessId::Qoder)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn cli_login_success_line_is_recognised_narrowly() {
+        assert!(scan_cli_login_success(
+            "Opening browser…\nLogin successful!\n"
+        ));
+        assert!(!scan_cli_login_success("Waiting for authorization…\n"));
+        assert!(!scan_cli_login_success("Login was not successful\n"));
+        assert!(!scan_cli_login_success(
+            "open https://qoder.com/device/success?x=1\n"
+        ));
+    }
+
+    #[test]
+    fn rewrite_detection_compares_mtime_to_flow_start() {
+        let path = std::env::temp_dir().join(format!("komet-rewrite-{}", std::process::id()));
+        std::fs::write(&path, b"x").unwrap();
+        // Written just now, flow started an hour ago ⇒ rewritten since start.
+        assert!(file_rewritten_since(&path, Duration::from_secs(3600)));
+        std::thread::sleep(Duration::from_millis(50));
+        // Flow started after the write ⇒ not rewritten.
+        assert!(!file_rewritten_since(&path, Duration::ZERO));
+        let _ = std::fs::remove_file(&path);
+        assert!(!file_rewritten_since(&path, Duration::from_secs(3600)));
+    }
+
+    #[test]
     fn last_output_line_skips_tui_repaints() {
         assert_eq!(last_output_line(""), None);
         assert_eq!(last_output_line("done\n\n"), Some("done".to_string()));
@@ -6610,6 +7513,7 @@ mod tests {
     fn dedup_test_config(root: &std::path::Path) -> AgentAccountsConfig {
         AgentAccountsConfig {
             data_dir: root.join("data"),
+            gh_cli: None,
             claude_config_dir: root.join("claude"),
             claude_config_file: root.join("claude.json"),
             codex_home: root.join("codex"),

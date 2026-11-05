@@ -295,6 +295,55 @@ fn is_expanded(expanded: &HashSet<HarnessId>, harness: HarnessId) -> bool {
     expanded.contains(&harness)
 }
 
+fn completed_browser_login_has_account(
+    login: Option<&LoginFlow>,
+    snapshot: &AgentAccountsSnapshot,
+) -> bool {
+    let Some(LoginFlow::Browser {
+        harness,
+        completed: true,
+        prior_account_ids,
+        ..
+    }) = login
+    else {
+        return false;
+    };
+    if *harness == HarnessId::Copilot {
+        // Copilot rows are also imported from the user's own `gh` config, so
+        // "some Copilot account exists" is already true before the new login
+        // lands — dismissing on that closed the dialog on the OLD account and
+        // left the finished one unsaved. Dismiss only on an id the flow did not
+        // start with; the duplicate case is reported separately.
+        return snapshot.accounts.iter().any(|account| {
+            account.harness == *harness && !prior_account_ids.contains(&account.id)
+        });
+    }
+    snapshot
+        .accounts
+        .iter()
+        .any(|account| account.harness == *harness)
+}
+
+fn completed_copilot_login_is_duplicate(
+    login: Option<&LoginFlow>,
+    snapshot: &AgentAccountsSnapshot,
+) -> bool {
+    let Some(LoginFlow::Browser {
+        harness: HarnessId::Copilot,
+        prior_account_ids,
+        completed: true,
+        ..
+    }) = login
+    else {
+        return false;
+    };
+    snapshot.accounts.iter().any(|account| {
+        account.harness == HarnessId::Copilot && prior_account_ids.contains(&account.id)
+    }) && !snapshot.accounts.iter().any(|account| {
+        account.harness == HarnessId::Copilot && !prior_account_ids.contains(&account.id)
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Entity
 // ---------------------------------------------------------------------------
@@ -315,6 +364,8 @@ enum LoginFlow {
         start: AgentLoginStart,
         message: Option<SharedString>,
         error: Option<SharedString>,
+        completed: bool,
+        prior_account_ids: HashSet<String>,
     },
 }
 
@@ -1028,6 +1079,12 @@ impl ProvidersPage {
                     serde_json::from_value::<AgentAccountsSnapshot>(value)
                         .map_err(|err| err.to_string())
                 });
+                let login_account_visible = parsed.as_ref().is_ok_and(|snapshot| {
+                    completed_browser_login_has_account(page.login.as_ref(), snapshot)
+                });
+                let duplicate_copilot_login = parsed.as_ref().is_ok_and(|snapshot| {
+                    completed_copilot_login_is_duplicate(page.login.as_ref(), snapshot)
+                });
                 page.accounts = match parsed {
                     Ok(snapshot) => {
                         page.accounts_error = None;
@@ -1044,6 +1101,16 @@ impl ProvidersPage {
                         Loadable::Error(message)
                     }
                 };
+                if login_account_visible || duplicate_copilot_login {
+                    if duplicate_copilot_login {
+                        page.error = Some(
+                            "This GitHub account is already connected. Sign in with a different GitHub account to add another."
+                                .into(),
+                        );
+                    }
+                    page.login = None;
+                    page.poll_task = None;
+                }
                 cx.notify();
             })
             .ok();
@@ -1526,6 +1593,14 @@ impl ProvidersPage {
             cx.notify();
             return;
         };
+        let prior_account_ids = self
+            .accounts
+            .ready()
+            .into_iter()
+            .flat_map(|snapshot| snapshot.accounts.iter())
+            .filter(|account| account.harness == harness)
+            .map(|account| account.id.clone())
+            .collect();
         self.login = Some(LoginFlow::Starting { harness });
         self.error = None;
         // Preflight hint only (never blocking): the page may target a REMOTE
@@ -1570,6 +1645,8 @@ impl ProvidersPage {
                                     start,
                                     message: None,
                                     error: None,
+                                    completed: false,
+                                    prior_account_ids,
                                 });
                                 page.spawn_poll(cx);
                             }
@@ -1643,7 +1720,12 @@ impl ProvidersPage {
 
     /// The browser-wait poll loop: PollAgentLogin every 1.5s until Done/Error.
     fn spawn_poll(&mut self, cx: &mut Context<Self>) {
-        let Some(LoginFlow::Browser { start, .. }) = &self.login else {
+        let Some(LoginFlow::Browser {
+            start,
+            completed: false,
+            ..
+        }) = &self.login
+        else {
             return;
         };
         let login_id = start.login_id.clone();
@@ -1651,63 +1733,147 @@ impl ProvidersPage {
             return;
         };
         let params = self.with_target(serde_json::json!({ "loginId": login_id }), cx);
+        let accounts_params = self.with_target(serde_json::json!({ "usageMode": "none" }), cx);
         self.poll_task = Some(cx.spawn(async move |this, cx| {
+            let mut login_completed = false;
             loop {
                 cx.background_executor()
                     .timer(Duration::from_millis(1500))
                     .await;
-                let result = engine
-                    .client()
-                    .call(methods::POLL_AGENT_LOGIN, params.clone())
-                    .await;
-                let outcome = this.update(cx, |page, cx| {
-                    let Some(LoginFlow::Browser { message, error, .. }) = &mut page.login else {
-                        return true; // dialog dismissed — stop polling
-                    };
-                    match result.as_ref().ok().and_then(|value| {
-                        serde_json::from_value::<AgentLoginPoll>(value.clone()).ok()
-                    }) {
-                        Some(poll) => match poll.status {
-                            AgentLoginStatus::Done => {
-                                page.login = None;
-                                page.load_accounts(cx);
-                                cx.notify();
-                                true
+                let outcome = if login_completed {
+                    let result = engine
+                        .client()
+                        .call(methods::LIST_AGENT_ACCOUNTS, accounts_params.clone())
+                        .await;
+                    this.update(cx, |page, cx| {
+                        if !matches!(
+                            page.login.as_ref(),
+                            Some(LoginFlow::Browser {
+                                completed: true,
+                                ..
+                            })
+                        ) {
+                            return true;
+                        }
+                        page.accounts_loading = false;
+                        let previous = page.accounts.ready().cloned();
+                        let parsed = result.map_err(|err| err.to_string()).and_then(|value| {
+                            serde_json::from_value::<AgentAccountsSnapshot>(value)
+                                .map_err(|err| err.to_string())
+                        });
+                        let account_visible = parsed.as_ref().is_ok_and(|snapshot| {
+                            completed_browser_login_has_account(page.login.as_ref(), snapshot)
+                        });
+                        let duplicate_copilot_login = parsed.as_ref().is_ok_and(|snapshot| {
+                            completed_copilot_login_is_duplicate(page.login.as_ref(), snapshot)
+                        });
+                        page.accounts = match parsed {
+                            Ok(snapshot) => {
+                                page.accounts_error = None;
+                                Loadable::Ready(snapshot)
                             }
-                            AgentLoginStatus::Error => {
-                                *error = Some(
-                                    poll.message
-                                        .unwrap_or_else(|| "Login failed".to_string())
+                            Err(message) if previous.is_some() => {
+                                page.accounts_error =
+                                    Some(format!("Refresh failed: {message}").into());
+                                Loadable::Ready(previous.expect("checked above"))
+                            }
+                            Err(message) => {
+                                page.accounts_error = Some(message.clone().into());
+                                Loadable::Error(message)
+                            }
+                        };
+                        if account_visible || duplicate_copilot_login {
+                            if duplicate_copilot_login {
+                                page.error = Some(
+                                    "This GitHub account is already connected. Sign in with a different GitHub account to add another."
                                         .into(),
                                 );
+                            }
+                            page.login = None;
+                            page.poll_task = None;
+                            cx.notify();
+                            return true;
+                        }
+                        if let Some(LoginFlow::Browser { message, .. }) = &mut page.login {
+                            *message = Some("Signed in; waiting for the saved account…".into());
+                        }
+                        cx.notify();
+                        false
+                    })
+                } else {
+                    let result = engine
+                        .client()
+                        .call(methods::POLL_AGENT_LOGIN, params.clone())
+                        .await;
+                    let poll = result.as_ref().ok().and_then(|value| {
+                        serde_json::from_value::<AgentLoginPoll>(value.clone()).ok()
+                    });
+                    if poll
+                        .as_ref()
+                        .is_some_and(|poll| poll.status == AgentLoginStatus::Done)
+                    {
+                        login_completed = true;
+                    }
+                    this.update(cx, |page, cx| {
+                        let Some(LoginFlow::Browser {
+                            message,
+                            error,
+                            completed,
+                            ..
+                        }) = &mut page.login
+                        else {
+                            return true; // dialog dismissed — stop polling
+                        };
+                        match poll {
+                            Some(poll) => match poll.status {
+                                AgentLoginStatus::Done => {
+                                    *completed = true;
+                                    *message = Some("Signed in; refreshing saved accounts…".into());
+                                    cx.notify();
+                                    false
+                                }
+                                AgentLoginStatus::Error => {
+                                    *error = Some(
+                                        poll.message
+                                            .unwrap_or_else(|| "Login failed".to_string())
+                                            .into(),
+                                    );
+                                    cx.notify();
+                                    true
+                                }
+                                AgentLoginStatus::Pending => {
+                                    if let Some(text) = poll.message {
+                                        *message = Some(text.into());
+                                    }
+                                    cx.notify();
+                                    false
+                                }
+                            },
+                            None => {
+                                let text = match &result {
+                                    Err(err) => format!("Poll failed: {err}"),
+                                    Ok(_) => "Poll failed: malformed reply".to_string(),
+                                };
+                                *error = Some(text.into());
                                 cx.notify();
                                 true
                             }
-                            AgentLoginStatus::Pending => {
-                                if let Some(text) = poll.message {
-                                    *message = Some(text.into());
-                                }
-                                cx.notify();
-                                false
-                            }
-                        },
-                        None => {
-                            let text = match &result {
-                                Err(err) => format!("Poll failed: {err}"),
-                                Ok(_) => "Poll failed: malformed reply".to_string(),
-                            };
-                            *error = Some(text.into());
-                            cx.notify();
-                            true
                         }
-                    }
-                });
+                    })
+                };
                 match outcome {
                     Ok(true) | Err(_) => break,
                     Ok(false) => {}
                 }
             }
         }));
+    }
+
+    /// A sign-in flow is still awaiting the user. The shell must not recreate this
+    /// page while one runs: the browser-wait poll lives on this entity, so
+    /// dropping it stops the only thing that notices the login landing.
+    pub fn has_login_in_flight(&self) -> bool {
+        self.login.is_some()
     }
 
     fn cancel_login(&mut self, cx: &mut Context<Self>) {
@@ -2012,6 +2178,8 @@ impl ProvidersPage {
                 start,
                 message,
                 error,
+                completed,
+                ..
             } => {
                 let has_error = error.is_some();
                 let instructions = match harness {
@@ -2079,7 +2247,7 @@ impl ProvidersPage {
                         &start.url,
                         cx,
                     ))
-                    .when(!has_error, |el| {
+                    .when(!has_error && !completed, |el| {
                         el.child(
                             div()
                                 .mt(px(16.0))
@@ -2109,6 +2277,17 @@ impl ProvidersPage {
                                 ),
                         )
                     })
+                    .when(*completed, |el| {
+                        el.child(
+                            div()
+                                .mt(px(16.0))
+                                .text_size(px(12.5))
+                                .text_color(theme.success)
+                                .child(message.clone().unwrap_or_else(|| {
+                                    SharedString::from("Signed in; refreshing saved accounts…")
+                                })),
+                        )
+                    })
                     .when_some(error.clone(), |el, message| {
                         el.child(
                             div()
@@ -2122,7 +2301,11 @@ impl ProvidersPage {
                         div().mt(px(16.0)).flex().flex_row().justify_end().child(
                             popover::btn_ghost(
                                 &theme,
-                                if has_error { "Close" } else { "Cancel" },
+                                if has_error || *completed {
+                                    "Close"
+                                } else {
+                                    "Cancel"
+                                },
                                 "login-cancel",
                                 cx.entity_id(),
                             )
@@ -2321,6 +2504,151 @@ mod tests {
             assert!(PROVIDERS.iter().any(|(provider, _, _)| *provider == agent));
         }
         assert!(!requires_login(HarnessId::Mock));
+    }
+
+    #[test]
+    fn completed_browser_login_closes_when_its_account_is_visible() {
+        let account = AgentAccount {
+            id: "copilot-1".into(),
+            harness: HarnessId::Copilot,
+            email: Some("octocat".into()),
+            plan_label: None,
+            active: false,
+            usage_windows: vec![],
+            display_name: None,
+            organization: None,
+            auth_kind: None,
+            switchable: true,
+            saved_at: None,
+        };
+        let copilot_login = |completed, prior_account_ids| LoginFlow::Browser {
+            harness: HarnessId::Copilot,
+            start: AgentLoginStart {
+                login_id: "login-1".into(),
+                url: "https://github.com/login/device".into(),
+                mode: AgentLoginMode::Browser,
+                user_code: None,
+            },
+            message: None,
+            error: None,
+            completed,
+            prior_account_ids,
+        };
+        let empty = AgentAccountsSnapshot {
+            accounts: vec![],
+            warnings: vec![],
+        };
+        assert!(!completed_browser_login_has_account(
+            Some(&copilot_login(true, HashSet::new())),
+            &empty
+        ));
+        let saved = AgentAccountsSnapshot {
+            accounts: vec![account.clone()],
+            warnings: vec![],
+        };
+        assert!(!completed_browser_login_has_account(
+            Some(&copilot_login(false, HashSet::new())),
+            &saved
+        ));
+        let prior_ids = HashSet::from(["copilot-1".to_string()]);
+        let with_new_account = AgentAccountsSnapshot {
+            accounts: vec![
+                account,
+                AgentAccount {
+                    id: "copilot-2".into(),
+                    ..saved.accounts[0].clone()
+                },
+            ],
+            warnings: vec![],
+        };
+        assert!(completed_browser_login_has_account(
+            Some(&copilot_login(true, prior_ids)),
+            &with_new_account
+        ));
+    }
+
+    /// Copilot rows are also imported from the user's own `gh` config, so an
+    /// account that predates the flow says nothing about the login being added.
+    /// Dismissing on it closed the dialog on the OLD account while the finished
+    /// one was never saved — the "added but never shows up" bug. The duplicate
+    /// must still end the flow, with a message instead of silence.
+    #[test]
+    fn duplicate_copilot_login_is_reported_not_mistaken_for_success() {
+        let existing = AgentAccount {
+            id: "copilot-1".into(),
+            harness: HarnessId::Copilot,
+            email: Some("octocat".into()),
+            plan_label: None,
+            active: true,
+            usage_windows: vec![],
+            display_name: None,
+            organization: None,
+            auth_kind: None,
+            switchable: true,
+            saved_at: None,
+        };
+        let snapshot = AgentAccountsSnapshot {
+            accounts: vec![existing],
+            warnings: vec![],
+        };
+        let login = LoginFlow::Browser {
+            harness: HarnessId::Copilot,
+            start: AgentLoginStart {
+                login_id: "login-1".into(),
+                url: "https://github.com/login/device".into(),
+                mode: AgentLoginMode::Browser,
+                user_code: None,
+            },
+            message: None,
+            error: None,
+            completed: true,
+            prior_account_ids: HashSet::from(["copilot-1".to_string()]),
+        };
+        assert!(!completed_browser_login_has_account(
+            Some(&login),
+            &snapshot
+        ));
+        assert!(completed_copilot_login_is_duplicate(
+            Some(&login),
+            &snapshot
+        ));
+    }
+
+    /// Other harnesses have no parallel import path, so their browser flows keep
+    /// the loose "any account of this harness" dismissal.
+    #[test]
+    fn non_copilot_browser_login_still_dismisses_on_any_account() {
+        let codex = AgentAccount {
+            id: "codex-1".into(),
+            harness: HarnessId::Codex,
+            email: Some("octocat@example.com".into()),
+            plan_label: None,
+            active: true,
+            usage_windows: vec![],
+            display_name: None,
+            organization: None,
+            auth_kind: None,
+            switchable: true,
+            saved_at: None,
+        };
+        let snapshot = AgentAccountsSnapshot {
+            accounts: vec![codex],
+            warnings: vec![],
+        };
+        let login = LoginFlow::Browser {
+            harness: HarnessId::Codex,
+            start: AgentLoginStart {
+                login_id: "login-2".into(),
+                url: "https://chatgpt.com".into(),
+                mode: AgentLoginMode::Browser,
+                user_code: None,
+            },
+            message: None,
+            error: None,
+            completed: true,
+            prior_account_ids: HashSet::from(["codex-1".to_string()]),
+        };
+        assert!(completed_browser_login_has_account(Some(&login), &snapshot));
     }
 
     /// The page must paint every card before the engine answers `ListHarnesses`
