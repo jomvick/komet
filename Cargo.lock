@@ -3883,6 +3883,7 @@ dependencies = [
  "gpui-base",
  "gpui_platform",
  "gpui_tokio",
+ "image",
  "komet-doc",
  "komet-engine",
  "komet-harness",
@@ -3902,6 +3903,7 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tracing",
+ "tungstenite",
  "unicode-segmentation",
  "uuid",
 ]

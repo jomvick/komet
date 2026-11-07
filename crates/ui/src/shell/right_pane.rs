@@ -1,4 +1,4 @@
-//! Right-pane surfaces: tabs, files/diff/subagent/terminal openers and close flow.
+//! Right-pane surfaces: browser/files/diff/terminal/subagent openers and close flow.
 
 use super::*;
 
@@ -123,6 +123,10 @@ impl Shell {
         stored
             .iter()
             .filter_map(|surface| match surface {
+                RightSurface::Browser => self
+                    .browsers
+                    .get(&key)
+                    .map(|browser| (*surface, browser.read(cx).tab_title(), false, None)),
                 RightSurface::Files => self.files.get(&key).map(|files| {
                     let files = files.read(cx);
                     (
@@ -205,6 +209,30 @@ impl Shell {
         }
     }
 
+    /// Open one Servo browser per panel key; repeated opens focus the existing
+    /// view instead of starting another engine process.
+    pub(super) fn add_browser_surface(&mut self, cx: &mut Context<Self>) {
+        let key = self.panel_key(cx);
+        if !self.browsers.contains_key(&key) {
+            let profile_key = key.clone();
+            let browser = cx.new(|cx| {
+                crate::browser::BrowserSurface::new("https://example.com".into(), profile_key, cx)
+            });
+            self.browsers.insert(key.clone(), browser);
+        }
+        push_unique_right_surface(
+            self.right_tabs.entry(key.clone()).or_default(),
+            RightSurface::Browser,
+        );
+        if !self.right_pane_open(cx) {
+            let from = self.right_target(cx);
+            self.panels
+                .update(&key, |panels| panels.changes_open = true);
+            self.right_tween = Some(WidthTween::new(from, self.right_target(cx)));
+        }
+        self.set_right_active(RightSurface::Browser, cx);
+    }
+
     /// The surface that actually renders: the stored pick when it still
     /// exists, else the first remaining tab, else the picker. Terminal keys
     /// go stale when their tab closes/exits — never render a dead surface.
@@ -252,7 +280,7 @@ impl Shell {
                     panel.update(cx, |panel, cx| panel.ensure_started(cx));
                 }
             }
-            RightSurface::Picker => {}
+            RightSurface::Browser | RightSurface::Picker => {}
         }
         cx.notify();
     }
@@ -433,7 +461,8 @@ impl Shell {
                 .get(&self.panel_key(cx))
                 .and_then(|files| files.read(cx).attachment_path().map(str::to_string))?,
             RightSurface::File(id) => self.file_surface_paths.get(&id).cloned()?,
-            RightSurface::Diff(_)
+            RightSurface::Browser
+            | RightSurface::Diff(_)
             | RightSurface::Picker
             | RightSurface::Terminal(_)
             | RightSurface::Subagent(_) => {
@@ -589,6 +618,9 @@ impl Shell {
             tabs.retain(|s| *s != surface);
         }
         match surface {
+            RightSurface::Browser => {
+                self.browsers.remove(&key);
+            }
             RightSurface::Files | RightSurface::File(_) => {}
             RightSurface::Diff(id) => {
                 // Dropping the entity tears down its diff watch.

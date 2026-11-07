@@ -251,7 +251,7 @@ pub struct Shell {
     /// bookkeeping). One subscription per panel entity.
     terminal_event_sub: Option<Subscription>,
     right_terminal_event_sub: Option<Subscription>,
-    /// The surface-tab strip's `+` menu (Terminal / Git diff rows).
+    /// The surface-tab strip's `+` menu (Terminal / Files / Git / Browser rows).
     right_plus: popover::Popup<()>,
     /// Titlebar GitHub control: its dropdown + the checkout's status.
     github_menu: popover::Popup<()>,
@@ -280,6 +280,9 @@ pub struct Shell {
     /// own tab, one level deeper).
     subagent_subs: std::collections::HashMap<u64, Subscription>,
     subagent_seq: u64,
+    /// One Servo browser surface per chat/panel key. Dropping the entity stops
+    /// its RPC client and terminates the child browser engine.
+    browsers: std::collections::HashMap<String, Entity<crate::browser::BrowserSurface>>,
     /// One workspace browser per chat/panel key. Dropping the entity closes
     /// its file watcher and every in-flight workspace request.
     files: std::collections::HashMap<String, Entity<FilesSurface>>,
@@ -647,6 +650,7 @@ impl Shell {
             subagent_tabs: std::collections::HashMap::new(),
             subagent_subs: std::collections::HashMap::new(),
             subagent_seq: 0,
+            browsers: std::collections::HashMap::new(),
             files: std::collections::HashMap::new(),
             files_subs: std::collections::HashMap::new(),
             file_surfaces: std::collections::HashMap::new(),

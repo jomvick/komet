@@ -1064,6 +1064,14 @@ impl Shell {
         let content: AnyElement = if self.right_pane_open(cx) {
             let active = self.resolved_right_active(cx);
             let main: AnyElement = match active {
+                RightSurface::Browser => {
+                    let key = self.panel_key(cx);
+                    if let Some(browser) = self.browsers.get(&key).cloned() {
+                        browser.into_any_element()
+                    } else {
+                        self.render_surface_picker(cx)
+                    }
+                }
                 RightSurface::Files => {
                     let key = self.panel_key(cx);
                     if let Some(files) = self.files.get(&key).cloned() {
@@ -1329,6 +1337,13 @@ impl Shell {
                                         this.add_files_surface(window, cx);
                                     })),
                             )
+                            .child(
+                                row("surface-card-browser", icons::GLOBAL, "Browser").on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        this.add_browser_surface(cx);
+                                    }),
+                                ),
+                            )
                             // Git only where there IS git — the pane itself
                             // no longer gates on it (terminals work anywhere).
                             .when(self.space_git_detected(cx), |el| {
@@ -1427,6 +1442,7 @@ impl Shell {
         for (ix, (surface, title, _dirty, _detail)) in rows.into_iter().enumerate() {
             let is_active = surface == active;
             let icon_path = match surface {
+                RightSurface::Browser => icons::GLOBAL,
                 RightSurface::Files => icons::FOLDER_WITH_FILES,
                 RightSurface::File(_) => icons::DOCUMENT,
                 RightSurface::Diff(_) => icons::GIT_BRANCH,
@@ -1642,6 +1658,20 @@ impl Shell {
                                         .text_color(theme.text_muted),
                                 )
                                 .child(SharedString::from("Files")),
+                        )
+                        .child(
+                            popover::menu_row(&theme, false, "right-plus-browser", cx.entity_id())
+                                .id("right-plus-browser-row")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.add_browser_surface(cx);
+                                    this.close_right_plus(cx);
+                                }))
+                                .child(
+                                    icon(icons::GLOBAL)
+                                        .size(px(13.0))
+                                        .text_color(theme.text_muted),
+                                )
+                                .child(SharedString::from("Browser")),
                         )
                         .child(
                             popover::menu_row(&theme, false, "right-plus-diff", cx.entity_id())

@@ -200,6 +200,19 @@ cargo run --bin komet             # main app (UI + engine)
 cargo run --bin komet-sync-server # standalone sync server
 ```
 
+The **Browser** surface uses the Servo webview engine as a sidecar process.
+Build `servo-webview-engine` from the Servo checkout, then point Komet at it:
+
+```bash
+cargo build --manifest-path ../servo/Cargo.toml \
+  -p webview-engine --bin servo-webview-engine
+SERVO_WEBVIEW_ENGINE="$(realpath ../servo/target/debug/servo-webview-engine)" \
+  cargo run --bin komet
+```
+
+In packaged builds, place `servo-webview-engine` beside the Komet executable
+or set `SERVO_WEBVIEW_ENGINE` to its absolute path.
+
 > `cargo run` alone fails: the workspace exposes two binaries, so `--bin` is required.
 
 ---

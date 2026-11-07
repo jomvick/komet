@@ -73,13 +73,14 @@ pub enum Route {
     Settings(SettingsSection),
 }
 
-/// One right-pane surface tab: a workspace browser, an individual workspace
-/// file editor, a git-diff page, an embedded terminal, a subagent transcript,
-/// `Picker` is the empty surface chooser.
+/// One right-pane surface tab: a Servo browser, workspace browser, individual
+/// workspace file editor, git-diff page, embedded terminal, or subagent
+/// transcript. `Picker` is the empty surface chooser.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RightSurface {
     #[default]
     Picker,
+    Browser,
     Files,
     File(u64),
     Diff(u64),
