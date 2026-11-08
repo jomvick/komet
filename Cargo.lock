@@ -3878,6 +3878,7 @@ dependencies = [
  "async-trait",
  "base64",
  "chrono",
+ "dirs",
  "futures",
  "gpui",
  "gpui-base",

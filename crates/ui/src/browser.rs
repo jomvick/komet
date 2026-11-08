@@ -26,6 +26,7 @@ use tungstenite::{Message, WebSocket, connect as ws_connect};
 use uuid::Uuid;
 
 use crate::composer::{ComposerInput, ComposerInputEvent};
+use crate::icons;
 
 const VIEWPORT: (u32, u32) = (1280, 800);
 type RpcSocket = WebSocket<MaybeTlsStream<std::net::TcpStream>>;
@@ -342,11 +343,7 @@ impl Render for BrowserSurface {
         let back = self.commands.clone();
         let forward = self.commands.clone();
         let reload = self.commands.clone();
-        let reload_command = if self.error.is_some() {
-            BrowserCommand::Retry
-        } else {
-            BrowserCommand::Reload
-        };
+        let retry = self.error.is_some();
 
         div()
             .size_full()
@@ -382,7 +379,11 @@ impl Render for BrowserSurface {
                         icons::REFRESH,
                         theme.text_muted,
                         move || {
-                            let _ = reload.send(reload_command);
+                            let _ = reload.send(if retry {
+                                BrowserCommand::Retry
+                            } else {
+                                BrowserCommand::Reload
+                            });
                         },
                     ))
                     .child(
@@ -460,7 +461,7 @@ impl Element for BrowserViewport {
         window: &mut Window,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
-        self.child.request_layout(window, cx)
+        (self.child.request_layout(window, cx), ())
     }
 
     fn prepaint(
@@ -496,6 +497,7 @@ fn browser_button(
     action: impl Fn() + 'static,
 ) -> impl IntoElement {
     div()
+        .id(icon_path)
         .size(px(28.0))
         .flex_none()
         .flex()
