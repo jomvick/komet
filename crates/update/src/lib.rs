@@ -478,20 +478,57 @@ pub fn apply_headless(app_root: &Path, version: &str) -> anyhow::Result<()> {
     }
 }
 
-/// Restart the installed engine service (the same units `komet daemon` and the
-/// curl|sh installer manage). Called after a symlink swap so the running daemon
-/// picks up the new binary.
-pub fn restart_service() -> anyhow::Result<()> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceRestart {
+    Restarted,
+    NotInstalled,
+}
+
+fn systemd_unit_is_installed(load_state: &str) -> anyhow::Result<bool> {
+    match load_state.trim() {
+        "not-found" => Ok(false),
+        "" => bail!("systemctl returned no LoadState for komet.service"),
+        _ => Ok(true),
+    }
+}
+
+/// Restart the installed engine service after a symlink swap. Desktop installs
+/// do not necessarily have a service; their running app must be relaunched.
+pub fn restart_service() -> anyhow::Result<ServiceRestart> {
     if cfg!(target_os = "macos") {
         let output = std::process::Command::new("id").arg("-u").output()?;
         let uid = String::from_utf8_lossy(&output.stdout).trim().to_string();
         run(
             "launchctl",
             &["kickstart", "-k", &format!("gui/{uid}/sh.komet.app")],
-        )
+        )?;
     } else {
+        if cfg!(target_os = "linux") {
+            let output = std::process::Command::new("systemctl")
+                .args([
+                    "--user",
+                    "show",
+                    "komet.service",
+                    "--property=LoadState",
+                    "--value",
+                ])
+                .output()
+                .context("checking whether komet.service is installed")?;
+            if !output.status.success() {
+                bail!(
+                    "systemctl --user show komet.service failed ({}): {}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+            }
+            if !systemd_unit_is_installed(&String::from_utf8_lossy(&output.stdout))? {
+                return Ok(ServiceRestart::NotInstalled);
+            }
+        }
         run("systemctl", &["--user", "restart", "komet.service"])
+            .context("restarting komet.service")?;
     }
+    Ok(ServiceRestart::Restarted)
 }
 
 // ---------------------------------------------------------------------------
@@ -770,9 +807,7 @@ impl Updater {
             tokio::time::sleep(IDLE_RECHECK).await;
         }
         match self.apply().await {
-            Ok(version) => {
-                tracing::info!(%version, "auto-update applied; service restarting")
-            }
+            Ok(version) => tracing::info!(%version, "auto-update applied"),
             Err(err) => tracing::warn!(error = %err, "auto-update failed"),
         }
     }
@@ -843,8 +878,14 @@ impl Updater {
         apply_headless(&app_root, &manifest.version)?;
         tokio::spawn(async {
             tokio::time::sleep(std::time::Duration::from_millis(800)).await;
-            if let Err(err) = restart_service() {
-                tracing::warn!(error = %err, "service restart failed — restart the engine to finish the update");
+            match restart_service() {
+                Ok(ServiceRestart::Restarted) => {}
+                Ok(ServiceRestart::NotInstalled) => {
+                    tracing::info!("no service installed; restart Komet to finish the update");
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, "service restart failed — restart Komet to finish the update");
+                }
             }
         });
         Ok(manifest.version)
@@ -861,6 +902,13 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn systemd_missing_unit_is_not_a_restart_error() {
+        assert!(!systemd_unit_is_installed("not-found\n").unwrap());
+        assert!(systemd_unit_is_installed("loaded\n").unwrap());
+        assert!(systemd_unit_is_installed("").is_err());
+    }
 
     #[test]
     fn version_compare() {
