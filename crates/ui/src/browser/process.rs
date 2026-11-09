@@ -214,14 +214,18 @@ fn wait_for_cdp_endpoint(
             let reader = BufReader::new(stderr);
             for line in reader.lines().map_while(Result::ok) {
                 if let Some(idx) = line.find("DevTools listening on ") {
-                    let ws_url = line[idx + "DevTools listening on ".len()..].trim().to_owned();
+                    let ws_url = line[idx + "DevTools listening on ".len()..]
+                        .trim()
+                        .to_owned();
                     if ws_url.starts_with("ws://") {
                         let _ = tx.send(Ok(ws_url));
                         return;
                     }
                 }
             }
-            let _ = tx.send(Err("Browser exited without outputting CDP WebSocket endpoint".into()));
+            let _ = tx.send(Err(
+                "Browser exited without outputting CDP WebSocket endpoint".into(),
+            ));
         })
         .map_err(|e| format!("Failed to spawn CDP listener thread: {e}"))?;
 
@@ -232,7 +236,9 @@ fn wait_for_cdp_endpoint(
         }
         Err(mpsc::RecvTimeoutError::Disconnected) => {
             let status = child.try_wait().ok().flatten();
-            return Err(format!("Browser process exited prematurely (status: {status:?})"));
+            return Err(format!(
+                "Browser process exited prematurely (status: {status:?})"
+            ));
         }
     };
 
@@ -248,7 +254,7 @@ fn wait_for_cdp_endpoint(
 
 fn resolve_page_ws_url(browser_ws: &str, port: u16, initial_url: &str) -> Result<String, String> {
     use tungstenite::stream::MaybeTlsStream;
-    use tungstenite::{connect as ws_connect, Message};
+    use tungstenite::{Message, connect as ws_connect};
 
     let mut socket = None;
     for _ in 0..20 {
@@ -265,27 +271,28 @@ fn resolve_page_ws_url(browser_ws: &str, port: u16, initial_url: &str) -> Result
         socket.ok_or_else(|| format!("Failed to connect to browser WebSocket at {browser_ws}"))?;
 
     socket
-        .send(Message::Text(r#"{"id":1,"method":"Target.getTargets"}"#.into()))
+        .send(Message::Text(
+            r#"{"id":1,"method":"Target.getTargets"}"#.into(),
+        ))
         .map_err(|e| e.to_string())?;
 
     for _ in 0..5 {
         if let Ok(Message::Text(text)) = socket.read() {
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&text) {
-                if let Some(targets) = val
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&text)
+                && let Some(targets) = val
                     .get("result")
                     .and_then(|r| r.get("targetInfos"))
                     .and_then(|t| t.as_array())
-                {
-                    for target in targets {
-                        if target.get("type").and_then(|t| t.as_str()) == Some("page") {
-                            if let Some(target_id) = target.get("targetId").and_then(|i| i.as_str()) {
-                                return Ok(format!("ws://127.0.0.1:{port}/devtools/page/{target_id}"));
-                            }
-                        }
+            {
+                for target in targets {
+                    if target.get("type").and_then(|t| t.as_str()) == Some("page")
+                        && let Some(target_id) = target.get("targetId").and_then(|i| i.as_str())
+                    {
+                        return Ok(format!("ws://127.0.0.1:{port}/devtools/page/{target_id}"));
                     }
-                    // targetInfos received but no page target found yet -> proceed immediately to createTarget
-                    break;
                 }
+                // targetInfos received but no page target found yet -> proceed immediately to createTarget
+                break;
             }
         } else {
             break;
@@ -299,20 +306,18 @@ fn resolve_page_ws_url(browser_ws: &str, port: u16, initial_url: &str) -> Result
     })
     .to_string();
     socket
-        .send(Message::Text(create_cmd.into()))
+        .send(Message::Text(create_cmd))
         .map_err(|e| e.to_string())?;
 
     for _ in 0..10 {
-        if let Ok(Message::Text(text)) = socket.read() {
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&text) {
-                if let Some(target_id) = val
-                    .get("result")
-                    .and_then(|r| r.get("targetId"))
-                    .and_then(|i| i.as_str())
-                {
-                    return Ok(format!("ws://127.0.0.1:{port}/devtools/page/{target_id}"));
-                }
-            }
+        if let Ok(Message::Text(text)) = socket.read()
+            && let Ok(val) = serde_json::from_str::<serde_json::Value>(&text)
+            && let Some(target_id) = val
+                .get("result")
+                .and_then(|r| r.get("targetId"))
+                .and_then(|i| i.as_str())
+        {
+            return Ok(format!("ws://127.0.0.1:{port}/devtools/page/{target_id}"));
         }
     }
 
@@ -334,7 +339,10 @@ pub fn browser_profile_path(profile_key: &str) -> PathBuf {
     }
 
     if let Some(local_data) = dirs::data_local_dir() {
-        let path = local_data.join("komet").join("browser-profiles").join(&name);
+        let path = local_data
+            .join("komet")
+            .join("browser-profiles")
+            .join(&name);
         if std::fs::create_dir_all(&path).is_ok() {
             return path;
         }

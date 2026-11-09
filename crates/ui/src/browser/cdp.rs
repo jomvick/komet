@@ -29,6 +29,20 @@ pub fn make_request(id: u64, method: &str, params: Value) -> String {
     .to_string()
 }
 
+/// Bits CDP `modifiers` : Alt=1, Ctrl=2, Meta=4, Shift=8.
+pub const CDP_MOD_ALT: u32 = 1;
+pub const CDP_MOD_CTRL: u32 = 2;
+pub const CDP_MOD_META: u32 = 4;
+pub const CDP_MOD_SHIFT: u32 = 8;
+
+/// (alt, ctrl, shift, meta) → bitmask CDP
+pub fn cdp_modifiers(alt: bool, ctrl: bool, shift: bool, meta: bool) -> u32 {
+    ((alt as u32) * CDP_MOD_ALT)
+        | ((ctrl as u32) * CDP_MOD_CTRL)
+        | ((shift as u32) * CDP_MOD_SHIFT)
+        | ((meta as u32) * CDP_MOD_META)
+}
+
 pub fn page_enable(id: u64) -> String {
     make_request(id, "Page.enable", json!({}))
 }
@@ -41,7 +55,13 @@ pub fn page_navigate(id: u64, url: &str) -> String {
     make_request(id, "Page.navigate", json!({ "url": url }))
 }
 
-pub fn start_screencast(id: u64, max_width: u32, max_height: u32, format: &str, quality: u32) -> String {
+pub fn start_screencast(
+    id: u64,
+    max_width: u32,
+    max_height: u32,
+    format: &str,
+    quality: u32,
+) -> String {
     make_request(
         id,
         "Page.startScreencast",
@@ -60,7 +80,11 @@ pub fn stop_screencast(id: u64) -> String {
 }
 
 pub fn screencast_frame_ack(id: u64, session_id: u64) -> String {
-    make_request(id, "Page.screencastFrameAck", json!({ "sessionId": session_id }))
+    make_request(
+        id,
+        "Page.screencastFrameAck",
+        json!({ "sessionId": session_id }),
+    )
 }
 
 pub fn capture_screenshot(id: u64) -> String {
@@ -92,7 +116,14 @@ pub fn dispatch_mouse_move(id: u64, x: f32, y: f32) -> String {
     )
 }
 
-pub fn dispatch_mouse_click(id: u64, event_type: &str, x: f32, y: f32, button: &str) -> String {
+pub fn dispatch_mouse_click(
+    id: u64,
+    event_type: &str,
+    x: f32,
+    y: f32,
+    button: &str,
+    click_count: u32,
+) -> String {
     make_request(
         id,
         "Input.dispatchMouseEvent",
@@ -101,7 +132,7 @@ pub fn dispatch_mouse_click(id: u64, event_type: &str, x: f32, y: f32, button: &
             "x": x,
             "y": y,
             "button": button,
-            "clickCount": 1
+            "clickCount": click_count
         }),
     )
 }
@@ -131,27 +162,62 @@ pub fn dispatch_char_event(id: u64, text: &str) -> String {
     )
 }
 
-pub fn dispatch_key_down(id: u64, key: &str, code: &str, windows_virtual_key_code: u32) -> String {
+pub fn dispatch_key_event(
+    id: u64,
+    event_type: &str,
+    key: &str,
+    code: &str,
+    windows_virtual_key_code: Option<u32>,
+    modifiers: u32,
+) -> String {
+    let mut params = json!({
+        "type": event_type, // "rawKeyDown" or "keyUp"
+        "key": key,
+        "code": code,
+        "modifiers": modifiers
+    });
+    if let Some(vk) = windows_virtual_key_code {
+        params["windowsVirtualKeyCode"] = json!(vk);
+    }
+    make_request(id, "Input.dispatchKeyEvent", params)
+}
+
+pub fn insert_text(id: u64, text: &str) -> String {
+    make_request(id, "Input.insertText", json!({ "text": text }))
+}
+
+pub fn page_reload(id: u64) -> String {
+    make_request(id, "Page.reload", json!({ "ignoreCache": false }))
+}
+
+pub fn get_navigation_history(id: u64) -> String {
+    make_request(id, "Page.getNavigationHistory", json!({}))
+}
+
+pub fn navigate_to_history_entry(id: u64, entry_id: u64) -> String {
     make_request(
         id,
-        "Input.dispatchKeyEvent",
-        json!({
-            "type": "rawKeyDown",
-            "key": key,
-            "code": code,
-            "windowsVirtualKeyCode": windows_virtual_key_code
-        }),
+        "Page.navigateToHistoryEntry",
+        json!({ "entryId": entry_id }),
     )
 }
 
-pub fn dispatch_key_up(id: u64, key: &str, code: &str) -> String {
+pub fn handle_java_script_dialog(id: u64, accept: bool, prompt_text: Option<&str>) -> String {
+    let mut params = json!({ "accept": accept });
+    if let Some(text) = prompt_text {
+        params["promptText"] = json!(text);
+    }
+    make_request(id, "Page.handleJavaScriptDialog", params)
+}
+
+pub fn set_auto_attach(id: u64) -> String {
     make_request(
         id,
-        "Input.dispatchKeyEvent",
+        "Target.setAutoAttach",
         json!({
-            "type": "keyUp",
-            "key": key,
-            "code": code
+            "autoAttach": true,
+            "flatten": true,
+            "waitForDebuggerOnStart": false
         }),
     )
 }
@@ -196,3 +262,112 @@ pub const EXTRACT_ELEMENTS_SCRIPT: &str = r#"
     return items;
 })()
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::Value;
+
+    fn parsed(request: &str) -> Value {
+        serde_json::from_str(request).unwrap()
+    }
+
+    #[test]
+    fn builds_page_reload() {
+        let v = parsed(&page_reload(3));
+        assert_eq!(v["method"], "Page.reload");
+        assert_eq!(v["params"]["ignoreCache"], false);
+    }
+
+    #[test]
+    fn builds_navigation_history_requests() {
+        let history = parsed(&get_navigation_history(7));
+        assert_eq!(history["method"], "Page.getNavigationHistory");
+        assert_eq!(history["params"].as_object().map(|o| o.len()), Some(0));
+
+        let jump = parsed(&navigate_to_history_entry(8, 12));
+        assert_eq!(jump["method"], "Page.navigateToHistoryEntry");
+        assert_eq!(jump["params"]["entryId"], 12);
+    }
+
+    #[test]
+    fn builds_javascript_dialog_responses() {
+        let accept = parsed(&handle_java_script_dialog(4, true, None));
+        assert_eq!(accept["method"], "Page.handleJavaScriptDialog");
+        assert_eq!(accept["params"]["accept"], true);
+        assert!(accept["params"].get("promptText").is_none());
+
+        let dismiss_prompt = parsed(&handle_java_script_dialog(5, false, Some("hello")));
+        assert_eq!(dismiss_prompt["params"]["accept"], false);
+        assert_eq!(dismiss_prompt["params"]["promptText"], "hello");
+    }
+
+    #[test]
+    fn builds_insert_text_request() {
+        let v = parsed(&insert_text(6, "collé ✓"));
+        assert_eq!(v["method"], "Input.insertText");
+        assert_eq!(v["params"]["text"], "collé ✓");
+    }
+
+    #[test]
+    fn builds_auto_attach_request() {
+        let v = parsed(&set_auto_attach(9));
+        assert_eq!(v["method"], "Target.setAutoAttach");
+        assert_eq!(v["params"]["autoAttach"], true);
+        assert_eq!(v["params"]["flatten"], true);
+        assert_eq!(v["params"]["waitForDebuggerOnStart"], false);
+    }
+
+    #[test]
+    fn builds_key_event_with_modifiers() {
+        let v = parsed(&dispatch_key_event(
+            10,
+            "rawKeyDown",
+            "Backspace",
+            "Backspace",
+            Some(8),
+            cdp_modifiers(false, false, false, false),
+        ));
+        assert_eq!(v["method"], "Input.dispatchKeyEvent");
+        assert_eq!(v["params"]["type"], "rawKeyDown");
+        assert_eq!(v["params"]["key"], "Backspace");
+        assert_eq!(v["params"]["code"], "Backspace");
+        assert_eq!(v["params"]["windowsVirtualKeyCode"], 8);
+        assert_eq!(v["params"]["modifiers"], 0);
+
+        let chord = parsed(&dispatch_key_event(
+            11,
+            "rawKeyDown",
+            "c",
+            "KeyC",
+            Some(67),
+            cdp_modifiers(false, true, false, true),
+        ));
+        assert_eq!(chord["params"]["modifiers"], 2 | 4); // ctrl + meta
+    }
+
+    #[test]
+    fn builds_mouse_click_with_button_and_count() {
+        let right_double = parsed(&dispatch_mouse_click(
+            12,
+            "mousePressed",
+            10.0,
+            20.0,
+            "right",
+            2,
+        ));
+        assert_eq!(right_double["params"]["type"], "mousePressed");
+        assert_eq!(right_double["params"]["button"], "right");
+        assert_eq!(right_double["params"]["clickCount"], 2);
+
+        let left = parsed(&dispatch_mouse_click(
+            13,
+            "mouseReleased",
+            0.0,
+            0.0,
+            "left",
+            1,
+        ));
+        assert_eq!(left["params"]["clickCount"], 1);
+    }
+}
