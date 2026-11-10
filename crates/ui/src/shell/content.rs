@@ -585,6 +585,7 @@ impl Shell {
                     ))
                     .into_any_element()
             });
+        let drop_confirm = self.drop_confirm_pill(theme);
         div()
             .id("chat-dropzone")
             .relative()
@@ -595,6 +596,7 @@ impl Shell {
             .flex_col()
             .on_drag_move::<gpui::ExternalPaths>(cx.listener(
                 |this, e: &gpui::DragMoveEvent<gpui::ExternalPaths>, _, cx| {
+                    this.file_drag_bounds = e.bounds;
                     let inside = e.bounds.contains(&e.event.position);
                     if this.file_drag_active != inside {
                         this.file_drag_active = inside;
@@ -602,13 +604,45 @@ impl Shell {
                     }
                 },
             ))
-            .on_drop(cx.listener(|this, paths: &gpui::ExternalPaths, _, cx| {
-                this.file_drag_active = false;
-                let paths = paths.paths().to_vec();
-                this.composer
-                    .update(cx, |composer, cx| composer.add_paths(paths, false, cx));
-                cx.notify();
-            }))
+            .on_drop(
+                cx.listener(|this, paths: &gpui::ExternalPaths, window, cx| {
+                    this.file_drag_active = false;
+                    let paths = paths.paths().to_vec();
+                    this.composer
+                        .update(cx, |composer, cx| composer.add_paths(paths, false, cx));
+                    // Issue #44 drop routing: a drop on the transcript confirms
+                    // transiently near the point (the files ride the composer's
+                    // stash into the chat's NEXT message); a drop on the composer
+                    // stack keeps the silent stash.
+                    let has_chat = this.state.read(cx).selected_chat.is_some();
+                    let position = window.mouse_position();
+                    if has_chat
+                        && file_drop_zone(
+                            f32::from(position.y),
+                            this.file_drag_bounds,
+                            this.bottom_stack.get(),
+                        ) == FileDropZone::Transcript
+                    {
+                        this.drop_confirm_seq += 1;
+                        let id = this.drop_confirm_seq;
+                        let origin = this.file_drag_bounds.origin;
+                        this.drop_confirm = Some(DropConfirm {
+                            id,
+                            x: f32::from(position.x - origin.x),
+                            y: f32::from(position.y - origin.y),
+                            _task: cx.spawn(async move |this, cx| {
+                                cx.background_executor().timer(DROP_CONFIRM_HOLD).await;
+                                this.update(cx, |this, cx| {
+                                    this.drop_confirm = None;
+                                    cx.notify();
+                                })
+                                .ok();
+                            }),
+                        });
+                    }
+                    cx.notify();
+                }),
+            )
             .on_drag_move::<WorkspacePathDrag>(cx.listener(
                 |this, e: &gpui::DragMoveEvent<WorkspacePathDrag>, _, cx| {
                     let inside = e.bounds.contains(&e.event.position);
@@ -703,6 +737,7 @@ impl Shell {
                     })
                     .child(self.render_terminal_container(cx))
             })
+            .children(drop_confirm)
             .when(file_drag_active, |el| {
                 el.child(
                     div()
@@ -718,6 +753,47 @@ impl Shell {
                 )
             })
             .into_any_element()
+    }
+
+    /// The transient "Will attach to your next message" pill (issue #44),
+    /// anchored near the transcript drop point inside the conversation
+    /// column. Clears itself via the task stored in [`DropConfirm`].
+    fn drop_confirm_pill(&self, theme: &Theme) -> Option<AnyElement> {
+        let confirm = self.drop_confirm.as_ref()?;
+        let size = self.file_drag_bounds.size;
+        let width = f32::from(size.width);
+        let height = f32::from(size.height);
+        // The pill is ~280px wide / ~30px tall; clamp so it stays inside.
+        let left = (confirm.x - 140.0).clamp(8.0, (width - 288.0).max(8.0));
+        let top = (confirm.y + 14.0).clamp(8.0, (height - 48.0).max(8.0));
+        Some(
+            motion::fade_in(
+                ("file-drop-confirm", confirm.id),
+                div()
+                    .absolute()
+                    .left(px(left))
+                    .top(px(top))
+                    .px(px(12.0))
+                    .py(px(7.0))
+                    .rounded(px(12.0))
+                    .border_1()
+                    .border_color(crate::theme::hairline(0.12))
+                    .bg(theme.surface)
+                    .shadow(crate::theme::card_selected_shadows())
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .text_size(px(11.5))
+                    .text_color(theme.text)
+                    .child(
+                        icon(crate::icons::PAPERCLIP)
+                            .size(px(12.0))
+                            .text_color(theme.text_muted),
+                    )
+                    .child("Will attach to your next message"),
+            )
+            .into_any_element(),
+        )
     }
 
     /// The "↓ Scroll to bottom" pill (round-9 §3): a LABELED rounded-full
@@ -2027,6 +2103,30 @@ pub fn nav_history_button(
             .into_any_element();
     }
     window_control_button(id, icon_path, theme, owner, on_click).into_any_element()
+}
+
+/// How long the transcript-drop confirmation stays up (issue #44).
+pub(crate) const DROP_CONFIRM_HOLD: Duration = Duration::from_millis(1600);
+
+/// Which side of the conversation column a file drop landed on (issue #44).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FileDropZone {
+    /// Above the bottom chrome stack — the transcript: stash + confirmation.
+    Transcript,
+    /// On the composer stack — unchanged behavior: stash only.
+    Composer,
+}
+
+/// Drop routing (issue #44): a drop above the measured bottom chrome stack
+/// lands on the transcript; anything lower is the composer. `stack_height`
+/// is the same `bottom_stack` measurement the transcript clearance uses, so
+/// the boundary tracks the composer pill, status strip and terminal dock.
+pub(crate) fn file_drop_zone(y: f32, dropzone: Bounds<Pixels>, stack_height: f32) -> FileDropZone {
+    if y < f32::from(dropzone.origin.y + dropzone.size.height) - stack_height {
+        FileDropZone::Transcript
+    } else {
+        FileDropZone::Composer
+    }
 }
 
 /// A size-7 icon button for the main-panel header (komet __root.tsx:

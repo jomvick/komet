@@ -18,10 +18,10 @@ use std::time::Duration;
 
 use chrono::Utc;
 use gpui::{
-    AnyElement, App, Context, Decorations, Empty, Entity, Focusable as _, IntoElement, MouseButton,
-    MouseDownEvent, MouseUpEvent, ObjectFit, Pixels, Point, Render, ResizeEdge, SharedString, Size,
-    StyleRefinement, StyledImage, Subscription, Task, Tiling, Window, WindowButton,
-    WindowButtonLayout, WindowControlArea, actions, div, img, prelude::*, px,
+    AnyElement, App, Bounds, Context, Decorations, Empty, Entity, Focusable as _, IntoElement,
+    MouseButton, MouseDownEvent, MouseUpEvent, ObjectFit, Pixels, Point, Render, ResizeEdge,
+    SharedString, Size, StyleRefinement, StyledImage, Subscription, Task, Tiling, Window,
+    WindowButton, WindowButtonLayout, WindowControlArea, actions, div, img, prelude::*, px,
 };
 
 use komet_engine::harness_cli::HarnessCliStatus;
@@ -211,6 +211,17 @@ pub(super) struct RenameChatDialog {
     pub(super) _events: Subscription,
 }
 
+/// Transient "will attach to your next message" pill shown near a transcript
+/// file drop (issue #44); `_task` clears it after [`DROP_CONFIRM_HOLD`].
+pub(super) struct DropConfirm {
+    /// Monotonic id so each drop replays the pill's entrance animation.
+    pub(super) id: usize,
+    /// Drop point relative to the conversation column.
+    pub(super) x: f32,
+    pub(super) y: f32,
+    pub(super) _task: Task<()>,
+}
+
 pub struct Shell {
     state: Entity<AppState>,
     transcript: Entity<Transcript>,
@@ -222,6 +233,13 @@ pub struct Shell {
     /// External file drag hovering the conversation column — shows the
     /// "Drop files or images to attach" veil; a drop stages them in the composer.
     file_drag_active: bool,
+    /// Bounds of the conversation column during the active file drag — anchors
+    /// the drop confirmation (issue #44); refreshed by every drag move.
+    file_drag_bounds: Bounds<Pixels>,
+    /// In-flight transcript-drop confirmation (issue #44).
+    drop_confirm: Option<DropConfirm>,
+    /// Monotonic id source for [`DropConfirm`]s.
+    drop_confirm_seq: usize,
     /// Measured height of the bottom chrome stack (status strip + composer +
     /// terminal dock) the full-height transcript scrolls under — written by a
     /// paint-time canvas each frame, read the NEXT frame for the fade inset,
@@ -627,6 +645,9 @@ impl Shell {
             pending_workspace_file: None,
             composer,
             file_drag_active: false,
+            file_drag_bounds: Bounds::default(),
+            drop_confirm: None,
+            drop_confirm_seq: 0,
             // Seed with the compact composer stack's rough height so the
             // first frame's clearance isn't zero (the measure corrects it).
             bottom_stack: std::rc::Rc::new(std::cell::Cell::new(120.0)),

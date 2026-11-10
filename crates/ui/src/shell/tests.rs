@@ -971,3 +971,38 @@ fn open_agent_shell_event_targets_the_processes_popup() {
     retarget_agent_shell(&mut strip);
     assert_eq!(strip.open.as_open(), Some(&WidgetKind::Processes));
 }
+
+#[test]
+fn file_drop_zone_routes_transcript_vs_composer() {
+    // Column from y=40 to y=900 (860px tall); the bottom chrome stack is 140px.
+    let dropzone = Bounds::new(
+        gpui::point(px(0.0), px(40.0)),
+        gpui::size(px(800.0), px(860.0)),
+    );
+    let stack = 140.0f32;
+
+    // A drop on a message row — well above the composer stack.
+    assert_eq!(
+        file_drop_zone(300.0, dropzone, stack),
+        FileDropZone::Transcript
+    );
+    // Just above the stack's top edge still counts as transcript.
+    assert_eq!(
+        file_drop_zone(759.0, dropzone, stack),
+        FileDropZone::Transcript
+    );
+    // On the composer pill / status strip: unchanged behavior.
+    assert_eq!(
+        file_drop_zone(761.0, dropzone, stack),
+        FileDropZone::Composer
+    );
+    assert_eq!(
+        file_drop_zone(890.0, dropzone, stack),
+        FileDropZone::Composer
+    );
+    // Degenerate bounds (drag never moved) never confirm.
+    assert_eq!(
+        file_drop_zone(100.0, Bounds::default(), stack),
+        FileDropZone::Composer
+    );
+}
