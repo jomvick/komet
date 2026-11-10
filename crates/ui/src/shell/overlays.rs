@@ -104,6 +104,17 @@ pub fn cli_row_pending(rows: &HashMap<HarnessId, CliUpdateRow>, harness: Harness
     )
 }
 
+/// Any active update means the stale status card is no longer helpful: it would
+/// otherwise sit on the window while an installer is already running.
+pub fn cli_updates_busy(
+    rows: &HashMap<HarnessId, CliUpdateRow>,
+    statuses: &[HarnessCliStatus],
+) -> bool {
+    statuses
+        .iter()
+        .any(|status| matches!(rows.get(&status.harness), Some(CliUpdateRow::Updating)))
+}
+
 /// Enabled harnesses on this device. `None` (registry unavailable) means
 /// "don't filter" rather than hiding every row.
 pub async fn enabled_harness_ids(
@@ -333,12 +344,13 @@ impl Shell {
             return None;
         }
         let theme = Theme::of(cx).clone();
-        let busy = self.cli_updates.iter().any(|status| {
-            matches!(
-                self.cli_update_rows.get(&status.harness),
-                Some(CliUpdateRow::Updating)
-            )
-        });
+        let busy = cli_updates_busy(&self.cli_update_rows, &self.cli_updates);
+        // While a CLI update is running, the popup would otherwise remain in the
+        // way and look like a stale prompt instead of a live update. Hide it until
+        // the status settles so the user can keep working without the stale card.
+        if busy {
+            return None;
+        }
         let pending = self
             .cli_updates
             .iter()

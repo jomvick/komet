@@ -132,6 +132,23 @@ fn update_notification_preferences_gate_background_pings() {
     assert!(!update_notification_allowed(false, false, false));
 }
 
+#[test]
+fn cli_update_popup_hides_while_an_update_is_running() {
+    let statuses = vec![HarnessCliStatus {
+        harness: HarnessId::ClaudeCode,
+        installed_version: Some("1.0.0".into()),
+        latest_version: Some("1.1.0".into()),
+        managed: true,
+        update_available: true,
+        check_error: None,
+    }];
+    let idle = HashMap::from([(HarnessId::ClaudeCode, CliUpdateRow::Idle)]);
+    let busy = HashMap::from([(HarnessId::ClaudeCode, CliUpdateRow::Updating)]);
+
+    assert!(!cli_updates_busy(&idle, &statuses));
+    assert!(cli_updates_busy(&busy, &statuses));
+}
+
 #[tokio::test]
 async fn remote_shutdown_waits_for_ipc_release() {
     let dir = tempfile::tempdir().unwrap();

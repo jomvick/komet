@@ -3,7 +3,7 @@
 //! instead; source builds are report-only.
 
 use anyhow::bail;
-use komet_update::{InstallKind, current_version, version_newer};
+use komet_update::{InstallKind, ServiceRestart, current_version, version_newer};
 
 /// `--check` prints the verdict and exits (nonzero when an update is available,
 /// so scripts can gate on it).
@@ -36,9 +36,12 @@ pub async fn update(check_only: bool) -> anyhow::Result<()> {
                 manifest.version
             );
             match komet_update::restart_service() {
-                Ok(()) => println!("engine service restarted."),
+                Ok(ServiceRestart::Restarted) => println!("engine service restarted."),
+                Ok(ServiceRestart::NotInstalled) => println!(
+                    "note: no Komet service is installed — quit and relaunch Komet to use the update."
+                ),
                 Err(err) => println!(
-                    "note: service restart failed ({err:#}) — restart the engine manually to finish."
+                    "note: service restart failed ({err:#}) — restart Komet manually to finish."
                 ),
             }
             Ok(())
