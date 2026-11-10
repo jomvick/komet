@@ -1356,7 +1356,7 @@ fn run_client(
     loop {
         // Chrome partagé du pool (keeper thread) ; la lease rendue au bout de
         // la session décrémente le refcount — à 0 le pool tue le process.
-        let result = match acquire_browser(&profile_key, &current_url) {
+        let result = match acquire_browser(&profile_key) {
             Ok((page_ws, warning, _lease)) => {
                 if let Some(warning) = warning {
                     push_event(&events, wake, BrowserEvent::Warning(warning));
@@ -1445,10 +1445,15 @@ fn run_session(
         .map_err(|e| e.to_string())?;
     next_id += 1;
 
-    // Pas de navigation initiale : le page target a été créé (ou trouvé) AVEC
-    // l'URL par le pool (createTarget / argument de lancement) — la
-    // re-naviguer doublait la charge de page à chaque ouverture.
+    // La navigation part APRÈS le startScreencast : le screencast capture
+    // ainsi la page dès son premier paint. (Naviguer avant = la page finit
+    // de peindre avant l'attachement et Chrome n'émet plus aucun frame.)
+    socket
+        .send(Message::Text(cdp::page_navigate(next_id, current_url)))
+        .map_err(|e| e.to_string())?;
     let mut navigate_request_ids = std::collections::HashSet::new();
+    navigate_request_ids.insert(next_id);
+    next_id += 1;
 
     let mut page_title = String::new();
     let mut screenshot_request_id: Option<u64> = None;
