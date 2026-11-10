@@ -50,7 +50,6 @@ impl Drop for PooledBrowser {
 
 pub fn acquire_browser(
     profile_key: &str,
-    initial_url: &str,
 ) -> Result<(String, Option<String>, PooledBrowser), String> {
     let _serial = SPAWN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
@@ -61,7 +60,7 @@ pub fn acquire_browser(
         .get(profile_key)
         .map(|e| e.browser_ws.clone());
     if let Some(browser_ws) = existing {
-        match create_page_target(&browser_ws, initial_url) {
+        match create_page_target(&browser_ws) {
             Ok(page_ws) => {
                 if let Some(entry) = POOL
                     .lock()
@@ -88,7 +87,7 @@ pub fn acquire_browser(
     }
 
     // 2. Spawn neuf (thread keeper + readiness + fallback sandbox).
-    let (page_ws, browser_ws, warning, kill) = spawn_pooled_browser(profile_key, initial_url)?;
+    let (page_ws, browser_ws, warning, kill) = spawn_pooled_browser(profile_key)?;
     match POOL
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -114,23 +113,21 @@ pub fn acquire_browser(
 
 fn spawn_pooled_browser(
     profile_key: &str,
-    initial_url: &str,
 ) -> Result<(String, String, Option<String>, mpsc::Sender<()>), String> {
     let (kill_tx, kill_rx) = mpsc::channel::<()>();
     let (reply_tx, reply_rx) =
         mpsc::sync_channel::<Result<(String, String, Option<String>), String>>(1);
     let key = profile_key.to_owned();
-    let initial = initial_url.to_owned();
 
     thread::Builder::new()
         .name("komet-browser-keeper".into())
         .spawn(move || {
             // sandbox-first : on tente AVEC sandbox ; --no-sandbox uniquement
             // en repli si Chrome refuse de démarrer sandboxé.
-            let launched = match launch_browser(&key, false, &initial) {
+            let launched = match launch_browser(&key, false) {
                 Ok((child, ws)) => Ok((child, ws, None)),
                 Err(e) if needs_sandbox_fallback(&e) => {
-                    launch_browser(&key, true, &initial).map(|(child, ws)| (child, ws, Some(e)))
+                    launch_browser(&key, true).map(|(child, ws)| (child, ws, Some(e)))
                 }
                 Err(e) => Err(e),
             };
@@ -142,7 +139,7 @@ fn spawn_pooled_browser(
                 }
             };
             let page_ws = match port_of(&browser_ws)
-                .and_then(|port| resolve_page_ws_url(&browser_ws, port, &initial))
+                .and_then(|port| resolve_page_ws_url(&browser_ws, port))
             {
                 Ok(ws) => ws,
                 Err(e) => {
@@ -174,11 +171,7 @@ fn spawn_pooled_browser(
         .map(|(page_ws, browser_ws, warning)| (page_ws, browser_ws, warning, kill_tx))
 }
 
-fn launch_browser(
-    profile_key: &str,
-    no_sandbox: bool,
-    initial_url: &str,
-) -> Result<(Child, String), String> {
+fn launch_browser(profile_key: &str, no_sandbox: bool) -> Result<(Child, String), String> {
     let executable = find_browser_executable().ok_or_else(|| {
         "No compatible browser executable found. Please install Chromium, Google Chrome, \
          Brave, Microsoft Edge, or Obscura, or set CHROME_PATH."
@@ -243,8 +236,10 @@ fn launch_browser(
         });
     }
 
-    // initial_url must be the very last positional argument
-    cmd.arg(initial_url)
+    // La page naît sur about:blank : la navigation est déclenchée par la
+    // session CDP APRÈS le startScreencast, sinon une page rapide (localhost)
+    // finit de peindre avant l'attachement et Chrome n'émet plus aucun frame.
+    cmd.arg("about:blank")
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
 
@@ -424,8 +419,10 @@ fn port_of(browser_ws: &str) -> Result<u16, String> {
 }
 
 /// Ouvre un NOUVEAU page target sur un Chrome déjà lancé (le pool partage un
-/// Chrome par profil : chaque surface a sa propre cible).
-fn create_page_target(browser_ws: &str, url: &str) -> Result<String, String> {
+/// Chrome par profil : chaque surface a sa propre cible). La cible naît sur
+/// about:blank : la session CDP navigue après le startScreencast (une seule
+/// charge, capturée depuis le début).
+fn create_page_target(browser_ws: &str) -> Result<String, String> {
     use tungstenite::stream::MaybeTlsStream;
     use tungstenite::{Message, connect as ws_connect};
 
@@ -447,7 +444,7 @@ fn create_page_target(browser_ws: &str, url: &str) -> Result<String, String> {
     let create_cmd = serde_json::json!({
         "id": 1,
         "method": "Target.createTarget",
-        "params": { "url": url }
+        "params": { "url": "about:blank" }
     })
     .to_string();
     socket
@@ -467,7 +464,7 @@ fn create_page_target(browser_ws: &str, url: &str) -> Result<String, String> {
     Err("Could not create page target on shared browser".into())
 }
 
-fn resolve_page_ws_url(browser_ws: &str, port: u16, initial_url: &str) -> Result<String, String> {
+fn resolve_page_ws_url(browser_ws: &str, port: u16) -> Result<String, String> {
     use tungstenite::stream::MaybeTlsStream;
     use tungstenite::{Message, connect as ws_connect};
 
@@ -517,7 +514,7 @@ fn resolve_page_ws_url(browser_ws: &str, port: u16, initial_url: &str) -> Result
     let create_cmd = serde_json::json!({
         "id": 2,
         "method": "Target.createTarget",
-        "params": { "url": initial_url }
+        "params": { "url": "about:blank" }
     })
     .to_string();
     socket
