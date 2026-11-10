@@ -35,15 +35,20 @@ type WsStream = WebSocket<MaybeTlsStream<std::net::TcpStream>>;
 
 /// Bout de pipe en écriture : chaque commande envoyée au thread CDP écrit un
 /// octet pour réveiller son poll(2) immédiatement (zéro latence, zéro timer).
+#[cfg(target_os = "linux")]
 struct FdGuard(i32);
 
+#[cfg(target_os = "linux")]
 impl Drop for FdGuard {
     fn drop(&mut self) {
         unsafe { libc::close(self.0) };
     }
 }
 
+/// Hors Linux il n'y a pas de self-pipe : le type existe pour que le champ
+/// de la surface reste le même partout, sans jamais être construit.
 #[cfg(not(target_os = "linux"))]
+#[derive(Debug)]
 struct FdGuard;
 
 /// Canal de commandes UI → CDP, doublé du self-pipe de réveil.
@@ -219,7 +224,10 @@ impl BrowserSurface {
         };
         #[cfg(not(target_os = "linux"))]
         let (wake_read, wake_write): (Option<i32>, Option<i32>) = (None, None);
+        #[cfg(target_os = "linux")]
         let _wake_write = wake_write.map(FdGuard);
+        #[cfg(not(target_os = "linux"))]
+        let _wake_write: Option<FdGuard> = None;
 
         let (command_tx, command_rx) = mpsc::channel();
         let commands = CommandPipe {
