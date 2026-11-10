@@ -10,7 +10,9 @@ use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{Message, WebSocket, connect};
 
 fn main() {
-    let url = std::env::args().nth(1).unwrap_or_else(|| "https://duckduckgo.com/".into());
+    let url = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "https://duckduckgo.com/".into());
     let exe = "/usr/bin/chromium-browser";
 
     let mut cmd = Command::new(exe);
@@ -30,7 +32,10 @@ fn main() {
         .arg("--no-first-run")
         .arg("--no-default-browser-check")
         .arg("--allow-insecure-localhost")
-        .arg(format!("--user-data-dir=/tmp/opencode/cdp-probe-{}", std::process::id()))
+        .arg(format!(
+            "--user-data-dir=/tmp/opencode/cdp-probe-{}",
+            std::process::id()
+        ))
         .arg("--no-sandbox")
         .arg(&url)
         .stdout(Stdio::null())
@@ -50,27 +55,33 @@ fn main() {
     println!("BROWSER_WS {browser_ws}");
 
     // découvre le page-target via le WS navigateur (comme process.rs::resolve_page_ws_url)
-    let port: u16 = browser_ws.split(':').nth(2).unwrap().split('/').next().unwrap().parse().unwrap();
+    let port: u16 = browser_ws
+        .split(':')
+        .nth(2)
+        .unwrap()
+        .split('/')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
     let (mut browser_socket, _) = connect(&browser_ws).unwrap();
     if let MaybeTlsStream::Plain(stream) = browser_socket.get_ref() {
         let _ = stream.set_read_timeout(Some(Duration::from_millis(1500)));
     }
-    browser_socket.send(Message::Text(r#"{"id":1,"method":"Target.getTargets"}"#.into())).unwrap();
+    browser_socket
+        .send(Message::Text(
+            r#"{"id":1,"method":"Target.getTargets"}"#.into(),
+        ))
+        .unwrap();
     let mut tid = None;
-    for _ in 0..5 {
-        if let Ok(Message::Text(text)) = browser_socket.read() {
-            if let Ok(v) = serde_json::from_str::<Value>(text.as_ref()) {
-                if let Some(targets) = v.pointer("/result/targetInfos").and_then(Value::as_array) {
-                    for t in targets {
-                        if t["type"] == "page" {
-                            tid = Some(t["targetId"].as_str().unwrap().to_owned());
-                        }
-                    }
-                    break;
-                }
+    if let Ok(Message::Text(text)) = browser_socket.read()
+        && let Ok(v) = serde_json::from_str::<Value>(text.as_ref())
+        && let Some(targets) = v.pointer("/result/targetInfos").and_then(Value::as_array)
+    {
+        for t in targets {
+            if t["type"] == "page" {
+                tid = Some(t["targetId"].as_str().unwrap().to_owned());
             }
-        } else {
-            break;
         }
     }
     let tid = tid.expect("no page target");
@@ -79,18 +90,38 @@ fn main() {
 
     let (mut socket, _) = connect(&page_ws).unwrap();
     let mut next_id: u64 = 1;
-    send(&mut socket, next_id, "Page.enable", json!({})); next_id += 1;
-    send(&mut socket, next_id, "Runtime.enable", json!({})); next_id += 1;
-    send(&mut socket, next_id, "Target.setAutoAttach",
-        json!({"autoAttach": true, "flatten": true, "waitForDebuggerOnStart": false})); next_id += 1;
-    send(&mut socket, next_id, "Emulation.setDeviceMetricsOverride",
-        json!({"width": 1280u32, "height": 800u32, "deviceScaleFactor": 1.0, "mobile": false})); next_id += 1;
-    send(&mut socket, next_id, "Page.startScreencast",
-        json!({"format": "jpeg", "quality": 90, "maxWidth": 1280u32, "maxHeight": 800u32, "everyNthFrame": 1})); next_id += 1;
-    send(&mut socket, next_id, "Page.navigate", json!({"url": url})); next_id += 1;
+    send(&mut socket, next_id, "Page.enable", json!({}));
+    next_id += 1;
+    send(&mut socket, next_id, "Runtime.enable", json!({}));
+    next_id += 1;
+    send(
+        &mut socket,
+        next_id,
+        "Target.setAutoAttach",
+        json!({"autoAttach": true, "flatten": true, "waitForDebuggerOnStart": false}),
+    );
+    next_id += 1;
+    send(
+        &mut socket,
+        next_id,
+        "Emulation.setDeviceMetricsOverride",
+        json!({"width": 1280u32, "height": 800u32, "deviceScaleFactor": 1.0, "mobile": false}),
+    );
+    next_id += 1;
+    send(
+        &mut socket,
+        next_id,
+        "Page.startScreencast",
+        json!({"format": "jpeg", "quality": 90, "maxWidth": 1280u32, "maxHeight": 800u32, "everyNthFrame": 1}),
+    );
+    next_id += 1;
+    send(&mut socket, next_id, "Page.navigate", json!({"url": url}));
+    next_id += 1;
 
     if let MaybeTlsStream::Plain(stream) = socket.get_ref() {
-        stream.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
     }
     let start = Instant::now();
     while start.elapsed() < Duration::from_secs(20) {
@@ -99,15 +130,27 @@ fn main() {
                 let v: Value = serde_json::from_str(text.as_ref()).unwrap();
                 match v.get("method").and_then(Value::as_str) {
                     Some("Page.screencastFrame") => {
-                        let size = v.pointer("/params/data").and_then(Value::as_str).map_or(0, |s| s.len());
-                        println!("EVENT screencastFrame ({} bytes base64) sessionId={:?}  [{:?}]",
-                            size, v.pointer("/params/sessionId"), start.elapsed());
-                        let sid = v.pointer("/params/sessionId").and_then(Value::as_u64).unwrap();
+                        let size = v
+                            .pointer("/params/data")
+                            .and_then(Value::as_str)
+                            .map_or(0, |s| s.len());
+                        println!(
+                            "EVENT screencastFrame ({} bytes base64) sessionId={:?}  [{:?}]",
+                            size,
+                            v.pointer("/params/sessionId"),
+                            start.elapsed()
+                        );
+                        let sid = v
+                            .pointer("/params/sessionId")
+                            .and_then(Value::as_u64)
+                            .unwrap();
                         let ack = json!({"id": next_id, "method": "Page.screencastFrameAck", "params": {"sessionId": sid}});
                         next_id += 1;
-                        socket.send(Message::Text(ack.to_string().into())).unwrap();
+                        socket.send(Message::Text(ack.to_string())).unwrap();
                     }
-                    Some(m) if m.starts_with("Page.") => println!("EVENT {m}  [{:?}]", start.elapsed()),
+                    Some(m) if m.starts_with("Page.") => {
+                        println!("EVENT {m}  [{:?}]", start.elapsed())
+                    }
                     Some(m) => println!("EVENT {m}  [{:?}]", start.elapsed()),
                     None => {
                         let s: &str = text.as_ref();
@@ -117,21 +160,25 @@ fn main() {
             }
             Ok(_) => {}
             Err(tungstenite::Error::Io(e))
-                if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {}
-            Err(e) => { println!("WS_ERR {e}"); break; }
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(e) => {
+                println!("WS_ERR {e}");
+                break;
+            }
         }
     }
     let _ = child.kill();
     let _ = child.wait();
 }
 
-fn send(socket: &mut WebSocket<MaybeTlsStream<std::net::TcpStream>>, id: u64, method: &str, params: Value) {
+fn send(
+    socket: &mut WebSocket<MaybeTlsStream<std::net::TcpStream>>,
+    id: u64,
+    method: &str,
+    params: Value,
+) {
     let msg = json!({"id": id, "method": method, "params": params}).to_string();
-    socket.send(Message::Text(msg.into())).expect("send");
+    socket.send(Message::Text(msg)).expect("send");
     println!("SENT {method}");
-}
-
-// /json list via HTTP (dép. legacy-simple : TcpStream + HTTP/1.0 à la main, pas de reqwest)
-fn reqwest_blocking_get(_port: u16) -> String {
-    String::new()
 }

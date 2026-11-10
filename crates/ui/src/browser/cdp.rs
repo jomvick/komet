@@ -263,6 +263,17 @@ pub const EXTRACT_ELEMENTS_SCRIPT: &str = r#"
 })()
 "#;
 
+// Ferme un page target (une surface qui se ferme libère sa cible ; le Chrome
+// partagé du pool survit si d'autres surfaces l'utilisent).
+pub fn close_target(id: u64, target_id: &str) -> String {
+    json!({
+        "id": id,
+        "method": "Target.closeTarget",
+        "params": { "targetId": target_id }
+    })
+    .to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -369,5 +380,13 @@ mod tests {
             1,
         ));
         assert_eq!(left["params"]["clickCount"], 1);
+    }
+
+    #[test]
+    fn builds_close_target_request() {
+        let parsed_value = parsed(&close_target(7, "ABC123"));
+        assert_eq!(parsed_value["id"], 7);
+        assert_eq!(parsed_value["method"], "Target.closeTarget");
+        assert_eq!(parsed_value["params"]["targetId"], "ABC123");
     }
 }

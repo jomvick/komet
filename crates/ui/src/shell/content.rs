@@ -1059,6 +1059,17 @@ impl Shell {
     /// page (its options row + the lazy [`Changes`] viewer), an embedded
     /// terminal, or the "Open a surface" picker when no tabs exist.
     pub(super) fn render_right_pane(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        // Park/unpark des sessions CDP selon l'affichage réel : seule la
+        // surface browser ACTIVE du pane OUVERT tourne ; les autres (autres
+        // panneaux, autres onglets, pane fermé) garent leur Chrome (zéro CPU).
+        let browser_visible =
+            self.right_pane_open(cx) && self.resolved_right_active(cx) == RightSurface::Browser;
+        let panel = self.panel_key(cx);
+        for (key, browser) in &self.browsers {
+            let visible = browser_visible && *key == panel;
+            browser.update(cx, |surface, _| surface.set_visible(visible));
+        }
+
         let theme = Theme::of(cx).clone();
         let bg = theme.bg;
         let content: AnyElement = if self.right_pane_open(cx) {
