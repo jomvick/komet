@@ -270,7 +270,7 @@ impl AgentAccountsConfig {
 
 // ── slot storage ────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SlotProfile {
     email: String,
@@ -1530,7 +1530,14 @@ impl AgentAccounts {
                 saved_at: now_ms(),
                 created_at: None,
             };
-            if self.write_slot(&slot).is_err() {
+            // Same contract as `snapshot_detected`: `saved_at` only moves on
+            // a real change, or every list() would look like a fresh login.
+            let unchanged = self.read_slots(HarnessId::Copilot).iter().any(|saved| {
+                saved.id == slot.id
+                    && saved.credentials == slot.credentials
+                    && saved.profile == slot.profile
+            });
+            if !unchanged && self.write_slot(&slot).is_err() {
                 warning = true;
                 continue;
             }
@@ -4217,19 +4224,30 @@ impl AgentAccounts {
         // is the opaque `Antigravity ·…hash` placeholder. If we already know
         // the real identity for this account_key (resolved on an earlier list),
         // keep it — only the display fields are at stake, never the tokens.
-        let profile = match self
+        let existing = self
             .read_slots(harness)
             .into_iter()
-            .find(|s| s.account_key == d.account_key)
-        {
+            .find(|s| s.account_key == d.account_key);
+        let profile = match &existing {
             Some(existing)
                 if is_opaque_antigravity_email(&d.profile.email)
                     && !is_opaque_antigravity_email(&existing.profile.email) =>
             {
-                existing.profile
+                existing.profile.clone()
             }
             _ => d.profile.clone(),
         };
+        // `saved_at` is the UI's "this account changed" signal (issue #77):
+        // rewriting an identical slot every list() would make every account
+        // look freshly updated and dismiss login dialogs early. Skip the
+        // write when nothing material changed.
+        if let Some(existing) = &existing
+            && existing.credentials == *credentials
+            && existing.profile == profile
+            && existing.claude_config == d.claude_config
+        {
+            return Ok(());
+        }
         self.write_slot(&Slot {
             id: slot_id_for(harness, &d.account_key),
             harness,
