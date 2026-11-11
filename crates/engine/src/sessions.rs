@@ -1323,7 +1323,7 @@ impl SessionsEngine {
             let fresh_or_switched = request.resume.is_none() || switched_from.is_some();
             if fresh_or_switched
                 && let Some(indexer) = self.inner.memory.get()
-                && let Ok(Some(text)) = indexer.briefing(&request.cwd)
+                && let Ok(Some(text)) = indexer.briefing(&request.cwd, Some(chat_id))
             {
                 Some(crate::memory::memory_context_block(&text))
             } else {

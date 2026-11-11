@@ -186,6 +186,21 @@ impl RunJournal {
         Ok(read_tail(&self.path_for(chat_id))?.0.map(|(seq, _)| seq))
     }
 
+    /// Wall-clock mtime of the chat's journal file (epoch ms), `None` when
+    /// the file is missing or its time can't be read. Journal lines carry
+    /// no timestamp, so the memory indexer uses this as the replay-time
+    /// approximation for catch-up events (issue #78).
+    pub fn journal_mtime_ms(&self, chat_id: &str) -> Option<i64> {
+        let modified = std::fs::metadata(self.path_for(chat_id))
+            .ok()?
+            .modified()
+            .ok()?;
+        modified
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|d| d.as_millis() as i64)
+    }
+
     /// Targeted lookup (issue #10): the `ToolCall` + `ToolResult` events for
     /// one tool part, in journal order. No full replay — one linear scan of
     /// the chat's file, keeping only matching lines. Unknown id or missing /

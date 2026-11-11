@@ -77,3 +77,43 @@ pub struct ChatCursor {
     /// known gap). Catch-up replays from `gap - 1` to heal it.
     pub gap_seq: Option<u64>,
 }
+
+// ── briefing digest (SQL aggregates → deterministic handoff text) ────────
+
+/// One file an agent modified, most recent first (cap applied upstream).
+#[derive(Debug, Clone, PartialEq)]
+pub struct FileTouch {
+    pub path: String,
+    pub last_ms: i64,
+}
+
+/// One recent failure attributed to an agent.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FailureDigest {
+    /// e.g. "exec on build.sh" or "run errored".
+    pub label: String,
+    pub last_ms: i64,
+}
+
+/// Per-agent rollup for the briefing: sessions, volume, last outcome,
+/// modified paths and recent failures.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AgentDigest {
+    pub agent: String,
+    pub sessions: u32,
+    pub tool_calls: u32,
+    pub file_reads: u32,
+    /// Outcome of the agent's most recent `session_end` in the window.
+    pub last_status: Option<String>,
+    pub last_activity_ms: i64,
+    pub modified_paths: Vec<FileTouch>,
+    pub failures: Vec<FailureDigest>,
+}
+
+/// Everything the briefing builder needs — produced by GROUP BY queries so
+/// one high-volume agent cannot crowd the others out of a row cap.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BriefingDigest {
+    pub chats: u64,
+    pub agents: Vec<AgentDigest>,
+}

@@ -8,11 +8,14 @@
 //! authoritative and [`MemoryIndexer::catch_up`] replays the gap.
 //!
 //! Replay caveat: journal lines carry no wall-clock timestamp, so events
-//! recovered by catch-up get `occurred_at_ms` ≈ catch-up time. Live events
-//! get real publish-time stamps. Ordering (and therefore briefing recency
-//! within a catch-up batch) stays correct via `source_seq`.
+//! recovered by catch-up get `occurred_at_ms` ≈ the journal file's mtime
+//! (its last write — a good approximation of the run's end, and far better
+//! than stamping a months-old backfill "now"). Live events get real
+//! publish-time stamps. Ordering (and therefore briefing recency within a
+//! catch-up batch) stays correct via `source_seq`.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
@@ -28,6 +31,9 @@ use crate::run_journal::RunJournal;
 struct ChatMemoryCtx {
     project_id: String,
     cwd: String,
+    /// Canonical cwd, resolved once per chat — `canonicalize` is a syscall
+    /// and must not run per tool call on the publish path.
+    canon_cwd: PathBuf,
     agent: String,
     model: Option<String>,
     run_started_ms: i64,
@@ -55,12 +61,14 @@ impl MemoryProjector {
     /// before the first `SessionStarted` arrives).
     fn note_chat(&mut self, chat_id: &str, cwd: &str, harness: HarnessId) {
         let project_id = self.project_id(cwd);
+        let canon_cwd = komet_memory::canonical_cwd(cwd);
         let ctx = self
             .chats
             .entry(chat_id.to_string())
             .or_insert_with(|| ChatMemoryCtx {
                 project_id: project_id.clone(),
                 cwd: cwd.to_string(),
+                canon_cwd: canon_cwd.clone(),
                 agent: harness.as_str().to_string(),
                 model: None,
                 run_started_ms: 0,
@@ -69,6 +77,7 @@ impl MemoryProjector {
         if ctx.cwd != cwd {
             ctx.cwd = cwd.to_string();
             ctx.project_id = project_id;
+            ctx.canon_cwd = canon_cwd;
         }
         ctx.agent = harness.as_str().to_string();
     }
@@ -116,6 +125,7 @@ impl MemoryProjector {
                     .or_insert_with(|| ChatMemoryCtx {
                         project_id: project_id.clone(),
                         cwd: String::new(),
+                        canon_cwd: komet_memory::canonical_cwd(cwd),
                         agent: harness.as_str().to_string(),
                         model: None,
                         run_started_ms: 0,
@@ -124,6 +134,7 @@ impl MemoryProjector {
                 ctx.project_id = project_id.clone();
                 if !cwd.trim().is_empty() {
                     ctx.cwd = cwd.clone();
+                    ctx.canon_cwd = komet_memory::canonical_cwd(cwd);
                 }
                 ctx.agent = harness.as_str().to_string();
                 ctx.model = Some(model.clone());
@@ -185,7 +196,7 @@ impl MemoryProjector {
                 let Some(ctx) = self.ctx(chat_id) else {
                     return Vec::new();
                 };
-                let (tool_name, rel_path) = project_tool_call(call, &ctx.cwd);
+                let (tool_name, rel_path) = project_tool_call(call, &ctx.cwd, &ctx.canon_cwd);
                 if ctx.pending_tools.len() >= 512 {
                     ctx.pending_tools.clear();
                 }
@@ -285,18 +296,20 @@ fn projectable(event: &AgentEvent) -> bool {
 
 /// Reduce a [`ToolCall`] to (tool_name, project-relative path?). Command
 /// text, patterns, queries, URLs and MCP inputs are never carried over.
-fn project_tool_call(call: &komet_proto::ToolCall, cwd: &str) -> (String, Option<String>) {
+/// `canon_cwd` is the chat's cached canonical cwd (see [`ChatMemoryCtx`]).
+fn project_tool_call(
+    call: &komet_proto::ToolCall,
+    cwd: &str,
+    canon_cwd: &std::path::Path,
+) -> (String, Option<String>) {
     use komet_proto::ToolCall as T;
-    let file_path = |p: &str| komet_memory::project_relative(cwd, p);
+    let file_path = |p: &str| komet_memory::project_relative(cwd, canon_cwd, p);
     match call {
         T::Exec { .. } => ("exec".into(), None),
         T::ReadFile { path } => ("read_file".into(), file_path(path)),
         T::WriteFile { path, .. } => ("write_file".into(), file_path(path)),
         T::EditFile { path, .. } => ("edit_file".into(), file_path(path)),
-        T::ApplyPatch { path } => (
-            "apply_patch".into(),
-            path.as_deref().and_then(file_path),
-        ),
+        T::ApplyPatch { path } => ("apply_patch".into(), path.as_deref().and_then(file_path)),
         T::Search { .. } => ("search".into(), None),
         T::Glob { .. } => ("glob".into(), None),
         T::WebFetch { .. } => ("web_fetch".into(), None),
@@ -328,6 +341,9 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 /// Catch-up throttle: after a queue overflow, replay at most this often.
 const CATCHUP_MIN_INTERVAL: Duration = Duration::from_secs(5);
+/// Gap-marker tick: how often the indexer checks for persisted enqueue
+/// gaps that need a journal replay (writer failures leave these behind).
+const GAP_TICK_INTERVAL: Duration = Duration::from_secs(60);
 
 /// The engine-facing memory indexer: projection + queue + journal catch-up.
 pub struct MemoryIndexer {
@@ -347,7 +363,7 @@ impl MemoryIndexer {
         journal: Arc<RunJournal>,
     ) -> Result<Arc<Self>, komet_memory::MemoryError> {
         let svc = Arc::new(MemoryService::open(data_dir.join("memory"))?);
-        Ok(Arc::new(Self {
+        let indexer = Arc::new(Self {
             svc,
             journal,
             projector: Mutex::new(MemoryProjector {
@@ -357,7 +373,27 @@ impl MemoryIndexer {
             lag: Mutex::new(HashMap::new()),
             catchup_running: AtomicBool::new(false),
             last_catchup: Mutex::new(None),
-        }))
+        });
+        // Periodic gap check: a failed writer batch persists gap markers but
+        // nothing re-triggers catch-up until the next overflow or restart.
+        // The tick only scans the journal when gaps actually exist.
+        let tick = Arc::clone(&indexer);
+        std::thread::Builder::new()
+            .name("komet-memory-gaptick".into())
+            .spawn(move || {
+                loop {
+                    std::thread::sleep(GAP_TICK_INTERVAL);
+                    match tick.svc.chats_with_gaps() {
+                        Ok(gaps) if !gaps.is_empty() => tick.catch_up(),
+                        Ok(_) => {}
+                        Err(err) => {
+                            tracing::warn!(error = %err, "memory: gap scan failed")
+                        }
+                    }
+                }
+            })
+            .ok();
+        Ok(indexer)
     }
 
     pub fn service(&self) -> &Arc<MemoryService> {
@@ -489,14 +525,23 @@ impl MemoryIndexer {
             return;
         }
         let reached = events.last().map(|(seq, _)| *seq).unwrap_or(from);
-        // Project the whole replay under one lock: cheap (no IO inside), and
-        // keeps per-chat ctx mutations atomic vs. live events.
-        let now = now_ms();
+        // Journal lines have no timestamps: stamp the replay with the
+        // file's mtime (≈ the run's end) rather than catch-up time, so an
+        // old backfill doesn't look like it happened today.
+        let now = self
+            .journal
+            .journal_mtime_ms(chat_id)
+            .unwrap_or_else(now_ms);
+        // Project the replay in chunks, releasing the projector lock between
+        // them: a long backfill must not starve live `index_event` calls
+        // (which share the same mutex) for its whole duration.
         let mut items: Vec<MemoryItem> = Vec::new();
-        {
-            let mut projector = lock(&self.projector);
-            for (seq, event) in &events {
-                items.extend(projector.project(chat_id, *seq, event, now));
+        for chunk in events.chunks(256) {
+            {
+                let mut projector = lock(&self.projector);
+                for (seq, event) in chunk {
+                    items.extend(projector.project(chat_id, *seq, event, now));
+                }
             }
         }
         // Enqueue everything; on the first failure stop — the remaining tail
@@ -526,10 +571,15 @@ impl MemoryIndexer {
 
     // ── queries / settings passthroughs ──────────────────────────────────
 
-    /// Handoff briefing for a run about to start in `cwd`, or `None`.
-    pub fn briefing(&self, cwd: &str) -> Result<Option<String>, komet_memory::MemoryError> {
+    /// Handoff briefing for a run about to start in `cwd`, excluding the
+    /// receiving chat's own activity, or `None`.
+    pub fn briefing(
+        &self,
+        cwd: &str,
+        exclude_chat_id: Option<&str>,
+    ) -> Result<Option<String>, komet_memory::MemoryError> {
         let project_id = lock(&self.projector).project_id(cwd);
-        self.svc.briefing(&project_id)
+        self.svc.briefing(&project_id, exclude_chat_id)
     }
 
     pub fn set_enabled(
@@ -561,7 +611,22 @@ impl MemoryIndexer {
         self.svc.search(project_id, query, limit)
     }
 
+    /// "Who touched this path?" — recorded ops under a project-relative
+    /// path prefix, newest first.
+    pub fn touched(
+        &self,
+        project_id: &str,
+        path_prefix: &str,
+        limit: usize,
+    ) -> Result<Vec<komet_memory::MemoryEvent>, komet_memory::MemoryError> {
+        self.svc.touched(project_id, path_prefix, limit)
+    }
+
+    /// Forget one chat's memory rows AND its projector context — chat
+    /// deletion must not leak `ChatMemoryCtx` entries (pending tool pairings,
+    /// per-chat cwd cache) for the engine's lifetime.
     pub fn forget_chat(&self, chat_id: &str) -> Result<usize, komet_memory::MemoryError> {
+        lock(&self.projector).chats.remove(chat_id);
         self.svc.forget_chat(chat_id)
     }
 

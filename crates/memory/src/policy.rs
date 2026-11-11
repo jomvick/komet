@@ -69,67 +69,181 @@ const SECRET_NAME_PATTERNS: &[&str] = &[
     "known_hosts",
 ];
 
-/// Substrings that mark a path (or any stored string) as carrying a
-/// credential-shaped value: well-known token prefixes and PEM armor.
-const SECRET_VALUE_PATTERNS: &[&str] = &[
-    "-----begin",
-    "sk-",
-    "sk_live",
-    "rk_live",
-    "pk_live",
-    "ghp_",
-    "gho_",
-    "ghu_",
-    "ghs_",
-    "ghr_",
-    "github_pat_",
-    "glpat-",
-    "xoxb-",
-    "xoxp-",
-    "xapp-",
-    "xoxa-",
-    "xoxr-",
-    "xoxs-",
-    "akia",
-    "asia",
-    "aiza",
-    "ya29.",
-    "dop_v1_",
-    "shpat_",
-    "npm_",
-    "pypi-",
-    "hf_",
-    "ntn_",
-    "vercel_",
-    "lin_api_",
+/// Credential-shaped content check used on any stored free-form string
+/// (paths today; kept public for the engine's own scrubbing needs).
+///
+/// Prefix patterns are ANCHORED: the prefix must start at a token boundary
+/// (preceded by start/non-token char) and be followed by a realistic secret
+/// tail — otherwise `task-runner.ts`, `disk-usage.rs` or `asian-markets`
+/// would be silently dropped. Name patterns (`.env`, `*.pem`, `secret`, …)
+/// stay liberal: failing safe on a path name costs one row, missing a real
+/// secret costs a leak.
+pub fn contains_secret_value(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("-----begin") {
+        return true;
+    }
+    SECRET_VALUE_PREFIXES.iter().any(|(prefix, min_tail)| {
+        let mut search_from = 0usize;
+        while let Some(pos) = lower[search_from..].find(prefix) {
+            let start = search_from + pos;
+            let preceded_ok = start == 0 || !is_token_char(lower.as_bytes()[start - 1]);
+            if preceded_ok {
+                let tail: usize = lower.as_bytes()[start + prefix.len()..]
+                    .iter()
+                    .take_while(|b| is_token_char(**b))
+                    .count();
+                if tail >= *min_tail {
+                    return true;
+                }
+            }
+            search_from = start + prefix.len();
+        }
+        false
+    })
+}
+
+/// `[a-z0-9_-]` — the charset real tokens are drawn from (and what must
+/// NOT precede a prefix for the boundary check to hold).
+fn is_token_char(b: u8) -> bool {
+    b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-'
+}
+
+/// (prefix, minimum trailing token chars) for well-known credential shapes.
+/// The tail minimums are deliberately conservative: a false negative on an
+/// exotic format is covered by the name patterns, a false positive silently
+/// deletes legitimate paths from memory.
+const SECRET_VALUE_PREFIXES: &[(&str, usize)] = &[
+    ("sk-", 20),         // OpenAI-style keys
+    ("sk_live_", 10),    // Stripe live secret
+    ("rk_live_", 10),    // Stripe restricted live
+    ("pk_live_", 10),    // Stripe publishable (still credential-shaped)
+    ("ghp_", 20),        // GitHub PAT (classic)
+    ("gho_", 20),        // GitHub OAuth
+    ("ghu_", 20),        // GitHub user-to-server
+    ("ghs_", 20),        // GitHub server-to-server
+    ("ghr_", 20),        // GitHub refresh
+    ("github_pat_", 20), // GitHub fine-grained PAT
+    ("glpat-", 15),      // GitLab PAT
+    ("xoxb-", 10),       // Slack bot
+    ("xoxp-", 10),       // Slack user
+    ("xapp-", 10),       // Slack app-level
+    ("xoxa-", 10),       // Slack app config
+    ("xoxr-", 10),       // Slack refresh
+    ("xoxs-", 10),       // Slack signing secret? (config token)
+    ("akia", 16),        // AWS access key id
+    ("asia", 16),        // AWS temporary key id
+    ("aiza", 20),        // Google API key
+    ("ya29.", 10),       // Google OAuth access token
+    ("dop_v1_", 10),     // DigitalOcean PAT
+    ("shpat_", 10),      // Shopify access token
+    ("npm_", 20),        // npm access token
+    ("pypi-", 10),       // PyPI token
+    ("hf_", 20),         // Hugging Face token
+    ("ntn_", 20),        // Notion token
+    ("vercel_", 10),     // Vercel token
+    ("lin_api_", 10),    // Linear API key
 ];
 
-/// Stable project id for a run cwd: `p_` + sha256(canonical cwd)[..16].
+/// Stable project id: `p_` + sha256(identity)[..16], where identity is the
+/// repository's COMMON git dir when `cwd` sits inside a git worktree, else
+/// the canonical cwd.
+///
+/// All worktrees of one repository (main checkout, `git worktree` links,
+/// submodules resolved through their `.git` file) share a memory: the id is
+/// derived from `<repo>/.git` (or the resolved `commondir`), never from the
+/// worktree root or a subdirectory. Chats launched in `/repo` and
+/// `/repo/crates/x` likewise land on the same project.
 ///
 /// Canonicalization resolves symlinks so two spellings of the same folder
-/// share one memory; when the path does not exist (deleted workspace, test
-/// fixtures) we hash the absolute lexical form instead — still stable.
+/// share one memory; when nothing exists on disk (deleted workspace, test
+/// fixtures) we hash the absolute lexical form — still stable.
 pub fn project_id_for(cwd: &str) -> String {
     let trimmed = cwd.trim();
-    let canonical = std::fs::canonicalize(trimmed)
-        .ok()
+    let identity = git_common_dir(trimmed)
+        .and_then(|p| p.canonicalize().ok().or(Some(p)))
         .and_then(|p| p.to_str().map(str::to_string))
+        .or_else(|| {
+            std::fs::canonicalize(trimmed)
+                .ok()
+                .and_then(|p| p.to_str().map(str::to_string))
+        })
         .unwrap_or_else(|| absolute_lexical(trimmed));
-    let digest = Sha256::digest(canonical.as_bytes());
+    let digest = Sha256::digest(identity.as_bytes());
     let hex = crate::hex(&digest[..8]);
     format!("p_{hex}")
+}
+
+/// The shared `.git` directory for the repository containing `cwd`, found
+/// by walking ancestors for a `.git` entry. A `.git` *file* is a worktree /
+/// submodule pointer (`gitdir: …`); its `commondir` file resolves to the
+/// repository's real git dir so linked worktrees share one identity.
+/// `None` outside any git repository.
+fn git_common_dir(cwd: &str) -> Option<PathBuf> {
+    let base = std::fs::canonicalize(cwd).unwrap_or_else(|_| PathBuf::from(absolute_lexical(cwd)));
+    for dir in base.ancestors() {
+        let dotgit = dir.join(".git");
+        if dotgit.is_dir() {
+            return Some(dotgit);
+        }
+        if !dotgit.is_file() {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&dotgit) else {
+            continue;
+        };
+        let Some(target) = text.trim().strip_prefix("gitdir:") else {
+            continue;
+        };
+        let target = target.trim();
+        let gitdir = if Path::new(target).is_absolute() {
+            PathBuf::from(target)
+        } else {
+            dir.join(target)
+        };
+        // Linked worktrees carry `commondir` (usually "../..") pointing at
+        // the main checkout's .git. Submodules may lack it — the gitdir
+        // itself is still a stable per-repo identity.
+        if let Ok(common) = std::fs::read_to_string(gitdir.join("commondir")) {
+            let common = common.trim();
+            let common = if Path::new(common).is_absolute() {
+                PathBuf::from(common)
+            } else {
+                gitdir.join(common)
+            };
+            return Some(normalize_abs(&common));
+        }
+        return Some(gitdir);
+    }
+    None
+}
+
+/// Lexically resolve `.`/`..` in an absolute path (no symlink resolution —
+/// `canonicalize` is attempted by the caller afterwards).
+fn normalize_abs(path: &Path) -> PathBuf {
+    let mut parts: Vec<std::ffi::OsString> = Vec::new();
+    for comp in path.components() {
+        match comp {
+            Component::RootDir | Component::Prefix(_) => {
+                parts.push(comp.as_os_str().to_os_string())
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                // `..` at the root stays at the root.
+                if parts.len() > 1 {
+                    parts.pop();
+                }
+            }
+            Component::Normal(s) => parts.push(s.to_os_string()),
+        }
+    }
+    parts.into_iter().collect()
 }
 
 /// Best-effort absolute path without touching the filesystem: expand a
 /// leading `~`, keep the input otherwise. Used only when canonicalize fails.
 fn absolute_lexical(path: &str) -> String {
-    let expanded = if let Some(rest) = path.strip_prefix("~/") {
-        dirs_home()
-            .map(|h| format!("{h}/{rest}"))
-            .unwrap_or_else(|| path.to_string())
-    } else {
-        path.to_string()
-    };
+    let expanded = expand_tilde(path);
     if Path::new(&expanded).is_absolute() {
         expanded
     } else {
@@ -149,19 +263,43 @@ fn dirs_home() -> Option<String> {
 /// not be stored: outside the project, escaping via `..`, empty, or matching
 /// the built-in secret/exclusion policy.
 ///
-/// `cwd` is the chat's run directory; `raw` is the path as the harness
-/// reported it (absolute or already relative). The result uses `/`
-/// separators and never contains a leading `/`.
-pub fn project_relative(cwd: &str, raw: &str) -> Option<String> {
+/// `cwd` is the chat's run directory; `canon_cwd` its canonical form,
+/// computed once per chat by the caller (canonicalize is a syscall and must
+/// not run per tool call); `raw` is the path as the harness reported it
+/// (absolute or already relative). The result uses `/` separators and never
+/// contains a leading `/`.
+pub fn project_relative(cwd: &str, canon_cwd: &Path, raw: &str) -> Option<String> {
     let raw = raw.trim();
     if raw.is_empty() || raw.len() > 4096 {
         return None;
     }
-    let rel = relativize(cwd, raw)?;
+    let rel = relativize(cwd, canon_cwd, raw)?;
     if is_default_excluded(&rel) || contains_secret_value(&rel) {
         return None;
     }
     Some(rel)
+}
+
+/// Canonical form of `cwd` for [`project_relative`]: resolved symlinks when
+/// the path exists, the absolute lexical form otherwise. Callers cache the
+/// result per chat.
+pub fn canonical_cwd(cwd: &str) -> PathBuf {
+    let expanded = if cwd.trim().is_empty() {
+        cwd.trim().to_string()
+    } else {
+        expand_tilde(cwd.trim())
+    };
+    std::fs::canonicalize(&expanded).unwrap_or_else(|_| PathBuf::from(absolute_lexical(&expanded)))
+}
+
+fn expand_tilde(path: &str) -> String {
+    if let Some(rest) = path.strip_prefix("~/") {
+        dirs_home()
+            .map(|h| format!("{h}/{rest}"))
+            .unwrap_or_else(|| path.to_string())
+    } else {
+        path.to_string()
+    }
 }
 
 /// Whether a project-relative path hits the built-in denylist (VCS dirs,
@@ -211,13 +349,6 @@ pub fn user_excluded(rel: &str, patterns: &[String]) -> bool {
     })
 }
 
-/// Credential-shaped content check used on any stored free-form string
-/// (paths today; kept public for the engine's own scrubbing needs).
-pub fn contains_secret_value(text: &str) -> bool {
-    let lower = text.to_ascii_lowercase();
-    SECRET_VALUE_PATTERNS.iter().any(|pat| lower.contains(pat))
-}
-
 /// Small glob: `*` → any sequence, `?` → one char, everything else literal.
 /// Case-sensitive; patterns are user-provided so we keep semantics obvious.
 fn glob_match(pattern: &str, text: &str) -> bool {
@@ -247,32 +378,27 @@ fn glob_match(pattern: &str, text: &str) -> bool {
     pi == p.len()
 }
 
-/// Strip `cwd` from an absolute `raw` path, or normalize an already-relative
-/// one. Returns `/`-joined relative path or `None` when the path escapes the
-/// project or cannot be normalized.
-fn relativize(cwd: &str, raw: &str) -> Option<String> {
+/// Strip `cwd` (or its canonical form) from an absolute `raw` path, or
+/// normalize an already-relative one. Returns `/`-joined relative path or
+/// `None` when the path escapes the project or cannot be normalized.
+fn relativize(cwd: &str, canon_cwd: &Path, raw: &str) -> Option<String> {
     let raw_path = Path::new(raw);
     if raw_path.is_absolute() {
-        // Try the reported cwd, then its canonical form (symlinked workspaces),
-        // then the canonicalized raw path against the canonical cwd.
-        for base in [PathBuf::from(cwd), canonical(cwd)] {
+        // Try the reported cwd, then its canonical form (symlinked
+        // workspaces), then the canonicalized raw path against canon_cwd.
+        for base in [PathBuf::from(cwd), canon_cwd.to_path_buf()] {
             if let Ok(rel) = raw_path.strip_prefix(&base) {
                 return normalize_rel(rel);
             }
         }
-        if let Ok(canon_raw) = std::fs::canonicalize(raw_path) {
-            let canon_cwd = canonical(cwd);
-            if let Ok(rel) = canon_raw.strip_prefix(&canon_cwd) {
-                return normalize_rel(rel);
-            }
+        if let Ok(canon_raw) = std::fs::canonicalize(raw_path)
+            && let Ok(rel) = canon_raw.strip_prefix(canon_cwd)
+        {
+            return normalize_rel(rel);
         }
         return None;
     }
     normalize_rel(raw_path)
-}
-
-fn canonical(path: &str) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path))
 }
 
 /// Lexical normalization of a relative path: resolve `.`/`..` where possible,
@@ -313,48 +439,53 @@ mod tests {
     #[test]
     fn relative_paths_stay_inside_project() {
         let cwd = "/repo";
+        let canon = canonical_cwd(cwd);
         assert_eq!(
-            project_relative(cwd, "/repo/src/main.rs").as_deref(),
+            project_relative(cwd, &canon, "/repo/src/main.rs").as_deref(),
             Some("src/main.rs")
         );
         assert_eq!(
-            project_relative(cwd, "src/./main.rs").as_deref(),
+            project_relative(cwd, &canon, "src/./main.rs").as_deref(),
             Some("src/main.rs")
         );
         assert_eq!(
-            project_relative(cwd, "src/../lib/x.rs").as_deref(),
+            project_relative(cwd, &canon, "src/../lib/x.rs").as_deref(),
             Some("lib/x.rs")
         );
         // Outside the project → not stored.
-        assert_eq!(project_relative(cwd, "/etc/passwd"), None);
-        assert_eq!(project_relative(cwd, "../outside.rs"), None);
-        assert_eq!(project_relative(cwd, ""), None);
+        assert_eq!(project_relative(cwd, &canon, "/etc/passwd"), None);
+        assert_eq!(project_relative(cwd, &canon, "../outside.rs"), None);
+        assert_eq!(project_relative(cwd, &canon, ""), None);
     }
 
     #[test]
     fn secret_and_excluded_paths_are_dropped() {
-        assert_eq!(project_relative("/repo", "/repo/.env"), None);
-        assert_eq!(project_relative("/repo", "/repo/.env.local"), None);
-        assert_eq!(project_relative("/repo", "/repo/id_rsa"), None);
-        assert_eq!(project_relative("/repo", "/repo/certs/server.pem"), None);
-        assert_eq!(project_relative("/repo", "/repo/.ssh/config"), None);
-        assert_eq!(project_relative("/repo", "/repo/.git/config"), None);
+        let canon = canonical_cwd("/repo");
+        assert_eq!(project_relative("/repo", &canon, "/repo/.env"), None);
+        assert_eq!(project_relative("/repo", &canon, "/repo/.env.local"), None);
+        assert_eq!(project_relative("/repo", &canon, "/repo/id_rsa"), None);
         assert_eq!(
-            project_relative("/repo", "/repo/node_modules/pkg/index.js"),
+            project_relative("/repo", &canon, "/repo/certs/server.pem"),
+            None
+        );
+        assert_eq!(project_relative("/repo", &canon, "/repo/.ssh/config"), None);
+        assert_eq!(project_relative("/repo", &canon, "/repo/.git/config"), None);
+        assert_eq!(
+            project_relative("/repo", &canon, "/repo/node_modules/pkg/index.js"),
             None
         );
         // A token-shaped path segment is dropped too.
         assert_eq!(
-            project_relative("/repo", "/repo/sk-abcdefghijklmnopqrstuvwxyz"),
+            project_relative("/repo", &canon, "/repo/sk-abcdefghijklmnopqrstuvwxyz"),
             None
         );
         // Ordinary code paths survive.
         assert_eq!(
-            project_relative("/repo", "/repo/src/env.rs").as_deref(),
+            project_relative("/repo", &canon, "/repo/src/env.rs").as_deref(),
             Some("src/env.rs")
         );
         assert_eq!(
-            project_relative("/repo", "/repo/docs/environment.md").as_deref(),
+            project_relative("/repo", &canon, "/repo/docs/environment.md").as_deref(),
             Some("docs/environment.md")
         );
     }
@@ -367,6 +498,51 @@ mod tests {
         assert!(user_excluded("src/foo.generated.ts", &pats));
         assert!(!user_excluded("src/foo.ts", &pats));
         assert!(!user_excluded("secretary/notes.md", &pats));
+    }
+
+    #[test]
+    fn token_prefixes_require_boundary_and_tail() {
+        // Real-shaped secrets are caught.
+        assert!(contains_secret_value("key=sk-abcdefghijklmnopqrstuvwxyz"));
+        assert!(contains_secret_value(
+            "ghp_abcdefghijklmnopqrstuvwxyz0123456789"
+        ));
+        assert!(contains_secret_value("AKIAIOSFODNN7EXAMPLE"));
+        assert!(contains_secret_value("-----BEGIN RSA PRIVATE KEY-----"));
+        // Lookalikes survive: prefix mid-word or without a realistic tail.
+        assert!(!contains_secret_value("task-runner.ts"));
+        assert!(!contains_secret_value("disk-usage.rs"));
+        assert!(!contains_secret_value("risk-model.rs"));
+        assert!(!contains_secret_value("asian-markets.md"));
+        assert!(!contains_secret_value("sk-short"));
+    }
+
+    #[test]
+    fn git_worktrees_share_one_project_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // Main checkout: <root>/repo/.git is a real directory.
+        let repo = root.join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(repo.join("crates/engine")).unwrap();
+        // Linked worktree: <root>/wt/.git is a FILE pointing at the repo's
+        // gitdir, whose `commondir` resolves back to <repo>/.git.
+        let wt = root.join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        let gitdir = repo.join(".git/worktrees/wt");
+        std::fs::create_dir_all(&gitdir).unwrap();
+        std::fs::write(wt.join(".git"), format!("gitdir: {}\n", gitdir.display())).unwrap();
+        std::fs::write(gitdir.join("commondir"), "../..\n").unwrap();
+
+        let main_id = project_id_for(repo.to_str().unwrap());
+        let subdir_id = project_id_for(repo.join("crates/engine").to_str().unwrap());
+        let wt_id = project_id_for(wt.to_str().unwrap());
+        assert_eq!(main_id, subdir_id, "subdir shares the repo memory");
+        assert_eq!(main_id, wt_id, "linked worktree shares the repo memory");
+        // A non-git directory keeps its own cwd-derived id.
+        let plain = root.join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        assert_ne!(project_id_for(plain.to_str().unwrap()), main_id);
     }
 
     #[test]

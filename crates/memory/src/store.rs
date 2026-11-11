@@ -17,7 +17,10 @@ use std::time::{Duration, Instant};
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 
 use crate::policy;
-use crate::record::{ChatCursor, MemoryEvent, MemoryItem, MemoryRecord};
+use crate::record::{
+    AgentDigest, BriefingDigest, ChatCursor, FailureDigest, FileTouch, MemoryEvent, MemoryItem,
+    MemoryRecord,
+};
 
 const DB_FILE: &str = "memory.sqlite";
 /// Bounded queue between the engine's publish path and the writer thread.
@@ -29,8 +32,6 @@ const WRITE_BATCH: usize = 100;
 const WRITE_FLUSH: Duration = Duration::from_millis(100);
 /// Recency window for the handoff briefing.
 pub const BRIEFING_WINDOW_MS: i64 = 30 * 24 * 60 * 60 * 1000;
-/// Row cap feeding the briefing builder.
-const BRIEFING_ROW_CAP: i64 = 400;
 
 #[derive(Debug, thiserror::Error)]
 pub enum MemoryError {
@@ -47,7 +48,12 @@ pub enum MemoryError {
 /// The assembled memory service. Cheap to share (`Arc`): every method takes
 /// `&self` and the heavy work lives on the writer thread.
 pub struct MemoryService {
+    /// Read connection (search, recent, stats, cursors, settings reads).
     conn: Mutex<Connection>,
+    /// Dedicated write connection for admin mutations (`forget_*`,
+    /// `set_*`, gap markers) so they never queue behind — or block — the
+    /// read path. WAL admits one writer at a time; these are rare ops.
+    write: Mutex<Connection>,
     tx: SyncSender<MemoryItem>,
     /// Kept so the writer's lifetime is observable in tests; dropping the
     /// service does not join it (engine lifetime ≈ process lifetime).
@@ -69,24 +75,34 @@ impl MemoryService {
         let dir = dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&dir)?;
         let path = dir.join(DB_FILE);
-        let mut conn = Connection::open(&path)?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.pragma_update(None, "synchronous", "NORMAL")?;
-        conn.pragma_update(None, "foreign_keys", "ON")?;
-        conn.busy_timeout(Duration::from_secs(5))?;
+        let open_conn = |path: &Path| -> Result<Connection, MemoryError> {
+            let conn = Connection::open(path)?;
+            conn.pragma_update(None, "journal_mode", "WAL")?;
+            conn.pragma_update(None, "synchronous", "NORMAL")?;
+            conn.pragma_update(None, "foreign_keys", "ON")?;
+            conn.pragma_update(None, "cache_size", -2000)?; // ~2 MB
+            conn.pragma_update(None, "journal_size_limit", 64 * 1024 * 1024)?;
+            conn.busy_timeout(Duration::from_secs(5))?;
+            Ok(conn)
+        };
+        let mut conn = open_conn(&path)?;
+        // Must precede table creation to take effect; a no-op on databases
+        // created before this pragma existed (they'd need a VACUUM).
+        conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
         migrate(&mut conn)?;
+        // One-shot planner stats after migrations (cheap on a fresh/small db).
+        conn.execute_batch("PRAGMA optimize;")?;
         let fts = ensure_fts(&conn)?;
         let (tx, rx) = sync_channel::<MemoryItem>(QUEUE_CAPACITY);
-        let writer_conn = Connection::open(&path)?;
-        writer_conn.pragma_update(None, "journal_mode", "WAL")?;
-        writer_conn.pragma_update(None, "synchronous", "NORMAL")?;
-        writer_conn.busy_timeout(Duration::from_secs(5))?;
+        let writer_conn = open_conn(&path)?;
+        let write_conn = open_conn(&path)?;
         let writer = std::thread::Builder::new()
             .name("komet-memory-writer".into())
             .spawn(move || writer_loop(writer_conn, rx))
             .map_err(|e| MemoryError::Other(format!("spawn writer: {e}")))?;
         Ok(Self {
             conn: Mutex::new(conn),
+            write: Mutex::new(write_conn),
             tx,
             writer,
             dir,
@@ -119,8 +135,9 @@ impl MemoryService {
 
     /// Synchronously record an enqueue gap (called ONLY on queue overflow —
     /// rare, and a tiny single-row write; the hot path never reaches this).
+    /// Goes through the dedicated write connection so it can't stall reads.
     pub fn note_gap(&self, chat_id: &str, seq: u64) -> Result<(), MemoryError> {
-        let conn = lock(&self.conn);
+        let conn = lock(&self.write);
         conn.execute(
             "INSERT INTO memory_chat_state(chat_id, gap_seq) VALUES(?1, ?2)
              ON CONFLICT(chat_id) DO UPDATE SET
@@ -182,7 +199,7 @@ impl MemoryService {
 
     pub fn set_enabled(&self, project_id: &str, enabled: bool) -> Result<(), MemoryError> {
         let now = now_ms();
-        let conn = lock(&self.conn);
+        let conn = lock(&self.write);
         conn.execute(
             "INSERT INTO memory_projects(project_id, enabled, created_at_ms, updated_at_ms)
              VALUES(?1, ?2, ?3, ?3)
@@ -213,7 +230,7 @@ impl MemoryService {
         exclusions: &[String],
     ) -> Result<(), MemoryError> {
         let now = now_ms();
-        let conn = lock(&self.conn);
+        let conn = lock(&self.write);
         conn.execute(
             "INSERT INTO memory_projects(project_id, enabled, exclusions, created_at_ms, updated_at_ms)
              VALUES(?1, 1, ?2, ?3, ?3)
@@ -277,7 +294,7 @@ impl MemoryService {
                  WHERE project_id = ?1",
             );
             for i in 0..terms.len() {
-                sql.push_str(&format!(" AND search_text LIKE ?{}", i + 2));
+                sql.push_str(&format!(" AND search_text LIKE ?{} ESCAPE '\\'", i + 2));
             }
             sql.push_str(" ORDER BY occurred_at_ms DESC LIMIT ?");
             let mut stmt = conn.prepare(&sql)?;
@@ -285,7 +302,7 @@ impl MemoryService {
             let mut values: Vec<rusqlite::types::Value> = Vec::with_capacity(terms.len() + 2);
             values.push(project_id.to_string().into());
             for t in &terms {
-                values.push(format!("%{t}%").into());
+                values.push(format!("%{}%", escape_like(t)).into());
             }
             values.push(limit.into());
             let rows = stmt.query_map(params_from_iter(values.iter()), row_to_event)?;
@@ -319,20 +336,234 @@ impl MemoryService {
 
     /// Deterministic 300–500-token handoff briefing, or `None` when the
     /// project has no useful memory (disabled, empty, or all stale).
-    pub fn briefing(&self, project_id: &str) -> Result<Option<String>, MemoryError> {
+    /// `exclude_chat_id` drops the receiving chat's own activity — the agent
+    /// already knows its own work.
+    pub fn briefing(
+        &self,
+        project_id: &str,
+        exclude_chat_id: Option<&str>,
+    ) -> Result<Option<String>, MemoryError> {
         if !self.is_enabled(project_id)? {
             return Ok(None);
         }
         let since = now_ms().saturating_sub(BRIEFING_WINDOW_MS);
-        let events = self.recent(project_id, BRIEFING_ROW_CAP as usize, Some(since))?;
-        Ok(crate::briefing::build(&events))
+        let digest = self.briefing_digest(project_id, exclude_chat_id, since)?;
+        Ok(crate::briefing::build(&digest, now_ms()))
+    }
+
+    /// SQL-aggregated briefing input: per-agent rollups, top modified paths
+    /// and recent failures. Grouped queries mean one high-volume agent
+    /// cannot consume the whole row budget.
+    pub fn briefing_digest(
+        &self,
+        project_id: &str,
+        exclude_chat_id: Option<&str>,
+        since_ms: i64,
+    ) -> Result<BriefingDigest, MemoryError> {
+        let conn = lock(&self.conn);
+        let chats: i64 = conn.query_row(
+            "SELECT COUNT(DISTINCT chat_id) FROM memory_events
+             WHERE project_id = ?1 AND (?2 IS NULL OR chat_id != ?2)
+               AND occurred_at_ms >= ?3",
+            params![project_id, exclude_chat_id, since_ms],
+            |r| r.get(0),
+        )?;
+
+        // Per-agent volume + recency.
+        let mut stmt = conn.prepare(
+            "SELECT agent,
+                    SUM(kind = 'session_start') AS sessions,
+                    SUM(kind = 'tool_call') AS tool_calls,
+                    SUM(kind = 'tool_call' AND tool_name = 'read_file') AS file_reads,
+                    MAX(occurred_at_ms) AS last_ms
+             FROM memory_events
+             WHERE project_id = ?1 AND (?2 IS NULL OR chat_id != ?2)
+               AND occurred_at_ms >= ?3
+             GROUP BY agent",
+        )?;
+        let mut agents: Vec<AgentDigest> = stmt
+            .query_map(params![project_id, exclude_chat_id, since_ms], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)? as u32,
+                    r.get::<_, i64>(2)? as u32,
+                    r.get::<_, i64>(3)? as u32,
+                    r.get::<_, i64>(4)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(
+                |(agent, sessions, tool_calls, file_reads, last_ms)| AgentDigest {
+                    agent,
+                    sessions,
+                    tool_calls,
+                    file_reads,
+                    last_status: None,
+                    last_activity_ms: last_ms,
+                    modified_paths: Vec::new(),
+                    failures: Vec::new(),
+                },
+            )
+            .collect();
+        drop(stmt);
+
+        // Latest session_end outcome per agent.
+        let mut stmt = conn.prepare(
+            "SELECT agent, outcome FROM memory_events e
+             WHERE project_id = ?1 AND kind = 'session_end'
+               AND (?2 IS NULL OR chat_id != ?2) AND occurred_at_ms >= ?3
+               AND occurred_at_ms = (
+                 SELECT MAX(occurred_at_ms) FROM memory_events
+                 WHERE project_id = ?1 AND agent = e.agent AND kind = 'session_end'
+                   AND (?2 IS NULL OR chat_id != ?2)
+               )",
+        )?;
+        let statuses: Vec<(String, Option<String>)> = stmt
+            .query_map(params![project_id, exclude_chat_id, since_ms], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(stmt);
+        for (agent, status) in statuses {
+            if let Some(d) = agents.iter_mut().find(|a| a.agent == agent) {
+                d.last_status = status;
+            }
+        }
+
+        // Top modified paths per agent (write-ish file ops only — reads are
+        // counted, not listed; `tool_result` rows never carry paths here).
+        let mut stmt = conn.prepare(
+            "SELECT agent, relative_path, MAX(occurred_at_ms) AS last_ms
+             FROM memory_events
+             WHERE project_id = ?1 AND kind = 'tool_call'
+               AND relative_path IS NOT NULL
+               AND tool_name IN ('write_file', 'edit_file', 'apply_patch')
+               AND (?2 IS NULL OR chat_id != ?2) AND occurred_at_ms >= ?3
+             GROUP BY agent, relative_path
+             ORDER BY last_ms DESC
+             LIMIT 200",
+        )?;
+        let touches: Vec<(String, String, i64)> = stmt
+            .query_map(params![project_id, exclude_chat_id, since_ms], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(stmt);
+        for (agent, path, last_ms) in touches {
+            if let Some(d) = agents.iter_mut().find(|a| a.agent == agent)
+                && d.modified_paths.len() < 8
+            {
+                d.modified_paths.push(FileTouch { path, last_ms });
+            }
+        }
+        // Keep each agent's paths newest-first.
+        for d in &mut agents {
+            d.modified_paths
+                .sort_by_key(|t| std::cmp::Reverse(t.last_ms));
+        }
+
+        // Recent failures, attributed per agent.
+        let mut stmt = conn.prepare(
+            "SELECT agent, kind, tool_name, relative_path, outcome, occurred_at_ms
+             FROM memory_events
+             WHERE project_id = ?1
+               AND ((kind = 'tool_result' AND outcome = 'error')
+                 OR (kind = 'session_end' AND outcome IN ('errored', 'interrupted')))
+               AND (?2 IS NULL OR chat_id != ?2) AND occurred_at_ms >= ?3
+             ORDER BY occurred_at_ms DESC
+             LIMIT 30",
+        )?;
+        type FailureRow = (
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            i64,
+        );
+        let failures: Vec<FailureRow> = stmt
+            .query_map(params![project_id, exclude_chat_id, since_ms], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(stmt);
+        for (agent, kind, tool_name, rel_path, outcome, ms) in failures {
+            let label = if kind == "tool_result" {
+                format!(
+                    "{} on {}",
+                    tool_name.as_deref().unwrap_or("tool"),
+                    rel_path.as_deref().unwrap_or("?")
+                )
+            } else {
+                format!("run {}", outcome.as_deref().unwrap_or("failed"))
+            };
+            if let Some(d) = agents.iter_mut().find(|a| a.agent == agent)
+                && d.failures.len() < 5
+            {
+                d.failures.push(FailureDigest { label, last_ms: ms });
+            }
+        }
+
+        Ok(BriefingDigest {
+            chats: chats.max(0) as u64,
+            agents,
+        })
+    }
+
+    /// "Who touched this path?" — the highest-value query for agent
+    /// handoff: every recorded op under `path_prefix` (project-relative),
+    /// newest first.
+    pub fn touched(
+        &self,
+        project_id: &str,
+        path_prefix: &str,
+        limit: usize,
+    ) -> Result<Vec<MemoryEvent>, MemoryError> {
+        let conn = lock(&self.conn);
+        let mut stmt = conn.prepare(
+            "SELECT id, project_id, chat_id, source_seq, agent, model, kind,
+                    occurred_at_ms, tool_name, relative_path, outcome,
+                    input_tokens, cached_input_tokens, output_tokens,
+                    reasoning_tokens, duration_ms
+             FROM memory_events
+             WHERE project_id = ?1 AND relative_path IS NOT NULL
+               AND (relative_path = ?2 OR relative_path LIKE ?3 ESCAPE '\\')
+             ORDER BY occurred_at_ms DESC
+             LIMIT ?4",
+        )?;
+        let prefix = format!("{}%", escape_like(path_prefix));
+        let rows = stmt.query_map(
+            params![project_id, path_prefix, prefix, limit.clamp(1, 200) as i64],
+            row_to_event,
+        )?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Chats with a persisted enqueue gap — the periodic catch-up tick only
+    /// runs a journal scan when this is non-empty.
+    pub fn chats_with_gaps(&self) -> Result<Vec<String>, MemoryError> {
+        let conn = lock(&self.conn);
+        let mut stmt =
+            conn.prepare("SELECT chat_id FROM memory_chat_state WHERE gap_seq IS NOT NULL")?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     // ── forget ────────────────────────────────────────────────────────────
 
     /// Delete every retained record for one chat (events + FTS rows + cursor).
     pub fn forget_chat(&self, chat_id: &str) -> Result<usize, MemoryError> {
-        let conn = lock(&self.conn);
+        let conn = lock(&self.write);
         let tx = conn.unchecked_transaction()?;
         let ids: Vec<i64> = {
             let mut stmt = tx.prepare("SELECT id FROM memory_events WHERE chat_id = ?1")?;
@@ -356,7 +587,7 @@ impl MemoryService {
 
     /// Delete every retained record for a whole project (all derived data).
     pub fn forget_project(&self, project_id: &str) -> Result<usize, MemoryError> {
-        let conn = lock(&self.conn);
+        let conn = lock(&self.write);
         let tx = conn.unchecked_transaction()?;
         let ids: Vec<i64> = {
             let mut stmt = tx.prepare("SELECT id FROM memory_events WHERE project_id = ?1")?;
@@ -385,7 +616,7 @@ impl MemoryService {
     /// Delete one retained record by id (per-fact/session forget granularity
     /// grows in later phases; events are the Phase-1 unit).
     pub fn forget_event(&self, id: i64) -> Result<bool, MemoryError> {
-        let conn = lock(&self.conn);
+        let conn = lock(&self.write);
         let tx = conn.unchecked_transaction()?;
         if self.fts {
             delete_fts_rows(&tx, &[id])?;
@@ -424,6 +655,13 @@ pub struct MemoryStats {
     pub events: i64,
     pub chats: i64,
     pub bytes: u64,
+}
+
+/// Escape `LIKE` metacharacters (`%`, `_`, `\`) for `ESCAPE '\'` clauses.
+fn escape_like(text: &str) -> String {
+    text.replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
 }
 
 fn row_to_event(r: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryEvent> {
@@ -526,8 +764,11 @@ fn migrate(conn: &mut Connection) -> Result<(), MemoryError> {
 /// false when the bundled SQLite lacks FTS5 — callers fall back to LIKE.
 fn ensure_fts(conn: &Connection) -> Result<bool, MemoryError> {
     let probe = conn.execute_batch(
+        // prefix='2 3' indexes 2-3 char token prefixes: path-ish queries
+        // ("src/mai") still hit without a trigram tokenizer.
         "CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
-           search_text, content='memory_events', content_rowid='id'
+           search_text, content='memory_events', content_rowid='id',
+           prefix='2 3'
          );",
     );
     match probe {
@@ -845,7 +1086,7 @@ mod tests {
             .unwrap();
         wait_for(|| svc.chat_cursor("chat-1").unwrap().last_seq == 1);
         assert_eq!(svc.stats("p_test").unwrap().events, 0);
-        assert!(svc.briefing("p_test").unwrap().is_none());
+        assert!(svc.briefing("p_test", None).unwrap().is_none());
     }
 
     #[test]
@@ -907,7 +1148,7 @@ mod tests {
     #[test]
     fn briefing_is_none_for_empty_project() {
         let (svc, _dir) = svc();
-        assert!(svc.briefing("p_empty").unwrap().is_none());
+        assert!(svc.briefing("p_empty", None).unwrap().is_none());
     }
 
     #[test]
