@@ -1105,6 +1105,9 @@ fn github_copilot_slot(username: &str, token: &str, user: Option<&serde_json::Va
         credentials: serde_json::json!({
             "githubToken": token,
             "username": username,
+            // In-app logins own the single Copilot slot; `gh`-mirrored
+            // accounts carry "gh" so the sync yields to them.
+            "origin": "login",
         }),
         claude_config: None,
         saved_at: now_ms(),
@@ -1408,6 +1411,16 @@ impl AgentAccounts {
     /// Import every public GitHub account available to `gh`, so accounts
     /// authenticated from a terminal appear beside Komet's in-app logins.
     async fn sync_copilot_gh_accounts(&self) -> Option<String> {
+        // Replace-only provider: an in-app login owns the single Copilot
+        // slot. Mirroring the user's own `gh` config would resurrect the
+        // account the user just replaced — yield to it entirely.
+        if self
+            .read_slots(HarnessId::Copilot)
+            .iter()
+            .any(|slot| slot.credentials.get("origin").and_then(|v| v.as_str()) == Some("login"))
+        {
+            return None;
+        }
         let gh_cli = self.gh_cli_path()?;
         let output = match tokio::time::timeout(
             Duration::from_secs(3),
@@ -1436,7 +1449,14 @@ impl AgentAccounts {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-        let gh_accounts = parse_github_cli_accounts(&status_text);
+        // Replace-only: mirror just gh's active login — secondary gh users
+        // would pile up as rows that can't be switched anyway.
+        let mut gh_accounts = parse_github_cli_accounts(&status_text);
+        let keep = gh_accounts
+            .iter()
+            .position(|(_, active)| *active)
+            .unwrap_or(0);
+        gh_accounts = gh_accounts.into_iter().skip(keep).take(1).collect();
         if gh_accounts.is_empty() {
             return None;
         }
@@ -1537,6 +1557,7 @@ impl AgentAccounts {
                 credentials: serde_json::json!({
                     "githubToken": token,
                     "username": actual_username,
+                    "origin": "gh",
                 }),
                 claude_config: None,
                 saved_at: now_ms(),
@@ -1629,7 +1650,11 @@ impl AgentAccounts {
             HarnessId::Codex => self.activate_codex(&slot)?,
             HarnessId::Antigravity => self.activate_antigravity(&slot).await?,
             HarnessId::Cursor => self.activate_cursor(&slot)?,
-            HarnessId::Copilot => self.activate_copilot(&slot)?,
+            HarnessId::Copilot => {
+                return Err(EngineError::Other(
+                    "Copilot keeps a single account — adding a new one replaces it.".into(),
+                ));
+            }
             HarnessId::Qoder => self.activate_qoder(&slot)?,
             HarnessId::Devin | HarnessId::Grok | HarnessId::Muse | HarnessId::Cline => {
                 self.activate_cli_file(harness, &slot)?
@@ -3766,6 +3791,18 @@ impl AgentAccounts {
             slot.profile = existing.profile;
         }
         self.write_slot(slot)?;
+        // Copilot is replace-only: a completed in-app login IS the account.
+        // Drop every other slot so the new login replaces instead of
+        // accumulating switchable entries (issue #77).
+        if let Ok(dir) = self.slots_dir(HarnessId::Copilot) {
+            for saved in self.read_slots(HarnessId::Copilot) {
+                if saved.id != slot.id
+                    && let Err(err) = std::fs::remove_file(dir.join(format!("{}.json", saved.id)))
+                {
+                    tracing::warn!(error = %err, "agent-accounts: could not remove replaced Copilot slot");
+                }
+            }
+        }
         let active_exists = self.read_copilot_active_id().is_some_and(|active_id| {
             self.read_slots(HarnessId::Copilot)
                 .iter()
@@ -5725,7 +5762,6 @@ fn supports_switching(harness: HarnessId) -> bool {
             | HarnessId::Codex
             | HarnessId::Antigravity
             | HarnessId::Cursor
-            | HarnessId::Copilot
             | HarnessId::Qoder
             | HarnessId::Devin
             | HarnessId::Grok

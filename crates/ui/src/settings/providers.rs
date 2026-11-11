@@ -463,6 +463,9 @@ pub struct ProvidersPage {
     /// failed read must not be painted as "not connected".
     accounts_error: Option<SharedString>,
     copied_login_command: Option<HarnessId>,
+    /// Replace-only providers (Copilot): pending "this overwrites the
+    /// current account" confirmation before the login flow starts.
+    confirm_replace: Option<HarnessId>,
     code_input: Entity<ComposerInput>,
     harnesses_task: Option<Task<()>>,
     accounts_task: Option<Task<()>>,
@@ -524,6 +527,7 @@ impl ProvidersPage {
             error: None,
             accounts_error: None,
             copied_login_command: None,
+            confirm_replace: None,
             code_input,
             harnesses_task: None,
             accounts_task: None,
@@ -1308,7 +1312,7 @@ impl ProvidersPage {
                             .hover(|s| widgets::ghost_hover(theme, s))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 cx.stop_propagation();
-                                this.start_login(harness, cx);
+                                this.request_login(harness, cx);
                             }))
                             .child(
                                 crate::icons::icon(crate::icons::KEY_MINIMALISTIC)
@@ -1426,7 +1430,7 @@ impl ProvidersPage {
                                     .hover(|s| widgets::ghost_hover(theme, s))
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         cx.stop_propagation();
-                                        this.start_login(harness, cx);
+                                        this.request_login(harness, cx);
                                     }))
                                     .child(
                                         crate::icons::icon(crate::icons::ADD_CIRCLE)
@@ -1606,6 +1610,30 @@ impl ProvidersPage {
     }
 
     // ---- add-account flows ----
+
+    /// Entry point for every "add account" affordance: on a replace-only
+    /// provider (accounts exist and none is switchable) a new login
+    /// overwrites the current one, so confirm first (issue #77).
+    fn request_login(&mut self, harness: HarnessId, cx: &mut Context<Self>) {
+        let mut has_account = false;
+        let mut all_replace_only = true;
+        for account in self
+            .accounts
+            .ready()
+            .into_iter()
+            .flat_map(|snapshot| snapshot.accounts.iter())
+            .filter(|account| account.harness == harness)
+        {
+            has_account = true;
+            all_replace_only &= !account.switchable;
+        }
+        if has_account && all_replace_only {
+            self.confirm_replace = Some(harness);
+            cx.notify();
+            return;
+        }
+        self.start_login(harness, cx);
+    }
 
     fn start_login(&mut self, harness: HarnessId, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
@@ -2277,7 +2305,7 @@ impl ProvidersPage {
                 let has_error = error.is_some();
                 let instructions = match harness {
                     HarnessId::Copilot => {
-                        "Authorize GitHub in the browser to add this Copilot account. Komet keeps each connected account separate; your current selection is unchanged until you switch."
+                        "Authorize GitHub in the browser to connect your Copilot account. Copilot keeps a single account — the new login replaces the current one."
                     }
                     HarnessId::Codex => {
                         "Finish signing in to OpenAI in your browser. The new login is captured in an isolated profile — your current session is untouched until you switch."
@@ -2472,6 +2500,56 @@ impl ProvidersPage {
             .into_any_element();
         Some(popover::modal("add-account-dialog", viewport, card))
     }
+
+    /// Replace-only providers (Copilot): confirm that the new login
+    /// overwrites the current account before the flow starts.
+    fn render_replace_dialog(
+        &self,
+        viewport: gpui::Size<gpui::Pixels>,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let harness = self.confirm_replace?;
+        let theme = Theme::of(cx).clone();
+        let name = PROVIDERS
+            .iter()
+            .find(|(id, _, _)| *id == harness)
+            .map(|(_, name, _)| *name)
+            .unwrap_or("this provider");
+        let title = format!("Replace {name} account?");
+        let body = format!(
+            "{name} keeps a single account. Signing in again replaces the \
+             current one — the old login is removed."
+        );
+        let card = popover::dialog_card(&theme)
+            .child(popover::dialog_title(&theme, &title))
+            .child(popover::dialog_body(&theme, body))
+            .child(
+                div()
+                    .mt(px(16.0))
+                    .flex()
+                    .flex_row()
+                    .justify_end()
+                    .gap(px(8.0))
+                    .child(
+                        popover::btn_ghost(&theme, "Cancel", "replace-cancel", cx.entity_id())
+                            .id("replace-cancel")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.confirm_replace = None;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        popover::btn_primary(&theme, "Replace account")
+                            .id("replace-confirm")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.confirm_replace = None;
+                                this.start_login(harness, cx);
+                            })),
+                    ),
+            )
+            .into_any_element();
+        Some(popover::modal("replace-account-dialog", viewport, card))
+    }
 }
 
 impl Render for ProvidersPage {
@@ -2480,6 +2558,7 @@ impl Render for ProvidersPage {
         let theme = Theme::of(cx).clone();
         let dialog = self.render_login_dialog(window.viewport_size(), window, cx);
         let update_dialog = self.render_cli_update_dialog(window.viewport_size(), cx);
+        let replace_dialog = self.render_replace_dialog(window.viewport_size(), cx);
         // Driven by the load flags, not the `Loadable` states: a reload keeps
         // the previous cards on screen, so `Loading` no longer means in flight.
         let refreshing = self.harnesses_loading || self.accounts_loading;
@@ -2621,6 +2700,7 @@ impl Render for ProvidersPage {
             )
             .when_some(dialog, |el, dialog| el.child(dialog))
             .when_some(update_dialog, |el, dialog| el.child(dialog))
+            .when_some(replace_dialog, |el, dialog| el.child(dialog))
     }
 }
 
