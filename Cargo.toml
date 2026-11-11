@@ -12,6 +12,7 @@ members = [
     "crates/ui",
     "crates/syntax",
     "crates/sync-server",
+    "crates/memory",
     "apps/komet",
 ]
 
@@ -32,6 +33,7 @@ komet-update = { path = "crates/update" }
 komet-ui = { path = "crates/ui" }
 komet-syntax = { path = "crates/syntax" }
 komet-sync-server = { path = "crates/sync-server" }
+komet-memory = { path = "crates/memory" }
 # gpui-free terminal emulator core, shared by komet-ui's panel and komet-engine's
 # PTY pump (see crates/term).
 komet-term = { path = "crates/term" }

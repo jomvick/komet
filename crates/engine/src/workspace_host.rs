@@ -173,6 +173,10 @@ struct WorkspaceHostInner {
     /// (and its revival budget) down with the row. `None` for a workspace with
     /// no journal of its own (a remote environment, seen only as a registry).
     journal: Mutex<Option<Arc<crate::run_journal::RunJournal>>>,
+    /// This device's project-memory indexer (issue #78), attached at assembly.
+    /// A chat whose journal dies must also lose its memory rows — the index
+    /// is derived data and follows the transcript's retention.
+    memory: Mutex<Option<Arc<crate::memory::MemoryIndexer>>>,
 }
 
 /// "This peer is alive" callback (device id) — see `WorkspaceHost::set_peer_alive_hook`.
@@ -298,6 +302,7 @@ impl WorkspaceHost {
                 peer_alive: Mutex::new(None),
                 presence_watch: Mutex::new(PresenceWatch::default()),
                 journal: Mutex::new(None),
+                memory: Mutex::new(None),
             }),
         };
         // Persist immediately: after this boot the migration source is never
@@ -458,6 +463,12 @@ impl WorkspaceHost {
     /// journal holds for it. Idempotent; the engine calls it once at assembly.
     pub fn attach_journal(&self, journal: Arc<crate::run_journal::RunJournal>) {
         *lock(&self.inner.journal) = Some(journal);
+    }
+
+    /// Attach the project-memory indexer so chat/space deletes also forget
+    /// the chat's indexed activity. Idempotent; called once at assembly.
+    pub fn attach_memory(&self, indexer: Arc<crate::memory::MemoryIndexer>) {
+        *lock(&self.inner.memory) = Some(indexer);
     }
 
     pub fn device_id(&self) -> &str {
@@ -833,6 +844,9 @@ impl WorkspaceHost {
                 }
             }
         }
+        for chat_id in &deleted.chat_ids {
+            self.inner.forget_memory_chat(chat_id);
+        }
         Ok(deleted)
     }
 
@@ -956,11 +970,13 @@ impl WorkspaceHost {
     /// any journal it does own.
     pub fn delete_chat(&self, chat_id: &str) -> Result<bool, EngineError> {
         let deleted = self.mutate(|doc| doc.delete_chat(chat_id))?;
-        if deleted
-            && let Some(journal) = lock(&self.inner.journal).as_ref()
-            && let Err(err) = journal.discard(chat_id)
-        {
-            tracing::warn!(chat = %chat_id, error = %err, "run journal delete failed");
+        if deleted {
+            if let Some(journal) = lock(&self.inner.journal).as_ref()
+                && let Err(err) = journal.discard(chat_id)
+            {
+                tracing::warn!(chat = %chat_id, error = %err, "run journal delete failed");
+            }
+            self.inner.forget_memory_chat(chat_id);
         }
         Ok(deleted)
     }
@@ -1007,6 +1023,17 @@ impl WorkspaceHost {
 }
 
 impl WorkspaceHostInner {
+    /// Forget one chat's memory rows (best-effort — derived data, never a
+    /// reason to fail a delete). Shared by the host's delete paths and the
+    /// orphan-journal sweep below.
+    fn forget_memory_chat(&self, chat_id: &str) {
+        if let Some(indexer) = lock(&self.memory).as_ref()
+            && let Err(err) = indexer.forget_chat(chat_id)
+        {
+            tracing::warn!(chat = %chat_id, error = %err, "memory forget failed");
+        }
+    }
+
     /// Drop the journal (and its `.resume` budget) of every chat the registry
     /// no longer holds. Remote chat tombstones and space cascades are applied
     /// by the registry client, never through this host's delete methods, so a
@@ -1037,6 +1064,7 @@ impl WorkspaceHostInner {
             if let Err(err) = journal.discard(&chat_id) {
                 tracing::warn!(chat = %chat_id, error = %err, "orphan journal delete failed");
             }
+            self.forget_memory_chat(&chat_id);
         }
     }
 

@@ -26,6 +26,7 @@ pub mod harness_cli;
 pub mod instance_lock;
 pub mod local_import;
 pub mod mcp;
+pub mod memory;
 pub mod profile;
 pub mod registry;
 pub mod repos;
@@ -133,6 +134,9 @@ pub struct EngineCore {
     pub agent_accounts: AgentAccounts,
     /// Local, unsynced usage history behind Settings › Usage.
     pub usage: Arc<UsageStore>,
+    /// Local, unsynced project-memory index (issue #78); `None` when the
+    /// store failed to open.
+    pub memory: Option<Arc<crate::memory::MemoryIndexer>>,
     /// Remote environments: their own docs stores, registry rooms and tokens.
     pub envs: Arc<EnvHosts>,
     pub device_id: String,
@@ -324,6 +328,7 @@ impl EngineCore {
         let mcp_secrets = Arc::new(crate::mcp::McpSecretStore::new(
             data_dir.join("mcp-secrets.json"),
         ));
+        let memory_journal = journal.clone();
         let sessions = SessionsEngine::new(
             device_id.clone(),
             journal,
@@ -397,6 +402,25 @@ impl EngineCore {
         sessions.set_agent_accounts(agent_accounts.clone());
         sessions.set_usage_store(usage.clone());
         agent_accounts.set_usage_store(usage.clone(), device_id.clone());
+        // Project memory (issue #78): a device-local SQLite index under
+        // `<data_dir>/memory/` — deliberately outside the profile store so
+        // it never enters workspace/session sync, whatever the profile
+        // scope. Journal replay on boot catches up anything the bounded
+        // queue dropped while the engine was down.
+        let memory = match memory::MemoryIndexer::open(data_dir, memory_journal) {
+            Ok(indexer) => {
+                sessions.set_memory(indexer.clone());
+                indexer.catch_up();
+                Some(indexer)
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "project memory unavailable, continuing without it");
+                None
+            }
+        };
+        if let Some(indexer) = &memory {
+            workspace.attach_memory(indexer.clone());
+        }
         sessions.set_titles(TitleGenerator::new(
             workspace.clone(),
             registry.clone(),
@@ -434,6 +458,7 @@ impl EngineCore {
             uploads,
             agent_accounts,
             usage,
+            memory,
             envs: Arc::new(EnvHosts::boot(
                 data_dir,
                 &device_id,
