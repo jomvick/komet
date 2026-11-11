@@ -1394,13 +1394,24 @@ impl AgentAccounts {
         Ok(AgentAccountsSnapshot { accounts, warnings })
     }
 
+    /// Resolved `gh` binary: the configured name goes through
+    /// `find_cli_path` so `~/.local/bin` & friends resolve even when the
+    /// engine's own PATH is minimal (desktop launch).
+    fn gh_cli_path(&self) -> Option<PathBuf> {
+        let configured = self.inner.config.gh_cli.as_deref()?;
+        if configured.is_absolute() {
+            return Some(configured.to_path_buf());
+        }
+        komet_harness::find_cli_path(&configured.to_string_lossy())
+    }
+
     /// Import every public GitHub account available to `gh`, so accounts
     /// authenticated from a terminal appear beside Komet's in-app logins.
     async fn sync_copilot_gh_accounts(&self) -> Option<String> {
-        let gh_cli = self.inner.config.gh_cli.as_ref()?;
+        let gh_cli = self.gh_cli_path()?;
         let output = match tokio::time::timeout(
             Duration::from_secs(3),
-            tokio::process::Command::new(gh_cli)
+            tokio::process::Command::new(&gh_cli)
                 .no_console()
                 .args(["auth", "status", "--hostname", "github.com"])
                 .env_remove("GH_TOKEN")
@@ -1435,7 +1446,7 @@ impl AgentAccounts {
         for (username, active) in gh_accounts {
             let token_output = match tokio::time::timeout(
                 Duration::from_secs(3),
-                tokio::process::Command::new(gh_cli)
+                tokio::process::Command::new(&gh_cli)
                     .no_console()
                     .args([
                         "auth",
@@ -2495,7 +2506,12 @@ impl AgentAccounts {
         std::fs::create_dir_all(&config_dir)?;
         set_directory_owner_only(&config_dir)?;
 
-        let mut command = tokio::process::Command::new("gh");
+        let Some(gh) = self.gh_cli_path() else {
+            return Err(EngineError::Other(
+                "GitHub CLI (`gh`) was not found on this device. Install it to connect Copilot accounts.".into(),
+            ));
+        };
+        let mut command = tokio::process::Command::new(gh);
 
         command.no_console();
         command
@@ -3872,17 +3888,22 @@ impl AgentAccounts {
                 ),
             });
         }
-        let token_result = tokio::process::Command::new("gh")
-            .no_console()
-            .args(["auth", "token", "--hostname", "github.com"])
-            .env("GH_CONFIG_DIR", &config_dir)
-            .env_remove("GH_TOKEN")
-            .env_remove("GITHUB_TOKEN")
-            .env_remove("GH_ENTERPRISE_TOKEN")
-            .stdin(std::process::Stdio::null())
-            .output()
-            .await;
-        if let Ok(result) = token_result
+        let token_result = match self.gh_cli_path() {
+            Some(gh) => Some(
+                tokio::process::Command::new(gh)
+                    .no_console()
+                    .args(["auth", "token", "--hostname", "github.com"])
+                    .env("GH_CONFIG_DIR", &config_dir)
+                    .env_remove("GH_TOKEN")
+                    .env_remove("GITHUB_TOKEN")
+                    .env_remove("GH_ENTERPRISE_TOKEN")
+                    .stdin(std::process::Stdio::null())
+                    .output()
+                    .await,
+            ),
+            None => None,
+        };
+        if let Some(Ok(result)) = token_result
             && result.status.success()
         {
             let token = String::from_utf8_lossy(&result.stdout).trim().to_string();
