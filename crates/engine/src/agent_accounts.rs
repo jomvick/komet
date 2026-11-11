@@ -258,6 +258,14 @@ impl AgentAccountsConfig {
     fn qoder_active_file(&self) -> PathBuf {
         self.root_dir().join("qoder-active")
     }
+
+    /// Selected slot for a CLI-file provider (`{slug}-active`), same pattern
+    /// as Qoder: the provider's own store carries the login but not which
+    /// saved slot it belongs to.
+    fn cli_active_file(&self, harness: HarnessId) -> PathBuf {
+        self.root_dir()
+            .join(format!("{}-active", harness_slug(harness)))
+    }
 }
 
 // ── slot storage ────────────────────────────────────────────────────────────
@@ -1232,21 +1240,21 @@ impl AgentAccounts {
             active_keys.insert(HarnessId::Cursor, detected.account_key.clone());
             self.snapshot_detected(HarnessId::Cursor, &detected)?;
         }
+        // Qoder and the other CLI-file providers are multi-account: one slot
+        // per saved login store (see `sync_qoder_accounts` /
+        // `sync_cli_file_accounts`), not one fixed slot.
+        if let Some(key) = self.sync_qoder_accounts()? {
+            active_keys.insert(HarnessId::Qoder, key);
+        }
         for harness in [
             HarnessId::Devin,
             HarnessId::Grok,
             HarnessId::Muse,
             HarnessId::Cline,
         ] {
-            if let Some(detected) = self.detect_cli_provider(harness) {
-                active_keys.insert(harness, detected.account_key.clone());
-                self.snapshot_detected(harness, &detected)?;
+            if let Some(key) = self.sync_cli_file_accounts(harness)? {
+                active_keys.insert(harness, key);
             }
-        }
-        // Qoder is multi-account: one slot per saved login file (see
-        // `sync_qoder_accounts`), not one fixed slot.
-        if let Some(key) = self.sync_qoder_accounts()? {
-            active_keys.insert(HarnessId::Qoder, key);
         }
         // Land any GitHub login whose dialog died mid-flow before anything reads
         // the list — the `gh` import below only knows the user's own config, not
@@ -1604,6 +1612,9 @@ impl AgentAccounts {
             HarnessId::Cursor => self.activate_cursor(&slot)?,
             HarnessId::Copilot => self.activate_copilot(&slot)?,
             HarnessId::Qoder => self.activate_qoder(&slot)?,
+            HarnessId::Devin | HarnessId::Grok | HarnessId::Muse | HarnessId::Cline => {
+                self.activate_cli_file(harness, &slot)?
+            }
             other => {
                 return Err(EngineError::Other(format!(
                     "agent accounts are not supported for {other:?}"
@@ -1790,6 +1801,264 @@ impl AgentAccounts {
             slot.id.as_bytes(),
             true,
         )
+    }
+
+    // ── CLI-file providers (Devin/Grok/Muse/Cline): Qoder's model, generalized ──
+    //
+    // These CLIs keep ONE live login in their own home, exactly like Qoder —
+    // but their stores DO carry a readable identity (email/account id), so a
+    // slot is keyed by that identity instead of a minted id. Each slot holds a
+    // restorable copy of the store slice:
+    //   - Devin/Grok/Muse: the provider's whole auth file, verbatim bytes.
+    //   - Cline: only `providers.<name>.settings.auth` — `providers.json` also
+    //     carries unrelated settings that must survive a switch untouched.
+    // `{slug}-active` tracks the selected slot; every list re-snapshots the
+    // live store so a CLI-side token refresh lands back on its slot.
+
+    fn read_cli_active_id(&self, harness: HarnessId) -> Option<String> {
+        std::fs::read_to_string(self.inner.config.cli_active_file(harness))
+            .ok()
+            .map(|id| id.trim().to_string())
+            .filter(|id| !id.is_empty())
+    }
+
+    /// The live store's restorable slice + parsed profile. `provider` is the
+    /// `providers.json` entry name for Cline (`None` elsewhere).
+    fn cli_live_store(&self, harness: HarnessId) -> Option<(Vec<u8>, Detected, Option<String>)> {
+        let path = self.inner.config.cli_auth_file(harness)?;
+        if harness == HarnessId::Cline {
+            let json = read_json(path)?;
+            let (provider, auth) = cline_auth_entry(&json)?;
+            let detected = parse_cline_auth(&json)?;
+            let bytes = serde_json::to_vec(&auth).ok()?;
+            return Some((bytes, detected, Some(provider)));
+        }
+        let bytes = std::fs::read(path).ok().filter(|b| !b.is_empty())?;
+        let detected = self.detect_cli_provider(harness)?;
+        Some((bytes, detected, None))
+    }
+
+    /// Slot credentials for a CLI-file account: base64 store slice, plus the
+    /// Cline provider entry name needed to write it back.
+    fn cli_slot_credentials(
+        harness: HarnessId,
+        provider: Option<&str>,
+        bytes: &[u8],
+    ) -> serde_json::Value {
+        let mut credentials = serde_json::json!({
+            "managedBy": harness_slug(harness),
+            "auth": BASE64.encode(bytes),
+        });
+        if let (Some(provider), Some(map)) = (provider, credentials.as_object_mut()) {
+            map.insert("provider".into(), provider.into());
+        }
+        credentials
+    }
+
+    fn cli_slot_bytes(credentials: &serde_json::Value) -> Option<Vec<u8>> {
+        credentials
+            .get("auth")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|encoded| BASE64.decode(encoded).ok())
+            .filter(|bytes| !bytes.is_empty())
+    }
+
+    fn cli_slot_provider(credentials: &serde_json::Value) -> Option<String> {
+        credentials
+            .get("provider")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    }
+
+    fn new_cli_file_slot(
+        &self,
+        harness: HarnessId,
+        detected: &Detected,
+        provider: Option<&str>,
+        bytes: &[u8],
+    ) -> Slot {
+        Slot {
+            id: slot_id_for(harness, &detected.account_key),
+            harness,
+            account_key: detected.account_key.clone(),
+            profile: detected.profile.clone(),
+            credentials: Self::cli_slot_credentials(harness, provider, bytes),
+            claude_config: None,
+            saved_at: now_ms(),
+            created_at: None,
+        }
+    }
+
+    /// Re-snapshot the provider's live store into its slot on every list —
+    /// the Qoder contract: a live store byte-identical to a saved slot IS that
+    /// slot; a changed store on the same account updates that slot in place
+    /// (token refresh); a store whose identity matches no slot becomes a NEW
+    /// account (an external login never overwrites another account's slot).
+    /// Returns the live account's `account_key`.
+    fn sync_cli_file_accounts(&self, harness: HarnessId) -> Result<Option<String>, EngineError> {
+        let Some((live, detected, provider)) = self.cli_live_store(harness) else {
+            return Ok(None);
+        };
+        let slots = self.read_slots(harness);
+        let active_file = self.inner.config.cli_active_file(harness);
+        let active_slot = self
+            .read_cli_active_id(harness)
+            .and_then(|id| slots.iter().find(|s| s.id == id).cloned());
+
+        // A live store identical to a saved slot IS that slot.
+        if let Some(matching) = slots
+            .iter()
+            .find(|s| Self::cli_slot_bytes(&s.credentials).is_some_and(|saved| saved == live))
+        {
+            if active_slot.as_ref().map(|s| &s.id) != Some(&matching.id) {
+                write_file_atomic(&active_file, matching.id.as_bytes(), true)?;
+            }
+            return Ok(Some(matching.account_key.clone()));
+        }
+        // A sign-in started from Komet is mid-flight: the new store belongs to
+        // the flow's own adoption, never to the selected slot.
+        let signing_in = lock(&self.inner.flows).values().any(|flow| {
+            matches!(
+                flow,
+                LoginFlow::Cli {
+                    harness: h,
+                    ..
+                } if *h == harness
+            )
+        });
+        if signing_in {
+            return Ok(active_slot.map(|s| s.account_key));
+        }
+        // Same identity, changed bytes (token refresh or a re-login of the
+        // same account — including a legacy `managedBy`-only slot, which
+        // gains its restorable copy here) → update that slot in place.
+        if let Some(existing) = slots.iter().find(|s| s.account_key == detected.account_key) {
+            let slot = Slot {
+                profile: detected.profile.clone(),
+                credentials: Self::cli_slot_credentials(harness, provider.as_deref(), &live),
+                saved_at: now_ms(),
+                ..existing.clone()
+            };
+            self.write_slot(&slot)?;
+            write_file_atomic(&active_file, slot.id.as_bytes(), true)?;
+            return Ok(Some(slot.account_key));
+        }
+        // A different account's store landed outside Komet (or the previous
+        // slot's identity can't be read): capture it as a NEW account rather
+        // than overwriting the selected slot's saved login.
+        let slot = self.new_cli_file_slot(harness, &detected, provider.as_deref(), &live);
+        self.write_slot(&slot)?;
+        write_file_atomic(&active_file, slot.id.as_bytes(), true)?;
+        Ok(Some(slot.account_key))
+    }
+
+    /// A freshly signed-in CLI-file provider login becomes the selected slot:
+    /// the live store updates its same-identity slot, or mints a new one when
+    /// the bytes match nothing saved.
+    fn adopt_cli_file_login(&self, harness: HarnessId) -> Result<(), EngineError> {
+        let Some((live, detected, provider)) = self.cli_live_store(harness) else {
+            return Err(EngineError::Other(format!(
+                "{harness:?} signed in but its credential store is unreadable."
+            )));
+        };
+        let slots = self.read_slots(harness);
+        let existing = slots
+            .iter()
+            .find(|s| Self::cli_slot_bytes(&s.credentials).is_some_and(|saved| saved == live))
+            .or_else(|| slots.iter().find(|s| s.account_key == detected.account_key));
+        let slot = match existing {
+            Some(existing) => Slot {
+                profile: detected.profile.clone(),
+                credentials: Self::cli_slot_credentials(harness, provider.as_deref(), &live),
+                saved_at: now_ms(),
+                ..existing.clone()
+            },
+            None => self.new_cli_file_slot(harness, &detected, provider.as_deref(), &live),
+        };
+        self.write_slot(&slot)?;
+        write_file_atomic(
+            &self.inner.config.cli_active_file(harness),
+            slot.id.as_bytes(),
+            true,
+        )
+    }
+
+    /// Switch a CLI-file provider to a saved login: restore the slot's store
+    /// slice (Cline merges only its `settings.auth`, preserving the rest of
+    /// `providers.json`), then mark the slot active.
+    fn activate_cli_file(&self, harness: HarnessId, slot: &Slot) -> Result<(), EngineError> {
+        let Some(bytes) = Self::cli_slot_bytes(&slot.credentials) else {
+            return Err(EngineError::Other(
+                "This account has no saved login — sign in to it again.".into(),
+            ));
+        };
+        if harness == HarnessId::Cline {
+            let provider = Self::cli_slot_provider(&slot.credentials).ok_or_else(|| {
+                EngineError::Other(
+                    "This Cline account has no saved provider entry — sign in to it again.".into(),
+                )
+            })?;
+            self.restore_cline_auth(&provider, &bytes)?;
+        } else {
+            let file = self
+                .inner
+                .config
+                .cli_auth_file(harness)
+                .ok_or_else(|| {
+                    EngineError::Other("This provider has no in-app sign-in flow.".into())
+                })?
+                .to_path_buf();
+            if let Some(parent) = file.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            write_file_atomic(&file, &bytes, true)?;
+        }
+        write_file_atomic(
+            &self.inner.config.cli_active_file(harness),
+            slot.id.as_bytes(),
+            true,
+        )
+    }
+
+    /// Write a saved Cline `settings.auth` back into `providers.json` at
+    /// `providers.<provider>.settings.auth`, preserving every other key —
+    /// the file also carries model/provider settings that are not credentials.
+    fn restore_cline_auth(&self, provider: &str, auth_bytes: &[u8]) -> Result<(), EngineError> {
+        let auth: serde_json::Value = serde_json::from_slice(auth_bytes)
+            .map_err(|e| EngineError::Other(format!("saved Cline auth is unreadable: {e}")))?;
+        let file = self.inner.config.cli_files.cline_providers.clone();
+        let mut json = read_json(&file).unwrap_or_else(|| serde_json::json!({ "providers": {} }));
+        if !json.get("providers").is_some_and(|p| p.is_object()) {
+            json["providers"] = serde_json::json!({});
+        }
+        let providers = json
+            .get_mut("providers")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("providers normalized to an object above");
+        let entry = providers
+            .entry(provider.to_string())
+            .or_insert_with(|| serde_json::json!({}));
+        if !entry.is_object() {
+            *entry = serde_json::json!({});
+        }
+        let settings = entry
+            .as_object_mut()
+            .expect("entry normalized to an object above")
+            .entry("settings")
+            .or_insert_with(|| serde_json::json!({}));
+        if !settings.is_object() {
+            *settings = serde_json::json!({});
+        }
+        settings
+            .as_object_mut()
+            .expect("settings normalized to an object above")
+            .insert("auth".into(), auth);
+        if let Some(parent) = file.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let encoded = serde_json::to_string_pretty(&json)
+            .map_err(|e| EngineError::Other(format!("could not encode providers.json: {e}")))?;
+        write_file_atomic(&file, encoded.as_bytes(), true)
     }
 
     fn read_copilot_active_id(&self) -> Option<String> {
@@ -2476,9 +2745,16 @@ impl AgentAccounts {
             ));
         };
 
-        // Persist the live Qoder login into its slot BEFORE the CLI can overwrite it.
-        if harness == HarnessId::Qoder {
-            self.sync_qoder_accounts()?;
+        // Persist the live login into its slot BEFORE the CLI can overwrite
+        // the provider's store (multi-account providers only).
+        match harness {
+            HarnessId::Qoder => {
+                self.sync_qoder_accounts()?;
+            }
+            HarnessId::Devin | HarnessId::Grok | HarnessId::Muse | HarnessId::Cline => {
+                self.sync_cli_file_accounts(harness)?;
+            }
+            _ => {}
         }
 
         let login_id = new_id();
@@ -3035,10 +3311,12 @@ impl AgentAccounts {
         harness: HarnessId,
         detected: &Detected,
     ) -> Result<(), EngineError> {
-        if harness == HarnessId::Qoder {
-            self.adopt_qoder_login()?;
-        } else {
-            self.snapshot_detected(harness, detected)?;
+        match harness {
+            HarnessId::Qoder => self.adopt_qoder_login()?,
+            HarnessId::Devin | HarnessId::Grok | HarnessId::Muse | HarnessId::Cline => {
+                self.adopt_cli_file_login(harness)?;
+            }
+            _ => self.snapshot_detected(harness, detected)?,
         }
         self.cancel_login(login_id);
         Ok(())
@@ -5353,6 +5631,10 @@ fn supports_switching(harness: HarnessId) -> bool {
             | HarnessId::Cursor
             | HarnessId::Copilot
             | HarnessId::Qoder
+            | HarnessId::Devin
+            | HarnessId::Grok
+            | HarnessId::Muse
+            | HarnessId::Cline
     )
 }
 
@@ -5780,6 +6062,18 @@ fn parse_muse_auth(auth: &serde_json::Value) -> Option<Detected> {
             credentials: Some(serde_json::json!({ "managedBy": "muse" })),
             claude_config: None,
         });
+    }
+    None
+}
+
+/// The `providers.<name>.settings.auth` entry Cline keeps its login in —
+/// `(provider name, auth value)`. Only this subtree is credential material;
+/// the rest of `providers.json` is provider settings.
+fn cline_auth_entry(auth: &serde_json::Value) -> Option<(String, serde_json::Value)> {
+    for (name, provider) in auth.get("providers")?.as_object()? {
+        if let Some(auth) = provider.pointer("/settings/auth") {
+            return Some((name.clone(), auth.clone()));
+        }
     }
     None
 }
@@ -6603,8 +6897,211 @@ mod tests {
             .collect();
         assert_eq!(rows.len(), 1, "{snapshot:?}");
         assert!(rows[0].active);
-        assert!(!rows[0].switchable);
+        assert!(rows[0].switchable);
         assert_eq!(rows[0].email.as_deref(), Some("g@rok.dev"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Issue #77: CLI-file providers keep restorable slots — add (external
+    /// store appears), switch (slot bytes land back in the live store), and
+    /// forget. A store whose identity matches no slot becomes a NEW account
+    /// instead of overwriting the selected one.
+    #[tokio::test]
+    async fn cli_file_provider_accounts_switch_and_forge() {
+        let root = std::env::temp_dir().join(format!(
+            "komet-cli-accounts-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let config = AgentAccountsConfig {
+            data_dir: root.join("data"),
+            gh_cli: None,
+            claude_config_dir: root.join("claude"),
+            claude_config_file: root.join("claude.json"),
+            codex_home: root.join("codex"),
+            antigravity_home: root.join("antigravity"),
+            cursor_auth_file: root.join("sdk").join("auth.json"),
+            cli_files: CliProviderFiles::under(&root),
+        };
+        let accounts = AgentAccounts::new(config.clone());
+        let grok = config.cli_files.grok_auth.clone();
+        std::fs::create_dir_all(grok.parent().unwrap()).unwrap();
+        let store_a =
+            br#"{"https://auth.x.ai::a":{"email":"a@x.dev","user_id":"grok-a","token":"t1"}}"#;
+        std::fs::write(&grok, store_a).unwrap();
+
+        // First sighting: one active, switchable slot holding the live bytes.
+        let snapshot = accounts.list(UsageMode::Offline).await.expect("list");
+        let rows: Vec<_> = snapshot
+            .accounts
+            .iter()
+            .filter(|a| a.harness == HarnessId::Grok)
+            .collect();
+        assert_eq!(rows.len(), 1, "{snapshot:?}");
+        assert!(rows[0].active);
+        assert!(rows[0].switchable);
+        let slot_a = rows[0].id.clone();
+
+        // A second account lands in the store externally → NEW slot, active.
+        let store_b =
+            br#"{"https://auth.x.ai::b":{"email":"b@x.dev","user_id":"grok-b","token":"t2"}}"#;
+        std::fs::write(&grok, store_b).unwrap();
+        let snapshot = accounts.list(UsageMode::Offline).await.expect("list");
+        let rows: Vec<_> = snapshot
+            .accounts
+            .iter()
+            .filter(|a| a.harness == HarnessId::Grok)
+            .collect();
+        assert_eq!(rows.len(), 2, "{snapshot:?}");
+        let active_b = rows.iter().find(|a| a.active).expect("active");
+        assert_ne!(active_b.id, slot_a);
+        assert_eq!(active_b.email.as_deref(), Some("b@x.dev"));
+        let slot_b = active_b.id.clone();
+
+        // Switch back to A: the live store gets A's bytes verbatim.
+        accounts
+            .activate(HarnessId::Grok, &slot_a)
+            .await
+            .expect("activate A");
+        assert_eq!(std::fs::read(&grok).unwrap(), store_a);
+        let snapshot = accounts.list(UsageMode::Offline).await.expect("list");
+        let active = snapshot
+            .accounts
+            .iter()
+            .find(|a| a.harness == HarnessId::Grok && a.active)
+            .expect("active grok");
+        assert_eq!(active.id, slot_a);
+
+        // A token refresh on A (same identity, new bytes) updates A's slot —
+        // it must NOT mint a third account.
+        let store_a2 =
+            br#"{"https://auth.x.ai::a":{"email":"a@x.dev","user_id":"grok-a","token":"t1b"}}"#;
+        std::fs::write(&grok, store_a2).unwrap();
+        let snapshot = accounts.list(UsageMode::Offline).await.expect("list");
+        let rows: Vec<_> = snapshot
+            .accounts
+            .iter()
+            .filter(|a| a.harness == HarnessId::Grok)
+            .collect();
+        assert_eq!(rows.len(), 2, "{snapshot:?}");
+        assert!(rows.iter().any(|a| a.id == slot_a && a.active));
+
+        // Forget B (inactive): its slot file is gone.
+        accounts
+            .forget(HarnessId::Grok, &slot_b)
+            .await
+            .expect("forget B");
+        let snapshot = accounts.list(UsageMode::Offline).await.expect("list");
+        assert!(
+            !snapshot
+                .accounts
+                .iter()
+                .any(|a| a.harness == HarnessId::Grok && a.id == slot_b)
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Issue #77: Cline exchanges ONLY `providers.<name>.settings.auth` —
+    /// unrelated settings in `providers.json` must survive a switch.
+    #[tokio::test]
+    async fn cline_switch_preserves_non_auth_settings() {
+        let root = std::env::temp_dir().join(format!(
+            "komet-cline-accounts-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let config = AgentAccountsConfig {
+            data_dir: root.join("data"),
+            gh_cli: None,
+            claude_config_dir: root.join("claude"),
+            claude_config_file: root.join("claude.json"),
+            codex_home: root.join("codex"),
+            antigravity_home: root.join("antigravity"),
+            cursor_auth_file: root.join("sdk").join("auth.json"),
+            cli_files: CliProviderFiles::under(&root),
+        };
+        let accounts = AgentAccounts::new(config.clone());
+        let providers_file = config.cli_files.cline_providers.clone();
+        std::fs::create_dir_all(providers_file.parent().unwrap()).unwrap();
+        let write_store = |auth: &str| {
+            std::fs::write(
+                &providers_file,
+                format!(
+                    r#"{{"providers":{{"cline":{{"settings":{{"auth":{auth},"theme":"dark"}},"otherSetting":42}},"otherProvider":{{"settings":{{"auth":{{"token":"x"}}}}}}}}}}"#
+                ),
+            )
+            .unwrap();
+        };
+        write_store(r#"{"accessToken":"tok-a","metadata":{"userInfo":{"email":"a@cline.dev"}}}"#);
+
+        let snapshot = accounts.list(UsageMode::Offline).await.expect("list");
+        let rows: Vec<_> = snapshot
+            .accounts
+            .iter()
+            .filter(|a| a.harness == HarnessId::Cline)
+            .collect();
+        assert_eq!(rows.len(), 1, "{snapshot:?}");
+        assert!(rows[0].switchable);
+        let slot_a = rows[0].id.clone();
+
+        // Second Cline account appears externally.
+        write_store(r#"{"accessToken":"tok-b","metadata":{"userInfo":{"email":"b@cline.dev"}}}"#);
+        let snapshot = accounts.list(UsageMode::Offline).await.expect("list");
+        let rows: Vec<_> = snapshot
+            .accounts
+            .iter()
+            .filter(|a| a.harness == HarnessId::Cline)
+            .collect();
+        assert_eq!(rows.len(), 2, "{snapshot:?}");
+        let slot_b = rows
+            .iter()
+            .find(|a| a.active)
+            .expect("active cline")
+            .id
+            .clone();
+
+        // Switch back to A and back to B: auth swaps, everything else stays.
+        for _ in 0..2 {
+            accounts
+                .activate(HarnessId::Cline, &slot_a)
+                .await
+                .expect("activate A");
+            let json: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&providers_file).unwrap()).unwrap();
+            assert_eq!(
+                json.pointer("/providers/cline/settings/auth/accessToken")
+                    .and_then(serde_json::Value::as_str),
+                Some("tok-a")
+            );
+            assert_eq!(
+                json.pointer("/providers/cline/settings/theme")
+                    .and_then(serde_json::Value::as_str),
+                Some("dark"),
+                "non-auth settings must survive: {json}"
+            );
+            assert_eq!(
+                json.pointer("/providers/cline/otherSetting")
+                    .and_then(serde_json::Value::as_u64),
+                Some(42)
+            );
+            assert_eq!(
+                json.pointer("/providers/otherProvider/settings/auth/token")
+                    .and_then(serde_json::Value::as_str),
+                Some("x"),
+                "other providers' auth must be untouched: {json}"
+            );
+            accounts
+                .activate(HarnessId::Cline, &slot_b)
+                .await
+                .expect("activate B");
+        }
+        let json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&providers_file).unwrap()).unwrap();
+        assert_eq!(
+            json.pointer("/providers/cline/settings/auth/accessToken")
+                .and_then(serde_json::Value::as_str),
+            Some("tok-b")
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
