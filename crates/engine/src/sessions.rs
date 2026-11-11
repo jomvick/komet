@@ -2083,6 +2083,10 @@ impl Inner {
                         ts: Utc::now().timestamp_millis(),
                         chat: chat_id.to_string(),
                         harness,
+                        account: self
+                            .agent_accounts
+                            .get()
+                            .and_then(|accounts| accounts.active_account_key(harness)),
                         model: lock(&self.models).get(chat_id).cloned(),
                         project: self.journal_harness_session(chat_id).map(|(_, cwd, _)| cwd),
                         input_tokens: *input_tokens,
@@ -2095,6 +2099,26 @@ impl Inner {
                     }
                 }
                 true
+            }
+            AgentEvent::Error {
+                kind: ErrorKind::RateLimit,
+                ..
+            } => {
+                // Rate-limit rejections feed the Usage dashboard counters
+                // (issue #53, M6). Counts only — the error text stays in the
+                // journal, never in the usage index.
+                if let Some(store) = self.usage_store.get()
+                    && let Some(harness) = self.harness_owner(chat_id)
+                {
+                    let account = self
+                        .agent_accounts
+                        .get()
+                        .and_then(|accounts| accounts.active_account_key(harness));
+                    if let Err(err) = store.record_rate_limit(harness, account) {
+                        tracing::warn!(chat = %chat_id, error = %err, "rate-limit record failed");
+                    }
+                }
+                false
             }
             _ => false,
         };

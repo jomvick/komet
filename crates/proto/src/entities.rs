@@ -806,6 +806,55 @@ impl UsageTotals {
     }
 }
 
+/// One row of a measured-usage breakdown: a model id or a project path.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageBreakdown {
+    /// `None` when the turn carried no model (or no project cwd).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    pub totals: UsageTotals,
+}
+
+/// Model and project leaders for one measured window (issue #53, M6).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageDetail {
+    pub models: Vec<UsageBreakdown>,
+    pub projects: Vec<UsageBreakdown>,
+}
+
+/// One time bucket of measured usage (mini-chart source, M6).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsagePoint {
+    /// Bucket start (hour or day aligned, UTC), epoch millis.
+    pub at: i64,
+    pub totals: UsageTotals,
+}
+
+/// Hourly (last 24 h) and daily (last 30 d) measured-usage buckets. Empty
+/// buckets are present as zero totals so charts stay regular.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageSeries {
+    pub hourly: Vec<UsagePoint>,
+    pub daily: Vec<UsagePoint>,
+}
+
+/// Rate-limit rejections per measured window. `None` = the journal has no
+/// rate-limit records at all (unknown — never render as a confident zero).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageRateLimits {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub day: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub week: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub month: Option<u64>,
+}
+
 /// One persisted quota sample (for pace projections).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -832,7 +881,47 @@ pub struct AgentUsageReport {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous_quota: Option<UsageQuotaPoint>,
     pub last_day: UsageTotals,
+    pub last_7_days: UsageTotals,
     pub last_30_days: UsageTotals,
+    /// Top models/projects inside each measured window (Komet-measured).
+    #[serde(default)]
+    pub day_detail: UsageDetail,
+    #[serde(default)]
+    pub week_detail: UsageDetail,
+    #[serde(default)]
+    pub month_detail: UsageDetail,
+    /// Same-length window immediately before each period (comparison, M6).
+    #[serde(default)]
+    pub prev_day: UsageTotals,
+    #[serde(default)]
+    pub prev_7_days: UsageTotals,
+    #[serde(default)]
+    pub prev_30_days: UsageTotals,
+    #[serde(default)]
+    pub series: UsageSeries,
+    #[serde(default)]
+    pub rate_limits: UsageRateLimits,
+    /// Estimated API-equivalent spend per window (M5); `None` when no model
+    /// in the window has a known price — never a fabricated zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub day_cost: Option<UsageCostEstimate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub week_cost: Option<UsageCostEstimate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub month_cost: Option<UsageCostEstimate>,
+}
+
+/// Estimated spend for one measured window, labelled as an estimate (M5).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageCostEstimate {
+    /// US dollars, rounded to cents for display by the UI.
+    pub usd: f64,
+    /// Pricing table date (`as_of`) so the estimate stays honest.
+    pub as_of: String,
+    /// Models that contributed tokens but have no known price.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unpriced_models: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

@@ -20,7 +20,8 @@ use gpui::{
 };
 
 use komet_proto::{
-    AgentUsageReport, AgentUsageWindow, HarnessId, UsageQuotaPoint, UsageReport, UsageTotals,
+    AgentUsageReport, AgentUsageWindow, HarnessId, UsageBreakdown, UsageCostEstimate, UsageDetail,
+    UsagePoint, UsageQuotaPoint, UsageReport, UsageTotals,
 };
 use komet_rpc::methods;
 
@@ -45,6 +46,87 @@ const AUTO_REFRESH_AFTER: Duration = Duration::from_secs(5 * 60);
 /// Minimum sample span before a time-to-exhaustion estimate is meaningful.
 const MIN_PROJECTION_SPAN: f64 = 10.0 / 60.0; // hours
 
+/// Period the measured block sums. The report carries all three, so switching
+/// is free (no probe, no RPC).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Period {
+    Day,
+    Week,
+    Month,
+}
+
+impl Period {
+    const ALL: [Self; 3] = [Self::Day, Self::Week, Self::Month];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Day => "24 h",
+            Self::Week => "7 d",
+            Self::Month => "30 d",
+        }
+    }
+
+    fn range_label(self) -> &'static str {
+        match self {
+            Self::Day => "Last 24 hours",
+            Self::Week => "Last 7 days",
+            Self::Month => "Last 30 days",
+        }
+    }
+
+    fn totals(self, report: &AgentUsageReport) -> &UsageTotals {
+        match self {
+            Self::Day => &report.last_day,
+            Self::Week => &report.last_7_days,
+            Self::Month => &report.last_30_days,
+        }
+    }
+
+    fn detail(self, report: &AgentUsageReport) -> &UsageDetail {
+        match self {
+            Self::Day => &report.day_detail,
+            Self::Week => &report.week_detail,
+            Self::Month => &report.month_detail,
+        }
+    }
+
+    /// Same-length window immediately before this period (M6 comparison).
+    fn previous(self, report: &AgentUsageReport) -> &UsageTotals {
+        match self {
+            Self::Day => &report.prev_day,
+            Self::Week => &report.prev_7_days,
+            Self::Month => &report.prev_30_days,
+        }
+    }
+
+    /// Rate-limit rejections in this period; `None` = journal predates the
+    /// counter, which the UI must not paint as a confident zero.
+    fn rate_limits(self, report: &AgentUsageReport) -> Option<u64> {
+        match self {
+            Self::Day => report.rate_limits.day,
+            Self::Week => report.rate_limits.week,
+            Self::Month => report.rate_limits.month,
+        }
+    }
+
+    fn cost(self, report: &AgentUsageReport) -> Option<&UsageCostEstimate> {
+        match self {
+            Self::Day => report.day_cost.as_ref(),
+            Self::Week => report.week_cost.as_ref(),
+            Self::Month => report.month_cost.as_ref(),
+        }
+    }
+
+    /// Pre-aggregated buckets for the mini-chart: hourly for 24 h, daily
+    /// beyond (M6).
+    fn points(self, report: &AgentUsageReport) -> &[UsagePoint] {
+        match self {
+            Self::Day => &report.series.hourly,
+            Self::Week | Self::Month => &report.series.daily,
+        }
+    }
+}
+
 pub enum UsageEvent {
     /// The user added or removed an agent; the shell persists the list.
     SelectionChanged(Vec<HarnessId>),
@@ -60,6 +142,9 @@ pub struct UsagePage {
     picker_open: bool,
     last_load: Option<Instant>,
     error: Option<SharedString>,
+    /// Period the Komet-measured block sums (M6 filter). UI-only: the report
+    /// already carries 24 h / 7 d / 30 d, so switching costs no RPC.
+    period: Period,
 }
 
 impl EventEmitter<UsageEvent> for UsagePage {}
@@ -76,6 +161,7 @@ impl UsagePage {
             picker_open: false,
             last_load: None,
             error: None,
+            period: Period::Day,
         };
         cx.observe(&page.state, |page, state, cx| {
             if page.report.ready().is_none() && state.read(cx).engine().is_some() {
@@ -216,6 +302,38 @@ impl UsagePage {
             .and_then(|report| report.agents.iter().find(|agent| agent.harness == harness))
     }
 
+    /// Copy the visible measured totals as CSV (metadata only — M6 export).
+    fn copy_csv(&mut self, cx: &mut Context<Self>) {
+        let Some(report) = self.report.ready() else {
+            return;
+        };
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(csv_report(
+            report,
+            self.period,
+        )));
+    }
+
+    fn period_button(&self, period: Period, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let active = self.period == period;
+        widgets::ghost_action(theme)
+            .id(SharedString::from(format!(
+                "usage-period-{}",
+                period.label()
+            )))
+            .flex_none()
+            .text_size(px(11.5))
+            .when(active, |el| {
+                el.bg(crate::theme::ink(0.06)).text_color(theme.text)
+            })
+            .when(!active, |el| el.hover(|s| widgets::ghost_hover(theme, s)))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.period = period;
+                cx.notify();
+            }))
+            .child(SharedString::from(period.label()))
+            .into_any_element()
+    }
+
     fn agent_card(
         &self,
         harness: HarnessId,
@@ -257,8 +375,9 @@ impl UsagePage {
         }
 
         let mut card = widgets::section_card(theme);
+        let (mark, tint) = crate::pickers::harness_brand_icon(harness);
         let row = widgets::card_row(theme, true)
-            .child(widgets::row_tile(theme, crate::icons::SORT_VERTICAL))
+            .child(widgets::row_tile_branded(theme, mark, tint))
             .child(
                 div()
                     .flex()
@@ -326,6 +445,7 @@ impl UsagePage {
         _cx: &mut Context<Self>,
     ) -> AnyElement {
         let fraction = window.used_fraction.clamp(0.0, 1.0);
+        let pace = pace(window, now);
         let fill = if fraction >= 0.9 {
             theme.danger
         } else if fraction >= 0.7 {
@@ -337,12 +457,18 @@ impl UsagePage {
             .display_value
             .clone()
             .unwrap_or_else(|| format!("{}%", (fraction * 100.0).round() as i64));
+        // A billing report (`display_value`, no denominator) gets no gauge: an
+        // empty bar would read as "0% used", which is exactly the lie M3 bans.
+        let gauge = window.display_value.is_none() || fraction > 0.0;
         let mut meta = vec![
             SharedString::from(reset_phrase(window.resets_at, now)).into_any_element(),
             SharedString::from(window_phrase(window.window_seconds)).into_any_element(),
             SharedString::from("Provider").into_any_element(),
         ];
-        if let Some(pace) = pace(window, now) {
+        if !gauge {
+            meta.push(SharedString::from("No quota denominator").into_any_element());
+        }
+        if let Some(pace) = pace {
             let delta = (pace.delta * 100.0).round() as i64;
             meta.push(
                 SharedString::from(match delta {
@@ -357,10 +483,41 @@ impl UsagePage {
         {
             meta.push(SharedString::from(eta_phrase(hours)).into_any_element());
         }
+        let track = gauge.then(|| {
+            let mut track = div()
+                .relative()
+                .w_full()
+                .h(px(8.0))
+                .rounded_full()
+                .bg(theme.border)
+                .overflow_hidden()
+                .child(
+                    div()
+                        .h_full()
+                        .w(relative(fraction.max(0.01)))
+                        .rounded_full()
+                        .bg(fill),
+                );
+            if let Some(pace) = pace {
+                // The "even burn" marker: where usage would sit if the quota
+                // were spent linearly across the window. Fill left of it =
+                // ahead of pace.
+                track = track.child(
+                    div()
+                        .absolute()
+                        .top(px(0.0))
+                        .bottom(px(0.0))
+                        .left(relative(pace.elapsed_fraction.clamp(0.0, 1.0)))
+                        .w(px(2.0))
+                        .bg(theme.text_muted.opacity(0.55)),
+                );
+            }
+            track
+        });
         div()
             .flex()
             .flex_col()
-            .gap(px(6.0))
+            .gap(px(8.0))
             .child(
                 div()
                     .flex()
@@ -378,25 +535,15 @@ impl UsagePage {
                     .child(
                         div()
                             .text_size(px(12.0))
-                            .text_color(theme.text_muted)
+                            .text_color(if fraction >= 0.7 {
+                                fill
+                            } else {
+                                theme.text_muted
+                            })
                             .child(SharedString::from(value)),
                     ),
             )
-            .child(
-                div()
-                    .w_full()
-                    .h(px(6.0))
-                    .rounded_full()
-                    .bg(theme.border)
-                    .overflow_hidden()
-                    .child(
-                        div()
-                            .h_full()
-                            .w(relative(fraction.max(0.01)))
-                            .rounded_full()
-                            .bg(fill),
-                    ),
-            )
+            .when_some(track, |el, track| el.child(track))
             .child(widgets::meta_line(theme, meta))
             .into_any_element()
     }
@@ -407,23 +554,97 @@ impl UsagePage {
         theme: &Theme,
         _now: DateTime<Utc>,
     ) -> AnyElement {
-        div()
+        let totals = self.period.totals(report);
+        let mut block = div()
             .flex()
             .flex_col()
             .gap(px(4.0))
-            .pt(px(6.0))
+            .pt(px(10.0))
             .border_t_1()
             .border_color(theme.border)
             .child(
                 div()
-                    .text_size(px(12.0))
-                    .font_weight(gpui::FontWeight::MEDIUM)
-                    .text_color(theme.text_muted)
-                    .child(SharedString::from("Komet-measured usage")),
+                    .flex()
+                    .flex_row()
+                    .items_baseline()
+                    .gap(px(8.0))
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(theme.text_muted)
+                            .child(SharedString::from("Komet-measured usage")),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(theme.text_muted.opacity(0.7))
+                            .child(SharedString::from(self.period.range_label())),
+                    ),
             )
-            .child(measured_line(theme, "Last 24 hours", &report.last_day))
-            .child(measured_line(theme, "Last 30 days", &report.last_30_days))
-            .into_any_element()
+            .child(measured_line(theme, "Tokens", totals));
+        if let Some(rates) = rates_phrase(totals) {
+            block = block.child(
+                div()
+                    .text_size(px(11.5))
+                    .text_color(theme.text_muted.opacity(0.75))
+                    .child(SharedString::from(rates)),
+            );
+        }
+        if let Some(line) = sparkline(theme, self.period.points(report)) {
+            block = block.child(line);
+        }
+        if let Some(line) = comparison_line(theme, self.period, totals, report) {
+            block = block.child(line);
+        }
+        if let Some(count) = self.period.rate_limits(report) {
+            block = block.child(
+                div()
+                    .text_size(px(11.5))
+                    .text_color(if count > 0 {
+                        theme.warning
+                    } else {
+                        theme.text_muted.opacity(0.75)
+                    })
+                    .child(SharedString::from(format!(
+                        "{count} rate limit{}",
+                        if count == 1 { "" } else { "s" }
+                    ))),
+            );
+        }
+        let cost_line = match self.period.cost(report) {
+            Some(cost) => {
+                let mut text = format!("≈ ${:.2} API-equivalent (rates {})", cost.usd, cost.as_of);
+                if !cost.unpriced_models.is_empty() {
+                    text.push_str(&format!(" · {} unpriced", cost.unpriced_models.len()));
+                }
+                Some(text)
+            }
+            // Tokens were measured but no model in the window has a known
+            // price — say so instead of implying $0.
+            None if totals.input_tokens + totals.output_tokens > 0 => {
+                Some("API-equivalent cost: tarif inconnu".to_string())
+            }
+            None => None,
+        };
+        if let Some(text) = cost_line {
+            block = block.child(
+                div()
+                    .text_size(px(11.5))
+                    .text_color(theme.text_muted.opacity(0.75))
+                    .child(SharedString::from(text)),
+            );
+        }
+        let detail = self.period.detail(report);
+        for (caption, rows, unknown) in [
+            ("Models", &detail.models, "unknown model"),
+            ("Projects", &detail.projects, "unknown project"),
+        ] {
+            if let Some(line) = breakdown_line(theme, caption, rows, unknown) {
+                block = block.child(line);
+            }
+        }
+        block.into_any_element()
     }
 
     fn picker(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
@@ -435,15 +656,18 @@ impl UsagePage {
             }
             let first = !any;
             any = true;
+            let (mark, tint) = crate::pickers::harness_brand_icon(harness);
             card = card.child(
+                // `card_row` already paints the hover wash — a second `.hover`
+                // panics gpui ("hover style already set") and kills the app.
                 widgets::card_row(theme, first)
                     .id(SharedString::from(format!(
                         "usage-add-{}",
                         harness.as_str()
                     )))
                     .cursor_pointer()
-                    .hover(|s| s.bg(crate::theme::ink(0.03)))
                     .on_click(cx.listener(move |this, _, _, cx| this.add_agent(harness, cx)))
+                    .child(widgets::row_tile_branded(theme, mark, tint))
                     .child(
                         div()
                             .flex()
@@ -493,6 +717,16 @@ impl Render for UsagePage {
                         Some(self.selected.len()),
                     ))
                     .child(div().flex_1())
+                    .children(Period::ALL.map(|period| self.period_button(period, &theme, cx)))
+                    .child(
+                        widgets::ghost_action(&theme)
+                            .id("usage-copy-csv")
+                            .flex_none()
+                            .text_size(px(12.0))
+                            .hover(|s| widgets::ghost_hover(&theme, s))
+                            .on_click(cx.listener(|this, _, _, cx| this.copy_csv(cx)))
+                            .child(SharedString::from("Copy CSV")),
+                    )
                     .child(
                         widgets::ghost_action(&theme)
                             .id("usage-add-agent")
@@ -540,7 +774,11 @@ impl Render for UsagePage {
                     .child(SharedString::from("Reading the local usage history…")),
             );
         }
-        page
+        div()
+            .id("usage-page-scroll")
+            .size_full()
+            .overflow_y_scroll()
+            .child(page)
     }
 }
 
@@ -681,7 +919,7 @@ fn measured_line(theme: &Theme, label: &str, totals: &UsageTotals) -> AnyElement
         .text_color(theme.text_muted)
         .child(
             div()
-                .w(px(96.0))
+                .w(px(56.0))
                 .text_color(theme.text_muted.opacity(0.75))
                 .child(SharedString::from(label.to_string())),
         )
@@ -694,6 +932,191 @@ fn measured_line(theme: &Theme, label: &str, totals: &UsageTotals) -> AnyElement
             token_phrase(totals.reasoning_tokens),
         )))
         .into_any_element()
+}
+
+/// Cache-hit and reasoning shares, when the totals can support them (M6).
+fn rates_phrase(totals: &UsageTotals) -> Option<String> {
+    if totals.runs == 0 {
+        return None;
+    }
+    let mut parts = Vec::new();
+    if totals.input_tokens > 0 {
+        parts.push(format!(
+            "Cache hit {}%",
+            percent(totals.cached_input_tokens, totals.input_tokens)
+        ));
+    }
+    if totals.output_tokens > 0 {
+        parts.push(format!(
+            "Reasoning {}% of output",
+            percent(totals.reasoning_tokens, totals.output_tokens)
+        ));
+    }
+    (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
+/// Tokens a bucket contributes to the mini-chart: fresh input + output
+/// (cached input and reasoning are subsets on most providers).
+fn point_tokens(point: &UsagePoint) -> u64 {
+    point.totals.input_tokens + point.totals.output_tokens
+}
+
+/// Compact bar chart of the pre-aggregated buckets (M6). `None` when every
+/// bucket is empty — an all-zero chart is noise, not information.
+fn sparkline(theme: &Theme, points: &[UsagePoint]) -> Option<AnyElement> {
+    let max = points.iter().map(point_tokens).max()?;
+    if max == 0 {
+        return None;
+    }
+    let bars = points
+        .iter()
+        .map(|point| {
+            let height = 4.0f32 + 28.0 * (point_tokens(point) as f32 / max as f32);
+            div()
+                .flex_1()
+                .h(px(height))
+                .rounded_sm()
+                .bg(if point_tokens(point) == 0 {
+                    theme.border
+                } else {
+                    theme.accent.opacity(0.75)
+                })
+        })
+        .collect::<Vec<_>>();
+    Some(
+        div()
+            .flex()
+            .flex_row()
+            .items_end()
+            .gap(px(2.0))
+            .h(px(32.0))
+            .children(bars)
+            .into_any_element(),
+    )
+}
+
+/// "▲ 23% vs previous 24 h"-style line. Both windows empty → nothing; a zero
+/// previous window is reported as new usage, not as an infinite delta.
+fn comparison_line(
+    theme: &Theme,
+    period: Period,
+    totals: &UsageTotals,
+    report: &AgentUsageReport,
+) -> Option<AnyElement> {
+    let current = totals.input_tokens + totals.output_tokens;
+    let previous = {
+        let p = period.previous(report);
+        p.input_tokens + p.output_tokens
+    };
+    if current == 0 && previous == 0 {
+        return None;
+    }
+    let text = if previous == 0 {
+        format!(
+            "{} — none in the previous {}",
+            token_phrase(current),
+            period.label()
+        )
+    } else {
+        let delta = (current as f64 - previous as f64) / previous as f64 * 100.0;
+        let arrow = if delta >= 0.0 { "▲" } else { "▼" };
+        format!(
+            "{} {}% vs previous {}",
+            arrow,
+            delta.abs().round() as i64,
+            period.label()
+        )
+    };
+    Some(
+        div()
+            .text_size(px(11.5))
+            .text_color(theme.text_muted.opacity(0.75))
+            .child(SharedString::from(text))
+            .into_any_element(),
+    )
+}
+
+/// One breakdown dimension ("Models" / "Projects"): the leading rows as
+/// `label · tokens`, `unknown` standing in for a turn that carried none.
+fn breakdown_line(
+    theme: &Theme,
+    caption: &str,
+    rows: &[UsageBreakdown],
+    unknown: &str,
+) -> Option<AnyElement> {
+    if rows.is_empty() {
+        return None;
+    }
+    let entries: Vec<String> = rows
+        .iter()
+        .take(3)
+        .map(|row| {
+            let label = row.label.clone().unwrap_or_else(|| unknown.to_string());
+            format!(
+                "{} · {}",
+                label,
+                token_phrase(row.totals.input_tokens + row.totals.output_tokens)
+            )
+        })
+        .collect();
+    Some(
+        div()
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .gap_x(px(10.0))
+            .text_size(px(11.5))
+            .text_color(theme.text_muted.opacity(0.75))
+            .child(
+                div()
+                    .w(px(56.0))
+                    .flex_none()
+                    .text_color(theme.text_muted.opacity(0.6))
+                    .child(SharedString::from(caption.to_string())),
+            )
+            .child(SharedString::from(entries.join("   ")))
+            .into_any_element(),
+    )
+}
+
+fn percent(part: u64, whole: u64) -> u64 {
+    ((part as f64 / whole as f64) * 100.0).round() as u64
+}
+
+/// CSV of the visible report: usage metadata only (no message text, prompts,
+/// credentials, or provider tokens — M6 export constraint).
+fn csv_report(report: &UsageReport, period: Period) -> String {
+    let mut csv = String::from(
+        "agent,account,period,runs,input_tokens,cached_input_tokens,output_tokens,reasoning_tokens\n",
+    );
+    for agent in &report.agents {
+        let totals = period.totals(agent);
+        let account = agent
+            .account
+            .as_ref()
+            .and_then(|account| account.email.as_deref())
+            .unwrap_or("");
+        csv.push_str(&format!(
+            "{},{},{},{},{},{},{},{}\n",
+            csv_field(harness_display_name(agent.harness)),
+            csv_field(account),
+            period.label(),
+            totals.runs,
+            totals.input_tokens,
+            totals.cached_input_tokens,
+            totals.output_tokens,
+            totals.reasoning_tokens,
+        ));
+    }
+    csv
+}
+
+fn csv_field(value: &str) -> String {
+    if value.contains([',', '"', '\n']) {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_string()
+    }
 }
 
 fn runs_phrase(runs: u64) -> String {
@@ -795,5 +1218,114 @@ mod tests {
             windows: vec![other],
         };
         assert!(previous_sample_for(&current, Some(&point)).is_none());
+    }
+
+    fn report(period: UsageTotals, account: Option<&str>) -> AgentUsageReport {
+        AgentUsageReport {
+            harness: HarnessId::ClaudeCode,
+            account: account.map(|email| komet_proto::AgentAccount {
+                id: "a".into(),
+                harness: HarnessId::ClaudeCode,
+                email: Some(email.into()),
+                plan_label: Some("Max".into()),
+                active: true,
+                usage_windows: Vec::new(),
+                display_name: None,
+                organization: None,
+                auth_kind: None,
+                switchable: true,
+                saved_at: None,
+            }),
+            last_quota_at: None,
+            previous_quota: None,
+            last_day: period,
+            last_7_days: period,
+            last_30_days: period,
+            day_detail: UsageDetail::default(),
+            week_detail: UsageDetail::default(),
+            month_detail: UsageDetail::default(),
+            prev_day: UsageTotals::default(),
+            prev_7_days: UsageTotals::default(),
+            prev_30_days: UsageTotals::default(),
+            series: komet_proto::UsageSeries::default(),
+            rate_limits: komet_proto::UsageRateLimits::default(),
+            day_cost: None,
+            week_cost: None,
+            month_cost: None,
+        }
+    }
+
+    #[test]
+    fn csv_export_is_metadata_only_and_quotes_commas() {
+        let totals = UsageTotals {
+            runs: 2,
+            input_tokens: 100,
+            cached_input_tokens: 40,
+            output_tokens: 50,
+            reasoning_tokens: 10,
+        };
+        let report = UsageReport {
+            agents: vec![report(totals, Some("me,inc@example.com"))],
+        };
+        let csv = csv_report(&report, Period::Week);
+        let mut lines = csv.lines();
+        assert_eq!(
+            lines.next(),
+            Some(
+                "agent,account,period,runs,input_tokens,cached_input_tokens,output_tokens,reasoning_tokens"
+            )
+        );
+        assert_eq!(
+            lines.next(),
+            Some("Claude Code,\"me,inc@example.com\",7 d,2,100,40,50,10")
+        );
+        assert_eq!(lines.next(), None);
+    }
+
+    #[test]
+    fn rates_need_a_denominator() {
+        let zero = UsageTotals::default();
+        assert!(rates_phrase(&zero).is_none());
+        let tokens = UsageTotals {
+            runs: 1,
+            input_tokens: 100,
+            cached_input_tokens: 25,
+            output_tokens: 40,
+            reasoning_tokens: 10,
+        };
+        let rates = rates_phrase(&tokens).unwrap();
+        assert!(rates.contains("Cache hit 25%"), "{rates}");
+        assert!(rates.contains("Reasoning 25% of output"), "{rates}");
+    }
+
+    #[test]
+    fn breakdown_line_labels_unknown_and_sums_tokens() {
+        let theme = Theme::dark();
+        let rows = vec![
+            UsageBreakdown {
+                label: Some("claude-x".into()),
+                totals: UsageTotals {
+                    runs: 2,
+                    input_tokens: 1_000_000,
+                    cached_input_tokens: 0,
+                    output_tokens: 500_000,
+                    reasoning_tokens: 0,
+                },
+            },
+            UsageBreakdown {
+                label: None,
+                totals: UsageTotals {
+                    runs: 1,
+                    input_tokens: 10,
+                    cached_input_tokens: 0,
+                    output_tokens: 5,
+                    reasoning_tokens: 0,
+                },
+            },
+        ];
+        let element = breakdown_line(&theme, "Models", &rows, "unknown model")
+            .expect("non-empty breakdown renders");
+        let _ = element;
+        assert!(breakdown_line(&theme, "Models", &[], "unknown model").is_none());
     }
 }

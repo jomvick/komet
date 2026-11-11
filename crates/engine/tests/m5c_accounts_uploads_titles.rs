@@ -35,6 +35,9 @@ fn test_accounts(root: &Path) -> (AgentAccounts, AgentAccountsConfig) {
         codex_home: root.join("codex"),
         antigravity_home: root.join("antigravity"),
         cursor_auth_file: root.join("cursor-sdk-auth.json"),
+        opencode_db: root.join("opencode/opencode.db"),
+        pi_auth: root.join("pi/auth.json"),
+        pi_settings: root.join("pi/settings.json"),
         cli_files: komet_engine::CliProviderFiles::under(root),
     };
     (AgentAccounts::new(config.clone()), config)

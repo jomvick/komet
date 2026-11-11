@@ -188,6 +188,12 @@ pub struct AgentAccountsConfig {
     pub antigravity_home: PathBuf,
     /// Cursor SDK login (`~/.cursor/sdk/auth.json`) — separate from `cursor-agent`.
     pub cursor_auth_file: PathBuf,
+    /// OpenCode v2 credential store (`opencode.db` → `credential` table) —
+    /// holds the console OAuth login with `metadata.email`.
+    pub opencode_db: PathBuf,
+    /// Pi agent auth (`~/.pi/agent/auth.json`) + settings (default provider).
+    pub pi_auth: PathBuf,
+    pub pi_settings: PathBuf,
     /// Auth stores of the CLI-managed providers with in-app sign-in.
     pub cli_files: CliProviderFiles,
 }
@@ -206,6 +212,10 @@ impl AgentAccountsConfig {
             Some(dir) => dir.join(".claude.json"),
             None => home_dir().join(".claude.json"),
         };
+        let data_home = std::env::var_os("XDG_DATA_HOME")
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home_dir().join(".local/share"));
         Self {
             data_dir: data_dir.to_path_buf(),
             gh_cli: Some(PathBuf::from("gh")),
@@ -216,6 +226,10 @@ impl AgentAccountsConfig {
                 .unwrap_or_else(|| home_dir().join(".gemini/antigravity-cli")),
             cursor_auth_file: env_dir("CURSOR_AUTH_FILE")
                 .unwrap_or_else(|| home_dir().join(".cursor/sdk/auth.json")),
+            opencode_db: env_dir("OPENCODE_DB")
+                .unwrap_or_else(|| data_home.join("opencode/opencode.db")),
+            pi_auth: home_dir().join(".pi/agent/auth.json"),
+            pi_settings: home_dir().join(".pi/agent/settings.json"),
             cli_files: CliProviderFiles::detect(),
         }
     }
@@ -327,11 +341,17 @@ struct CliLoginSpec {
     binary: &'static str,
     args: &'static [&'static str],
     mode: AgentLoginMode,
-    /// The authorize URL starts with this — scoping keeps TUI noise out.
-    url_prefix: &'static str,
+    /// The authorize URL starts with one of these — scoping keeps TUI noise
+    /// out. Several prefixes because providers migrate domains.
+    url_prefixes: &'static [&'static str],
     /// Muse asks for Enter to open the browser; Komet opens the URL itself and
     /// sends the keystroke so the CLI starts waiting for approval.
     send_enter: bool,
+    /// Some CLIs refuse to sign in while a login is live (`devin auth login`
+    /// exits with "You are already logged in"). When set, Komet runs these
+    /// args first — AFTER the live store has been snapshotted into its slot,
+    /// so the previous account stays one switch away.
+    logout_args: Option<&'static [&'static str]>,
 }
 
 const CLI_LOGIN_SPECS: &[CliLoginSpec] = &[
@@ -340,40 +360,52 @@ const CLI_LOGIN_SPECS: &[CliLoginSpec] = &[
         binary: "devin",
         args: &["auth", "login", "--force-manual-token-flow"],
         mode: AgentLoginMode::PasteCode,
-        url_prefix: "https://windsurf.com/devin/account/login",
+        // The CLI moved from windsurf.com to windsurf.ai / app.devin.ai; keep
+        // every host it has printed so the URL scan never misses.
+        url_prefixes: &[
+            "https://windsurf.com/devin/account/login",
+            "https://windsurf.ai",
+            "https://app.devin.ai",
+            "https://devin.ai",
+        ],
         send_enter: false,
+        logout_args: Some(&["auth", "logout"]),
     },
     CliLoginSpec {
         harness: HarnessId::Grok,
         binary: "grok",
         args: &["login", "--device-auth"],
         mode: AgentLoginMode::Browser,
-        url_prefix: "https://accounts.x.ai/oauth2/device",
+        url_prefixes: &["https://accounts.x.ai/oauth2/device"],
         send_enter: false,
+        logout_args: None,
     },
     CliLoginSpec {
         harness: HarnessId::Qoder,
         binary: "qoder",
         args: &["login"],
         mode: AgentLoginMode::Browser,
-        url_prefix: "https://qoder.com/device",
+        url_prefixes: &["https://qoder.com/device"],
         send_enter: false,
+        logout_args: None,
     },
     CliLoginSpec {
         harness: HarnessId::Muse,
         binary: "muse",
         args: &["login"],
         mode: AgentLoginMode::Browser,
-        url_prefix: "https://auth.meta.com/oauth/device",
+        url_prefixes: &["https://auth.meta.com/oauth/device"],
         send_enter: true,
+        logout_args: None,
     },
     CliLoginSpec {
         harness: HarnessId::Cline,
         binary: "cline",
         args: &["auth", "cline"],
         mode: AgentLoginMode::Browser,
-        url_prefix: "https://authkit.cline.bot/device",
+        url_prefixes: &["https://authkit.cline.bot/device"],
         send_enter: false,
+        logout_args: None,
     },
 ];
 
@@ -453,6 +485,11 @@ enum LoginFlow {
         exit: Arc<Mutex<Option<Option<i32>>>>,
         /// Digest of the provider's store before the flow — success = changed.
         initial_digest: Option<String>,
+        /// Set when Komet signed the CLI out first (some CLIs refuse `login`
+        /// while a session is live): the id of the slot holding the previous
+        /// account's store, restored if the flow is cancelled or fails so the
+        /// CLI is never left signed out. `None` = nothing was logged out.
+        restore_slot: Option<String>,
     },
 }
 
@@ -705,6 +742,9 @@ github.com:
             codex_home: dir.join("codex"),
             antigravity_home: dir.join("antigravity"),
             cursor_auth_file: dir.join("cursor/auth.json"),
+            opencode_db: dir.join("opencode/opencode.db"),
+            pi_auth: dir.join("pi/auth.json"),
+            pi_settings: dir.join("pi/settings.json"),
             cli_files: CliProviderFiles::under(&dir),
         });
         let make_slot = |id: &str, username: &str, token: &str| Slot {
@@ -799,6 +839,9 @@ github.com:
             codex_home: dir.join("codex"),
             antigravity_home: dir.join("antigravity"),
             cursor_auth_file: dir.join("sdk").join("auth.json"),
+            opencode_db: dir.join("opencode/opencode.db"),
+            pi_auth: dir.join("pi/auth.json"),
+            pi_settings: dir.join("pi/settings.json"),
             cli_files: CliProviderFiles::under(&dir),
         };
         let accounts = AgentAccounts::new(config);
@@ -875,6 +918,9 @@ github.com:
             codex_home: dir.join("codex"),
             antigravity_home: dir.join("antigravity"),
             cursor_auth_file: dir.join("sdk").join("auth.json"),
+            opencode_db: dir.join("opencode/opencode.db"),
+            pi_auth: dir.join("pi/auth.json"),
+            pi_settings: dir.join("pi/settings.json"),
             cli_files: CliProviderFiles::under(&dir),
         });
         let store = Arc::new(crate::usage::UsageStore::open(&dir.join("store")).unwrap());
@@ -1194,15 +1240,17 @@ fn composed_login_path() -> Option<std::ffi::OsString> {
 }
 
 /// Pull the authorize URL out of a PTY's output. Scoped by the provider's
-/// prefix so unrelated links in TUI banners never win.
-fn scan_cli_url(output: &str, prefix: &str) -> Option<String> {
-    let start = output.find(prefix)?;
-    let rest = &output[start..];
-    let end = rest
-        .find(|c: char| c.is_whitespace() || matches!(c, '\x1b' | '"' | '\'' | '<' | '>' | ')'))
-        .unwrap_or(rest.len());
-    let url = rest[..end].trim_end_matches(['.', ',', ';']);
-    (!url.is_empty()).then(|| url.to_string())
+/// prefixes so unrelated links in TUI banners never win.
+fn scan_cli_url(output: &str, prefixes: &[&str]) -> Option<String> {
+    prefixes.iter().find_map(|prefix| {
+        let start = output.find(prefix)?;
+        let rest = &output[start..];
+        let end = rest
+            .find(|c: char| c.is_whitespace() || matches!(c, '\x1b' | '"' | '\'' | '<' | '>' | ')'))
+            .unwrap_or(rest.len());
+        let url = rest[..end].trim_end_matches(['.', ',', ';']);
+        (!url.is_empty()).then(|| url.to_string())
+    })
 }
 
 /// Device code carried in the authorize URL (`?user_code=…` / `?code=…`).
@@ -1322,6 +1370,16 @@ impl AgentAccounts {
             active_keys.insert(HarnessId::Cursor, detected.account_key.clone());
             self.snapshot_detected(HarnessId::Cursor, &detected)?;
         }
+        // CLI-owned accounts with no Komet sign-in: mirror whatever the CLI
+        // itself is logged into so the card is never blank.
+        if let Some(detected) = self.detect_opencode() {
+            active_keys.insert(HarnessId::Opencode, detected.account_key.clone());
+            self.snapshot_detected(HarnessId::Opencode, &detected)?;
+        }
+        if let Some(detected) = self.detect_pi() {
+            active_keys.insert(HarnessId::Pi, detected.account_key.clone());
+            self.snapshot_detected(HarnessId::Pi, &detected)?;
+        }
         // Qoder and the other CLI-file providers are multi-account: one slot
         // per saved login store (see `sync_qoder_accounts` /
         // `sync_cli_file_accounts`), not one fixed slot.
@@ -1426,6 +1484,8 @@ impl AgentAccounts {
             HarnessId::Muse,
             HarnessId::Cline,
             HarnessId::Qoder,
+            HarnessId::Opencode,
+            HarnessId::Pi,
         ] {
             let active_key = active_keys.get(&harness).cloned();
             let slots = self.read_slots(harness);
@@ -1745,6 +1805,26 @@ impl AgentAccounts {
             }
         }
         self.list(UsageMode::Offline).await
+    }
+
+    /// `account_key` of the account currently selected for `harness`, read
+    /// from the same active-marker files `activate` writes — cheap enough to
+    /// call per usage event. `None` for providers whose active account is
+    /// simply the CLI's live login (Claude/Codex/Antigravity/Cursor, where
+    /// Komet snapshots rather than selects) or that have no managed accounts.
+    pub fn active_account_key(&self, harness: HarnessId) -> Option<String> {
+        let active_id = match harness {
+            HarnessId::Copilot => self.read_copilot_active_id()?,
+            HarnessId::Qoder => self.read_qoder_active_id()?,
+            HarnessId::Devin | HarnessId::Grok | HarnessId::Muse | HarnessId::Cline => {
+                self.read_cli_active_id(harness)?
+            }
+            _ => return None,
+        };
+        self.read_slots(harness)
+            .into_iter()
+            .find(|slot| slot.id == active_id)
+            .map(|slot| slot.account_key)
     }
 
     /// Token for the selected Komet Copilot account. Returned only for the
@@ -2930,15 +3010,34 @@ impl AgentAccounts {
         };
 
         // Persist the live login into its slot BEFORE the CLI can overwrite
-        // the provider's store (multi-account providers only).
-        match harness {
-            HarnessId::Qoder => {
-                self.sync_qoder_accounts()?;
-            }
+        // the provider's store (multi-account providers only). The returned
+        // account_key tells us a live login existed — some CLIs (devin) then
+        // refuse `login` outright until it is cleared.
+        let live_account = match harness {
+            HarnessId::Qoder => self.sync_qoder_accounts()?,
             HarnessId::Devin | HarnessId::Grok | HarnessId::Muse | HarnessId::Cline => {
-                self.sync_cli_file_accounts(harness)?;
+                self.sync_cli_file_accounts(harness)?
             }
-            _ => {}
+            _ => None,
+        };
+        // Logout when a session MAY be live: a parseable store (live_account)
+        // or simply the auth file on disk — an unreadable credentials.toml
+        // still makes `devin auth login` refuse, and there is no slot to
+        // restore anyway.
+        let mut restore_slot = None;
+        if let Some(logout_args) = spec.logout_args {
+            let auth_file_present = self
+                .inner
+                .config
+                .cli_auth_file(harness)
+                .is_some_and(|path| path.exists());
+            if live_account.is_some() || auth_file_present {
+                self.logout_cli_provider(&binary, spec.binary, logout_args)
+                    .await?;
+                // The pre-flow snapshot is the active slot now; remember it so
+                // a cancelled/failed sign-in can put the previous login back.
+                restore_slot = self.read_cli_active_id(harness);
+            }
         }
 
         let login_id = new_id();
@@ -3043,13 +3142,14 @@ impl AgentAccounts {
                 output: output.clone(),
                 exit: exit.clone(),
                 initial_digest: initial_digest.clone(),
+                restore_slot,
             },
         );
 
         let deadline = Instant::now() + Duration::from_secs(30);
         let url = loop {
             let out = lock(&output).clone();
-            if let Some(url) = scan_cli_url(&out, spec.url_prefix) {
+            if let Some(url) = scan_cli_url(&out, spec.url_prefixes) {
                 break Some(url);
             }
             if lock(&exit).is_some() || Instant::now() > deadline {
@@ -3093,6 +3193,53 @@ impl AgentAccounts {
             mode: spec.mode,
             user_code,
         })
+    }
+
+    /// Run a provider's own sign-out before its sign-in — some CLIs (devin)
+    /// refuse `login` while a session is live. The caller already snapshotted
+    /// the live store into its slot, so this only clears the CLI's live file:
+    /// the previous account stays one switch away in Accounts.
+    async fn logout_cli_provider(
+        &self,
+        binary: &Path,
+        name: &str,
+        args: &[&str],
+    ) -> Result<(), EngineError> {
+        let mut cmd = tokio::process::Command::new(binary);
+        cmd.args(args)
+            .env("TERM", "xterm-256color")
+            .env("NO_COLOR", "1")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped());
+        if let Some(path) = composed_login_path() {
+            cmd.env("PATH", path);
+        }
+        let output = match tokio::time::timeout(Duration::from_secs(20), cmd.output()).await {
+            Ok(Ok(output)) => output,
+            Ok(Err(err)) => {
+                return Err(EngineError::Other(format!(
+                    "Could not sign out of the current {name} account: {err}"
+                )));
+            }
+            Err(_) => {
+                return Err(EngineError::Other(format!(
+                    "Signing out of the current {name} account timed out."
+                )));
+            }
+        };
+        if !output.status.success() {
+            let tail = String::from_utf8_lossy(&output.stderr)
+                .lines()
+                .rev()
+                .find(|line| !line.trim().is_empty())
+                .unwrap_or("unknown error")
+                .to_string();
+            return Err(EngineError::Other(format!(
+                "Could not sign out of the current {name} account: {tail}"
+            )));
+        }
+        Ok(())
     }
 
     /// Exchange the pasted `code#state` for tokens and save the account as a slot
@@ -3502,7 +3649,13 @@ impl AgentAccounts {
             }
             _ => self.snapshot_detected(harness, detected)?,
         }
-        self.cancel_login(login_id);
+        // Tear down WITHOUT cancel_login's restore: the store on disk IS the
+        // new account — restoring the pre-flow slot would undo the sign-in.
+        if let Some(LoginFlow::Cli { killer, .. }) = lock(&self.inner.flows).remove(login_id)
+            && let Some(k) = lock(&killer).as_mut()
+        {
+            let _ = k.kill();
+        }
         Ok(())
     }
 
@@ -4045,8 +4198,30 @@ impl AgentAccounts {
             }
         }
 
-        if let Some(code) = *lock(&exit) {
+        let exited = *lock(&exit);
+        if let Some(code) = exited {
             let output_snapshot = lock(&output).clone();
+            // A clean exit means `gh` finished its part — the token may sit in
+            // hosts.yml even when `gh auth token` or `/user` never answered
+            // (API hiccup, slow link). Adopt it before declaring failure.
+            if code == Some(0)
+                && let Some((username, token)) = read_gh_hosts_login(&config_dir)
+            {
+                let user = self.fetch_github_user(&token).await;
+                let username = user
+                    .as_ref()
+                    .and_then(|u| u.get("login"))
+                    .and_then(|v| v.as_str())
+                    .filter(|login| !login.is_empty())
+                    .unwrap_or(&username)
+                    .to_string();
+                self.store_github_slot(&username, &token, user.as_ref())?;
+                self.abandon_github_flow(login_id);
+                return Ok(AgentLoginPoll {
+                    status: AgentLoginStatus::Done,
+                    message: None,
+                });
+            }
             let detail = output_snapshot
                 .lines()
                 .rev()
@@ -4174,11 +4349,29 @@ impl AgentAccounts {
                 #[cfg(not(target_os = "linux"))]
                 let _ = initial;
             }
-            Some(LoginFlow::Cli { killer, .. }) => {
-                // Nothing to restore: the provider owns its store. Killing the
-                // PTY child also ends any "Waiting for authorization…" spinner.
+            Some(LoginFlow::Cli {
+                harness,
+                killer,
+                restore_slot,
+                ..
+            }) => {
                 if let Some(k) = lock(&killer).as_mut() {
                     let _ = k.kill();
+                }
+                // Komet logged the CLI out before this flow; a cancelled or
+                // failed sign-in must not leave the provider signed out. The
+                // pre-flow slot still holds its store — write it back.
+                if let Some(slot_id) = restore_slot
+                    && let Some(slot) = self
+                        .read_slots(harness)
+                        .into_iter()
+                        .find(|s| s.id == slot_id)
+                    && let Err(err) = self.activate_cli_file(harness, &slot)
+                {
+                    tracing::warn!(
+                        error = %err,
+                        "agent-accounts: could not restore the previous CLI login after a cancelled sign-in"
+                    );
                 }
             }
             _ => {}
@@ -4291,6 +4484,119 @@ impl AgentAccounts {
             }
         }
         None
+    }
+
+    /// OpenCode keeps its console login inside its own SQLite store: the
+    /// `credential` table's OAuth blob carries `metadata.email`/`accountID`.
+    /// Read-only and busy-tolerant, same contract as the Cursor `state.vscdb`
+    /// probe — the CLI owns the file, Komet only mirrors the identity.
+    fn detect_opencode(&self) -> Option<Detected> {
+        let db = self.inner.config.opencode_db.clone();
+        if !db.exists() {
+            return None;
+        }
+        use rusqlite::OpenFlags;
+        let conn = rusqlite::Connection::open_with_flags(
+            &db,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .ok()?;
+        conn.busy_timeout(Duration::from_millis(0)).ok()?;
+        let mut stmt = conn.prepare("SELECT value FROM credential").ok()?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0)).ok()?;
+        let mut fallback = None;
+        for value in rows.flatten() {
+            let Ok(credential) = serde_json::from_str::<serde_json::Value>(&value) else {
+                continue;
+            };
+            let metadata = credential.get("metadata");
+            let Some(email) = metadata
+                .and_then(|m| m.get("email"))
+                .and_then(serde_json::Value::as_str)
+                .filter(|email| !email.is_empty())
+            else {
+                continue;
+            };
+            let account_id = metadata
+                .and_then(|m| m.get("accountID"))
+                .and_then(serde_json::Value::as_str)
+                .filter(|id| !id.is_empty());
+            let org = metadata
+                .and_then(|m| m.get("orgName"))
+                .and_then(serde_json::Value::as_str)
+                .filter(|name| !name.is_empty());
+            let server = metadata
+                .and_then(|m| m.get("server"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let detected = Detected {
+                account_key: account_id.unwrap_or(email).to_lowercase(),
+                profile: SlotProfile {
+                    email: email.to_string(),
+                    display_name: None,
+                    organization: org.map(str::to_string),
+                    plan: None,
+                    auth_kind: AgentAuthKind::Oauth,
+                },
+                // Marker only — the OAuth blob stays in opencode.db; nothing
+                // in Komet consumes it, and mirroring live tokens would just
+                // churn `saved_at` on every CLI refresh.
+                credentials: Some(serde_json::json!({
+                    "managedBy": "opencode",
+                    "consoleAccount": account_id.unwrap_or(email),
+                })),
+                claude_config: None,
+            };
+            if server.contains("opencode") {
+                return Some(detected);
+            }
+            fallback.get_or_insert(detected);
+        }
+        fallback
+    }
+
+    /// Pi's `~/.pi/agent/auth.json` maps provider id → credentials; its
+    /// `settings.json` names the default. Pi has no per-user identity we can
+    /// read, so the account shown is the PROVIDER the CLI is signed into
+    /// ("GitHub Copilot", "Anthropic", …) — the same "which login is live"
+    /// answer the CLI itself would give.
+    fn detect_pi(&self) -> Option<Detected> {
+        let auth = read_json(&self.inner.config.pi_auth)?;
+        let providers = auth.as_object()?;
+        if providers.is_empty() {
+            return None;
+        }
+        let settings = read_json(&self.inner.config.pi_settings);
+        let default = settings
+            .as_ref()
+            .and_then(|settings| settings.get("defaultProvider"))
+            .and_then(serde_json::Value::as_str);
+        let provider = default
+            .filter(|id| providers.contains_key(*id))
+            .or_else(|| providers.keys().next().map(String::as_str))?;
+        let entry = &providers[provider];
+        let signed_in = ["access", "refresh", "key", "apiKey", "token", "accessToken"]
+            .iter()
+            .any(|key| entry.get(*key).is_some_and(|v| !v.is_null()));
+        if !signed_in {
+            return None;
+        }
+        let label = pi_provider_label(provider);
+        Some(Detected {
+            account_key: format!("pi:{provider}"),
+            profile: SlotProfile {
+                email: label,
+                display_name: None,
+                organization: None,
+                plan: None,
+                auth_kind: AgentAuthKind::Oauth,
+            },
+            credentials: Some(serde_json::json!({
+                "managedBy": "pi",
+                "provider": provider,
+            })),
+            claude_config: None,
+        })
     }
 
     /// Read a CLI-managed provider's own credential store. These providers
@@ -5864,6 +6170,25 @@ fn harness_slug(harness: HarnessId) -> &'static str {
     }
 }
 
+/// Display label for a Pi provider id (`github-copilot` → "GitHub Copilot").
+fn pi_provider_label(provider: &str) -> String {
+    match provider {
+        "github-copilot" | "copilot" => "GitHub Copilot".to_string(),
+        "anthropic" => "Anthropic".to_string(),
+        "openai" => "OpenAI".to_string(),
+        "google" | "gemini" => "Google".to_string(),
+        "openrouter" => "OpenRouter".to_string(),
+        "opencode" | "opencode-zen" => "OpenCode Zen".to_string(),
+        other => {
+            let mut label = other.replace(['-', '_'], " ");
+            if let Some(first) = label.get_mut(0..1) {
+                first.make_ascii_uppercase();
+            }
+            label
+        }
+    }
+}
+
 /// Providers whose live store komet can rewrite to select a saved account.
 /// The CLI-managed sign-in providers keep one login in their own home, so
 /// their rows are shown active but never switchable.
@@ -6246,45 +6571,62 @@ fn parse_cursor_auth(auth: serde_json::Value) -> Option<Detected> {
 }
 
 fn parse_grok_auth(auth: &serde_json::Value) -> Option<Detected> {
+    // `auth.json` is a map of `issuer::client_id` entries — one per OAuth
+    // client, and a device-auth login can add an entry beside an older
+    // browser login's. Map order is alphabetical, NOT recency, so picking the
+    // first entry could detect the stale account and adopt the login into the
+    // wrong slot. The entry with the newest `create_time` is the live login.
+    let mut best: Option<(&serde_json::Value, &str)> = None;
     for entry in auth.as_object()?.values() {
-        let Some(email) = entry
+        let has_email = entry
             .get("email")
             .and_then(serde_json::Value::as_str)
-            .filter(|email| !email.is_empty())
-        else {
+            .is_some_and(|email| !email.is_empty());
+        if !has_email {
             continue;
-        };
-        let display_name = match (
-            entry.get("first_name").and_then(serde_json::Value::as_str),
-            entry.get("last_name").and_then(serde_json::Value::as_str),
-        ) {
-            (Some(first), Some(last)) => Some(format!("{first} {last}")),
-            (Some(first), None) => Some(first.to_string()),
-            (None, Some(last)) => Some(last.to_string()),
-            (None, None) => None,
-        };
-        let account_key = ["user_id", "principal_id"]
-            .into_iter()
-            .find_map(|key| entry.get(key).and_then(serde_json::Value::as_str))
-            .filter(|key| !key.is_empty())
-            .unwrap_or(email);
-        return Some(Detected {
-            account_key: account_key.to_string(),
-            profile: SlotProfile {
-                email: email.to_string(),
-                display_name,
-                organization: entry
-                    .get("team_id")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_string),
-                plan: None,
-                auth_kind: AgentAuthKind::Oauth,
-            },
-            credentials: Some(serde_json::json!({ "managedBy": "grok" })),
-            claude_config: None,
-        });
+        }
+        let created = entry
+            .get("create_time")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        if best.is_none_or(|(_, best_created)| created > best_created) {
+            best = Some((entry, created));
+        }
     }
-    None
+    let (entry, _) = best?;
+    let email = entry
+        .get("email")
+        .and_then(serde_json::Value::as_str)
+        .filter(|email| !email.is_empty())?;
+    let display_name = match (
+        entry.get("first_name").and_then(serde_json::Value::as_str),
+        entry.get("last_name").and_then(serde_json::Value::as_str),
+    ) {
+        (Some(first), Some(last)) => Some(format!("{first} {last}")),
+        (Some(first), None) => Some(first.to_string()),
+        (None, Some(last)) => Some(last.to_string()),
+        (None, None) => None,
+    };
+    let account_key = ["user_id", "principal_id"]
+        .into_iter()
+        .find_map(|key| entry.get(key).and_then(serde_json::Value::as_str))
+        .filter(|key| !key.is_empty())
+        .unwrap_or(email);
+    Some(Detected {
+        account_key: account_key.to_string(),
+        profile: SlotProfile {
+            email: email.to_string(),
+            display_name,
+            organization: entry
+                .get("team_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            plan: None,
+            auth_kind: AgentAuthKind::Oauth,
+        },
+        credentials: Some(serde_json::json!({ "managedBy": "grok" })),
+        claude_config: None,
+    })
 }
 
 fn parse_muse_auth(auth: &serde_json::Value) -> Option<Detected> {
@@ -7082,6 +7424,22 @@ mod tests {
         assert_eq!(grok.profile.email, "a@b.c");
         assert_eq!(grok.profile.display_name.as_deref(), Some("Ada Lovelace"));
 
+        // auth.json can hold one entry per OAuth client; the live login is
+        // the NEWEST `create_time`, not the alphabetically-first key.
+        let multi = parse_grok_auth(&serde_json::json!({
+            "https://auth.x.ai::aaa-old-client": {
+                "email": "old@b.c", "user_id": "old-user",
+                "create_time": "2026-01-01T00:00:00Z",
+            },
+            "https://auth.x.ai::zzz-new-client": {
+                "email": "new@b.c", "user_id": "new-user",
+                "create_time": "2026-06-01T00:00:00Z",
+            },
+        }))
+        .expect("multi-entry grok auth");
+        assert_eq!(multi.account_key, "new-user");
+        assert_eq!(multi.profile.email, "new@b.c");
+
         let muse = parse_muse_auth(&serde_json::json!({
             "providers": {"meta": {"user_email": "M@Example.com", "user_full_name": "Muse User"}}
         }))
@@ -7113,7 +7471,7 @@ mod tests {
     fn cli_login_url_and_code_scan() {
         let output =
             "\r\nVisit https://accounts.x.ai/oauth2/device?user_code=S2NS-VSFM to sign in\r\n";
-        let url = scan_cli_url(output, "https://accounts.x.ai/oauth2/device").expect("url");
+        let url = scan_cli_url(output, &["https://accounts.x.ai/oauth2/device"]).expect("url");
         assert_eq!(
             url,
             "https://accounts.x.ai/oauth2/device?user_code=S2NS-VSFM"
@@ -7124,7 +7482,7 @@ mod tests {
             Some("WDDX-BTWH")
         );
         assert_eq!(
-            scan_cli_url("no link here", "https://qoder.com/device"),
+            scan_cli_url("no link here", &["https://qoder.com/device"]),
             None
         );
     }
@@ -7144,6 +7502,9 @@ mod tests {
             codex_home: root.join("codex"),
             antigravity_home: root.join("antigravity"),
             cursor_auth_file: root.join("sdk").join("auth.json"),
+            opencode_db: root.join("opencode/opencode.db"),
+            pi_auth: root.join("pi/auth.json"),
+            pi_settings: root.join("pi/settings.json"),
             cli_files: CliProviderFiles::under(&root),
         };
         let grok = config.cli_files.grok_auth.clone();
@@ -7186,6 +7547,9 @@ mod tests {
             codex_home: root.join("codex"),
             antigravity_home: root.join("antigravity"),
             cursor_auth_file: root.join("sdk").join("auth.json"),
+            opencode_db: root.join("opencode/opencode.db"),
+            pi_auth: root.join("pi/auth.json"),
+            pi_settings: root.join("pi/settings.json"),
             cli_files: CliProviderFiles::under(&root),
         };
         let accounts = AgentAccounts::new(config.clone());
@@ -7283,6 +7647,9 @@ mod tests {
             codex_home: root.join("codex"),
             antigravity_home: root.join("antigravity"),
             cursor_auth_file: root.join("sdk").join("auth.json"),
+            opencode_db: root.join("opencode/opencode.db"),
+            pi_auth: root.join("pi/auth.json"),
+            pi_settings: root.join("pi/settings.json"),
             cli_files: CliProviderFiles::under(&root),
         };
         let accounts = AgentAccounts::new(config.clone());
@@ -7385,6 +7752,9 @@ mod tests {
             codex_home: root.join("codex"),
             antigravity_home: root.join("antigravity"),
             cursor_auth_file: root.join("sdk").join("auth.json"),
+            opencode_db: root.join("opencode/opencode.db"),
+            pi_auth: root.join("pi/auth.json"),
+            pi_settings: root.join("pi/settings.json"),
             cli_files: CliProviderFiles::under(&root),
         };
         let live = config.cursor_auth_file.clone();
@@ -7407,6 +7777,92 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    #[tokio::test]
+    async fn opencode_console_login_is_mirrored_from_its_sqlite_store() {
+        let root = std::env::temp_dir().join(format!(
+            "komet-opencode-detect-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let db = root.join("opencode/opencode.db");
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE credential(id TEXT PRIMARY KEY, label TEXT, value TEXT);",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO credential(id, label, value) VALUES(?1, ?2, ?3)",
+                rusqlite::params!["c1", "supabase", r#"{"type":"oauth","access":"x"}"#,],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO credential(id, label, value) VALUES(?1, ?2, ?3)",
+                rusqlite::params![
+                    "c2",
+                    "Default",
+                    r#"{"type":"oauth","metadata":{"server":"https://opencode.ai/console","accountID":"acc_1","email":"dev@example.com","orgName":"Default"}}"#,
+                ],
+            )
+            .unwrap();
+        }
+        let config = AgentAccountsConfig {
+            opencode_db: db,
+            ..cursor_test_config(&root)
+        };
+        let accounts = AgentAccounts::new(config);
+        let snapshot = accounts.list(UsageMode::Offline).await.expect("list");
+        let opencode: Vec<_> = snapshot
+            .accounts
+            .iter()
+            .filter(|a| a.harness == HarnessId::Opencode)
+            .collect();
+        assert_eq!(opencode.len(), 1, "{snapshot:?}");
+        assert!(opencode[0].active);
+        assert!(!opencode[0].switchable);
+        assert_eq!(opencode[0].email.as_deref(), Some("dev@example.com"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn pi_default_provider_is_mirrored_as_the_account() {
+        let root = std::env::temp_dir().join(format!(
+            "komet-pi-detect-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let pi_dir = root.join("pi");
+        std::fs::create_dir_all(&pi_dir).unwrap();
+        std::fs::write(
+            pi_dir.join("auth.json"),
+            r#"{"github-copilot":{"type":"oauth","access":"a","refresh":"r"},"openrouter":{"type":"api","key":"k"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            pi_dir.join("settings.json"),
+            r#"{"defaultProvider":"github-copilot"}"#,
+        )
+        .unwrap();
+        let config = AgentAccountsConfig {
+            pi_auth: pi_dir.join("auth.json"),
+            pi_settings: pi_dir.join("settings.json"),
+            ..cursor_test_config(&root)
+        };
+        let accounts = AgentAccounts::new(config);
+        let snapshot = accounts.list(UsageMode::Offline).await.expect("list");
+        let pi: Vec<_> = snapshot
+            .accounts
+            .iter()
+            .filter(|a| a.harness == HarnessId::Pi)
+            .collect();
+        assert_eq!(pi.len(), 1, "{snapshot:?}");
+        assert!(pi[0].active);
+        assert!(!pi[0].switchable);
+        assert_eq!(pi[0].email.as_deref(), Some("GitHub Copilot"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     fn cursor_test_config(root: &std::path::Path) -> AgentAccountsConfig {
         AgentAccountsConfig {
             data_dir: root.join("data"),
@@ -7416,6 +7872,9 @@ mod tests {
             codex_home: root.join("codex"),
             antigravity_home: root.join("antigravity"),
             cursor_auth_file: root.join("sdk").join("auth.json"),
+            opencode_db: root.join("opencode/opencode.db"),
+            pi_auth: root.join("pi/auth.json"),
+            pi_settings: root.join("pi/settings.json"),
             cli_files: CliProviderFiles::under(root),
         }
     }
@@ -7589,6 +8048,9 @@ mod tests {
             codex_home: root.join("codex"),
             antigravity_home: root.join("antigravity"),
             cursor_auth_file: root.join("cursor-sdk-auth.json"),
+            opencode_db: root.join("opencode/opencode.db"),
+            pi_auth: root.join("pi/auth.json"),
+            pi_settings: root.join("pi/settings.json"),
             cli_files: CliProviderFiles::under(&root),
         };
         let accounts = AgentAccounts::new(config);
@@ -7675,6 +8137,9 @@ mod tests {
             codex_home: root.join("codex"),
             antigravity_home: root.join("antigravity"),
             cursor_auth_file: root.join("cursor-sdk-auth.json"),
+            opencode_db: root.join("opencode/opencode.db"),
+            pi_auth: root.join("pi/auth.json"),
+            pi_settings: root.join("pi/settings.json"),
             cli_files: CliProviderFiles::under(&root),
         };
         let accounts = AgentAccounts::new(config);
@@ -7950,6 +8415,9 @@ mod tests {
             codex_home: dir.path().join("codex"),
             antigravity_home: dir.path().join("antigravity"),
             cursor_auth_file: dir.path().join("cursor/auth.json"),
+            opencode_db: dir.path().join("opencode/opencode.db"),
+            pi_auth: dir.path().join("pi/auth.json"),
+            pi_settings: dir.path().join("pi/settings.json"),
             cli_files: CliProviderFiles::under(dir.path()),
         };
         std::fs::create_dir_all(
@@ -8285,6 +8753,9 @@ mod tests {
             codex_home: root.join("codex"),
             antigravity_home: root.join("antigravity"),
             cursor_auth_file: root.join("sdk").join("auth.json"),
+            opencode_db: root.join("opencode/opencode.db"),
+            pi_auth: root.join("pi/auth.json"),
+            pi_settings: root.join("pi/settings.json"),
             cli_files: CliProviderFiles::under(root),
         }
     }

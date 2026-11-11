@@ -184,6 +184,15 @@ pub fn card_row(theme: &Theme, first: bool) -> gpui::Div {
 /// The identity tile on a row: `size-9 rounded-[10px] border bg-white/[0.03]`
 /// around a 16px icon.
 pub fn row_tile(theme: &Theme, icon_path: &'static str) -> gpui::Div {
+    row_tile_branded(theme, icon_path, None)
+}
+
+/// [`row_tile`] keeping a brand mark's own tint (Claude orange, Muse black).
+pub fn row_tile_branded(
+    theme: &Theme,
+    icon_path: &'static str,
+    tint: Option<gpui::Hsla>,
+) -> gpui::Div {
     div()
         .flex_none()
         .size(px(36.0))
@@ -197,7 +206,7 @@ pub fn row_tile(theme: &Theme, icon_path: &'static str) -> gpui::Div {
         .child(
             crate::icons::icon(icon_path)
                 .size(px(16.0))
-                .text_color(theme.text_muted),
+                .text_color(tint.unwrap_or(theme.text_muted)),
         )
 }
 

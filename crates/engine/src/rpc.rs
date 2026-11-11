@@ -2768,14 +2768,78 @@ impl RpcService for EngineRpc {
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 let now = chrono::Utc::now();
                 let store = self.sessions.usage_store();
+                // Measured usage is tagged with the account active when each
+                // turn ran; aggregate only rows visible to the account the
+                // Providers page currently selects (untagged legacy rows
+                // still count — they cannot be attributed).
+                let active_accounts: HashMap<HarnessId, String> = harnesses
+                    .iter()
+                    .filter_map(|harness| {
+                        self.agent_accounts
+                            .active_account_key(*harness)
+                            .map(|key| (*harness, key))
+                    })
+                    .collect();
                 let day = store
                     .as_ref()
-                    .map(|store| store.totals(now - chrono::Duration::days(1)))
+                    .map(|store| store.summarize(now - chrono::Duration::days(1), &active_accounts))
+                    .unwrap_or_default();
+                let week = store
+                    .as_ref()
+                    .map(|store| store.summarize(now - chrono::Duration::days(7), &active_accounts))
                     .unwrap_or_default();
                 let month = store
                     .as_ref()
-                    .map(|store| store.totals(now - chrono::Duration::days(30)))
+                    .map(|store| {
+                        store.summarize(now - chrono::Duration::days(30), &active_accounts)
+                    })
                     .unwrap_or_default();
+                // Previous same-length windows for the M6 comparison.
+                let prev_day = store
+                    .as_ref()
+                    .map(|store| {
+                        store.range_totals(
+                            now - chrono::Duration::days(2),
+                            now - chrono::Duration::days(1),
+                            &active_accounts,
+                        )
+                    })
+                    .unwrap_or_default();
+                let prev_week = store
+                    .as_ref()
+                    .map(|store| {
+                        store.range_totals(
+                            now - chrono::Duration::days(14),
+                            now - chrono::Duration::days(7),
+                            &active_accounts,
+                        )
+                    })
+                    .unwrap_or_default();
+                let prev_month = store
+                    .as_ref()
+                    .map(|store| {
+                        store.range_totals(
+                            now - chrono::Duration::days(60),
+                            now - chrono::Duration::days(30),
+                            &active_accounts,
+                        )
+                    })
+                    .unwrap_or_default();
+                let series = store
+                    .as_ref()
+                    .map(|store| store.series(now, &active_accounts))
+                    .unwrap_or_default();
+                let rate_limits = (
+                    store.as_ref().and_then(|store| {
+                        store.rate_limit_counts(now - chrono::Duration::days(1), &active_accounts)
+                    }),
+                    store.as_ref().and_then(|store| {
+                        store.rate_limit_counts(now - chrono::Duration::days(7), &active_accounts)
+                    }),
+                    store.as_ref().and_then(|store| {
+                        store.rate_limit_counts(now - chrono::Duration::days(30), &active_accounts)
+                    }),
+                );
                 let agents = harnesses
                     .into_iter()
                     .map(|harness| {
@@ -2809,8 +2873,42 @@ impl RpcService for EngineRpc {
                                     windows: windows.clone(),
                                 }
                             }),
-                            last_day: day.get(&harness).copied().unwrap_or_default(),
-                            last_30_days: month.get(&harness).copied().unwrap_or_default(),
+                            last_day: day.totals.get(&harness).copied().unwrap_or_default(),
+                            last_7_days: week.totals.get(&harness).copied().unwrap_or_default(),
+                            last_30_days: month.totals.get(&harness).copied().unwrap_or_default(),
+                            day_detail: day.details.get(&harness).cloned().unwrap_or_default(),
+                            week_detail: week.details.get(&harness).cloned().unwrap_or_default(),
+                            month_detail: month.details.get(&harness).cloned().unwrap_or_default(),
+                            prev_day: prev_day.get(&harness).copied().unwrap_or_default(),
+                            prev_7_days: prev_week.get(&harness).copied().unwrap_or_default(),
+                            prev_30_days: prev_month.get(&harness).copied().unwrap_or_default(),
+                            series: series.get(&harness).cloned().unwrap_or_default(),
+                            rate_limits: komet_proto::UsageRateLimits {
+                                day: rate_limits
+                                    .0
+                                    .as_ref()
+                                    .and_then(|counts| counts.get(&harness).copied()),
+                                week: rate_limits
+                                    .1
+                                    .as_ref()
+                                    .and_then(|counts| counts.get(&harness).copied()),
+                                month: rate_limits
+                                    .2
+                                    .as_ref()
+                                    .and_then(|counts| counts.get(&harness).copied()),
+                            },
+                            day_cost: day
+                                .details
+                                .get(&harness)
+                                .and_then(crate::usage_pricing::estimate),
+                            week_cost: week
+                                .details
+                                .get(&harness)
+                                .and_then(crate::usage_pricing::estimate),
+                            month_cost: month
+                                .details
+                                .get(&harness)
+                                .and_then(crate::usage_pricing::estimate),
                         }
                     })
                     .collect();

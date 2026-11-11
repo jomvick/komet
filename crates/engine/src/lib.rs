@@ -37,6 +37,7 @@ pub mod terminals;
 pub mod titles;
 pub mod uploads;
 pub mod usage;
+pub mod usage_pricing;
 pub mod workspace_files;
 pub mod workspace_host;
 pub mod workspace_runtime;
@@ -230,6 +231,15 @@ impl EngineCore {
         let device_id = load_or_create_device_id(data_dir)?;
         // Settings › Usage history: local and unsynced, 180-day rolling retention.
         let usage = Arc::new(UsageStore::open(profile.store_root())?);
+        // Backfill measured tokens from the run journals once: turns recorded
+        // before this index existed would otherwise read as "no usage".
+        match usage.import_journals_once(&profile.store_root().join("journals")) {
+            Ok(0) => {}
+            Ok(imported) => tracing::info!(imported, "usage journal backfill"),
+            Err(err) => {
+                tracing::warn!(error = %err, "usage journal backfill failed")
+            }
+        }
         tracing::info!(
             elapsed_ms = assembly_start.elapsed().as_millis(),
             "device id loaded"
