@@ -45,6 +45,7 @@ use crate::settings::providers::ProvidersPage;
 use crate::settings::security::{SecurityDefaults, SecurityEvent, SecurityPage};
 use crate::settings::shortcuts::{ShortcutsEvent, ShortcutsPage};
 use crate::settings::sync::{SyncEvent, SyncPage};
+use crate::settings::usage::{UsageEvent, UsagePage};
 use crate::settings::wallpaper;
 use crate::settings::{
     RIGHT_PANE_DEFAULT, RIGHT_PANE_MAX, RIGHT_PANE_MIN, RememberedNavigation, SAVE_DEBOUNCE_MS,
@@ -333,6 +334,7 @@ pub struct Shell {
     notifications_page: Option<Entity<NotificationsPage>>,
     shortcuts_page: Option<Entity<ShortcutsPage>>,
     providers_page: Option<Entity<ProvidersPage>>,
+    usage_page: Option<Entity<UsagePage>>,
     security_page: Option<Entity<SecurityPage>>,
     sync_page: Option<Entity<SyncPage>>,
     integrations_page: Option<Entity<IntegrationsPage>>,
@@ -340,6 +342,7 @@ pub struct Shell {
     notifications_sub: Option<Subscription>,
     security_sub: Option<Subscription>,
     sync_sub: Option<Subscription>,
+    usage_sub: Option<Subscription>,
     /// Session-row context menu: (chat id, window position).
     chat_menu: popover::Popup<(String, Point<Pixels>)>,
     rename_dialog: Option<RenameChatDialog>,
@@ -693,6 +696,7 @@ impl Shell {
             notifications_page: None,
             shortcuts_page: None,
             providers_page: None,
+            usage_page: None,
             security_page: None,
             sync_page: None,
             integrations_page: None,
@@ -700,6 +704,7 @@ impl Shell {
             notifications_sub: None,
             security_sub: None,
             sync_sub: None,
+            usage_sub: None,
             chat_menu: popover::Popup::default(),
             rename_dialog: None,
             delete_confirm: None,

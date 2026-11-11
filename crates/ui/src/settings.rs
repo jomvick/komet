@@ -41,6 +41,7 @@ pub mod providers;
 pub mod security;
 pub mod shortcuts;
 pub mod sync;
+pub mod usage;
 pub mod wallpaper;
 pub mod widgets;
 
@@ -176,6 +177,14 @@ pub struct UiSettings {
     pub files_editor_font_size: f32,
     /// Include hidden and ignored entries in workspace file trees.
     pub files_show_all: bool,
+    /// Agents shown on Settings › Usage (harness slugs). Starts with the two
+    /// providers whose quotas Komet reads first.
+    #[serde(default = "default_usage_agents")]
+    pub usage_agents: Vec<String>,
+}
+
+fn default_usage_agents() -> Vec<String> {
+    vec!["claude-code".into(), "codex".into()]
 }
 
 impl Default for UiSettings {
@@ -210,6 +219,7 @@ impl Default for UiSettings {
             files_word_wrap: false,
             files_editor_font_size: FILES_EDITOR_FONT_SIZE_DEFAULT,
             files_show_all: false,
+            usage_agents: default_usage_agents(),
         }
     }
 }
@@ -540,6 +550,7 @@ mod tests {
             files_word_wrap: true,
             files_editor_font_size: 13.0,
             files_show_all: false,
+            usage_agents: vec!["claude-code".into(), "cursor".into()],
         };
         settings.save(dir.path()).unwrap();
         let json = std::fs::read_to_string(UiSettings::path(dir.path())).unwrap();

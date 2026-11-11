@@ -477,6 +477,11 @@ struct Inner {
     harness_sessions: Mutex<HashMap<String, HarnessSessionRef>>,
     /// Latest context-window snapshot per chat (replaced, not summed).
     usage_stats: Mutex<HashMap<String, komet_proto::ContextUsageStats>>,
+    /// Last model seen in `SessionStarted` per chat — `AgentEvent::Usage`
+    /// carries token counts only, so the usage index reads the model here.
+    models: Mutex<HashMap<String, String>>,
+    /// Local usage-history sink (wired at engine assembly; absent in bare tests).
+    usage_store: OnceLock<Arc<crate::usage::UsageStore>>,
     /// Auto-titler for untitled chats (wired at engine assembly; absent in bare tests).
     titles: OnceLock<crate::titles::TitleGenerator>,
     /// Fired with `(chat_id, cwd)` when a user prompt starts a turn (fresh
@@ -537,6 +542,8 @@ impl SessionsEngine {
                 last_requests: Mutex::new(HashMap::new()),
                 harness_sessions: Mutex::new(HashMap::new()),
                 usage_stats: Mutex::new(HashMap::new()),
+                models: Mutex::new(HashMap::new()),
+                usage_store: OnceLock::new(),
                 titles: OnceLock::new(),
                 turn_listener: OnceLock::new(),
                 permission_timeout: Mutex::new(Some(std::time::Duration::from_secs(10 * 60))),
@@ -566,6 +573,18 @@ impl SessionsEngine {
         if self.inner.agent_accounts.set(accounts).is_err() {
             tracing::warn!("agent accounts service was already wired to sessions");
         }
+    }
+
+    /// Wire the local usage-history store (once per engine graph).
+    pub fn set_usage_store(&self, store: Arc<crate::usage::UsageStore>) {
+        if self.inner.usage_store.set(store).is_err() {
+            tracing::warn!("usage store was already wired to sessions");
+        }
+    }
+
+    /// The usage-history store, when the engine wired one.
+    pub fn usage_store(&self) -> Option<Arc<crate::usage::UsageStore>> {
+        self.inner.usage_store.get().cloned()
     }
 
     /// Wire the device's terminals so the internal MCP catalog can answer
@@ -2017,6 +2036,7 @@ impl Inner {
         }
         let usage_changed = match event {
             AgentEvent::SessionStarted { model, .. } => {
+                lock(&self.models).insert(chat_id.to_string(), model.clone());
                 let mut usage_stats = lock(&self.usage_stats);
                 let default_limit = komet_proto::default_context_limit_for_model(model);
                 usage_stats
@@ -2054,6 +2074,26 @@ impl Inner {
                     *reasoning_tokens,
                     *context_limit,
                 );
+                // Durable measured-usage index (Settings › Usage). Local only;
+                // no prompt or credential ever reaches this record.
+                if let Some(store) = self.usage_store.get()
+                    && let Some(harness) = self.harness_owner(chat_id)
+                {
+                    let turn = crate::usage::TurnUsage {
+                        ts: Utc::now().timestamp_millis(),
+                        chat: chat_id.to_string(),
+                        harness,
+                        model: lock(&self.models).get(chat_id).cloned(),
+                        project: self.journal_harness_session(chat_id).map(|(_, cwd, _)| cwd),
+                        input_tokens: *input_tokens,
+                        cached_input_tokens: *cached_input_tokens,
+                        output_tokens: *output_tokens,
+                        reasoning_tokens: *reasoning_tokens,
+                    };
+                    if let Err(err) = store.record_turn(&turn) {
+                        tracing::warn!(chat = %chat_id, error = %err, "usage turn append failed");
+                    }
+                }
                 true
             }
             _ => false,
@@ -3999,6 +4039,47 @@ mod tests {
                 .map(|s| s.used()),
             Some(20_000),
         );
+    }
+
+    #[test]
+    fn usage_events_feed_the_local_usage_index() {
+        let (dir, engine) = test_engine();
+        let store = Arc::new(crate::usage::UsageStore::open(&dir.path().join("store")).unwrap());
+        engine.set_usage_store(store.clone());
+        let chat = "chat-index";
+        lock(&engine.inner.harness_sessions).insert(
+            chat.into(),
+            HarnessSessionRef {
+                harness: HarnessId::ClaudeCode,
+                session_id: "claude-session".into(),
+                cwd: "/workspace".into(),
+            },
+        );
+        engine.inner.publish(
+            chat,
+            &AgentEvent::SessionStarted {
+                harness: HarnessId::ClaudeCode,
+                model: "claude-sonnet".into(),
+                tools: Vec::new(),
+                cwd: "/workspace".into(),
+                session_id: "claude-session".into(),
+                assistant_message_id: "a".into(),
+            },
+        );
+        engine.inner.publish(chat, &turn_usage(120, 8));
+
+        let totals = store.totals(Utc::now() - chrono::Duration::days(1));
+        let claude = totals.get(&HarnessId::ClaudeCode).expect("indexed turn");
+        assert_eq!(claude.runs, 1);
+        assert_eq!(claude.input_tokens, 120);
+        assert_eq!(claude.output_tokens, 8);
+    }
+
+    #[test]
+    fn usage_events_are_not_indexed_without_a_store() {
+        let (_dir, engine) = test_engine();
+        engine.inner.publish("chat-none", &turn_usage(5, 1));
+        assert!(engine.usage_store().is_none());
     }
 
     #[test]

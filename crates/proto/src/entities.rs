@@ -779,6 +779,66 @@ pub struct AgentUsageWindow {
     /// Provider-reported usage when no comparable quota denominator exists.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_value: Option<String>,
+    /// Quota-window duration in seconds when the provider states it. Absent =
+    /// unknown — pace must not be invented.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_seconds: Option<u32>,
+}
+
+/// Komet-measured token totals for one period. Never provider billing data.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageTotals {
+    pub runs: u64,
+    pub input_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub output_tokens: u64,
+    pub reasoning_tokens: u64,
+}
+
+impl UsageTotals {
+    pub fn add(&mut self, other: &Self) {
+        self.runs += other.runs;
+        self.input_tokens += other.input_tokens;
+        self.cached_input_tokens += other.cached_input_tokens;
+        self.output_tokens += other.output_tokens;
+        self.reasoning_tokens += other.reasoning_tokens;
+    }
+}
+
+/// One persisted quota sample (for pace projections).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageQuotaPoint {
+    pub at: DateTime<Utc>,
+    pub windows: Vec<AgentUsageWindow>,
+}
+
+/// One agent's row on the Usage page: the active account's provider meters
+/// plus Komet-measured totals.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentUsageReport {
+    pub harness: HarnessId,
+    /// The active account (with `usage_windows`); `None` when the CLI has no
+    /// login on this device.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<AgentAccount>,
+    /// Newest persisted quota sample for this agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_quota_at: Option<DateTime<Utc>>,
+    /// The sample before `last_quota_at` — the only history pace projections
+    /// may use.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_quota: Option<UsageQuotaPoint>,
+    pub last_day: UsageTotals,
+    pub last_30_days: UsageTotals,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageReport {
+    pub agents: Vec<AgentUsageReport>,
 }
 
 /// An open PTY session on the owning device (`OpenTerminal` reply).

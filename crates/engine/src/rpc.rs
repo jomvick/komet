@@ -386,6 +386,18 @@ struct AgentAccountParams {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct GetUsageReportParams {
+    /// Agents the Usage page currently shows; empty = the default pair.
+    #[serde(default)]
+    agents: Vec<HarnessId>,
+    #[serde(default)]
+    usage_mode: Option<String>,
+    #[serde(default)]
+    force_usage: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct StartAgentLoginParams {
     harness: HarnessId,
 }
@@ -1283,6 +1295,7 @@ fn forwardable(method: &str) -> bool {
             // Agent accounts are per-device CLI logins (the device switcher
             // retargets which device's logins are shown).
             | methods::LIST_AGENT_ACCOUNTS
+            | methods::GET_USAGE_REPORT
             | methods::ACTIVATE_AGENT_ACCOUNT
             | methods::FORGET_AGENT_ACCOUNT
             | methods::START_AGENT_LOGIN
@@ -2736,6 +2749,72 @@ impl RpcService for EngineRpc {
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&snapshot)
+            }
+            methods::GET_USAGE_REPORT => {
+                let p: GetUsageReportParams = parse_params(params)?;
+                let mode = crate::agent_accounts::UsageMode::from_params(
+                    p.usage_mode.as_deref(),
+                    p.force_usage,
+                );
+                let harnesses = if p.agents.is_empty() {
+                    vec![HarnessId::ClaudeCode, HarnessId::Codex]
+                } else {
+                    p.agents
+                };
+                let snapshot = self
+                    .agent_accounts
+                    .list_only(mode, &harnesses)
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                let now = chrono::Utc::now();
+                let store = self.sessions.usage_store();
+                let day = store
+                    .as_ref()
+                    .map(|store| store.totals(now - chrono::Duration::days(1)))
+                    .unwrap_or_default();
+                let month = store
+                    .as_ref()
+                    .map(|store| store.totals(now - chrono::Duration::days(30)))
+                    .unwrap_or_default();
+                let agents = harnesses
+                    .into_iter()
+                    .map(|harness| {
+                        let account = snapshot
+                            .accounts
+                            .iter()
+                            .find(|account| account.harness == harness && account.active)
+                            .cloned();
+                        let samples = account
+                            .as_ref()
+                            .and_then(|account| account.email.as_deref())
+                            .zip(store.as_ref())
+                            .map(|(email, store)| store.quota_samples(harness, email, 2))
+                            .unwrap_or_default();
+                        // Draw the newest persisted sample until a live probe
+                        // answers: an Offline report is instant and never blank.
+                        let mut account = account;
+                        if let Some(account) = &mut account
+                            && account.usage_windows.is_empty()
+                            && let Some((_, windows)) = samples.first()
+                        {
+                            account.usage_windows = windows.clone();
+                        }
+                        komet_proto::AgentUsageReport {
+                            harness,
+                            account,
+                            last_quota_at: samples.first().map(|(at, _)| *at),
+                            previous_quota: samples.get(1).map(|(at, windows)| {
+                                komet_proto::UsageQuotaPoint {
+                                    at: *at,
+                                    windows: windows.clone(),
+                                }
+                            }),
+                            last_day: day.get(&harness).copied().unwrap_or_default(),
+                            last_30_days: month.get(&harness).copied().unwrap_or_default(),
+                        }
+                    })
+                    .collect();
+                RpcReply::value(&komet_proto::UsageReport { agents })
             }
             methods::ACTIVATE_AGENT_ACCOUNT => {
                 let p: AgentAccountParams = parse_params(params)?;

@@ -803,7 +803,7 @@ fn nav_settings_sections_are_distinct_entries() {
 
 #[test]
 fn settings_sections_include_security() {
-    assert_eq!(SettingsSection::ALL.len(), 10);
+    assert_eq!(SettingsSection::ALL.len(), 11);
     assert!(SettingsSection::ALL.contains(&SettingsSection::Providers));
     assert_eq!(SettingsSection::Providers.label(), "Providers");
     assert!(SettingsSection::ALL.contains(&SettingsSection::Security));

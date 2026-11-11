@@ -36,6 +36,7 @@ pub mod spaces;
 pub mod terminals;
 pub mod titles;
 pub mod uploads;
+pub mod usage;
 pub mod workspace_files;
 pub mod workspace_host;
 pub mod workspace_runtime;
@@ -61,6 +62,7 @@ pub use spaces::SpacesSync;
 pub use terminals::{TerminalDelta, TerminalScreen, TerminalTail, Terminals};
 pub use titles::TitleGenerator;
 pub use uploads::{AttachmentChunk, Uploads};
+pub use usage::{QuotaSample, TurnUsage, UsageStore};
 pub use workspace_files::{WorkspaceFiles, WorkspaceFilesError};
 pub use workspace_host::{
     DEFAULT_ORG_ID, DEFAULT_USER_ID, WORKSPACE_DOC_ID, WorkspaceHost, WorkspaceHostConfig,
@@ -128,6 +130,8 @@ pub struct EngineCore {
     pub spaces_sync: SpacesSync,
     pub uploads: Uploads,
     pub agent_accounts: AgentAccounts,
+    /// Local, unsynced usage history behind Settings › Usage.
+    pub usage: Arc<UsageStore>,
     /// Remote environments: their own docs stores, registry rooms and tokens.
     pub envs: Arc<EnvHosts>,
     pub device_id: String,
@@ -224,6 +228,8 @@ impl EngineCore {
             "legacy uploads claimed"
         );
         let device_id = load_or_create_device_id(data_dir)?;
+        // Settings › Usage history: local and unsynced, 180-day rolling retention.
+        let usage = Arc::new(UsageStore::open(profile.store_root())?);
         tracing::info!(
             elapsed_ms = assembly_start.elapsed().as_millis(),
             "device id loaded"
@@ -379,6 +385,8 @@ impl EngineCore {
         });
         let agent_accounts = AgentAccounts::new(AgentAccountsConfig::detect(data_dir));
         sessions.set_agent_accounts(agent_accounts.clone());
+        sessions.set_usage_store(usage.clone());
+        agent_accounts.set_usage_store(usage.clone(), device_id.clone());
         sessions.set_titles(TitleGenerator::new(
             workspace.clone(),
             registry.clone(),
@@ -415,6 +423,7 @@ impl EngineCore {
             spaces_sync,
             uploads,
             agent_accounts,
+            usage,
             envs: Arc::new(EnvHosts::boot(
                 data_dir,
                 &device_id,

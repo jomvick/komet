@@ -115,6 +115,9 @@ const AGY_KEYRING_USER: &str = "antigravity";
 const KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
 
 const USAGE_TTL: Duration = Duration::from_secs(60);
+/// Manual Refresh cooldown per account (issue #53): no second provider probe
+/// inside this window; the cached windows answer instead.
+const MANUAL_REFRESH_COOLDOWN: Duration = Duration::from_secs(30);
 /// An abandoned login flow (dialog dismissed without Cancel) is reaped past this.
 const FLOW_TTL: Duration = Duration::from_secs(15 * 60);
 /// A CLI sign-in still pending this long after it started is reported as an
@@ -821,6 +824,7 @@ github.com:
             used_fraction: 0.42,
             resets_at: None,
             display_value: None,
+            window_seconds: Some(18_000),
         }];
         let key = format!("{}:{}", harness_slug(slot.harness), slot.account_key);
         lock(&accounts.inner.usage_cache).insert(key, (Some(windows.clone()), Instant::now()));
@@ -853,6 +857,58 @@ github.com:
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// A successful quota probe is what fills the Usage page's history — the
+    /// sample carries the window duration and the account identity only.
+    #[test]
+    fn quota_samples_land_in_the_usage_history() {
+        let dir = std::env::temp_dir().join(format!(
+            "komet-usage-history-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let accounts = AgentAccounts::new(AgentAccountsConfig {
+            data_dir: dir.join("data"),
+            gh_cli: None,
+            claude_config_dir: dir.join("claude"),
+            claude_config_file: dir.join("claude.json"),
+            codex_home: dir.join("codex"),
+            antigravity_home: dir.join("antigravity"),
+            cursor_auth_file: dir.join("sdk").join("auth.json"),
+            cli_files: CliProviderFiles::under(&dir),
+        });
+        let store = Arc::new(crate::usage::UsageStore::open(&dir.join("store")).unwrap());
+        accounts.set_usage_store(store.clone(), "device-1".into());
+        let slot = Slot {
+            id: "0123456789abcdef".into(),
+            harness: HarnessId::ClaudeCode,
+            account_key: "acct-key".into(),
+            profile: SlotProfile {
+                email: "a@example.com".into(),
+                display_name: None,
+                organization: None,
+                plan: None,
+                auth_kind: AgentAuthKind::Oauth,
+            },
+            credentials: serde_json::json!({}),
+            claude_config: None,
+            saved_at: 0,
+            created_at: None,
+        };
+        let windows = vec![AgentUsageWindow {
+            label: "Session".into(),
+            used_fraction: 0.42,
+            resets_at: None,
+            display_value: None,
+            window_seconds: Some(18_000),
+        }];
+        accounts.record_quota_sample(HarnessId::ClaudeCode, &slot, &windows);
+
+        let samples = store.quota_samples(HarnessId::ClaudeCode, "a@example.com", 1);
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].1, windows);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 /// Classify an HTTP status for any usage probe (Claude, Codex, Antigravity).
@@ -881,6 +937,12 @@ struct Inner {
     /// via Google's userinfo endpoint are cached by `account_key` (the stable
     /// refresh-token hash) so `list()` doesn't hit Google again once resolved.
     antigravity_profile_cache: Mutex<HashMap<String, (String, Option<String>)>>,
+    /// `"{harness}:{accountKey}"` → last explicit Refresh probe. Enforces the
+    /// 30 s manual-refresh cooldown (issue #53): a second click inside it is
+    /// answered from the cache instead of hammering the provider.
+    fresh_probes: Mutex<HashMap<String, Instant>>,
+    /// Local usage-history sink + this device's id (wired at engine assembly).
+    usage_sink: Mutex<Option<(Arc<crate::usage::UsageStore>, String)>>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -1198,14 +1260,31 @@ impl AgentAccounts {
                 usage_cache: Mutex::new(HashMap::new()),
                 inflight_refreshes: Mutex::new(std::collections::HashSet::new()),
                 antigravity_profile_cache: Mutex::new(antigravity_profile_cache),
+                fresh_probes: Mutex::new(HashMap::new()),
+                usage_sink: Mutex::new(None),
             }),
         }
     }
 
     // ── list ────────────────────────────────────────────────────────────────
 
+    /// Wire the local usage-history store (once per engine graph).
+    pub fn set_usage_store(&self, store: Arc<crate::usage::UsageStore>, device_id: String) {
+        *lock(&self.inner.usage_sink) = Some((store, device_id));
+    }
+
     /// Detect both CLIs, auto-snapshot the live logins, and assemble the view.
     pub async fn list(&self, mode: UsageMode) -> Result<AgentAccountsSnapshot, EngineError> {
+        self.list_only(mode, &[]).await
+    }
+
+    /// `list` restricted to `only` agents for provider probes (issue #53: never
+    /// probe an agent the Usage page has not selected). Empty `only` = all.
+    pub async fn list_only(
+        &self,
+        mode: UsageMode,
+        only: &[HarnessId],
+    ) -> Result<AgentAccountsSnapshot, EngineError> {
         // No cache eviction here: whether an entry may be served is decided by
         // `usage_for` from `mode` alone (`Fresh` ignores the cache outright).
         // The old eviction pass tested the same `elapsed() < USAGE_TTL`
@@ -1355,7 +1434,7 @@ impl AgentAccounts {
                 // Quotas describe the live CLI session, not every saved login.
                 // Avoid probing inactive accounts and only attach usage to the
                 // account that is currently selected for this provider.
-                let usage = if active {
+                let usage = if active && (only.is_empty() || only.contains(&harness)) {
                     self.usage_for(harness, slot, true, mode).await
                 } else {
                     None
@@ -4495,6 +4574,16 @@ impl AgentAccounts {
         mode: UsageMode,
     ) -> Option<Vec<AgentUsageWindow>> {
         let key = format!("{}:{}", harness_slug(harness), slot.account_key);
+        // Manual-refresh cooldown: a Fresh request inside 30 s of the previous
+        // one is answered from the cache, never from a second provider probe.
+        if mode == UsageMode::Fresh
+            && lock(&self.inner.fresh_probes)
+                .get(&key)
+                .is_some_and(|at| at.elapsed() < MANUAL_REFRESH_COOLDOWN)
+            && let Some((usage, _)) = lock(&self.inner.usage_cache).get(&key)
+        {
+            return usage.clone();
+        }
         // `Fresh` never reads the cache: a Refresh must produce a real probe
         // even when the previous one succeeded less than USAGE_TTL ago.
         if mode.may_serve_cache()
@@ -4506,6 +4595,9 @@ impl AgentAccounts {
         if !mode.probes() {
             // Offline lists never hit the network (see module docs).
             return None;
+        }
+        if mode == UsageMode::Fresh {
+            lock(&self.inner.fresh_probes).insert(key.clone(), Instant::now());
         }
         let usage = match harness {
             HarnessId::ClaudeCode => self.claude_usage(slot, is_active).await,
@@ -4519,10 +4611,28 @@ impl AgentAccounts {
         // (offline, provider 403, expired token) stick as "Usage unavailable"
         // for the whole TTL — and every non-forced list (Switch/Forget) then
         // re-served that stale miss instead of retrying.
-        if usage.is_some() {
+        if let Some(windows) = &usage {
             lock(&self.inner.usage_cache).insert(key, (usage.clone(), Instant::now()));
+            self.record_quota_sample(harness, slot, windows);
         }
         usage
+    }
+
+    /// Persist one quota sample for the local history (no-op until wired).
+    fn record_quota_sample(&self, harness: HarnessId, slot: &Slot, windows: &[AgentUsageWindow]) {
+        let Some((store, device)) = lock(&self.inner.usage_sink).clone() else {
+            return;
+        };
+        let sample = crate::usage::QuotaSample {
+            ts: now_ms(),
+            device,
+            harness,
+            account: slot.profile.email.clone(),
+            windows: windows.to_vec(),
+        };
+        if let Err(err) = store.record_quota(&sample) {
+            tracing::warn!(error = %err, "usage quota sample append failed");
+        }
     }
 
     async fn claude_usage(&self, slot: &Slot, is_active: bool) -> Option<Vec<AgentUsageWindow>> {
@@ -4563,6 +4673,8 @@ impl AgentAccounts {
                     used_fraction: (utilization / 100.0).clamp(0.0, 1.0) as f32,
                     resets_at: parse_when(w.get("resets_at")),
                     display_value: None,
+                    // Anthropic's published plan windows: 5 hours and 7 days.
+                    window_seconds: Some(if key == "five_hour" { 18_000 } else { 604_800 }),
                 });
             }
         }
@@ -5933,6 +6045,7 @@ fn parse_codex_usage_response(body: &serde_json::Value) -> Vec<AgentUsageWindow>
                 used_fraction: (used / 100.0) as f32,
                 resets_at: parse_when(w.get("reset_at")),
                 display_value: None,
+                window_seconds: (span > 0).then_some(span as u32),
             });
         }
     }
@@ -5973,6 +6086,7 @@ fn parse_cursor_usage_response(body: &serde_json::Value) -> Vec<AgentUsageWindow
                     used_fraction: (count / limit).clamp(0.0, 1.0) as f32,
                     resets_at: parse_when(body.get("billingCycleEnd")),
                     display_value: None,
+                    window_seconds: None,
                 })
             })
             .collect();
@@ -5995,6 +6109,7 @@ fn parse_cursor_usage_response(body: &serde_json::Value) -> Vec<AgentUsageWindow
             used_fraction: (count / limit).clamp(0.0, 1.0) as f32,
             resets_at: parse_when(body.get("resetsAt")).or_else(|| parse_when(body.get("resetAt"))),
             display_value: None,
+            window_seconds: (span > 0).then_some(span as u32),
         });
     }
 
@@ -6009,6 +6124,7 @@ fn parse_cursor_usage_response(body: &serde_json::Value) -> Vec<AgentUsageWindow
             used_fraction: (count / limit).clamp(0.0, 1.0) as f32,
             resets_at: None,
             display_value: None,
+            window_seconds: (span > 0).then_some(span as u32),
         });
     }
 
@@ -6041,6 +6157,7 @@ fn parse_cursor_usage_summary(body: &serde_json::Value) -> Option<Vec<AgentUsage
         used_fraction: used.clamp(0.0, 1.0) as f32,
         resets_at,
         display_value: None,
+        window_seconds: None,
     }])
 }
 
@@ -6420,6 +6537,7 @@ fn parse_antigravity_quota_response(body: &serde_json::Value) -> Vec<AgentUsageW
                             used_fraction: used,
                             resets_at,
                             display_value: None,
+                            window_seconds: bucket_window_seconds(bucket),
                         });
                         break;
                     }
@@ -6445,6 +6563,7 @@ fn parse_antigravity_quota_response(body: &serde_json::Value) -> Vec<AgentUsageW
                     used_fraction: used,
                     resets_at,
                     display_value: None,
+                    window_seconds: bucket_window_seconds(bucket),
                 });
             }
         }
@@ -6474,6 +6593,8 @@ fn parse_copilot_usage_report(body: &serde_json::Value) -> Option<Vec<AgentUsage
         used_fraction: 0.0,
         resets_at: None,
         display_value: Some(format!("${total:.2} billed")),
+        // Calendar-month billing report: no fixed window duration to pace.
+        window_seconds: None,
     }])
 }
 
@@ -6490,6 +6611,18 @@ fn bucket_used_fraction(bucket: &serde_json::Value) -> Option<f32> {
         }
     }
     None
+}
+
+/// Quota bucket duration from its `window` string (`daily`/`weekly`/`monthly`).
+fn bucket_window_seconds(bucket: &serde_json::Value) -> Option<u32> {
+    let window = str_field(bucket, "window")?;
+    match window.to_ascii_lowercase().as_str() {
+        "hourly" | "hour" => Some(3_600),
+        "daily" | "day" => Some(86_400),
+        "weekly" | "week" => Some(604_800),
+        "monthly" | "month" => Some(2_592_000),
+        _ => None,
+    }
 }
 
 /// Last meaningful line of a PTY transcript — the `agy` failure message to show
@@ -7634,6 +7767,7 @@ mod tests {
         assert_eq!(windows[0].label, "Gemini");
         assert!((windows[0].used_fraction - 0.0).abs() < 0.01);
         assert!(windows[0].resets_at.is_some());
+        assert_eq!(windows[0].window_seconds, Some(604_800));
 
         assert_eq!(windows[1].label, "Claude/GPT");
         assert!((windows[1].used_fraction - 0.84).abs() < 0.01);
@@ -7975,6 +8109,8 @@ mod tests {
         assert!(windows[0].resets_at.is_some());
         assert_eq!(windows[1].label, "Session");
         assert!((windows[1].used_fraction - 0.125).abs() < 0.001);
+        assert_eq!(windows[0].window_seconds, Some(604_800));
+        assert_eq!(windows[1].window_seconds, Some(18_000));
         assert!(parse_codex_usage_response(&serde_json::json!({"other": 1})).is_empty());
     }
 
@@ -8042,6 +8178,7 @@ mod tests {
         // Monthly label when window > 86 400 s.
         assert_eq!(windows[0].label, "Month Requests");
         assert!((windows[0].used_fraction - 0.5).abs() < 0.001);
+        assert_eq!(windows[0].window_seconds, Some(2_592_000));
         assert_eq!(windows[1].label, "Month Tokens");
         assert!((windows[1].used_fraction - 0.5).abs() < 0.001);
     }

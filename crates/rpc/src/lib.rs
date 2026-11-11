@@ -169,6 +169,9 @@ pub mod methods {
     pub const GET_CHECKOUT_FILE_DIFF_TEXT: &str = "GetCheckoutFileDiffText";
     // Agent accounts (ControlRpc, relay-forwardable — CLI logins are per-device).
     pub const LIST_AGENT_ACCOUNTS: &str = "ListAgentAccounts";
+    /// Settings › Usage (issue #53): selected agents' provider quotas joined
+    /// with Komet-measured token totals. Route to the target device.
+    pub const GET_USAGE_REPORT: &str = "GetUsageReport";
     pub const ACTIVATE_AGENT_ACCOUNT: &str = "ActivateAgentAccount";
     pub const FORGET_AGENT_ACCOUNT: &str = "ForgetAgentAccount";
     pub const START_AGENT_LOGIN: &str = "StartAgentLogin";

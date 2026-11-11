@@ -6,6 +6,8 @@ pub enum SettingsSection {
     Devices,
     /// One card per agent: enablement, CLI install state and its logins.
     Providers,
+    /// Provider quota windows + Komet-measured token usage (issue #53).
+    Usage,
     Appearance,
     Files,
     Notifications,
@@ -17,9 +19,10 @@ pub enum SettingsSection {
 }
 
 impl SettingsSection {
-    pub const ALL: [SettingsSection; 10] = [
+    pub const ALL: [SettingsSection; 11] = [
         SettingsSection::Devices,
         SettingsSection::Providers,
+        SettingsSection::Usage,
         SettingsSection::Appearance,
         SettingsSection::Files,
         SettingsSection::Notifications,
@@ -36,6 +39,7 @@ impl SettingsSection {
         match self {
             SettingsSection::Devices => "Devices",
             SettingsSection::Providers => "Providers",
+            SettingsSection::Usage => "Usage",
             SettingsSection::Appearance => "Appearance",
             SettingsSection::Files => "Files",
             SettingsSection::Notifications => "Notifications",
@@ -54,6 +58,7 @@ impl SettingsSection {
         match self {
             SettingsSection::Devices => icons::MONITOR,
             SettingsSection::Providers => icons::WIDGET,
+            SettingsSection::Usage => icons::SORT_VERTICAL,
             SettingsSection::Appearance => icons::TUNING,
             SettingsSection::Files => icons::FOLDER_WITH_FILES,
             SettingsSection::Notifications => icons::BELL,
@@ -389,6 +394,36 @@ impl Shell {
                     self.providers_page = Some(cx.new(|cx| ProvidersPage::new(state, cx)));
                 }
                 match &self.providers_page {
+                    Some(page) => page.clone().into_any_element(),
+                    None => Empty.into_any_element(),
+                }
+            }
+            SettingsSection::Usage => {
+                if self.usage_page.is_none() {
+                    let state = self.state.clone();
+                    let selected = self
+                        .settings
+                        .usage_agents
+                        .iter()
+                        .filter_map(|slug| HarnessId::from_slug(slug))
+                        .collect::<Vec<_>>();
+                    let page = cx.new(|cx| UsagePage::new(state, selected, cx));
+                    self.usage_sub = Some(cx.subscribe(
+                        &page,
+                        |this: &mut Shell, _, event: &UsageEvent, cx| {
+                            let UsageEvent::SelectionChanged(selected) = event;
+                            this.settings.usage_agents =
+                                selected.iter().map(|h| h.as_str().to_string()).collect();
+                            this.schedule_save(cx);
+                            cx.notify();
+                        },
+                    ));
+                    self.usage_page = Some(page);
+                }
+                if let Some(page) = &self.usage_page {
+                    page.update(cx, |page, cx| page.on_shown(cx));
+                }
+                match &self.usage_page {
                     Some(page) => page.clone().into_any_element(),
                     None => Empty.into_any_element(),
                 }

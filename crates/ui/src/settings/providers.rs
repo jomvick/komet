@@ -171,7 +171,7 @@ pub fn cli_name(harness: HarnessId) -> &'static str {
     }
 }
 
-fn harness_display_name(harness: HarnessId) -> &'static str {
+pub fn harness_display_name(harness: HarnessId) -> &'static str {
     match harness {
         HarnessId::ClaudeCode => "Claude Code",
         HarnessId::Codex => "Codex",
