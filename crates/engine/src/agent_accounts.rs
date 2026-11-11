@@ -1256,6 +1256,7 @@ impl AgentAccounts {
                 active_keys.insert(harness, key);
             }
         }
+        self.enrich_devin_profile().await;
         // Land any GitHub login whose dialog died mid-flow before anything reads
         // the list — the `gh` import below only knows the user's own config, not
         // the token a finished in-app login left in its throwaway dir.
@@ -1957,6 +1958,62 @@ impl AgentAccounts {
         self.write_slot(&slot)?;
         write_file_atomic(&active_file, slot.id.as_bytes(), true)?;
         Ok(Some(slot.account_key))
+    }
+
+    /// Devin's `credentials.toml` carries no identity — only API URLs and the
+    /// `windsurf_api_key`. `devin auth status` is the CLI's own whoami: resolve
+    /// the active slot's placeholder profile once (email/name/tier), the same
+    /// trick `enrich_antigravity_profile` plays for Google userinfo.
+    async fn enrich_devin_profile(&self) {
+        let Some(active_id) = self.read_cli_active_id(HarnessId::Devin) else {
+            return;
+        };
+        let Some(mut slot) = self
+            .read_slots(HarnessId::Devin)
+            .into_iter()
+            .find(|s| s.id == active_id)
+        else {
+            return;
+        };
+        if slot.profile.email != "Devin account" {
+            return; // already resolved — the CLI call is not free
+        }
+        let Ok(Ok(output)) = tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::process::Command::new("devin")
+                .args(["auth", "status"])
+                .stdin(std::process::Stdio::null())
+                .output(),
+        )
+        .await
+        else {
+            return;
+        };
+        if !output.status.success() {
+            return;
+        }
+        let text = String::from_utf8_lossy(&output.stdout);
+        let field = |label: &str| -> Option<String> {
+            text.lines().find_map(|line| {
+                let (key, value) = line.split_once(':')?;
+                (key.trim() == label)
+                    .then(|| value.trim().to_string())
+                    .filter(|v| !v.is_empty())
+            })
+        };
+        let Some(email) = field("Email") else {
+            return;
+        };
+        slot.profile.email = email;
+        if let Some(name) = field("Name") {
+            slot.profile.display_name = Some(name);
+        }
+        if let Some(tier) = field("Tier") {
+            slot.profile.organization = Some(tier);
+        }
+        if let Err(err) = self.write_slot(&slot) {
+            tracing::warn!(error = %err, "agent-accounts: could not save enriched Devin profile");
+        }
     }
 
     /// A freshly signed-in CLI-file provider login becomes the selected slot:
