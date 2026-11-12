@@ -15,6 +15,7 @@ komet-update.workspace = true
 # PTY output is folded into a gpui-free emulator mirror (terminals.rs).
 komet-term.workspace = true
 komet-memory.workspace = true
+komet-syntax.workspace = true
 loro.workspace = true
 tokio.workspace = true
 futures.workspace = true

@@ -1,4 +1,4 @@
-//! komet-memory — local-first, per-device project memory (issue #78, Phase 1).
+//! komet-memory — local-first, per-device project memory (issue #78).
 //!
 //! Stores an allow-listed projection of the run journal (event metadata only —
 //! never prompts, message text, tool arguments, command strings, diffs, or
@@ -13,23 +13,27 @@
 
 mod briefing;
 pub mod config;
+mod facts;
+mod graph;
 mod policy;
 mod record;
 mod store;
 
 pub use briefing::build as build_briefing;
 pub use config::{MemoryConfig, RETENTION_DAYS_MAX, RETENTION_DAYS_MIN, resolve_location};
+pub use facts::{FactKind, FactScope, FactSource, MemoryFact, NewMemoryFact};
+pub use graph::{GraphNeighbor, MemorySymbol};
 pub use policy::{
     canonical_cwd, contains_secret_value, is_default_excluded, project_id_for, project_relative,
     project_root_for, user_excluded,
 };
 pub use record::{
-    AgentDigest, BriefingDigest, ChatCursor, FailureDigest, FileTouch, MemoryEvent, MemoryItem,
-    MemoryRecord,
+    AgentDigest, BriefingDigest, ChatCursor, FactDigest, FailureDigest, FileTouch, MemoryEvent,
+    MemoryItem, MemoryRecord,
 };
 pub use store::{
-    MemoryError, MemoryService, MemoryStats, ProjectInfo, QUEUE_CAPACITY, RETENTION_MS,
-    relocate_store,
+    MemoryError, MemoryService, MemoryStats, ObsidianExportReport, ProjectInfo, QUEUE_CAPACITY,
+    RETENTION_MS, relocate_store,
 };
 
 /// Lowercase hex of raw bytes (same shape as `repos::hex` in the engine).

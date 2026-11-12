@@ -256,6 +256,18 @@ pub mod methods {
     /// Replay every journal into the index — the explicit "index history"
     /// action; pre-feature history is never indexed silently.
     pub const IMPORT_MEMORY_HISTORY: &str = "ImportMemoryHistory";
+    /// `{projectId, chatId?, includeStale?, limit?}` — typed facts with provenance.
+    pub const GET_MEMORY_FACTS: &str = "GetMemoryFacts";
+    /// `{id}` — forget one retained fact.
+    pub const FORGET_MEMORY_FACT: &str = "ForgetMemoryFact";
+    /// `{id, confirmed}` — explicitly promote one fact to device-global scope.
+    pub const PROMOTE_MEMORY_FACT: &str = "PromoteMemoryFact";
+    /// `{projectId, destination}` — one-way Obsidian Markdown export.
+    pub const EXPORT_MEMORY_OBSIDIAN: &str = "ExportMemoryObsidian";
+    /// `{projectId, limit?}` — bounded project graph for the native memory panel.
+    pub const GET_MEMORY_PROJECT_GRAPH: &str = "GetMemoryProjectGraph";
+    /// `{projectId, limit?}` — per-agent project activity timeline.
+    pub const GET_MEMORY_ACTIVITY: &str = "GetMemoryActivity";
 }
 
 #[derive(Debug, thiserror::Error)]

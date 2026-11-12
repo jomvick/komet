@@ -2328,6 +2328,127 @@ impl RpcService for EngineRpc {
                 indexer.request_history_import();
                 RpcReply::value(&serde_json::json!({ "started": true }))
             }
+            methods::GET_MEMORY_FACTS => {
+                #[derive(serde::Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct P {
+                    project_id: String,
+                    #[serde(default)]
+                    chat_id: Option<String>,
+                    #[serde(default)]
+                    include_stale: bool,
+                    #[serde(default)]
+                    limit: Option<usize>,
+                }
+                let p: P = parse_params(params)?;
+                let indexer = self
+                    .sessions
+                    .memory()
+                    .ok_or_else(|| RpcError::Failed("memory unavailable".into()))?;
+                let facts = indexer
+                    .facts(
+                        &p.project_id,
+                        p.chat_id.as_deref(),
+                        p.include_stale,
+                        p.limit.unwrap_or(20),
+                    )
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "facts": facts }))
+            }
+            methods::FORGET_MEMORY_FACT => {
+                #[derive(serde::Deserialize)]
+                struct P {
+                    id: i64,
+                }
+                let p: P = parse_params(params)?;
+                let indexer = self
+                    .sessions
+                    .memory()
+                    .ok_or_else(|| RpcError::Failed("memory unavailable".into()))?;
+                let removed = indexer
+                    .forget_fact(p.id)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "removed": removed }))
+            }
+            methods::PROMOTE_MEMORY_FACT => {
+                #[derive(serde::Deserialize)]
+                struct P {
+                    id: i64,
+                    confirmed: bool,
+                }
+                let p: P = parse_params(params)?;
+                let indexer = self
+                    .sessions
+                    .memory()
+                    .ok_or_else(|| RpcError::Failed("memory unavailable".into()))?;
+                let promoted = indexer
+                    .promote_fact_to_global(p.id, p.confirmed)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "promoted": promoted }))
+            }
+            methods::EXPORT_MEMORY_OBSIDIAN => {
+                #[derive(serde::Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct P {
+                    project_id: String,
+                    destination: String,
+                }
+                let p: P = parse_params(params)?;
+                let destination = std::path::PathBuf::from(p.destination.trim());
+                if !destination.is_absolute() {
+                    return Err(RpcError::BadParams(
+                        "Obsidian export destination must be an absolute path".into(),
+                    ));
+                }
+                let indexer = self
+                    .sessions
+                    .memory()
+                    .ok_or_else(|| RpcError::Failed("memory unavailable".into()))?;
+                let report = indexer
+                    .export_obsidian(&p.project_id, &destination)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                RpcReply::value(&serde_json::json!({
+                    "facts": report.facts,
+                    "sessions": report.sessions,
+                    "destination": destination,
+                }))
+            }
+            methods::GET_MEMORY_PROJECT_GRAPH => {
+                #[derive(serde::Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct P {
+                    project_id: String,
+                    #[serde(default)]
+                    limit: Option<usize>,
+                }
+                let p: P = parse_params(params)?;
+                let indexer = self
+                    .sessions
+                    .memory()
+                    .ok_or_else(|| RpcError::Failed("memory unavailable".into()))?;
+                let files = indexer
+                    .project_graph(&p.project_id, p.limit.unwrap_or(20))
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                RpcReply::value(&serde_json::json!({"files": files}))
+            }
+            methods::GET_MEMORY_ACTIVITY => {
+                #[derive(serde::Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct P {
+                    project_id: String,
+                    #[serde(default)]
+                    limit: Option<usize>,
+                }
+                let p: P = parse_params(params)?;
+                let indexer = self
+                    .sessions
+                    .memory()
+                    .ok_or_else(|| RpcError::Failed("memory unavailable".into()))?;
+                let events = indexer
+                    .recent_activity(&p.project_id, p.limit.unwrap_or(50))
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                RpcReply::value(&serde_json::json!({"events": events}))
+            }
             methods::LOCAL_DEVICE => {
                 RpcReply::value(&serde_json::json!({ "deviceId": self.doc_host.device_id() }))
             }

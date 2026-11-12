@@ -17,10 +17,12 @@ use std::time::{Duration, Instant};
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use serde::Serialize;
 
+use crate::facts::{FactKind, FactScope, FactSource, MemoryFact, NewMemoryFact};
+use crate::graph::{GraphNeighbor, MemorySymbol};
 use crate::policy;
 use crate::record::{
-    AgentDigest, BriefingDigest, ChatCursor, FailureDigest, FileTouch, MemoryEvent, MemoryItem,
-    MemoryRecord,
+    AgentDigest, BriefingDigest, ChatCursor, FactDigest, FailureDigest, FileTouch, MemoryEvent,
+    MemoryItem, MemoryRecord,
 };
 
 const DB_FILE: &str = "memory.sqlite";
@@ -50,6 +52,174 @@ pub enum MemoryError {
     Other(String),
 }
 
+/// One-way export into an explicitly chosen new or previously-owned
+/// directory. A marker prevents overwriting an unrelated existing vault.
+pub fn export_obsidian(
+    service: &MemoryService,
+    project_id: &str,
+    destination: &Path,
+) -> Result<ObsidianExportReport, MemoryError> {
+    const MARKER: &str = ".komet-memory-export";
+    let destination = destination.to_path_buf();
+    if destination.exists() {
+        let metadata = std::fs::symlink_metadata(&destination)?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_dir()
+            || !destination.join(MARKER).is_file()
+        {
+            return Err(MemoryError::Other(
+                "export destination exists and is not a Komet-owned export".into(),
+            ));
+        }
+    } else {
+        std::fs::create_dir_all(&destination)?;
+        std::fs::write(destination.join(MARKER), "Komet one-way memory export\n")?;
+    }
+
+    let facts = service.facts(project_id, None, true, 10_000)?;
+    let events = service.recent(project_id, 10_000, None)?;
+    let facts_dir = destination.join("Facts");
+    let sessions_dir = destination.join("Sessions");
+    ensure_export_directory(&facts_dir)?;
+    ensure_export_directory(&sessions_dir)?;
+
+    for fact in &facts {
+        let path_link = fact
+            .source_path
+            .as_deref()
+            .map(|path| format!("\nsourcePath: {}\n", yaml_scalar(path)))
+            .unwrap_or_default();
+        let content = format!(
+            "---\nid: {}\nprojectId: {}\nkind: {}\nscope: {}\nsource: {}\nconfidence: {}\nuserConfirmed: {}\nvalidFromMs: {}\nstaleAtMs: {}\nchatId: {}\nsourceEventSeq: {}\n{}---\n# {}\n\n{}\n\n## Provenance\n- agent: {}\n- model: {}\n- replacedBy: {}\n",
+            fact.id,
+            yaml_scalar(&fact.project_id),
+            fact.kind.as_str(),
+            fact.scope.as_str(),
+            fact.source.as_str(),
+            fact.confidence,
+            fact.user_confirmed,
+            fact.valid_from_ms,
+            fact.stale_at_ms.map_or("null".into(), |ms| ms.to_string()),
+            yaml_optional(fact.chat_id.as_deref()),
+            fact.source_event_seq
+                .map_or("null".into(), |seq| seq.to_string()),
+            path_link,
+            markdown_text(&fact.content),
+            markdown_text(&fact.content),
+            yaml_optional(fact.source_agent.as_deref()),
+            yaml_optional(fact.source_model.as_deref()),
+            fact.replaced_by.map_or("null".into(), |id| id.to_string()),
+        );
+        write_export_file(
+            &facts_dir.join(format!("{}-{}.md", fact.kind.as_str(), fact.id)),
+            &content,
+        )?;
+    }
+
+    let mut chats: HashMap<String, Vec<MemoryEvent>> = HashMap::new();
+    for event in events {
+        chats.entry(event.chat_id.clone()).or_default().push(event);
+    }
+    for (chat_id, chat_events) in &mut chats {
+        chat_events.sort_by_key(|event| (event.occurred_at_ms, event.source_seq));
+        let linked_facts: Vec<_> = facts
+            .iter()
+            .filter(|fact| fact.chat_id.as_deref() == Some(chat_id.as_str()))
+            .map(|fact| format!("- [[../Facts/{}-{}]]", fact.kind.as_str(), fact.id))
+            .collect();
+        let mut markdown = format!(
+            "---\nchatId: {}\nprojectId: {}\nevents: {}\n---\n# Session {}\n\n## Related facts\n{}\n\n## Activity\n",
+            yaml_scalar(chat_id),
+            yaml_scalar(project_id),
+            chat_events.len(),
+            markdown_text(chat_id),
+            if linked_facts.is_empty() {
+                "- None linked".to_string()
+            } else {
+                linked_facts.join("\n")
+            }
+        );
+        for event in chat_events.iter() {
+            let path_link = event
+                .relative_path
+                .as_deref()
+                .map(|path| format!(" · [[{}]]", markdown_text(path)))
+                .unwrap_or_default();
+            markdown.push_str(&format!(
+                "- {} · {} · {}{}{}\n",
+                event.occurred_at_ms,
+                markdown_text(&event.agent),
+                markdown_text(&event.kind),
+                event
+                    .tool_name
+                    .as_deref()
+                    .map(|tool| format!(" · {}", markdown_text(tool)))
+                    .unwrap_or_default(),
+                path_link
+            ));
+        }
+        write_export_file(
+            &sessions_dir.join(format!("{}.md", stable_export_slug(chat_id))),
+            &markdown,
+        )?;
+    }
+    Ok(ObsidianExportReport {
+        facts: facts.len(),
+        sessions: chats.len(),
+    })
+}
+
+fn yaml_scalar(value: &str) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| "\"\"".into())
+}
+
+fn yaml_optional(value: Option<&str>) -> String {
+    value.map_or_else(|| "null".into(), yaml_scalar)
+}
+
+fn markdown_text(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('`', "\\`")
+        .replace('[', "\\[")
+        .replace(']', "\\]")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace(['\r', '\n'], " ")
+}
+
+fn stable_export_slug(value: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(value.as_bytes());
+    crate::hex(&digest[..12])
+}
+
+fn write_export_file(path: &Path, content: &str) -> Result<(), MemoryError> {
+    if std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return Err(MemoryError::Other(
+            "refusing to write through an export symlink".into(),
+        ));
+    }
+    let temporary = path.with_extension("md.tmp");
+    std::fs::write(&temporary, content)?;
+    std::fs::rename(temporary, path)?;
+    Ok(())
+}
+
+fn ensure_export_directory(path: &Path) -> Result<(), MemoryError> {
+    if path.exists() {
+        let metadata = std::fs::symlink_metadata(path)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(MemoryError::Other(
+                "export subdirectory is not a regular directory".into(),
+            ));
+        }
+    } else {
+        std::fs::create_dir(path)?;
+    }
+    Ok(())
+}
+
 /// The assembled memory service. Cheap to share (`Arc`): every method takes
 /// `&self` and the heavy work lives on the writer thread.
 pub struct MemoryService {
@@ -66,13 +236,29 @@ pub struct MemoryService {
     writer: JoinHandle<()>,
     dir: PathBuf,
     fts: bool,
+    facts_fts: bool,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ObsidianExportReport {
+    pub facts: usize,
+    pub sessions: usize,
+}
+
 impl MemoryService {
+    pub fn export_obsidian(
+        &self,
+        project_id: &str,
+        destination: &Path,
+    ) -> Result<ObsidianExportReport, MemoryError> {
+        export_obsidian(self, project_id, destination)
+    }
+
     /// Open (or create) the store under `dir` — typically
     /// `<data_dir>/memory`. Creates the schema, enables WAL, and spawns the
     /// single writer thread.
@@ -98,6 +284,7 @@ impl MemoryService {
         // One-shot planner stats after migrations (cheap on a fresh/small db).
         conn.execute_batch("PRAGMA optimize;")?;
         let fts = ensure_fts(&conn)?;
+        let facts_fts = ensure_facts_fts(&conn)?;
         let (tx, rx) = sync_channel::<MemoryItem>(QUEUE_CAPACITY);
         let writer_conn = open_conn(&path)?;
         let write_conn = open_conn(&path)?;
@@ -112,6 +299,7 @@ impl MemoryService {
             writer,
             dir,
             fts,
+            facts_fts,
         })
     }
 
@@ -262,6 +450,8 @@ impl MemoryService {
                exclusions = excluded.exclusions, updated_at_ms = excluded.updated_at_ms",
             params![project_id, serde_json::to_string(exclusions)?, now],
         )?;
+        drop(conn);
+        self.drop_excluded_file_indexes(project_id, exclusions)?;
         Ok(())
     }
 
@@ -555,9 +745,33 @@ impl MemoryService {
             }
         }
 
+        let mut stmt = conn.prepare(
+            "SELECT kind, content, source, source_agent, source_path, confidence, stale_at_ms
+             FROM memory_facts
+             WHERE (project_id = ?1 OR scope = 'global')
+               AND (scope != 'session' OR ?2 IS NULL OR chat_id != ?2)
+               AND (stale_at_ms IS NULL OR stale_at_ms >= ?3)
+             ORDER BY stale_at_ms IS NOT NULL, confidence DESC, valid_from_ms DESC, id DESC
+             LIMIT 8",
+        )?;
+        let facts = stmt
+            .query_map(params![project_id, exclude_chat_id, since_ms], |r| {
+                Ok(FactDigest {
+                    kind: r.get(0)?,
+                    content: r.get(1)?,
+                    source: r.get(2)?,
+                    source_agent: r.get(3)?,
+                    source_path: r.get(4)?,
+                    confidence: r.get(5)?,
+                    stale: r.get::<_, Option<i64>>(6)?.is_some(),
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
         Ok(BriefingDigest {
             chats: chats.max(0) as u64,
             agents,
+            facts,
         })
     }
 
@@ -591,6 +805,431 @@ impl MemoryService {
             row_to_event,
         )?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Replace the parsed graph for one file when its content hash changes.
+    /// The caller reads and parses files off the agent event path.
+    pub fn index_file_symbols(
+        &self,
+        project_id: &str,
+        path: &str,
+        content_hash: &str,
+        symbols: &[MemorySymbol],
+    ) -> Result<bool, MemoryError> {
+        validate_graph_path(path)?;
+        if project_id.trim().is_empty()
+            || content_hash.len() != 64
+            || !content_hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(MemoryError::Other("invalid file index identity".into()));
+        }
+        let exclusions = self.exclusions(project_id)?;
+        if policy::is_default_excluded(path) || policy::user_excluded(path, &exclusions) {
+            return Err(MemoryError::Other(
+                "file path is excluded from memory".into(),
+            ));
+        }
+        let symbols: Vec<_> = symbols
+            .iter()
+            .filter(|symbol| {
+                !symbol.name.trim().is_empty()
+                    && symbol.name.chars().count() <= 256
+                    && symbol.kind.chars().count() <= 100
+                    && !policy::contains_secret_value(&symbol.name)
+            })
+            .take(1000)
+            .collect();
+        let conn = lock(&self.write);
+        let tx = conn.unchecked_transaction()?;
+        let old_hash: Option<String> = tx
+            .query_row(
+                "SELECT content_hash FROM memory_files
+                 WHERE project_id = ?1 AND path = ?2",
+                params![project_id, path],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let changed = old_hash.as_deref() != Some(content_hash);
+        let file_node = upsert_graph_node(&tx, project_id, "file", path, path)?;
+        if changed {
+            let prefix = format!("{path}::");
+            let old_symbols: Vec<i64> = {
+                let mut stmt = tx.prepare(
+                    "SELECT id FROM memory_graph_nodes
+                     WHERE project_id = ?1 AND kind = 'symbol'
+                       AND substr(node_key, 1, length(?2)) = ?2",
+                )?;
+                stmt.query_map(params![project_id, prefix], |row| row.get(0))?
+                    .collect::<Result<Vec<_>, _>>()?
+            };
+            for id in old_symbols {
+                tx.execute("DELETE FROM memory_graph_nodes WHERE id = ?1", params![id])?;
+            }
+            tx.execute(
+                "INSERT INTO memory_files(project_id, path, content_hash, indexed_at_ms, node_id)
+                 VALUES(?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(project_id, path) DO UPDATE SET
+                   content_hash = excluded.content_hash,
+                   indexed_at_ms = excluded.indexed_at_ms,
+                   node_id = excluded.node_id",
+                params![project_id, path, content_hash, now_ms(), file_node],
+            )?;
+            for symbol in symbols {
+                let key = format!(
+                    "{path}::{}::{}::{}",
+                    symbol.kind, symbol.name, symbol.start_byte
+                );
+                let symbol_node = upsert_graph_node(&tx, project_id, "symbol", &key, &symbol.name)?;
+                insert_graph_edge(&tx, project_id, file_node, symbol_node, "contains", "", 0)?;
+            }
+            if old_hash.is_some() {
+                tx.execute(
+                    "UPDATE memory_facts
+                     SET stale_at_ms = ?3
+                     WHERE project_id = ?1 AND source_path = ?2 AND stale_at_ms IS NULL",
+                    params![project_id, path, now_ms()],
+                )?;
+            }
+        }
+        connect_file_history(&tx, project_id, path, file_node)?;
+        tx.execute(
+            "DELETE FROM memory_graph_edges
+             WHERE project_id = ?1 AND target_node = ?2
+               AND source_node IN (
+                 SELECT id FROM memory_graph_nodes
+                 WHERE project_id = ?1 AND kind = 'fact'
+               )",
+            params![project_id, file_node],
+        )?;
+        connect_file_facts(&tx, project_id, path, file_node)?;
+        tx.commit()?;
+        Ok(changed)
+    }
+
+    pub fn graph_neighbors(
+        &self,
+        project_id: &str,
+        path: &str,
+        limit: usize,
+    ) -> Result<Vec<GraphNeighbor>, MemoryError> {
+        validate_graph_path(path)?;
+        let exclusions = self.exclusions(project_id)?;
+        if policy::is_default_excluded(path) || policy::user_excluded(path, &exclusions) {
+            return Err(MemoryError::Other(
+                "file path is excluded from memory".into(),
+            ));
+        }
+        let conn = lock(&self.conn);
+        let file_id: Option<i64> = conn
+            .query_row(
+                "SELECT id FROM memory_graph_nodes
+                 WHERE project_id = ?1 AND kind = 'file' AND node_key = ?2",
+                params![project_id, path],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(file_id) = file_id else {
+            return Ok(Vec::new());
+        };
+        let mut stmt = conn.prepare(
+            "SELECT node.kind, node.node_key, node.label, edge.relation
+             FROM memory_graph_edges edge
+             JOIN memory_graph_nodes node
+               ON node.id = CASE WHEN edge.source_node = ?3
+                                 THEN edge.target_node ELSE edge.source_node END
+             WHERE edge.project_id = ?1
+               AND (edge.source_node = ?3 OR edge.target_node = ?3)
+             ORDER BY edge.relation, node.kind, node.label
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(
+            params![project_id, limit.clamp(1, 100) as i64, file_id],
+            |row| {
+                Ok(GraphNeighbor {
+                    kind: row.get(0)?,
+                    key: row.get(1)?,
+                    label: row.get(2)?,
+                    relation: row.get(3)?,
+                })
+            },
+        )?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn file_indexes(&self, project_id: &str) -> Result<Vec<(String, String)>, MemoryError> {
+        let conn = lock(&self.conn);
+        let mut stmt = conn.prepare(
+            "SELECT path, content_hash FROM memory_files
+             WHERE project_id = ?1 ORDER BY path LIMIT 10000",
+        )?;
+        let rows = stmt.query_map(params![project_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn drop_excluded_file_indexes(
+        &self,
+        project_id: &str,
+        exclusions: &[String],
+    ) -> Result<usize, MemoryError> {
+        let indexed = self.file_indexes(project_id)?;
+        let excluded: Vec<_> = indexed
+            .into_iter()
+            .filter(|(path, _)| {
+                policy::is_default_excluded(path) || policy::user_excluded(path, exclusions)
+            })
+            .map(|(path, _)| path)
+            .collect();
+        let conn = lock(&self.write);
+        let tx = conn.unchecked_transaction()?;
+        let mut removed = 0;
+        for path in excluded {
+            let file_id: Option<i64> = tx
+                .query_row(
+                    "SELECT id FROM memory_graph_nodes
+                     WHERE project_id = ?1 AND kind = 'file' AND node_key = ?2",
+                    params![project_id, path],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(file_id) = file_id {
+                let prefix = format!("{path}::");
+                tx.execute(
+                    "DELETE FROM memory_graph_nodes
+                     WHERE project_id = ?1 AND kind = 'symbol'
+                       AND substr(node_key, 1, length(?2)) = ?2",
+                    params![project_id, prefix],
+                )?;
+                tx.execute(
+                    "DELETE FROM memory_graph_nodes
+                     WHERE id = ?1 AND project_id = ?2",
+                    params![file_id, project_id],
+                )?;
+                tx.execute(
+                    "UPDATE memory_facts SET stale_at_ms = ?3
+                     WHERE project_id = ?1 AND source_path = ?2
+                       AND stale_at_ms IS NULL",
+                    params![project_id, path, now_ms()],
+                )?;
+                removed += 1;
+            }
+        }
+        tx.commit()?;
+        Ok(removed)
+    }
+
+    pub fn remove_file_index(&self, project_id: &str, path: &str) -> Result<bool, MemoryError> {
+        validate_graph_path(path)?;
+        let conn = lock(&self.write);
+        let tx = conn.unchecked_transaction()?;
+        let file_id: Option<i64> = tx
+            .query_row(
+                "SELECT id FROM memory_graph_nodes
+                 WHERE project_id = ?1 AND kind = 'file' AND node_key = ?2",
+                params![project_id, path],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(id) = file_id {
+            let prefix = format!("{path}::");
+            tx.execute(
+                "DELETE FROM memory_graph_nodes
+                 WHERE project_id = ?1 AND kind = 'symbol'
+                   AND substr(node_key, 1, length(?2)) = ?2",
+                params![project_id, prefix],
+            )?;
+            tx.execute("DELETE FROM memory_graph_nodes WHERE id = ?1", params![id])?;
+            tx.execute(
+                "UPDATE memory_facts SET stale_at_ms = ?3
+                 WHERE project_id = ?1 AND source_path = ?2 AND stale_at_ms IS NULL",
+                params![project_id, path, now_ms()],
+            )?;
+        }
+        tx.commit()?;
+        Ok(file_id.is_some())
+    }
+
+    /// Store one explicit, typed fact. This API never distills transcript
+    /// text; callers must provide a reviewed fact and provenance.
+    pub fn create_fact(&self, fact: &NewMemoryFact) -> Result<i64, MemoryError> {
+        self.validate_fact(fact)?;
+        let conn = lock(&self.write);
+        let tx = conn.unchecked_transaction()?;
+        insert_fact(&tx, fact)?;
+        let id = tx.last_insert_rowid();
+        tx.commit()?;
+        Ok(id)
+    }
+
+    /// Return valid facts relevant to a project/session, including explicitly
+    /// promoted global facts. Result counts are capped to keep MCP bounded.
+    pub fn facts(
+        &self,
+        project_id: &str,
+        chat_id: Option<&str>,
+        include_stale: bool,
+        limit: usize,
+    ) -> Result<Vec<MemoryFact>, MemoryError> {
+        let conn = lock(&self.conn);
+        let mut stmt = conn.prepare(
+            "SELECT id, project_id, chat_id, kind, scope, content, source,
+                    source_agent, source_model, source_event_seq, source_path,
+                    confidence, user_confirmed, valid_from_ms, stale_at_ms, replaced_by
+             FROM memory_facts
+             WHERE (project_id = ?1 OR scope = 'global')
+               AND (?2 IS NULL OR scope != 'session' OR chat_id = ?2)
+               AND (?3 OR stale_at_ms IS NULL)
+             ORDER BY stale_at_ms IS NOT NULL, valid_from_ms DESC, id DESC
+             LIMIT ?4",
+        )?;
+        let rows = stmt.query_map(
+            params![
+                project_id,
+                chat_id,
+                include_stale,
+                limit.clamp(1, 200) as i64
+            ],
+            row_to_fact,
+        )?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Bounded substring search over the project's valid facts.
+    pub fn search_facts(
+        &self,
+        project_id: &str,
+        chat_id: Option<&str>,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<MemoryFact>, MemoryError> {
+        let needle = query.trim();
+        if needle.is_empty() || needle.len() > 256 {
+            return Ok(Vec::new());
+        }
+        let conn = lock(&self.conn);
+        let mut sql = String::from(
+            "SELECT id, project_id, chat_id, kind, scope, content, source,
+                    source_agent, source_model, source_event_seq, source_path,
+                    confidence, user_confirmed, valid_from_ms, stale_at_ms, replaced_by
+             FROM memory_facts
+             WHERE (project_id = ?1 OR scope = 'global')
+               AND (?2 IS NULL OR scope != 'session' OR chat_id = ?2)
+               AND stale_at_ms IS NULL",
+        );
+        if self.facts_fts {
+            sql.push_str(
+                " AND id IN (
+                   SELECT rowid FROM memory_facts_fts WHERE memory_facts_fts MATCH ?3
+                 )",
+            );
+        } else {
+            sql.push_str(" AND instr(lower(content), lower(?3)) > 0");
+        }
+        sql.push_str(" ORDER BY valid_from_ms DESC, id DESC LIMIT ?4");
+        let mut stmt = conn.prepare(&sql)?;
+        let search_query = if self.facts_fts {
+            needle
+                .split_whitespace()
+                .take(8)
+                .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
+                .collect::<Vec<_>>()
+                .join(" AND ")
+        } else {
+            needle.to_string()
+        };
+        let rows = stmt.query_map(
+            params![
+                project_id,
+                chat_id,
+                search_query,
+                limit.clamp(1, 100) as i64
+            ],
+            row_to_fact,
+        )?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Supersede one fact and insert its replacement in one transaction.
+    pub fn replace_fact(
+        &self,
+        old_id: i64,
+        replacement: &NewMemoryFact,
+    ) -> Result<i64, MemoryError> {
+        self.validate_fact(replacement)?;
+        let conn = lock(&self.write);
+        let tx = conn.unchecked_transaction()?;
+        let changed = tx.execute(
+            "UPDATE memory_facts
+             SET stale_at_ms = ?2
+             WHERE id = ?1 AND stale_at_ms IS NULL",
+            params![old_id, replacement.valid_from_ms],
+        )?;
+        if changed != 1 {
+            return Err(MemoryError::Other("fact not found or already stale".into()));
+        }
+        insert_fact(&tx, replacement)?;
+        let new_id = tx.last_insert_rowid();
+        tx.execute(
+            "UPDATE memory_facts SET replaced_by = ?2 WHERE id = ?1",
+            params![old_id, new_id],
+        )?;
+        tx.commit()?;
+        Ok(new_id)
+    }
+
+    /// Mark a fact as potentially stale without asserting a contradiction.
+    pub fn mark_fact_stale(&self, id: i64, at_ms: i64) -> Result<bool, MemoryError> {
+        let conn = lock(&self.write);
+        let changed = conn.execute(
+            "UPDATE memory_facts SET stale_at_ms = ?2
+             WHERE id = ?1 AND stale_at_ms IS NULL",
+            params![id, at_ms],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Promote a fact only through a caller-controlled, explicit confirmation
+    /// action. This does not make the original assertion more certain.
+    pub fn promote_fact_to_global(&self, id: i64, confirmed: bool) -> Result<bool, MemoryError> {
+        if !confirmed {
+            return Err(MemoryError::Other(
+                "global promotion requires explicit user confirmation".into(),
+            ));
+        }
+        let conn = lock(&self.write);
+        let changed = conn.execute(
+            "UPDATE memory_facts SET scope = 'global', user_confirmed = 1
+             WHERE id = ?1 AND stale_at_ms IS NULL",
+            params![id],
+        )?;
+        Ok(changed == 1)
+    }
+
+    pub fn forget_fact(&self, id: i64) -> Result<bool, MemoryError> {
+        let conn = lock(&self.write);
+        let tx = conn.unchecked_transaction()?;
+        let changed = tx.execute("DELETE FROM memory_facts WHERE id = ?1", params![id])?;
+        if changed == 1 {
+            tx.execute(
+                "DELETE FROM memory_graph_nodes
+                 WHERE kind = 'fact' AND node_key = ?1",
+                params![id.to_string()],
+            )?;
+        }
+        tx.commit()?;
+        Ok(changed == 1)
+    }
+
+    fn validate_fact(&self, fact: &NewMemoryFact) -> Result<(), MemoryError> {
+        validate_fact_input(fact)?;
+        if let Some(path) = fact.source_path.as_deref() {
+            let exclusions = self.exclusions(&fact.project_id)?;
+            if policy::is_default_excluded(path) || policy::user_excluded(path, &exclusions) {
+                return Err(MemoryError::Other(
+                    "fact source_path is excluded from memory".into(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Record/refresh a project's display root (first writer wins per row;
@@ -765,6 +1404,16 @@ impl MemoryService {
             "DELETE FROM memory_events WHERE chat_id = ?1",
             params![chat_id],
         )?;
+        tx.execute(
+            "DELETE FROM memory_facts WHERE chat_id = ?1",
+            params![chat_id],
+        )?;
+        tx.execute(
+            "DELETE FROM memory_graph_edges WHERE source_chat_id = ?1",
+            params![chat_id],
+        )?;
+        delete_orphan_fact_nodes(&tx)?;
+        remove_orphan_activity_nodes(&tx, "")?;
         let through = through_seq.unwrap_or(u64::MAX).min(i64::MAX as u64) as i64;
         // Wildcard project_id '' = every project this chat ever touched.
         tx.execute(
@@ -824,6 +1473,14 @@ impl MemoryService {
             "DELETE FROM memory_events WHERE project_id = ?1",
             params![project_id],
         )?;
+        tx.execute(
+            "DELETE FROM memory_facts WHERE project_id = ?1",
+            params![project_id],
+        )?;
+        tx.execute(
+            "DELETE FROM memory_graph_nodes WHERE project_id = ?1",
+            params![project_id],
+        )?;
         // Tombstones: jump every known chat's cursor past its journal tail
         // and record the forget horizon so the writer refuses any record at
         // or below it — queued, replayed, or straddling this transaction.
@@ -876,6 +1533,8 @@ impl MemoryService {
             delete_fts_rows(&tx, &ids)?;
         }
         let removed = tx.execute("DELETE FROM memory_events", [])?;
+        tx.execute("DELETE FROM memory_facts", [])?;
+        tx.execute("DELETE FROM memory_graph_nodes", [])?;
         for (chat_id, seq) in horizons {
             let through = (*seq).min(i64::MAX as u64) as i64;
             tx.execute(
@@ -899,15 +1558,42 @@ impl MemoryService {
         Ok(removed)
     }
 
-    /// Delete one retained record by id (per-fact/session forget granularity
-    /// grows in later phases; events are the Phase-1 unit).
+    /// Delete one retained activity event and any facts explicitly sourced
+    /// from it, along with its derived graph edges.
     pub fn forget_event(&self, id: i64) -> Result<bool, MemoryError> {
         let conn = lock(&self.write);
         let tx = conn.unchecked_transaction()?;
         if self.fts {
             delete_fts_rows(&tx, &[id])?;
         }
+        let source = tx
+            .query_row(
+                "SELECT project_id, chat_id, source_seq FROM memory_events WHERE id = ?1",
+                params![id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
         let removed = tx.execute("DELETE FROM memory_events WHERE id = ?1", params![id])?;
+        if let Some((project_id, chat_id, seq)) = source {
+            tx.execute(
+                "DELETE FROM memory_facts
+                 WHERE project_id = ?1 AND chat_id = ?2 AND source_event_seq = ?3",
+                params![project_id, chat_id, seq],
+            )?;
+            tx.execute(
+                "DELETE FROM memory_graph_edges
+                 WHERE project_id = ?1 AND source_chat_id = ?2 AND source_event_seq = ?3",
+                params![project_id, chat_id, seq],
+            )?;
+            delete_orphan_fact_nodes(&tx)?;
+            remove_orphan_activity_nodes(&tx, &project_id)?;
+        }
         tx.commit()?;
         Ok(removed > 0)
     }
@@ -921,27 +1607,41 @@ impl MemoryService {
         loop {
             let conn = lock(&self.write);
             let tx = conn.unchecked_transaction()?;
-            let ids: Vec<i64> = {
+            let rows: Vec<(i64, String, String, i64)> = {
                 let mut stmt = tx.prepare(
-                    "SELECT id FROM memory_events WHERE occurred_at_ms < ?1 ORDER BY id LIMIT ?2",
+                    "SELECT id, project_id, chat_id, source_seq
+                     FROM memory_events
+                     WHERE occurred_at_ms < ?1
+                     ORDER BY id LIMIT ?2",
                 )?;
-                stmt.query_map(params![cutoff_ms, BATCH], |r| r.get::<_, i64>(0))?
-                    .collect::<Result<Vec<_>, _>>()?
+                stmt.query_map(params![cutoff_ms, BATCH], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?
             };
-            if ids.is_empty() {
+            if rows.is_empty() {
                 break;
             }
             if self.fts {
+                let ids: Vec<_> = rows.iter().map(|(id, _, _, _)| *id).collect();
                 delete_fts_rows(&tx, &ids)?;
             }
             {
                 let mut del = tx.prepare("DELETE FROM memory_events WHERE id = ?1")?;
-                for id in &ids {
+                for (id, project_id, chat_id, seq) in &rows {
                     del.execute(params![id])?;
+                    tx.execute(
+                        "DELETE FROM memory_graph_edges
+                         WHERE project_id = ?1 AND source_chat_id = ?2
+                           AND source_event_seq = ?3",
+                        params![project_id, chat_id, seq],
+                    )?;
                 }
             }
+            delete_orphan_fact_nodes(&tx)?;
+            remove_orphan_activity_nodes(&tx, "")?;
             tx.commit()?;
-            total += ids.len();
+            total += rows.len();
         }
         if total > 0 {
             let conn = lock(&self.write);
@@ -1023,6 +1723,268 @@ fn row_to_event(r: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryEvent> {
         reasoning_tokens: r.get(14)?,
         duration_ms: r.get(15)?,
     })
+}
+
+fn row_to_fact(r: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryFact> {
+    let kind: String = r.get(3)?;
+    let scope: String = r.get(4)?;
+    let source: String = r.get(6)?;
+    Ok(MemoryFact {
+        id: r.get(0)?,
+        project_id: r.get(1)?,
+        chat_id: r.get(2)?,
+        kind: parse_fact_enum(&kind, 3, "fact kind", FactKind::parse(&kind))?,
+        scope: parse_fact_enum(&scope, 4, "fact scope", FactScope::parse(&scope))?,
+        content: r.get(5)?,
+        source: parse_fact_enum(&source, 6, "fact source", FactSource::parse(&source))?,
+        source_agent: r.get(7)?,
+        source_model: r.get(8)?,
+        source_event_seq: r.get::<_, Option<i64>>(9)?.map(|seq| seq.max(0) as u64),
+        source_path: r.get(10)?,
+        confidence: r.get(11)?,
+        user_confirmed: r.get(12)?,
+        valid_from_ms: r.get(13)?,
+        stale_at_ms: r.get(14)?,
+        replaced_by: r.get(15)?,
+    })
+}
+
+fn parse_fact_enum<T>(
+    value: &str,
+    index: usize,
+    name: &str,
+    parsed: Option<T>,
+) -> rusqlite::Result<T> {
+    parsed.ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            index,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::other(format!(
+                "unknown {name} value: {value}"
+            ))),
+        )
+    })
+}
+
+fn validate_fact_input(fact: &NewMemoryFact) -> Result<(), MemoryError> {
+    fact.validate().map_err(|e| MemoryError::Other(e.into()))?;
+    if policy::contains_secret_value(&fact.content)
+        || fact
+            .source_path
+            .as_deref()
+            .is_some_and(policy::contains_secret_value)
+        || fact
+            .source_agent
+            .as_deref()
+            .is_some_and(policy::contains_secret_value)
+        || fact
+            .source_model
+            .as_deref()
+            .is_some_and(policy::contains_secret_value)
+    {
+        return Err(MemoryError::Other(
+            "fact contains credential-shaped content".into(),
+        ));
+    }
+    if fact
+        .source_path
+        .as_deref()
+        .is_some_and(|path| Path::new(path).is_absolute())
+    {
+        return Err(MemoryError::Other(
+            "fact source_path must be project-relative".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn insert_fact(conn: &Connection, fact: &NewMemoryFact) -> Result<(), MemoryError> {
+    conn.execute(
+        "INSERT INTO memory_facts(
+           project_id, chat_id, kind, scope, content, source, source_agent,
+           source_model, source_event_seq, source_path, confidence,
+           user_confirmed, valid_from_ms
+         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+        params![
+            fact.project_id,
+            fact.chat_id,
+            fact.kind.as_str(),
+            fact.scope.as_str(),
+            fact.content.trim(),
+            fact.source.as_str(),
+            fact.source_agent,
+            fact.source_model,
+            fact.source_event_seq.map(|seq| seq as i64),
+            fact.source_path,
+            fact.confidence,
+            fact.user_confirmed,
+            fact.valid_from_ms
+        ],
+    )?;
+    Ok(())
+}
+
+fn validate_graph_path(path: &str) -> Result<(), MemoryError> {
+    let path_buf = Path::new(path);
+    if path.trim().is_empty()
+        || path_buf.is_absolute()
+        || path_buf.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir | std::path::Component::RootDir
+            )
+        })
+        || policy::contains_secret_value(path)
+    {
+        return Err(MemoryError::Other(
+            "graph path must be a safe project-relative path".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn upsert_graph_node(
+    conn: &Connection,
+    project_id: &str,
+    kind: &str,
+    key: &str,
+    label: &str,
+) -> Result<i64, MemoryError> {
+    Ok(conn.query_row(
+        "INSERT INTO memory_graph_nodes(project_id, kind, node_key, label)
+         VALUES(?1, ?2, ?3, ?4)
+         ON CONFLICT(project_id, kind, node_key) DO UPDATE SET label = excluded.label
+         RETURNING id",
+        params![project_id, kind, key, label],
+        |row| row.get(0),
+    )?)
+}
+
+fn insert_graph_edge(
+    conn: &Connection,
+    project_id: &str,
+    source_node: i64,
+    target_node: i64,
+    relation: &str,
+    source_chat_id: &str,
+    source_event_seq: u64,
+) -> Result<(), MemoryError> {
+    conn.execute(
+        "INSERT OR IGNORE INTO memory_graph_edges(
+           project_id, source_node, target_node, relation,
+           source_chat_id, source_event_seq
+         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            project_id,
+            source_node,
+            target_node,
+            relation,
+            source_chat_id,
+            source_event_seq.min(i64::MAX as u64) as i64
+        ],
+    )?;
+    Ok(())
+}
+
+fn connect_file_history(
+    conn: &Connection,
+    project_id: &str,
+    path: &str,
+    file_node: i64,
+) -> Result<(), MemoryError> {
+    let events: Vec<(String, String, u64)> = {
+        let mut stmt = conn.prepare(
+            "SELECT chat_id, agent, source_seq
+             FROM memory_events
+             WHERE project_id = ?1 AND relative_path = ?2 AND kind = 'tool_call'
+               AND tool_name IN ('write_file', 'edit_file', 'apply_patch')
+             ORDER BY occurred_at_ms DESC, id DESC
+             LIMIT 1000",
+        )?;
+        stmt.query_map(params![project_id, path], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get::<_, i64>(2)?.max(0) as u64,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?
+    };
+    for (chat_id, agent, seq) in events {
+        let session_node = upsert_graph_node(conn, project_id, "session", &chat_id, &chat_id)?;
+        let agent_node = upsert_graph_node(conn, project_id, "agent", &agent, &agent)?;
+        insert_graph_edge(
+            conn,
+            project_id,
+            session_node,
+            file_node,
+            "touched",
+            &chat_id,
+            seq,
+        )?;
+        insert_graph_edge(
+            conn, project_id, agent_node, file_node, "modifies", &chat_id, seq,
+        )?;
+    }
+    Ok(())
+}
+
+fn connect_file_facts(
+    conn: &Connection,
+    project_id: &str,
+    path: &str,
+    file_node: i64,
+) -> Result<(), MemoryError> {
+    let facts: Vec<(i64, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT id, kind FROM memory_facts
+             WHERE project_id = ?1 AND source_path = ?2 AND stale_at_ms IS NULL",
+        )?;
+        stmt.query_map(params![project_id, path], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?
+    };
+    for (id, kind) in facts {
+        let label = format!("{kind} #{id}");
+        let fact_node = upsert_graph_node(conn, project_id, "fact", &id.to_string(), &label)?;
+        let relation = match kind.as_str() {
+            "decision" => "decided",
+            "bug" | "failed_attempt" => "explains",
+            "convention" | "state" | "todo" => "related_to",
+            _ => "related_to",
+        };
+        insert_graph_edge(conn, project_id, fact_node, file_node, relation, "", 0)?;
+    }
+    Ok(())
+}
+
+fn remove_orphan_activity_nodes(conn: &Connection, project_id: &str) -> Result<(), MemoryError> {
+    conn.execute(
+        "DELETE FROM memory_graph_nodes
+         WHERE (?1 = '' OR project_id = ?1) AND kind IN ('session', 'agent')
+           AND NOT EXISTS (
+             SELECT 1 FROM memory_graph_edges edge
+             WHERE edge.source_node = memory_graph_nodes.id
+                OR edge.target_node = memory_graph_nodes.id
+           )",
+        params![project_id],
+    )?;
+    Ok(())
+}
+
+fn delete_orphan_fact_nodes(conn: &Connection) -> Result<(), MemoryError> {
+    conn.execute(
+        "DELETE FROM memory_graph_nodes
+         WHERE kind = 'fact'
+           AND NOT EXISTS (
+             SELECT 1 FROM memory_facts fact
+             WHERE fact.project_id = memory_graph_nodes.project_id
+               AND CAST(fact.id AS TEXT) = memory_graph_nodes.node_key
+           )",
+        [],
+    )?;
+    Ok(())
 }
 
 fn delete_fts_rows(conn: &Connection, ids: &[i64]) -> Result<(), MemoryError> {
@@ -1159,6 +2121,85 @@ fn migrate(conn: &mut Connection) -> Result<(), MemoryError> {
              PRAGMA user_version = 4;",
         )?;
     }
+    if version < 5 {
+        conn.execute_batch(
+            "CREATE TABLE memory_facts (
+               id INTEGER PRIMARY KEY,
+               project_id TEXT NOT NULL,
+               chat_id TEXT,
+               kind TEXT NOT NULL CHECK(kind IN (
+                 'decision', 'bug', 'convention', 'state', 'todo', 'failed_attempt'
+               )),
+               scope TEXT NOT NULL CHECK(scope IN ('session', 'project', 'global')),
+               content TEXT NOT NULL,
+               source TEXT NOT NULL CHECK(source IN (
+                 'agent_assertion', 'observed', 'test', 'user_confirmed'
+               )),
+               source_agent TEXT,
+               source_model TEXT,
+               source_event_seq INTEGER,
+               source_path TEXT,
+               confidence REAL NOT NULL CHECK(confidence >= 0 AND confidence <= 1),
+               user_confirmed INTEGER NOT NULL DEFAULT 0,
+               valid_from_ms INTEGER NOT NULL,
+               stale_at_ms INTEGER,
+               replaced_by INTEGER REFERENCES memory_facts(id) ON DELETE SET NULL,
+               CHECK(scope != 'session' OR chat_id IS NOT NULL),
+               CHECK(scope != 'global' OR user_confirmed = 1)
+             );
+             CREATE INDEX idx_memory_facts_project_scope_validity
+               ON memory_facts(project_id, scope, stale_at_ms, valid_from_ms);
+             CREATE INDEX idx_memory_facts_chat_validity
+               ON memory_facts(chat_id, stale_at_ms, valid_from_ms);
+             CREATE INDEX idx_memory_facts_source
+               ON memory_facts(project_id, chat_id, source_event_seq);
+             PRAGMA user_version = 5;",
+        )?;
+    }
+    if version < 6 {
+        conn.execute_batch(
+            "CREATE TABLE memory_graph_nodes (
+               id INTEGER PRIMARY KEY,
+               project_id TEXT NOT NULL,
+               kind TEXT NOT NULL CHECK(kind IN (
+                 'file', 'symbol', 'session', 'agent', 'fact', 'issue'
+               )),
+               node_key TEXT NOT NULL,
+               label TEXT NOT NULL,
+               UNIQUE(project_id, kind, node_key)
+             );
+             CREATE TABLE memory_graph_edges (
+               id INTEGER PRIMARY KEY,
+               project_id TEXT NOT NULL,
+               source_node INTEGER NOT NULL REFERENCES memory_graph_nodes(id) ON DELETE CASCADE,
+               target_node INTEGER NOT NULL REFERENCES memory_graph_nodes(id) ON DELETE CASCADE,
+               relation TEXT NOT NULL CHECK(relation IN (
+                 'contains', 'modifies', 'touched', 'decided', 'contradicts',
+                 'replaces', 'depends_on', 'explains', 'related_to'
+               )),
+               source_chat_id TEXT NOT NULL DEFAULT '',
+               source_event_seq INTEGER NOT NULL DEFAULT 0,
+               UNIQUE(project_id, source_node, target_node, relation,
+                      source_chat_id, source_event_seq)
+             );
+             CREATE INDEX idx_memory_graph_edges_source
+               ON memory_graph_edges(project_id, source_node, relation);
+             CREATE INDEX idx_memory_graph_edges_target
+               ON memory_graph_edges(project_id, target_node, relation);
+             CREATE INDEX idx_memory_graph_edges_chat
+               ON memory_graph_edges(project_id, source_chat_id, source_event_seq);
+             CREATE TABLE memory_files (
+               project_id TEXT NOT NULL,
+               path TEXT NOT NULL,
+               content_hash TEXT NOT NULL,
+               indexed_at_ms INTEGER NOT NULL,
+               node_id INTEGER NOT NULL UNIQUE
+                 REFERENCES memory_graph_nodes(id) ON DELETE CASCADE,
+               PRIMARY KEY(project_id, path)
+             );
+             PRAGMA user_version = 6;",
+        )?;
+    }
     Ok(())
 }
 
@@ -1177,6 +2218,44 @@ fn ensure_fts(conn: &Connection) -> Result<bool, MemoryError> {
         Ok(()) => Ok(true),
         Err(err) => {
             tracing::warn!(error = %err, "memory: FTS5 unavailable, using LIKE search");
+            Ok(false)
+        }
+    }
+}
+
+fn ensure_facts_fts(conn: &Connection) -> Result<bool, MemoryError> {
+    let existed = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'memory_facts_fts')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .unwrap_or(false);
+    let mut setup = String::from(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS memory_facts_fts USING fts5(
+           content, content='memory_facts', content_rowid='id'
+         );
+         CREATE TRIGGER IF NOT EXISTS memory_facts_ai AFTER INSERT ON memory_facts BEGIN
+           INSERT INTO memory_facts_fts(rowid, content) VALUES(new.id, new.content);
+         END;
+         CREATE TRIGGER IF NOT EXISTS memory_facts_ad AFTER DELETE ON memory_facts BEGIN
+           INSERT INTO memory_facts_fts(memory_facts_fts, rowid, content)
+             VALUES('delete', old.id, old.content);
+         END;
+         CREATE TRIGGER IF NOT EXISTS memory_facts_au AFTER UPDATE OF content ON memory_facts BEGIN
+           INSERT INTO memory_facts_fts(memory_facts_fts, rowid, content)
+             VALUES('delete', old.id, old.content);
+           INSERT INTO memory_facts_fts(rowid, content) VALUES(new.id, new.content);
+         END;",
+    );
+    if !existed {
+        setup.push_str("\nINSERT INTO memory_facts_fts(memory_facts_fts) VALUES('rebuild');");
+    }
+    let result = conn.execute_batch(&setup);
+    match result {
+        Ok(()) => Ok(true),
+        Err(error) => {
+            tracing::warn!(error = %error, "memory: facts FTS5 unavailable, using substring search");
             Ok(false)
         }
     }
@@ -1265,6 +2344,7 @@ fn apply_batch(conn: &Connection, items: &[MemoryItem], fts: bool) -> Result<(),
     let tx = conn.unchecked_transaction()?;
     // Per-batch settings cache: project enabled flag + exclusions.
     let mut settings: HashMap<String, (bool, Vec<String>)> = HashMap::new();
+    let mut changed_paths = std::collections::HashSet::new();
     let mut insert = tx.prepare(
         "INSERT OR IGNORE INTO memory_events(
            project_id, chat_id, source_seq, agent, model, kind, occurred_at_ms,
@@ -1346,6 +2426,15 @@ fn apply_batch(conn: &Connection, items: &[MemoryItem], fts: bool) -> Result<(),
                     if let (Some(id), Some(fts)) = (id, fts_insert.as_mut()) {
                         fts.execute(params![id, search_text])?;
                     }
+                    if rec.kind == "tool_call"
+                        && matches!(
+                            rec.tool_name.as_deref(),
+                            Some("write_file" | "edit_file" | "apply_patch")
+                        )
+                        && let Some(path) = rel_path
+                    {
+                        changed_paths.insert((rec.project_id.clone(), path.to_string()));
+                    }
                 }
                 // Disabled projects still advance the cursor: "disable" means
                 // stop recording from this point, not "backfill on re-enable".
@@ -1388,6 +2477,19 @@ fn apply_batch(conn: &Connection, items: &[MemoryItem], fts: bool) -> Result<(),
     drop(cursor);
     drop(gap_clear);
     drop(forgotten_stmt);
+    for (project_id, path) in changed_paths {
+        let file_node: Option<i64> = tx
+            .query_row(
+                "SELECT id FROM memory_graph_nodes
+                 WHERE project_id = ?1 AND kind = 'file' AND node_key = ?2",
+                params![project_id, path],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(file_node) = file_node {
+            connect_file_history(&tx, &project_id, &path, file_node)?;
+        }
+    }
     tx.commit()?;
     Ok(())
 }
@@ -1562,6 +2664,8 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::facts::{FactKind, FactScope, FactSource, NewMemoryFact};
+    use crate::graph::MemorySymbol;
     use crate::record::MemoryRecord;
 
     fn svc() -> (MemoryService, tempfile::TempDir) {
@@ -1587,6 +2691,24 @@ mod tests {
             output_tokens: None,
             reasoning_tokens: None,
             duration_ms: None,
+        }
+    }
+
+    fn fact(content: &str) -> NewMemoryFact {
+        NewMemoryFact {
+            project_id: "p_test".into(),
+            chat_id: None,
+            kind: FactKind::Decision,
+            scope: FactScope::Project,
+            content: content.into(),
+            source: FactSource::AgentAssertion,
+            source_agent: Some("claude-code".into()),
+            source_model: Some("opus".into()),
+            source_event_seq: Some(3),
+            source_path: Some("src/main.rs".into()),
+            confidence: 0.6,
+            user_confirmed: false,
+            valid_from_ms: now_ms(),
         }
     }
 
@@ -1635,6 +2757,198 @@ mod tests {
         let cursor = svc.chat_cursor("chat-1").unwrap();
         assert_eq!(cursor.last_seq, 2);
         assert_eq!(cursor.gap_seq, None);
+    }
+
+    #[test]
+    fn facts_are_typed_scoped_searchable_and_have_provenance() {
+        let (svc, _dir) = svc();
+        let id = svc
+            .create_fact(&fact("Use SQLite as the canonical memory store"))
+            .unwrap();
+        let found = svc.facts("p_test", None, false, 20).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, id);
+        assert_eq!(found[0].kind, FactKind::Decision);
+        assert_eq!(found[0].scope, FactScope::Project);
+        assert_eq!(found[0].source, FactSource::AgentAssertion);
+        assert_eq!(found[0].source_event_seq, Some(3));
+        assert_eq!(
+            svc.search_facts("p_test", None, "canonical memory", 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            svc.facts("another-project", None, false, 20)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn replacing_facts_is_atomic_and_keeps_stale_provenance() {
+        let (svc, _dir) = svc();
+        let old_id = svc
+            .create_fact(&fact("Use the first storage design"))
+            .unwrap();
+        let mut replacement = fact("Use the revised storage design");
+        replacement.valid_from_ms += 1;
+        let new_id = svc.replace_fact(old_id, &replacement).unwrap();
+        let all = svc.facts("p_test", None, true, 20).unwrap();
+        let old = all.iter().find(|f| f.id == old_id).unwrap();
+        assert_eq!(old.stale_at_ms, Some(replacement.valid_from_ms));
+        assert_eq!(old.replaced_by, Some(new_id));
+        assert_eq!(svc.facts("p_test", None, false, 20).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn global_facts_require_confirmation_and_follow_project_forget() {
+        let (svc, _dir) = svc();
+        let id = svc.create_fact(&fact("Keep this convention")).unwrap();
+        assert!(svc.promote_fact_to_global(id, false).is_err());
+        assert!(svc.promote_fact_to_global(id, true).unwrap());
+        assert_eq!(
+            svc.facts("other-project", None, false, 20).unwrap().len(),
+            1
+        );
+        svc.forget_project("p_test", &[]).unwrap();
+        assert!(
+            svc.facts("other-project", None, true, 20)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn fact_validation_rejects_secrets_and_unconfirmed_global_scope() {
+        let (svc, _dir) = svc();
+        let mut secret = fact("Never store ghp_123456789012345678901234567890");
+        assert!(svc.create_fact(&secret).is_err());
+        secret = fact("A global assertion");
+        secret.scope = FactScope::Global;
+        assert!(svc.create_fact(&secret).is_err());
+        secret.scope = FactScope::Session;
+        secret.chat_id = None;
+        assert!(svc.create_fact(&secret).is_err());
+    }
+
+    #[test]
+    fn file_graph_updates_only_on_hash_change_and_marks_linked_facts_stale() {
+        let (svc, _dir) = svc();
+        let mut linked_fact = fact("The parser keeps its input bounded");
+        linked_fact.source_path = Some("src/parser.rs".into());
+        let fact_id = svc.create_fact(&linked_fact).unwrap();
+        let symbols = vec![MemorySymbol {
+            name: "Parser".into(),
+            kind: "struct_item".into(),
+            start_byte: 0,
+            end_byte: 40,
+        }];
+        assert!(
+            svc.index_file_symbols("p_test", "src/parser.rs", &"a".repeat(64), &symbols)
+                .unwrap()
+        );
+        let neighbors = svc.graph_neighbors("p_test", "src/parser.rs", 20).unwrap();
+        assert!(
+            neighbors
+                .iter()
+                .any(|node| node.kind == "symbol" && node.label == "Parser")
+        );
+        assert!(
+            neighbors
+                .iter()
+                .any(|node| node.kind == "fact" && node.key == fact_id.to_string())
+        );
+        assert!(
+            !svc.index_file_symbols("p_test", "src/parser.rs", &"a".repeat(64), &symbols)
+                .unwrap()
+        );
+
+        let changed_symbols = vec![MemorySymbol {
+            name: "parse".into(),
+            kind: "function_item".into(),
+            start_byte: 50,
+            end_byte: 90,
+        }];
+        assert!(
+            svc.index_file_symbols("p_test", "src/parser.rs", &"b".repeat(64), &changed_symbols)
+                .unwrap()
+        );
+        let facts = svc.facts("p_test", None, true, 10).unwrap();
+        assert!(facts[0].stale_at_ms.is_some());
+        let neighbors = svc.graph_neighbors("p_test", "src/parser.rs", 20).unwrap();
+        assert!(!neighbors.iter().any(|node| node.label == "Parser"));
+        assert!(neighbors.iter().any(|node| node.label == "parse"));
+
+        assert!(svc.remove_file_index("p_test", "src/parser.rs").unwrap());
+        assert!(
+            svc.graph_neighbors("p_test", "src/parser.rs", 20)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn graph_index_obeys_exclusions_and_validates_paths_and_hashes() {
+        let (svc, _dir) = svc();
+        svc.set_exclusions("p_test", &["vendor".into()]).unwrap();
+        let symbols = [];
+        assert!(
+            svc.index_file_symbols("p_test", "vendor/lib.rs", &"a".repeat(64), &symbols)
+                .is_err()
+        );
+        assert!(
+            svc.index_file_symbols("p_test", "../secret.rs", &"a".repeat(64), &symbols)
+                .is_err()
+        );
+        assert!(
+            svc.index_file_symbols("p_test", "src/lib.rs", "not-a-hash", &symbols)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn obsidian_export_is_one_way_linked_and_refuses_unowned_destinations() {
+        let (svc, dir) = svc();
+        let mut linked = fact("Use [[SQLite]] as canonical storage");
+        linked.chat_id = Some("chat-1".into());
+        linked.scope = FactScope::Session;
+        svc.create_fact(&linked).unwrap();
+        let mut event = rec(7, "tool_call");
+        event.tool_name = Some("edit_file".into());
+        event.relative_path = Some("src/store.rs".into());
+        svc.enqueue(MemoryItem::Record(Box::new(event))).unwrap();
+        wait_for(|| svc.stats("p_test").unwrap().events == 1);
+
+        let destination = dir.path().join("vault");
+        let report = svc.export_obsidian("p_test", &destination).unwrap();
+        assert_eq!(report.facts, 1);
+        assert_eq!(report.sessions, 1);
+        let fact_note = std::fs::read_to_string(destination.join("Facts/decision-1.md")).unwrap();
+        assert!(fact_note.contains("userConfirmed: false"));
+        assert!(fact_note.contains("\\[\\[SQLite\\]\\]"));
+        let session_path = std::fs::read_dir(destination.join("Sessions"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let session = std::fs::read_to_string(session_path).unwrap();
+        assert!(session.contains("[[../Facts/decision-1]]"));
+        assert!(session.contains("[[src/store.rs]]"));
+        assert_eq!(
+            svc.export_obsidian("p_test", &destination).unwrap().facts,
+            1
+        );
+
+        let unowned = dir.path().join("existing-vault");
+        std::fs::create_dir(&unowned).unwrap();
+        std::fs::write(unowned.join("keep.md"), "user content").unwrap();
+        assert!(svc.export_obsidian("p_test", &unowned).is_err());
+        assert_eq!(
+            std::fs::read_to_string(unowned.join("keep.md")).unwrap(),
+            "user content"
+        );
     }
 
     #[test]

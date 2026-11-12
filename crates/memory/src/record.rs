@@ -5,6 +5,8 @@
 //! tool arguments/results, command strings, diffs, or file contents. The
 //! engine builds these; this crate stores them.
 
+use serde::Serialize;
+
 /// One allow-listed activity row, ready for `INSERT OR IGNORE`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MemoryRecord {
@@ -58,7 +60,8 @@ pub enum MemoryItem {
 }
 
 /// A stored activity row, as read back for search/inspection/briefing.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct MemoryEvent {
     pub id: i64,
     pub project_id: String,
@@ -105,6 +108,18 @@ pub struct FailureDigest {
     pub last_ms: i64,
 }
 
+/// A bounded, source-linked fact shown in a handoff briefing.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FactDigest {
+    pub kind: String,
+    pub content: String,
+    pub source: String,
+    pub source_agent: Option<String>,
+    pub source_path: Option<String>,
+    pub confidence: f64,
+    pub stale: bool,
+}
+
 /// Per-agent rollup for the briefing: sessions, volume, last outcome,
 /// modified paths and recent failures.
 #[derive(Debug, Clone, PartialEq)]
@@ -126,4 +141,5 @@ pub struct AgentDigest {
 pub struct BriefingDigest {
     pub chats: u64,
     pub agents: Vec<AgentDigest>,
+    pub facts: Vec<FactDigest>,
 }

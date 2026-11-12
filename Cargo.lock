@@ -3710,6 +3710,7 @@ dependencies = [
  "komet-rpc",
  "komet-sync",
  "komet-sync-server",
+ "komet-syntax",
  "komet-term",
  "komet-update",
  "libc",

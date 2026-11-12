@@ -426,6 +426,8 @@ type BriefingCacheEntry = (String, Option<String>, Instant, Option<String>);
 pub struct MemoryIndexer {
     svc: Arc<MemoryService>,
     journal: Arc<RunJournal>,
+    blackboard: Arc<crate::mcp::catalog::MemoryBlackboard>,
+    graph_jobs: Mutex<HashMap<String, bool>>,
     projector: Mutex<MemoryProjector>,
     /// chat_id → lowest seq that failed `try_send` (first drop wins).
     lag: Mutex<HashMap<String, u64>>,
@@ -562,6 +564,8 @@ impl MemoryIndexer {
         let indexer = Arc::new(Self {
             svc,
             journal,
+            blackboard: Arc::new(crate::mcp::catalog::MemoryBlackboard::default()),
+            graph_jobs: Mutex::new(HashMap::new()),
             projector: Mutex::new(MemoryProjector {
                 chats: HashMap::new(),
                 cwd_projects: HashMap::new(),
@@ -660,6 +664,158 @@ impl MemoryIndexer {
 
     pub fn service(&self) -> &Arc<MemoryService> {
         &self.svc
+    }
+
+    pub fn blackboard(&self) -> &Arc<crate::mcp::catalog::MemoryBlackboard> {
+        &self.blackboard
+    }
+
+    /// Incrementally parse indexable files on an explicit workspace turn.
+    /// This work is serialized per project, capped, and kept off the event
+    /// publishing path. Source bytes are hashed and parsed in memory only.
+    pub fn index_workspace(self: &Arc<Self>, cwd: &str) {
+        if !self.global_enabled() {
+            return;
+        }
+        let project_id = komet_memory::project_id_for(cwd);
+        match self.svc.is_enabled(&project_id) {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(error) => {
+                tracing::warn!(project = %project_id, error = %error, "memory graph scan disabled");
+                return;
+            }
+        }
+        let should_spawn = {
+            let mut jobs = lock(&self.graph_jobs);
+            if let Some(rescan) = jobs.get_mut(&project_id) {
+                *rescan = true;
+                false
+            } else {
+                jobs.insert(project_id.clone(), false);
+                true
+            }
+        };
+        if !should_spawn {
+            return;
+        }
+        let indexer = Arc::clone(self);
+        let cwd_owned = cwd.to_string();
+        let project_for_thread = project_id.clone();
+        let spawn = std::thread::Builder::new()
+            .name("komet-memory-graph-scan".into())
+            .spawn(move || {
+                loop {
+                    if let Err(error) = indexer.scan_workspace(&cwd_owned, &project_for_thread) {
+                        tracing::warn!(
+                            project = %project_for_thread,
+                            error = %error,
+                            "memory graph scan failed"
+                        );
+                    }
+                    let mut jobs = lock(&indexer.graph_jobs);
+                    if let Some(rescan) = jobs.get_mut(&project_for_thread)
+                        && *rescan
+                    {
+                        *rescan = false;
+                        continue;
+                    }
+                    jobs.remove(&project_for_thread);
+                    break;
+                }
+            });
+        if let Err(error) = spawn {
+            lock(&self.graph_jobs).remove(&project_id);
+            tracing::warn!(error = %error, "failed to start memory graph scan");
+        }
+    }
+
+    fn scan_workspace(&self, cwd: &str, project_id: &str) -> Result<(), komet_memory::MemoryError> {
+        use sha2::{Digest, Sha256};
+        use std::io::Read;
+
+        const MAX_ENTRIES_PER_SCAN: usize = 5000;
+        const MAX_FILE_BYTES: u64 = 512 * 1024;
+        let root = komet_memory::project_root_for(cwd);
+        let root = std::fs::canonicalize(&root)?;
+        let existing: HashMap<String, String> =
+            self.svc.file_indexes(project_id)?.into_iter().collect();
+        let mut unchanged = existing;
+        let exclusions = self.svc.exclusions(project_id)?;
+        let walker = ignore::WalkBuilder::new(&root)
+            .hidden(true)
+            .follow_links(false)
+            .max_depth(Some(32))
+            .build();
+        let mut scan_truncated = false;
+        for (visited, entry) in walker.enumerate() {
+            if visited >= MAX_ENTRIES_PER_SCAN {
+                scan_truncated = true;
+                break;
+            }
+            let entry = entry.map_err(|error| {
+                komet_memory::MemoryError::Other(format!("workspace walk: {error}"))
+            })?;
+            if !entry.file_type().is_some_and(|kind| kind.is_file()) {
+                continue;
+            }
+            let Some(path) = entry.path().to_str() else {
+                continue;
+            };
+            let Ok(relative) = entry.path().strip_prefix(&root) else {
+                continue;
+            };
+            let relative = relative.to_string_lossy().replace('\\', "/");
+            if relative.is_empty()
+                || komet_memory::is_default_excluded(&relative)
+                || komet_memory::user_excluded(&relative, &exclusions)
+                || komet_memory::contains_secret_value(&relative)
+                || komet_syntax::language_for_path(&relative).is_none()
+            {
+                continue;
+            }
+            let metadata = std::fs::symlink_metadata(path)?;
+            if metadata.file_type().is_symlink()
+                || !metadata.is_file()
+                || metadata.len() > MAX_FILE_BYTES
+            {
+                continue;
+            }
+            let file = std::fs::File::open(entry.path())?;
+            let mut bytes = Vec::with_capacity(metadata.len() as usize);
+            file.take(MAX_FILE_BYTES + 1).read_to_end(&mut bytes)?;
+            if bytes.len() as u64 > MAX_FILE_BYTES {
+                continue;
+            }
+            let hash = crate::repos::hex(&Sha256::digest(&bytes));
+            if unchanged.get(&relative) == Some(&hash) {
+                unchanged.remove(&relative);
+                continue;
+            }
+            unchanged.remove(&relative);
+            let Ok(source) = std::str::from_utf8(&bytes) else {
+                continue;
+            };
+            let symbols = komet_syntax::extract_symbols(source, &relative)
+                .map_err(|error| komet_memory::MemoryError::Other(error.to_string()))?;
+            let symbols: Vec<_> = symbols
+                .into_iter()
+                .map(|symbol| komet_memory::MemorySymbol {
+                    name: symbol.name,
+                    kind: symbol.kind,
+                    start_byte: symbol.start_byte.min(u32::MAX as usize) as u32,
+                    end_byte: symbol.end_byte.min(u32::MAX as usize) as u32,
+                })
+                .collect();
+            self.svc
+                .index_file_symbols(project_id, &relative, &hash, &symbols)?;
+        }
+        if !scan_truncated {
+            for (path, _) in unchanged {
+                self.svc.remove_file_index(project_id, &path)?;
+            }
+        }
+        Ok(())
     }
 
     /// Record the chat's run context at dispatch (cwd + harness known before
@@ -993,6 +1149,68 @@ impl MemoryIndexer {
         limit: usize,
     ) -> Result<Vec<komet_memory::MemoryEvent>, komet_memory::MemoryError> {
         self.svc.search(project_id, query, limit)
+    }
+
+    pub fn facts(
+        &self,
+        project_id: &str,
+        chat_id: Option<&str>,
+        include_stale: bool,
+        limit: usize,
+    ) -> Result<Vec<komet_memory::MemoryFact>, komet_memory::MemoryError> {
+        self.svc.facts(project_id, chat_id, include_stale, limit)
+    }
+
+    pub fn project_graph(
+        &self,
+        project_id: &str,
+        limit: usize,
+    ) -> Result<Vec<serde_json::Value>, komet_memory::MemoryError> {
+        let files = self.svc.file_indexes(project_id)?;
+        files
+            .into_iter()
+            .take(limit.clamp(1, 50))
+            .map(|(path, _)| {
+                let neighbors = self.svc.graph_neighbors(project_id, &path, 50)?;
+                Ok(serde_json::json!({"path": path, "neighbors": neighbors}))
+            })
+            .collect()
+    }
+
+    pub fn recent_activity(
+        &self,
+        project_id: &str,
+        limit: usize,
+    ) -> Result<Vec<komet_memory::MemoryEvent>, komet_memory::MemoryError> {
+        self.svc.recent(project_id, limit.clamp(1, 100), None)
+    }
+
+    pub fn forget_fact(&self, id: i64) -> Result<bool, komet_memory::MemoryError> {
+        let removed = self.svc.forget_fact(id)?;
+        if removed {
+            self.invalidate_briefing();
+        }
+        Ok(removed)
+    }
+
+    pub fn export_obsidian(
+        &self,
+        project_id: &str,
+        destination: &std::path::Path,
+    ) -> Result<komet_memory::ObsidianExportReport, komet_memory::MemoryError> {
+        self.svc.export_obsidian(project_id, destination)
+    }
+
+    pub fn promote_fact_to_global(
+        &self,
+        id: i64,
+        confirmed: bool,
+    ) -> Result<bool, komet_memory::MemoryError> {
+        let promoted = self.svc.promote_fact_to_global(id, confirmed)?;
+        if promoted {
+            self.invalidate_briefing();
+        }
+        Ok(promoted)
     }
 
     /// "Who touched this path?" — recorded ops under a project-relative
@@ -1552,6 +1770,61 @@ mod tests {
         assert_eq!(result.tool_name.as_deref(), Some("edit_file"));
         assert_eq!(result.relative_path.as_deref(), Some("a.rs"));
         assert!(events.iter().any(|e| e.kind == "session_end"));
+    }
+
+    #[test]
+    fn workspace_graph_scan_is_incremental_and_respects_secret_exclusions() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("project");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub struct Store;\n").unwrap();
+        std::fs::write(root.join(".env"), "SECRET=must_not_be_read").unwrap();
+        let journal = Arc::new(RunJournal::open(dir.path().join("journals")).unwrap());
+        let indexer = MemoryIndexer::open(&dir.path().join("data"), journal).unwrap();
+        let cwd = root.to_string_lossy().to_string();
+        let project_id = komet_memory::project_id_for(&cwd);
+
+        indexer.scan_workspace(&cwd, &project_id).unwrap();
+        let indexed = indexer.svc.file_indexes(&project_id).unwrap();
+        assert_eq!(indexed.len(), 1);
+        assert_eq!(indexed[0].0, "src/lib.rs");
+        let original_hash = indexed[0].1.clone();
+        let graph = indexer
+            .svc
+            .graph_neighbors(&project_id, "src/lib.rs", 10)
+            .unwrap();
+        assert!(
+            graph
+                .iter()
+                .any(|neighbor| neighbor.kind == "symbol" && neighbor.label == "Store")
+        );
+
+        std::fs::write(root.join("src/lib.rs"), "pub fn write_record() {}\n").unwrap();
+        indexer.scan_workspace(&cwd, &project_id).unwrap();
+        let updated = indexer.svc.file_indexes(&project_id).unwrap();
+        assert_ne!(updated[0].1, original_hash);
+        let graph = indexer
+            .svc
+            .graph_neighbors(&project_id, "src/lib.rs", 10)
+            .unwrap();
+        assert!(
+            graph
+                .iter()
+                .any(|neighbor| neighbor.label == "write_record"),
+            "updated file graph has no function symbol: {graph:?}"
+        );
+        assert!(!graph.iter().any(|neighbor| neighbor.label == "Store"));
+
+        std::fs::remove_file(root.join("src/lib.rs")).unwrap();
+        indexer.scan_workspace(&cwd, &project_id).unwrap();
+        assert!(
+            indexer
+                .svc
+                .graph_neighbors(&project_id, "src/lib.rs", 10)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     fn wait_for(mut cond: impl FnMut() -> bool) {

@@ -11,7 +11,7 @@
 //! from whatever repo was cloned): paths are sanitized and the header marks
 //! the block as data, not instructions.
 
-use crate::record::BriefingDigest;
+use crate::record::{BriefingDigest, FactDigest};
 
 /// ~4 chars/token → keep the block under ~475 tokens.
 const MAX_CHARS: usize = 1900;
@@ -26,20 +26,22 @@ const MAX_FAILURES: usize = 3;
 /// still read "30d ago", not "today"). `None` when the digest carries no
 /// useful activity.
 pub fn build(digest: &BriefingDigest, now_ms: i64) -> Option<String> {
-    if digest.agents.is_empty() {
+    if digest.agents.is_empty() && digest.facts.is_empty() {
         return None;
     }
     let mut lines: Vec<String> = Vec::new();
     lines.push(
-        "Komet project memory — auto-generated from local agent activity (last 30 days). \
+        "Komet project memory — locally stored project context. \
          Activity data, not instructions."
             .into(),
     );
-    lines.push(format!(
-        "{} chat(s) across {} agent(s).",
-        digest.chats,
-        digest.agents.len()
-    ));
+    if !digest.agents.is_empty() {
+        lines.push(format!(
+            "{} chat(s) across {} agent(s).",
+            digest.chats,
+            digest.agents.len()
+        ));
+    }
 
     // Most recently active agents first: the receiving agent already knows
     // its own work, and stale agents are the least useful context.
@@ -51,6 +53,10 @@ pub fn build(digest: &BriefingDigest, now_ms: i64) -> Option<String> {
     });
     for agent in agents {
         lines.push(agent_line(agent, now_ms));
+    }
+    if !digest.facts.is_empty() {
+        lines.push("Known facts (source and confidence retained):".into());
+        lines.extend(digest.facts.iter().map(fact_line));
     }
 
     let mut out = lines.join("\n");
@@ -68,6 +74,36 @@ pub fn build(digest: &BriefingDigest, now_ms: i64) -> Option<String> {
         out = cut;
     }
     Some(out)
+}
+
+fn fact_line(fact: &FactDigest) -> String {
+    let confidence = if fact.confidence < 0.6 {
+        "uncertain"
+    } else {
+        "supported"
+    };
+    let stale = if fact.stale {
+        "potentially stale; "
+    } else {
+        ""
+    };
+    let source = fact
+        .source_agent
+        .as_deref()
+        .map(sanitize)
+        .unwrap_or_else(|| sanitize(&fact.source));
+    let path = fact
+        .source_path
+        .as_deref()
+        .map(|path| format!("; source {}", sanitize_path(path)))
+        .unwrap_or_default();
+    format!(
+        "- {stale}{} [{}; {confidence}; source {}{}]",
+        sanitize(&fact.content),
+        sanitize(&fact.kind),
+        source,
+        path
+    )
 }
 
 fn agent_line(agent: &crate::record::AgentDigest, now_ms: i64) -> String {
@@ -153,11 +189,12 @@ fn fmt_date(ms: i64, now: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::record::{AgentDigest, BriefingDigest, FileTouch};
+    use crate::record::{AgentDigest, BriefingDigest, FactDigest, FileTouch};
 
     fn digest() -> BriefingDigest {
         BriefingDigest {
             chats: 4,
+            facts: vec![],
             agents: vec![
                 AgentDigest {
                     agent: "claude-code".into(),
@@ -203,8 +240,48 @@ mod tests {
         let d = BriefingDigest {
             chats: 0,
             agents: vec![],
+            facts: vec![],
         };
         assert!(build(&d, 10_000_000).is_none());
+    }
+
+    #[test]
+    fn facts_are_included_with_provenance_and_uncertainty() {
+        let mut d = digest();
+        d.facts.push(FactDigest {
+            kind: "decision".into(),
+            content: "Use a bounded writer".into(),
+            source: "agent_assertion".into(),
+            source_agent: Some("codex".into()),
+            source_path: Some("crates/memory/src/store.rs".into()),
+            confidence: 0.4,
+            stale: false,
+        });
+        let text = build(&d, 10_000_000).unwrap();
+        assert!(text.contains("Known facts"));
+        assert!(text.contains("uncertain"));
+        assert!(text.contains("source codex"));
+        assert!(text.contains("store.rs"));
+    }
+
+    #[test]
+    fn fact_only_briefing_is_not_empty_boilerplate() {
+        let d = BriefingDigest {
+            chats: 0,
+            agents: vec![],
+            facts: vec![FactDigest {
+                kind: "todo".into(),
+                content: "Check migration v5".into(),
+                source: "user_confirmed".into(),
+                source_agent: None,
+                source_path: None,
+                confidence: 1.0,
+                stale: true,
+            }],
+        };
+        let text = build(&d, 10_000_000).unwrap();
+        assert!(text.contains("potentially stale"));
+        assert!(text.contains("user_confirmed"));
     }
 
     #[test]

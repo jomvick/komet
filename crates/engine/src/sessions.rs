@@ -755,6 +755,8 @@ impl SessionsEngine {
         &self,
         chat_id: &str,
         run_id: &str,
+        cwd: &str,
+        agent: &str,
         ask: AskFn,
     ) -> Option<RunningEndpoint> {
         let Some(workspace) = self.inner.workspace() else {
@@ -763,6 +765,27 @@ impl SessionsEngine {
         };
         let mut catalog =
             McpCatalog::komet_default(Arc::new(EngineMcpHost::new(self.clone(), workspace)));
+        if let Some(indexer) = self.memory()
+            && indexer.global_enabled()
+        {
+            let project_id = komet_memory::project_id_for(cwd);
+            match indexer.is_enabled(&project_id) {
+                Ok(true) => {
+                    catalog = catalog.with_memory(
+                        indexer.service().clone(),
+                        indexer.blackboard().clone(),
+                        project_id,
+                        chat_id.to_string(),
+                        agent.to_string(),
+                        run_id.to_string(),
+                    );
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(chat = %chat_id, error = %error, "memory MCP tools unavailable");
+                }
+            }
+        }
         match self.inner.mcp_secrets.composio_platform_api_key() {
             Ok(Some(api_key)) => {
                 let api = ComposioApi::new(api_key, self.inner.device_id.clone());
@@ -1473,7 +1496,8 @@ impl SessionsEngine {
             })
         };
         let internal_mcp = if mcp_supported {
-            self.start_internal_mcp(chat_id, &run_id, mcp_ask).await
+            self.start_internal_mcp(chat_id, &run_id, &request.cwd, harness_id.as_str(), mcp_ask)
+                .await
         } else {
             None
         };
@@ -1536,6 +1560,7 @@ impl SessionsEngine {
         // the run's remaining events (and its Done) to the steer's cwd.
         if let Some(indexer) = self.inner.memory.get() {
             indexer.note_chat(chat_id, &request.cwd, harness_id);
+            indexer.index_workspace(&request.cwd);
         }
 
         tokio::spawn(drive_run(

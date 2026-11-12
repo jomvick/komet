@@ -1,10 +1,11 @@
-//! Settings → Memory: the local project-memory index (issue #78, phase 1).
+//! Settings → Memory: local project memory (issue #78, phases 1–5 and 7).
 //!
 //! The index is device-local and allow-listed — it never leaves this machine
 //! and never stores prompts, commands, file contents or credentials. This page
 //! is the visibility/control surface that makes the default-on choice
 //! acceptable: where the data lives, how much there is, per-project switches
-//! and exclusions, retention, and explicit forget/import actions.
+//! and exclusions, retention, typed facts, graph/timeline inspection,
+//! explicit forget actions, and one-way Obsidian export.
 //!
 //! Storage changes apply at next engine start (the live SQLite connections
 //! cannot be moved underneath themselves); the page says so instead of
@@ -53,11 +54,73 @@ pub struct MemoryProject {
     pub last_activity_ms: Option<i64>,
 }
 
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct MemoryFact {
+    pub id: i64,
+    pub project_id: String,
+    pub chat_id: Option<String>,
+    pub kind: String,
+    pub scope: String,
+    pub content: String,
+    pub source: String,
+    pub source_agent: Option<String>,
+    pub source_model: Option<String>,
+    pub source_event_seq: Option<u64>,
+    pub source_path: Option<String>,
+    pub confidence: f64,
+    pub user_confirmed: bool,
+    pub valid_from_ms: i64,
+    pub stale_at_ms: Option<i64>,
+    pub replaced_by: Option<i64>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct MemoryGraphNeighbor {
+    pub kind: String,
+    pub key: String,
+    pub label: String,
+    pub relation: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct MemoryGraphFile {
+    pub path: String,
+    pub neighbors: Vec<MemoryGraphNeighbor>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct MemoryActivity {
+    pub chat_id: String,
+    pub source_seq: u64,
+    pub agent: String,
+    pub kind: String,
+    pub occurred_at_ms: i64,
+    pub tool_name: Option<String>,
+    pub relative_path: Option<String>,
+    pub outcome: Option<String>,
+}
+
 /// Which destructive action is waiting for its second click.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Confirm {
     ForgetProject(String),
     ForgetAll,
+    ForgetFact(i64),
+    PromoteFact(i64),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum FactFilter {
+    #[default]
+    Current,
+    AgentAssertions,
+    UserConfirmed,
+    LowConfidence,
+    Stale,
 }
 
 pub struct MemoryPage {
@@ -76,15 +139,23 @@ pub struct MemoryPage {
     generation: u64,
     /// Draft for a custom storage folder (empty = the default location).
     location_input: Entity<ComposerInput>,
+    export_input: Entity<ComposerInput>,
     /// Project whose detail row is expanded, plus its exclusions draft.
     expanded: Option<String>,
     exclusions_input: Option<Entity<ComposerInput>>,
+    facts: Vec<MemoryFact>,
+    graph_files: Vec<MemoryGraphFile>,
+    activity: Vec<MemoryActivity>,
+    facts_loading: bool,
+    facts_generation: u64,
+    fact_filter: FactFilter,
     confirm: Option<Confirm>,
 }
 
 impl MemoryPage {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let location_input = cx.new(|cx| ComposerInput::new("Custom folder…", cx));
+        let export_input = cx.new(|cx| ComposerInput::new("New or Komet-owned export folder…", cx));
         cx.subscribe(&location_input, |this: &mut Self, _, event, cx| {
             if matches!(event, ComposerInputEvent::Submitted) {
                 this.apply_location(cx);
@@ -103,8 +174,15 @@ impl MemoryPage {
             engine: None,
             generation: 0,
             location_input,
+            export_input,
             expanded: None,
             exclusions_input: None,
+            facts: Vec::new(),
+            graph_files: Vec::new(),
+            activity: Vec::new(),
+            facts_loading: false,
+            facts_generation: 0,
+            fact_filter: FactFilter::Current,
             confirm: None,
         };
         page.load(cx);
@@ -129,6 +207,12 @@ impl MemoryPage {
         self.status = Loadable::Idle;
         self.expanded = None;
         self.exclusions_input = None;
+        self.facts.clear();
+        self.graph_files.clear();
+        self.activity.clear();
+        self.facts_loading = false;
+        self.facts_generation += 1;
+        self.fact_filter = FactFilter::Current;
         self.confirm = None;
         self.load(cx);
     }
@@ -172,6 +256,9 @@ impl MemoryPage {
                 }
                 page.loading = false;
                 page.apply(result, cx);
+                if let Some(project_id) = page.expanded.clone() {
+                    page.load_facts(&project_id, cx);
+                }
                 cx.notify();
             })
             .ok();
@@ -307,6 +394,8 @@ impl MemoryPage {
         if self.expanded.as_deref() == Some(project.project_id.as_str()) {
             self.expanded = None;
             self.exclusions_input = None;
+            self.facts.clear();
+            self.facts_generation += 1;
         } else {
             self.expanded = Some(project.project_id.clone());
             let input = cx.new(|cx| ComposerInput::new("Path exclusions (one per line)", cx));
@@ -314,7 +403,128 @@ impl MemoryPage {
                 input.set_text(project.exclusions.join("\n"), cx)
             });
             self.exclusions_input = Some(input);
+            self.load_facts(&project.project_id, cx);
         }
+        cx.notify();
+    }
+
+    fn load_facts(&mut self, project_id: &str, cx: &mut Context<Self>) {
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        self.facts_generation += 1;
+        let facts_generation = self.facts_generation;
+        let page_generation = self.generation;
+        let project_id = project_id.to_string();
+        let include_stale = self.fact_filter == FactFilter::Stale;
+        let params = self.with_target(
+            serde_json::json!({
+                "projectId": project_id,
+                "includeStale": include_stale,
+                "limit": 200
+            }),
+            cx,
+        );
+        let graph_params = self.with_target(
+            serde_json::json!({"projectId": project_id, "limit": 25}),
+            cx,
+        );
+        let activity_params = self.with_target(
+            serde_json::json!({"projectId": project_id, "limit": 50}),
+            cx,
+        );
+        self.facts_loading = true;
+        self.task = Some(cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(methods::GET_MEMORY_FACTS, params)
+                .await;
+            let graph_result = engine
+                .client()
+                .call(methods::GET_MEMORY_PROJECT_GRAPH, graph_params)
+                .await;
+            let activity_result = engine
+                .client()
+                .call(methods::GET_MEMORY_ACTIVITY, activity_params)
+                .await;
+            this.update(cx, |page, cx| {
+                if page.generation != page_generation
+                    || page.facts_generation != facts_generation
+                    || page.expanded.as_deref() != Some(project_id.as_str())
+                {
+                    return;
+                }
+                page.facts_loading = false;
+                match result
+                    .map_err(|error| error.to_string())
+                    .and_then(|value| {
+                        serde_json::from_value::<serde_json::Value>(value)
+                            .map_err(|error| error.to_string())
+                    })
+                    .and_then(|value| {
+                        serde_json::from_value::<Vec<MemoryFact>>(
+                            value.get("facts").cloned().unwrap_or_default(),
+                        )
+                        .map_err(|error| error.to_string())
+                    }) {
+                    Ok(facts) => page.facts = facts,
+                    Err(error) => page.error = Some(SharedString::from(error)),
+                }
+                match graph_result
+                    .map_err(|error| error.to_string())
+                    .and_then(|value| {
+                        serde_json::from_value::<serde_json::Value>(value)
+                            .map_err(|error| error.to_string())
+                    })
+                    .and_then(|value| {
+                        serde_json::from_value::<Vec<MemoryGraphFile>>(
+                            value.get("files").cloned().unwrap_or_default(),
+                        )
+                        .map_err(|error| error.to_string())
+                    }) {
+                    Ok(files) => page.graph_files = files,
+                    Err(error) => page.error = Some(SharedString::from(error)),
+                }
+                match activity_result
+                    .map_err(|error| error.to_string())
+                    .and_then(|value| {
+                        serde_json::from_value::<serde_json::Value>(value)
+                            .map_err(|error| error.to_string())
+                    })
+                    .and_then(|value| {
+                        serde_json::from_value::<Vec<MemoryActivity>>(
+                            value.get("events").cloned().unwrap_or_default(),
+                        )
+                        .map_err(|error| error.to_string())
+                    }) {
+                    Ok(activity) => page.activity = activity,
+                    Err(error) => page.error = Some(SharedString::from(error)),
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    fn cycle_fact_filter(&mut self, project_id: &str, cx: &mut Context<Self>) {
+        self.fact_filter = match self.fact_filter {
+            FactFilter::Current => FactFilter::AgentAssertions,
+            FactFilter::AgentAssertions => FactFilter::UserConfirmed,
+            FactFilter::UserConfirmed => FactFilter::LowConfidence,
+            FactFilter::LowConfidence => FactFilter::Stale,
+            FactFilter::Stale => FactFilter::Current,
+        };
+        self.load_facts(project_id, cx);
+        cx.notify();
+    }
+
+    fn ask_forget_fact(&mut self, id: i64, cx: &mut Context<Self>) {
+        self.confirm = Some(Confirm::ForgetFact(id));
+        cx.notify();
+    }
+
+    fn ask_promote_fact(&mut self, id: i64, cx: &mut Context<Self>) {
+        self.confirm = Some(Confirm::PromoteFact(id));
         cx.notify();
     }
 
@@ -334,6 +544,58 @@ impl MemoryPage {
             serde_json::json!({ "projectId": project_id, "exclusions": exclusions }),
             cx,
         );
+    }
+
+    fn export_obsidian(&mut self, project_id: String, cx: &mut Context<Self>) {
+        let destination = self.export_input.read(cx).text().trim().to_string();
+        if destination.is_empty() || !std::path::Path::new(&destination).is_absolute() {
+            self.error = Some(SharedString::from(
+                "Choose an absolute local folder for the Obsidian export.",
+            ));
+            cx.notify();
+            return;
+        }
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            self.error = Some(SharedString::from("Engine not connected."));
+            cx.notify();
+            return;
+        };
+        let page_generation = self.generation;
+        let params = self.with_target(
+            serde_json::json!({
+                "projectId": project_id,
+                "destination": destination,
+            }),
+            cx,
+        );
+        self.task = Some(cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(methods::EXPORT_MEMORY_OBSIDIAN, params)
+                .await;
+            this.update(cx, |page, cx| {
+                if page.generation != page_generation {
+                    return;
+                }
+                match result {
+                    Ok(value) => {
+                        let facts = value["facts"].as_u64().unwrap_or(0);
+                        let sessions = value["sessions"].as_u64().unwrap_or(0);
+                        let path = value["destination"].as_str().unwrap_or("the selected folder");
+                        page.error = None;
+                        page.notice = Some(SharedString::from(format!(
+                            "Exported {facts} fact(s) and {sessions} session(s) to {path}. SQLite remains canonical; export is one-way."
+                        )));
+                    }
+                    Err(error) => {
+                        page.error = Some(SharedString::from(error.to_string()));
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
     }
 
     fn ask_forget_project(&mut self, project_id: String, cx: &mut Context<Self>) {
@@ -362,6 +624,20 @@ impl MemoryPage {
             }
             Some(Confirm::ForgetAll) => {
                 self.call(methods::FORGET_ALL_MEMORY, serde_json::json!({}), cx);
+            }
+            Some(Confirm::ForgetFact(id)) => {
+                self.call(
+                    methods::FORGET_MEMORY_FACT,
+                    serde_json::json!({ "id": id }),
+                    cx,
+                );
+            }
+            Some(Confirm::PromoteFact(id)) => {
+                self.call(
+                    methods::PROMOTE_MEMORY_FACT,
+                    serde_json::json!({ "id": id, "confirmed": true }),
+                    cx,
+                );
             }
             None => {}
         }
@@ -448,19 +724,33 @@ fn project_label(project: &MemoryProject) -> String {
 impl MemoryPage {
     fn confirm_strip(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
         let confirm = self.confirm.clone()?;
-        let (message, danger_id) = match &confirm {
+        let (message, danger_id, action_label) = match &confirm {
             Confirm::ForgetProject(project_id) => (
                 SharedString::from(format!(
                     "Forget every retained activity record for {}? This cannot be undone.",
                     project_id
                 )),
                 "memory-forget-project-confirm",
+                "Forget",
             ),
             Confirm::ForgetAll => (
                 SharedString::from(
                     "Forget ALL retained agent memory on this device? This cannot be undone.",
                 ),
                 "memory-forget-all-confirm",
+                "Forget",
+            ),
+            Confirm::ForgetFact(id) => (
+                SharedString::from(format!("Forget memory fact {id}? This cannot be undone.")),
+                "memory-forget-fact-confirm",
+                "Forget",
+            ),
+            Confirm::PromoteFact(id) => (
+                SharedString::from(format!(
+                    "Promote fact {id} to device-global memory? Every project on this device may use it."
+                )),
+                "memory-promote-fact-confirm",
+                "Promote",
             ),
         };
         Some(
@@ -486,7 +776,7 @@ impl MemoryPage {
                                 .text_color(theme.danger)
                                 .hover(|s| s.bg(crate::theme::ink(0.06)))
                                 .on_click(cx.listener(|this, _, _, cx| this.confirm_forget(cx)))
-                                .child(SharedString::from("Forget")),
+                                .child(SharedString::from(action_label)),
                         ),
                 )
                 .into_any_element(),
@@ -552,6 +842,13 @@ impl MemoryPage {
                     .child(SharedString::from(dir.clone())),
             );
         }
+        card = card.child(widgets::card_row(theme, false).child(widgets::meta_line(
+            theme,
+            vec![SharedString::from(
+                "Resource guardrails: one background scan per project, at most 5,000 workspace entries and 512 KiB per source file, with one file parsed at a time. No continuous graph simulation.",
+            )
+            .into_any_element()],
+        )));
         if status.restart_required
             && let Some(pending) = &status.pending_dir
         {
@@ -783,7 +1080,8 @@ impl MemoryPage {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let project_id = project.project_id.clone();
+        let export_project_id = project.project_id.clone();
+        let exclusions_project_id = project.project_id.clone();
         let forget_project_id = project.project_id.clone();
         let mut detail = div()
             .px(px(20.0))
@@ -801,6 +1099,38 @@ impl MemoryPage {
                     .child(SharedString::from(root.clone())),
             );
         }
+        detail = detail.child(self.facts_detail(project, theme, cx));
+        detail = detail
+            .child(self.graph_detail(theme))
+            .child(self.activity_detail(theme));
+        detail = detail
+            .child(widgets::field_label(theme, "Obsidian export"))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(div().flex_1().min_w_0().child(self.export_input.clone()))
+                    .child(
+                        widgets::ghost_action(theme)
+                            .id("memory-obsidian-export")
+                            .flex_none()
+                            .text_size(px(12.0))
+                            .hover(|style| widgets::ghost_hover(theme, style))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.export_obsidian(export_project_id.clone(), cx)
+                            }))
+                            .child(SharedString::from("Export")),
+                    ),
+            )
+            .child(widgets::meta_line(
+                theme,
+                vec![SharedString::from(
+                    "One-way Markdown with YAML frontmatter and wikilinks. Choose a new folder; existing folders are only updated when already owned by Komet.",
+                )
+                .into_any_element()],
+            ));
         detail = detail.child(widgets::field_label(theme, "Path exclusions"));
         if let Some(input) = &self.exclusions_input {
             detail = detail.child(
@@ -817,7 +1147,7 @@ impl MemoryPage {
                             .text_size(px(12.0))
                             .hover(|s| widgets::ghost_hover(theme, s))
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                this.save_exclusions(project_id.clone(), cx)
+                                this.save_exclusions(exclusions_project_id.clone(), cx)
                             }))
                             .child(SharedString::from("Save")),
                     ),
@@ -837,6 +1167,229 @@ impl MemoryPage {
             ),
         );
         detail.into_any_element()
+    }
+
+    fn facts_detail(
+        &self,
+        project: &MemoryProject,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let project_id = project.project_id.clone();
+        let filter_label = match self.fact_filter {
+            FactFilter::Current => "Current facts",
+            FactFilter::AgentAssertions => "Agent assertions",
+            FactFilter::UserConfirmed => "User-confirmed",
+            FactFilter::LowConfidence => "Low confidence",
+            FactFilter::Stale => "Stale facts",
+        };
+        let mut section = div()
+            .flex()
+            .flex_col()
+            .gap(px(7.0))
+            .child(widgets::field_label(theme, "Typed facts"));
+        section = section.child(
+            widgets::ghost_action(theme)
+                .id("memory-fact-filter")
+                .text_size(px(11.5))
+                .hover(|style| widgets::ghost_hover(theme, style))
+                .on_click(
+                    cx.listener(move |this, _, _, cx| this.cycle_fact_filter(&project_id, cx)),
+                )
+                .child(SharedString::from(format!("Filter: {filter_label}"))),
+        );
+        if self.facts_loading {
+            section = section.child(
+                div()
+                    .text_size(px(11.5))
+                    .text_color(theme.text_muted)
+                    .child(SharedString::from("Loading memory facts…")),
+            );
+        } else {
+            let visible: Vec<&MemoryFact> = self
+                .facts
+                .iter()
+                .filter(|fact| match self.fact_filter {
+                    FactFilter::Current => fact.stale_at_ms.is_none(),
+                    FactFilter::AgentAssertions => {
+                        fact.source == "agent_assertion" && fact.stale_at_ms.is_none()
+                    }
+                    FactFilter::UserConfirmed => {
+                        (fact.user_confirmed || fact.source == "user_confirmed")
+                            && fact.stale_at_ms.is_none()
+                    }
+                    FactFilter::LowConfidence => {
+                        fact.confidence < 0.6 && fact.stale_at_ms.is_none()
+                    }
+                    FactFilter::Stale => fact.stale_at_ms.is_some(),
+                })
+                .collect();
+            if visible.is_empty() {
+                section = section.child(
+                    div()
+                        .text_size(px(11.5))
+                        .text_color(theme.text_muted)
+                        .child(SharedString::from("No facts match this filter.")),
+                );
+            } else {
+                for fact in visible {
+                    section = section.child(self.fact_row(fact, theme, cx));
+                }
+            }
+        }
+        section.into_any_element()
+    }
+
+    fn graph_detail(&self, theme: &Theme) -> AnyElement {
+        let mut section = div()
+            .flex()
+            .flex_col()
+            .gap(px(5.0))
+            .child(widgets::field_label(theme, "Code graph"));
+        if self.graph_files.is_empty() {
+            section = section.child(
+                div()
+                    .text_size(px(11.5))
+                    .text_color(theme.text_muted)
+                    .child(SharedString::from(
+                        "No indexed files yet. A bounded local scan runs when a project session starts.",
+                    )),
+            );
+        } else {
+            for file in self.graph_files.iter().take(15) {
+                let mut line = format!("{} ·", file.path);
+                for neighbor in file.neighbors.iter().take(5) {
+                    line.push_str(&format!(
+                        " {} {} ({}) ·",
+                        neighbor.relation, neighbor.kind, neighbor.label
+                    ));
+                }
+                section = section.child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(theme.text_muted)
+                        .child(SharedString::from(line)),
+                );
+            }
+        }
+        section.into_any_element()
+    }
+
+    fn activity_detail(&self, theme: &Theme) -> AnyElement {
+        let mut section = div()
+            .flex()
+            .flex_col()
+            .gap(px(5.0))
+            .child(widgets::field_label(theme, "Agent timeline"));
+        if self.activity.is_empty() {
+            section = section.child(
+                div()
+                    .text_size(px(11.5))
+                    .text_color(theme.text_muted)
+                    .child(SharedString::from("No recent activity is indexed.")),
+            );
+        } else {
+            for event in self.activity.iter().take(15) {
+                let mut line = format!(
+                    "{} · {} · {}",
+                    event.occurred_at_ms, event.agent, event.kind
+                );
+                if let Some(tool) = &event.tool_name {
+                    line.push_str(&format!(" · {tool}"));
+                }
+                if let Some(path) = &event.relative_path {
+                    line.push_str(&format!(" · {path}"));
+                }
+                if let Some(outcome) = &event.outcome {
+                    line.push_str(&format!(" · {outcome}"));
+                }
+                section = section.child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(theme.text_muted)
+                        .child(SharedString::from(line)),
+                );
+            }
+        }
+        section.into_any_element()
+    }
+
+    fn fact_row(&self, fact: &MemoryFact, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let forget_id = fact.id;
+        let promote_id = fact.id;
+        let mut details = format!(
+            "{} · {} · {}% confidence · valid from {}",
+            fact.scope,
+            fact.source,
+            (fact.confidence * 100.0).round() as u32,
+            fact.valid_from_ms
+        );
+        if let Some(agent) = &fact.source_agent {
+            details.push_str(&format!(" · {agent}"));
+        }
+        if let Some(path) = &fact.source_path {
+            details.push_str(&format!(" · {path}"));
+        }
+        if let Some(seq) = fact.source_event_seq {
+            details.push_str(&format!(" · event {seq}"));
+        }
+        if let Some(stale_at) = fact.stale_at_ms {
+            details.push_str(&format!(" · potentially stale since {stale_at}"));
+        }
+        if let Some(replaced_by) = fact.replaced_by {
+            details.push_str(&format!(" · replaced by {replaced_by}"));
+        }
+
+        let mut row = div()
+            .rounded(px(8.0))
+            .border_1()
+            .border_color(theme.border)
+            .p(px(9.0))
+            .flex()
+            .flex_col()
+            .gap(px(5.0))
+            .child(widgets::row_title(
+                theme,
+                format!("{} · {}", fact.kind, fact.content),
+            ))
+            .child(
+                div()
+                    .text_size(px(10.5))
+                    .text_color(theme.text_muted)
+                    .child(SharedString::from(details)),
+            )
+            .child(
+                div().flex().flex_row().gap(px(6.0)).child(
+                    widgets::ghost_action(theme)
+                        .id(SharedString::from(format!(
+                            "memory-forget-fact-{}",
+                            fact.id
+                        )))
+                        .text_size(px(10.5))
+                        .text_color(theme.danger)
+                        .hover(|style| style.bg(crate::theme::ink(0.06)))
+                        .on_click(
+                            cx.listener(move |this, _, _, cx| this.ask_forget_fact(forget_id, cx)),
+                        )
+                        .child(SharedString::from("Forget")),
+                ),
+            );
+        if fact.scope != "global" && !fact.user_confirmed {
+            row = row.child(
+                widgets::ghost_action(theme)
+                    .id(SharedString::from(format!(
+                        "memory-promote-fact-{}",
+                        fact.id
+                    )))
+                    .text_size(px(10.5))
+                    .hover(|style| widgets::ghost_hover(theme, style))
+                    .on_click(
+                        cx.listener(move |this, _, _, cx| this.ask_promote_fact(promote_id, cx)),
+                    )
+                    .child(SharedString::from("Promote to global…")),
+            );
+        }
+        row.into_any_element()
     }
 
     fn history_card(
