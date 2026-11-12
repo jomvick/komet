@@ -44,7 +44,11 @@ pub fn build(digest: &BriefingDigest, now_ms: i64) -> Option<String> {
     // Most recently active agents first: the receiving agent already knows
     // its own work, and stale agents are the least useful context.
     let mut agents: Vec<&crate::record::AgentDigest> = digest.agents.iter().collect();
-    agents.sort_by_key(|a| std::cmp::Reverse(a.last_activity_ms));
+    agents.sort_by(|a, b| {
+        b.last_activity_ms
+            .cmp(&a.last_activity_ms)
+            .then_with(|| a.agent.cmp(&b.agent))
+    });
     for agent in agents {
         lines.push(agent_line(agent, now_ms));
     }

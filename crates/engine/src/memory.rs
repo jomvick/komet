@@ -44,7 +44,9 @@ struct ChatMemoryCtx {
     model: Option<String>,
     run_started_ms: i64,
     /// tool_call_id → (tool_name, relative_path) for pairing results.
-    pending_tools: HashMap<String, (String, Option<String>)>,
+    /// `tool_name` is `None` when the harness-supplied name was
+    /// credential-shaped and got filtered out.
+    pending_tools: HashMap<String, (Option<String>, Option<String>)>,
 }
 
 /// cwd → project_id memo (canonicalize is a syscall; chats reuse cwds).
@@ -110,6 +112,17 @@ impl MemoryProjector {
         self.chats.get_mut(chat_id)
     }
 
+    /// Chat ids whose live projection context belongs to `project_id` —
+    /// covers chats with records still sitting in the writer queue (no
+    /// `memory_chat_state` row exists for them yet).
+    fn chats_for_project(&self, project_id: &str) -> Vec<String> {
+        self.chats
+            .iter()
+            .filter(|(_, ctx)| ctx.project_id == project_id)
+            .map(|(chat_id, _)| chat_id.clone())
+            .collect()
+    }
+
     /// Project one journaled event into 0..=2 queue items. `now_ms` is the
     /// caller's clock (publish time live, catch-up time on replay).
     fn project(
@@ -167,7 +180,7 @@ impl MemoryProjector {
                     ctx.root_recorded = false;
                 }
                 ctx.agent = harness.as_str().to_string();
-                ctx.model = Some(model.clone());
+                ctx.model = clean_meta(model);
                 ctx.run_started_ms = now;
                 ctx.pending_tools.clear();
                 let (agent, model_out) = (ctx.agent.clone(), ctx.model.clone());
@@ -240,7 +253,7 @@ impl MemoryProjector {
                     model: ctx.model.clone(),
                     kind: "tool_call",
                     occurred_at_ms: now,
-                    tool_name: Some(tool_name),
+                    tool_name,
                     relative_path: rel_path,
                     outcome: None,
                     input_tokens: None,
@@ -257,7 +270,7 @@ impl MemoryProjector {
                 let (tool_name, rel_path) = ctx
                     .pending_tools
                     .remove(id)
-                    .unwrap_or_else(|| ("unknown".to_string(), None));
+                    .unwrap_or_else(|| (Some("unknown".to_string()), None));
                 vec![MemoryItem::Record(Box::new(MemoryRecord {
                     project_id: ctx.project_id.clone(),
                     chat_id: chat_id.to_string(),
@@ -266,7 +279,7 @@ impl MemoryProjector {
                     model: ctx.model.clone(),
                     kind: "tool_result",
                     occurred_at_ms: now,
-                    tool_name: Some(tool_name),
+                    tool_name,
                     relative_path: rel_path,
                     outcome: Some(if *is_error { "error" } else { "ok" }.to_string()),
                     input_tokens: None,
@@ -324,36 +337,61 @@ fn projectable(event: &AgentEvent) -> bool {
     }
 }
 
+/// Free-form metadata (model ids, MCP/unknown tool names) is harness-
+/// supplied text: it can carry a credential (`mcp:svc/ghp_…`) straight into
+/// the store and `search_text`. Drop anything the secret filter flags —
+/// `None` reads as "not recorded", which is the honest answer.
+fn clean_meta(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() || komet_memory::contains_secret_value(value) {
+        return None;
+    }
+    Some(value.chars().take(128).collect())
+}
+
 /// Reduce a [`ToolCall`] to (tool_name, project-relative path?). Command
 /// text, patterns, queries, URLs and MCP inputs are never carried over.
-/// `canon_cwd` is the chat's cached canonical cwd (see [`ChatMemoryCtx`]).
+/// `tool_name` is `None` when the harness-supplied name was credential-
+/// shaped. `canon_cwd` is the chat's cached canonical cwd.
 fn project_tool_call(
     call: &komet_proto::ToolCall,
     cwd: &str,
     canon_cwd: &std::path::Path,
-) -> (String, Option<String>) {
+) -> (Option<String>, Option<String>) {
     use komet_proto::ToolCall as T;
     let file_path = |p: &str| komet_memory::project_relative(cwd, canon_cwd, p);
     match call {
-        T::Exec { .. } => ("exec".into(), None),
-        T::ReadFile { path } => ("read_file".into(), file_path(path)),
-        T::WriteFile { path, .. } => ("write_file".into(), file_path(path)),
-        T::EditFile { path, .. } => ("edit_file".into(), file_path(path)),
-        T::ApplyPatch { path } => ("apply_patch".into(), path.as_deref().and_then(file_path)),
-        T::Search { .. } => ("search".into(), None),
-        T::Glob { .. } => ("glob".into(), None),
-        T::WebFetch { .. } => ("web_fetch".into(), None),
-        T::WebSearch { .. } => ("web_search".into(), None),
-        T::Todo { .. } => ("todo".into(), None),
-        T::Mcp { server, tool, .. } => {
-            let name = format!("mcp:{server}/{tool}");
-            (name.chars().take(128).collect(), None)
-        }
+        T::Exec { .. } => (Some("exec".into()), None),
+        T::ReadFile { path } => (Some("read_file".into()), file_path(path)),
+        T::WriteFile { path, .. } => (Some("write_file".into()), file_path(path)),
+        T::EditFile { path, .. } => (Some("edit_file".into()), file_path(path)),
+        T::ApplyPatch { path } => (
+            Some("apply_patch".into()),
+            path.as_deref().and_then(file_path),
+        ),
+        T::Search { .. } => (Some("search".into()), None),
+        T::Glob { .. } => (Some("glob".into()), None),
+        T::WebFetch { .. } => (Some("web_fetch".into()), None),
+        T::WebSearch { .. } => (Some("web_search".into()), None),
+        T::Todo { .. } => (Some("todo".into()), None),
+        T::Mcp { server, tool, .. } => (clean_meta(&format!("mcp:{server}/{tool}")), None),
         T::Unknown { name, .. } => {
             let name = name.trim();
-            let name = if name.is_empty() { "unknown" } else { name };
-            (name.chars().take(128).collect(), None)
+            (
+                clean_meta(if name.is_empty() { "unknown" } else { name }),
+                None,
+            )
         }
+    }
+}
+
+/// Journal seq a queue item was projected from. `None` for the purge
+/// barriers (they never come out of [`MemoryProjector::project`] anyway).
+fn item_seq(item: &MemoryItem) -> Option<u64> {
+    match item {
+        MemoryItem::Record(r) => Some(r.source_seq),
+        MemoryItem::Checkpoint { seq, .. } | MemoryItem::Resume { seq, .. } => Some(*seq),
+        _ => None,
     }
 }
 
@@ -392,6 +430,11 @@ pub struct MemoryIndexer {
     /// chat_id → lowest seq that failed `try_send` (first drop wins).
     lag: Mutex<HashMap<String, u64>>,
     catchup_running: AtomicBool,
+    /// A `catch_up` request arrived while a pass was running: the pass
+    /// re-triggers itself once instead of dropping the request (the 60s
+    /// gap tick would eventually cover it, but a live overflow shouldn't
+    /// wait that long).
+    catchup_pending: AtomicBool,
     last_catchup: Mutex<Option<Instant>>,
     /// (project_id, exclude_chat_id, computed_at, text) — see
     /// [`Self::briefing`].
@@ -480,6 +523,7 @@ impl MemoryIndexer {
             }),
             lag: Mutex::new(HashMap::new()),
             catchup_running: AtomicBool::new(false),
+            catchup_pending: AtomicBool::new(false),
             last_catchup: Mutex::new(None),
             briefing_cache: Mutex::new(None),
             gap_tx,
@@ -492,14 +536,19 @@ impl MemoryIndexer {
         });
         // Periodic gap check: a failed writer batch persists gap markers but
         // nothing re-triggers catch-up until the next overflow or restart.
-        // The tick only scans the journal when gaps actually exist.
-        let tick = Arc::clone(&indexer);
+        // The tick only scans the journal when gaps actually exist. It holds
+        // only a Weak ref: when the engine drops the indexer the thread must
+        // exit instead of pinning the store open forever.
+        let tick = Arc::downgrade(&indexer);
         std::thread::Builder::new()
             .name("komet-memory-gaptick".into())
             .spawn(move || {
                 let mut last_prune: Option<Instant> = None;
                 loop {
                     std::thread::sleep(GAP_TICK_INTERVAL);
+                    let Some(tick) = tick.upgrade() else {
+                        return;
+                    };
                     if last_prune.is_none_or(|t| t.elapsed() >= PRUNE_INTERVAL) {
                         last_prune = Some(Instant::now());
                         let retention_ms = i64::from(tick.retention_days.load(Ordering::Relaxed))
@@ -532,7 +581,36 @@ impl MemoryIndexer {
                 }
             })
             .ok();
+        // Chat deletes that arrived while the store was unavailable (or
+        // whose forget failed) left intent in `memory-forget.pending`
+        // next to the journals — apply it now that the index exists.
+        indexer.drain_pending_forgets();
         Ok(indexer)
+    }
+
+    /// Apply forget intents recorded while this indexer was unavailable.
+    /// The file lives beside the journals (`{journals}/memory-forget.pending`,
+    /// one chat id per line); failures stay in the file for the next start.
+    fn drain_pending_forgets(&self) {
+        let path = self.journal.dir().join("memory-forget.pending");
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            return;
+        };
+        let mut failed = Vec::new();
+        for chat_id in content.lines().map(str::trim).filter(|l| !l.is_empty()) {
+            match self.forget_chat(chat_id) {
+                Ok(_) => {}
+                Err(err) => {
+                    tracing::warn!(chat = %chat_id, error = %err, "memory: pending forget failed");
+                    failed.push(chat_id.to_string());
+                }
+            }
+        }
+        if failed.is_empty() {
+            let _ = std::fs::remove_file(&path);
+        } else if let Err(err) = std::fs::write(&path, failed.join("\n") + "\n") {
+            tracing::warn!(error = %err, "memory: pending-forget rewrite failed");
+        }
     }
 
     pub fn service(&self) -> &Arc<MemoryService> {
@@ -563,9 +641,8 @@ impl MemoryIndexer {
             let _ = self.svc.touch_project(&project_id, &root);
         }
         for item in items {
-            let item_seq = match &item {
-                MemoryItem::Record(r) => r.source_seq,
-                MemoryItem::Checkpoint { seq, .. } | MemoryItem::Resume { seq, .. } => *seq,
+            let Some(item_seq) = item_seq(&item) else {
+                continue;
             };
             if !self.svc.try_enqueue(item) {
                 self.note_drop(chat_id, item_seq);
@@ -616,9 +693,14 @@ impl MemoryIndexer {
     /// dedicated thread — journal parsing is blocking IO and must not sit on
     /// the async executor.
     pub fn catch_up(self: &Arc<Self>) {
-        if !self.enabled.load(Ordering::Relaxed)
-            || self.catchup_running.swap(true, Ordering::SeqCst)
-        {
+        if !self.enabled.load(Ordering::Relaxed) {
+            return;
+        }
+        if self.catchup_running.swap(true, Ordering::SeqCst) {
+            // A pass is already running: flag a rerun instead of dropping
+            // the request — drops that land mid-pass would otherwise wait
+            // for the 60s gap tick.
+            self.catchup_pending.store(true, Ordering::SeqCst);
             return;
         }
         let this = Arc::clone(self);
@@ -627,6 +709,9 @@ impl MemoryIndexer {
             .spawn(move || {
                 this.catch_up_inner();
                 this.catchup_running.store(false, Ordering::SeqCst);
+                if this.catchup_pending.swap(false, Ordering::SeqCst) {
+                    this.catch_up();
+                }
             })
             .ok();
     }
@@ -703,47 +788,61 @@ impl MemoryIndexer {
             }
             return;
         }
-        let events = match self.journal.replay(chat_id, from) {
-            Ok(events) => events,
+        // Replay the WHOLE journal through a throwaway projector, keeping
+        // only items past `from`. Two correctness requirements force the
+        // full pass:
+        // - Context: the chat's SessionStarted (project, agent, model) and
+        //   in-flight ToolCalls usually sit BEFORE the cursor — a tail-only
+        //   replay would drop every ToolResult/Done for want of a ctx.
+        // - Isolation: replaying stale history through the LIVE projector
+        //   would overwrite the running chat's cwd/agent/model and its
+        //   pending-tool pairings, mis-attributing subsequent live events.
+        let entries = match self.journal.replay_ts(chat_id, 0) {
+            Ok(entries) => entries,
             Err(err) => {
                 tracing::warn!(chat = %chat_id, error = %err, "memory: journal replay failed");
                 return;
             }
         };
-        if events.is_empty() {
+        if entries.is_empty() {
             if cursor.gap_seq.is_some() {
                 let _ = self.svc.clear_gap(chat_id);
             }
             return;
         }
-        let reached = events.last().map(|(seq, _)| *seq).unwrap_or(from);
-        // Journal lines have no timestamps: stamp the replay with the
-        // file's mtime (≈ the run's end) rather than catch-up time, so an
-        // old backfill doesn't look like it happened today.
-        let now = self
+        let reached = entries.last().map(|(seq, _, _)| *seq).unwrap_or(from);
+        // Lines written before journal timestamps existed (ts_ms = 0) fall
+        // back to the file's mtime (≈ the run's end) rather than catch-up
+        // time, so an old backfill doesn't look like it happened today.
+        let mtime = self
             .journal
             .journal_mtime_ms(chat_id)
             .unwrap_or_else(now_ms);
-        // Project the replay in chunks, releasing the projector lock between
-        // them: a long backfill must not starve live `index_event` calls
-        // (which share the same mutex) for its whole duration.
         let mut items: Vec<MemoryItem> = Vec::new();
         // A journal last written before the retention horizon would be
         // inserted only to be pruned hours later: skip the projection and
         // still advance the cursor through the Resume below.
-        let expired = now
+        let expired = mtime
             < now_ms()
                 - i64::from(self.retention_days.load(Ordering::Relaxed)) * 24 * 60 * 60 * 1000;
         if !expired {
-            for chunk in events.chunks(256) {
-                let mut projector = lock(&self.projector);
-                for (seq, event) in chunk {
-                    items.extend(projector.project(chat_id, *seq, event, now));
+            // Local projector: no lock, no shared state — live index_event
+            // calls are completely unaffected by the replay.
+            let mut replay = MemoryProjector {
+                chats: HashMap::new(),
+                cwd_projects: HashMap::new(),
+            };
+            for (seq, ts, event) in &entries {
+                let at = if *ts > 0 { *ts } else { mtime };
+                for item in replay.project(chat_id, *seq, event, at) {
+                    if item_seq(&item).is_some_and(|s| s > from) {
+                        items.push(item);
+                    }
                 }
             }
-        }
-        if let Some((project_id, root)) = lock(&self.projector).take_root_pending(chat_id) {
-            let _ = self.svc.touch_project(&project_id, &root);
+            if let Some((project_id, root)) = replay.take_root_pending(chat_id) {
+                let _ = self.svc.touch_project(&project_id, &root);
+            }
         }
         // Enqueue everything; on the first failure stop — the remaining tail
         // stays unindexed and the next catch-up resumes from the cursor.
@@ -865,15 +964,25 @@ impl MemoryIndexer {
         Ok(removed)
     }
 
-    /// Forget a whole project's derived memory. Each known chat gets a
-    /// tombstone at its journal tail (same anti-resurrection guarantee as
-    /// [`Self::forget_chat`]); projector contexts for the project go too.
+    /// Forget a whole project's derived memory. The horizon covers every
+    /// chat that could still produce rows for the project: chats the store
+    /// knows, chats with live projector context (queued records included),
+    /// and — via `u64::MAX` for journal-less chats — chats whose journal is
+    /// already gone. Each gets a tombstone so neither catch-up nor queued
+    /// writes can resurrect rows; projector contexts go too.
     pub fn forget_project(&self, project_id: &str) -> Result<usize, komet_memory::MemoryError> {
-        let chats = self.svc.project_chats(project_id)?;
+        let mut chats: std::collections::HashSet<String> =
+            self.svc.project_chats(project_id)?.into_iter().collect();
+        chats.extend(lock(&self.projector).chats_for_project(project_id));
         let mut horizons = Vec::with_capacity(chats.len());
         for chat_id in chats {
-            if let Ok(Some(seq)) = self.journal.last_seq(&chat_id) {
-                horizons.push((chat_id, seq));
+            match self.journal.last_seq(&chat_id) {
+                Ok(Some(seq)) => horizons.push((chat_id, seq)),
+                // Journal gone/empty: the chat cannot produce future events,
+                // so the horizon covers every seq it ever had.
+                Ok(None) => horizons.push((chat_id, u64::MAX)),
+                // Unreadable journal: skip rather than risk a wrong horizon.
+                Err(_) => {}
             }
         }
         {
@@ -998,14 +1107,29 @@ impl MemoryIndexer {
     }
 
     /// "Forget all": wipe every project's derived rows AND tombstone every
-    /// known chat at its journal tail so catch-up cannot rebuild them.
-    /// Project settings (enable flags, exclusions, location) are kept.
+    /// chat that could still produce rows — journal-backed chats at their
+    /// tail, journal-less chats (queued records, gap markers, cursor rows)
+    /// at `u64::MAX`. Live chats keep recording: their NEXT events carry
+    /// seqs above the horizon. Project settings are kept.
     pub fn forget_all(&self) -> Result<usize, komet_memory::MemoryError> {
-        let chats = self.svc.known_chats()?;
+        let mut chats: std::collections::HashSet<String> = std::collections::HashSet::new();
+        if let Ok(journals) = self.journal.chat_ids() {
+            chats.extend(journals);
+        }
+        if let Ok(known) = self.svc.known_chats() {
+            chats.extend(known);
+        }
+        chats.extend(lock(&self.lag).keys().cloned());
+        chats.extend(lock(&self.projector).chats.keys().cloned());
         let mut horizons = Vec::with_capacity(chats.len());
         for chat_id in chats {
-            if let Ok(Some(seq)) = self.journal.last_seq(&chat_id) {
-                horizons.push((chat_id, seq));
+            match self.journal.last_seq(&chat_id) {
+                Ok(Some(seq)) => horizons.push((chat_id, seq)),
+                // Journal confirmed gone/empty → no future events → cover
+                // every seq it ever had. An unreadable journal is skipped
+                // rather than risking a wrong horizon on a live chat.
+                Ok(None) => horizons.push((chat_id, u64::MAX)),
+                Err(_) => {}
             }
         }
         {
@@ -1176,6 +1300,189 @@ mod tests {
         assert_eq!(rec.outcome.as_deref(), Some("completed"));
         assert_eq!(rec.duration_ms, Some(45000));
         assert!(matches!(&items[1], MemoryItem::Checkpoint { seq: 2, .. }));
+    }
+
+    #[test]
+    fn credential_shaped_names_and_models_are_dropped() {
+        let mut p = projector();
+        p.note_chat("c1", "/repo", HarnessId::ClaudeCode);
+        let token = "ghp_aaaaaaaaaaaaaaaaaaaa";
+        // Model id carrying a token must not persist.
+        let start = AgentEvent::SessionStarted {
+            harness: HarnessId::ClaudeCode,
+            model: token.into(),
+            tools: vec![],
+            cwd: "/repo".into(),
+            session_id: "s1".into(),
+            assistant_message_id: "m1".into(),
+        };
+        let items = p.project("c1", 1, &start, 1000);
+        let MemoryItem::Record(rec) = &items[0] else {
+            panic!("expected record");
+        };
+        assert_eq!(rec.model, None);
+        assert!(!format!("{rec:?}").contains(token));
+
+        // MCP server/tool names are free-form: a token inside must not
+        // reach tool_name (and therefore search_text).
+        for (seq, call) in [
+            (
+                2u64,
+                ProtoToolCall::Mcp {
+                    server: "svc".into(),
+                    tool: token.into(),
+                    input: None,
+                },
+            ),
+            (
+                3,
+                ProtoToolCall::Unknown {
+                    name: format!("prefix_{token}"),
+                    input: None,
+                },
+            ),
+        ] {
+            let items = p.project(
+                "c1",
+                seq,
+                &AgentEvent::ToolCall {
+                    id: format!("t{seq}"),
+                    call,
+                },
+                1000,
+            );
+            let MemoryItem::Record(rec) = &items[0] else {
+                panic!("expected record");
+            };
+            assert_eq!(rec.tool_name, None, "seq {seq} leaked a credential");
+            assert!(!format!("{rec:?}").contains(token));
+        }
+
+        // Safe free-form names still record.
+        let items = p.project(
+            "c1",
+            4,
+            &AgentEvent::ToolCall {
+                id: "t4".into(),
+                call: ProtoToolCall::Mcp {
+                    server: "github".into(),
+                    tool: "create_issue".into(),
+                    input: None,
+                },
+            },
+            1001,
+        );
+        let MemoryItem::Record(rec) = &items[0] else {
+            panic!("expected record");
+        };
+        assert_eq!(rec.tool_name.as_deref(), Some("mcp:github/create_issue"));
+    }
+
+    /// The regression CodeRabbit flagged: a cursor ahead of `SessionStarted`
+    /// must not lose the tool pairing — catch-up rebuilds ctx from seq 0
+    /// through a dedicated replay projector.
+    #[test]
+    fn catch_up_rebuilds_context_from_full_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal =
+            Arc::new(RunJournal::open(dir.path().join("journals")).expect("journal open"));
+        let indexer = MemoryIndexer::open(dir.path(), journal.clone()).expect("indexer open");
+        let cwd = "/repo";
+        journal
+            .append(
+                "c1",
+                &AgentEvent::SessionStarted {
+                    harness: HarnessId::ClaudeCode,
+                    model: "opus".into(),
+                    tools: vec![],
+                    cwd: cwd.into(),
+                    session_id: "s1".into(),
+                    assistant_message_id: "m1".into(),
+                },
+            )
+            .unwrap();
+        journal
+            .append(
+                "c1",
+                &AgentEvent::ToolCall {
+                    id: "t1".into(),
+                    call: ProtoToolCall::EditFile {
+                        path: "/repo/a.rs".into(),
+                        old_string: None,
+                        new_string: None,
+                    },
+                },
+            )
+            .unwrap();
+        journal
+            .append(
+                "c1",
+                &AgentEvent::ToolResult {
+                    id: "t1".into(),
+                    is_error: false,
+                    output: None,
+                    diff: None,
+                },
+            )
+            .unwrap();
+        journal
+            .append(
+                "c1",
+                &AgentEvent::Done {
+                    status: DoneStatus::Completed,
+                    result: None,
+                    error: None,
+                    session_id: None,
+                    reason: None,
+                },
+            )
+            .unwrap();
+
+        // Pretend seqs 1-2 were already processed (cursor=2) — the live
+        // projector knows nothing about this chat, exactly like a restart.
+        indexer
+            .service()
+            .enqueue(MemoryItem::Checkpoint {
+                chat_id: "c1".into(),
+                seq: 2,
+            })
+            .unwrap();
+        wait_for(|| indexer.service().chat_cursor("c1").unwrap().last_seq == 2);
+
+        indexer.catch_up_inner();
+        let project_id = komet_memory::project_id_for(cwd);
+        wait_for(|| {
+            indexer
+                .service()
+                .recent(&project_id, 50, None)
+                .map(|e| e.iter().any(|ev| ev.kind == "session_end"))
+                .unwrap_or(false)
+        });
+        let events = indexer.service().recent(&project_id, 50, None).unwrap();
+        // seqs 3-4 only: the tool result must pair with the ToolCall seen
+        // during the context rebuild, and Done must emit session_end.
+        assert!(
+            events.iter().all(|e| e.kind != "session_start"),
+            "pre-cursor events must not be re-indexed: {events:?}"
+        );
+        let result = events
+            .iter()
+            .find(|e| e.kind == "tool_result")
+            .expect("tool_result missing");
+        assert_eq!(result.tool_name.as_deref(), Some("edit_file"));
+        assert_eq!(result.relative_path.as_deref(), Some("a.rs"));
+        assert!(events.iter().any(|e| e.kind == "session_end"));
+    }
+
+    fn wait_for(mut cond: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            if cond() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("timed out waiting for memory writer");
     }
 
     #[test]

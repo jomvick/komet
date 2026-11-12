@@ -43,8 +43,18 @@ pub enum MemoryItem {
     /// (text deltas, ephemeral frames). Sent at run boundaries.
     Checkpoint { chat_id: String, seq: u64 },
     /// Catch-up finished replaying through `seq`: like [`Self::Checkpoint`]
-    /// but also clears a persisted gap marker when `seq` covers it.
+    /// but also clears persisted gap markers at or below `seq`.
     Resume { chat_id: String, seq: u64 },
+    /// Post-forget sweep, enqueued right after a `forget_*` commit: deletes
+    /// any rows a straddling writer batch may have committed after the
+    /// forget's own delete. Queue-ordered, so it runs after every record
+    /// that was already in flight; later records are stopped by the
+    /// `memory_forgotten` tombstone guard instead.
+    PurgeChat { chat_id: String },
+    /// Same sweep scoped to one project.
+    PurgeProject { project_id: String },
+    /// Same sweep across every project.
+    PurgeAll,
 }
 
 /// A stored activity row, as read back for search/inspection/briefing.

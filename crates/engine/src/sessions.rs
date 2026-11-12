@@ -1128,11 +1128,6 @@ impl SessionsEngine {
         }
         // Every dispatched prompt is a turn — routed steer or fresh run alike.
         self.note_turn_start(chat_id, &request.cwd);
-        // Project memory (issue #78): seed chat→project context before the
-        // first SessionStarted lands, for both steer and fresh-run paths.
-        if let Some(indexer) = self.inner.memory.get() {
-            indexer.note_chat(chat_id, &request.cwd, harness_id);
-        }
         let routed = lock(&self.inner.runs).get(chat_id).map(|h| {
             (
                 h.run_id.clone(),
@@ -1534,6 +1529,14 @@ impl SessionsEngine {
         // AFTER Working (same causal-order guarantee as the steer path): the
         // lastMessageAt bump must never be observable ahead of the live run.
         self.inner.note_message(chat_id, &request.prompt);
+
+        // Project memory (issue #78): seed chat→project context once the run
+        // is definitely fresh — NOT for a routed steer, whose live run still
+        // owns the chat: overwriting its cwd/project here would re-attribute
+        // the run's remaining events (and its Done) to the steer's cwd.
+        if let Some(indexer) = self.inner.memory.get() {
+            indexer.note_chat(chat_id, &request.cwd, harness_id);
+        }
 
         tokio::spawn(drive_run(
             self.inner.clone(),

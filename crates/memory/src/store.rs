@@ -103,7 +103,7 @@ impl MemoryService {
         let write_conn = open_conn(&path)?;
         let writer = std::thread::Builder::new()
             .name("komet-memory-writer".into())
-            .spawn(move || writer_loop(writer_conn, rx))
+            .spawn(move || writer_loop(writer_conn, rx, fts))
             .map_err(|e| MemoryError::Other(format!("spawn writer: {e}")))?;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -141,28 +141,42 @@ impl MemoryService {
     /// Synchronously record an enqueue gap (called ONLY on queue overflow —
     /// rare, and a tiny single-row write; the hot path never reaches this).
     /// Goes through the dedicated write connection so it can't stall reads.
+    /// Each dropped seq is its own row: a drop during an active replay must
+    /// survive the `Resume` that heals the older gap.
     pub fn note_gap(&self, chat_id: &str, seq: u64) -> Result<(), MemoryError> {
         let conn = lock(&self.write);
         conn.execute(
-            "INSERT INTO memory_chat_state(chat_id, gap_seq) VALUES(?1, ?2)
-             ON CONFLICT(chat_id) DO UPDATE SET
-               gap_seq = MIN(COALESCE(memory_chat_state.gap_seq, ?2), ?2)",
+            "INSERT OR IGNORE INTO memory_chat_gaps(chat_id, seq) VALUES(?1, ?2)",
             params![chat_id, seq as i64],
         )?;
         Ok(())
     }
 
     /// Replay cursor for one chat (`last_seq` = highest processed seq,
-    /// `gap_seq` = lowest known-dropped seq).
+    /// `gap_seq` = lowest known-dropped seq still unhealed).
     pub fn chat_cursor(&self, chat_id: &str) -> Result<ChatCursor, MemoryError> {
         let conn = lock(&self.conn);
         let row = conn
             .query_row(
-                "SELECT last_seq, gap_seq FROM memory_chat_state WHERE chat_id = ?1",
+                "SELECT last_seq,
+                        (SELECT MIN(seq) FROM memory_chat_gaps WHERE chat_id = ?1)
+                 FROM memory_chat_state WHERE chat_id = ?1",
                 params![chat_id],
                 |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<i64>>(1)?)),
             )
             .optional()?;
+        // A chat known ONLY through gap rows (every record dropped before
+        // the first flush) has no chat_state row — still report its gap.
+        let row = match row {
+            Some(row) => Some(row),
+            None => conn
+                .query_row(
+                    "SELECT 0, MIN(seq) FROM memory_chat_gaps WHERE chat_id = ?1",
+                    params![chat_id],
+                    |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<i64>>(1)?)),
+                )
+                .optional()?,
+        };
         Ok(match row {
             Some((last, gap)) => ChatCursor {
                 last_seq: last.max(0) as u64,
@@ -175,10 +189,15 @@ impl MemoryService {
         })
     }
 
-    /// All chat ids the indexer has seen (for catch-up scans).
+    /// All chat ids the indexer has seen (for catch-up scans) — including
+    /// chats known only through gap rows.
     pub fn known_chats(&self) -> Result<Vec<String>, MemoryError> {
         let conn = lock(&self.conn);
-        let mut stmt = conn.prepare("SELECT chat_id FROM memory_chat_state")?;
+        let mut stmt = conn.prepare(
+            "SELECT chat_id FROM memory_chat_state
+             UNION
+             SELECT chat_id FROM memory_chat_gaps",
+        )?;
         let rows = stmt
             .query_map([], |r| r.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()?;
@@ -293,7 +312,7 @@ impl MemoryService {
                  FROM memory_events e
                  JOIN memory_fts f ON f.rowid = e.id
                  WHERE memory_fts MATCH ?1 AND e.project_id = ?2
-                 ORDER BY e.occurred_at_ms DESC
+                 ORDER BY e.occurred_at_ms DESC, e.id DESC
                  LIMIT ?3",
             )?;
             let rows = stmt.query_map(params![match_expr, project_id, limit], row_to_event)?;
@@ -312,7 +331,7 @@ impl MemoryService {
             for i in 0..terms.len() {
                 sql.push_str(&format!(" AND search_text LIKE ?{} ESCAPE '\\'", i + 2));
             }
-            sql.push_str(" ORDER BY occurred_at_ms DESC LIMIT ?");
+            sql.push_str(" ORDER BY occurred_at_ms DESC, id DESC LIMIT ?");
             let mut stmt = conn.prepare(&sql)?;
             // Positional binding in SQL order: project, one LIKE per term, limit.
             let mut values: Vec<rusqlite::types::Value> = Vec::with_capacity(terms.len() + 2);
@@ -343,7 +362,7 @@ impl MemoryService {
                     reasoning_tokens, duration_ms
              FROM memory_events
              WHERE project_id = ?1 AND (?2 IS NULL OR occurred_at_ms >= ?2)
-             ORDER BY occurred_at_ms DESC
+             ORDER BY occurred_at_ms DESC, id DESC
              LIMIT ?3",
         )?;
         let rows = stmt.query_map(params![project_id, since_ms, limit], row_to_event)?;
@@ -469,7 +488,7 @@ impl MemoryService {
                  AND (?2 IS NULL OR chat_id != ?2) AND occurred_at_ms >= ?3
                GROUP BY agent, relative_path
              ) WHERE rn <= 8
-             ORDER BY last_ms DESC",
+             ORDER BY last_ms DESC, agent, relative_path",
         )?;
         let touches: Vec<(String, String, i64)> = stmt
             .query_map(params![project_id, exclude_chat_id, since_ms], |r| {
@@ -487,7 +506,7 @@ impl MemoryService {
         // path query.
         let mut stmt = conn.prepare(
             "SELECT agent, kind, tool_name, relative_path, outcome, occurred_at_ms FROM (
-               SELECT agent, kind, tool_name, relative_path, outcome, occurred_at_ms,
+               SELECT id, agent, kind, tool_name, relative_path, outcome, occurred_at_ms,
                       ROW_NUMBER() OVER (
                         PARTITION BY agent
                         ORDER BY occurred_at_ms DESC, id DESC
@@ -498,7 +517,7 @@ impl MemoryService {
                    OR (kind = 'session_end' AND outcome IN ('errored', 'interrupted')))
                  AND (?2 IS NULL OR chat_id != ?2) AND occurred_at_ms >= ?3
              ) WHERE rn <= 5
-             ORDER BY occurred_at_ms DESC",
+             ORDER BY occurred_at_ms DESC, id DESC",
         )?;
         type FailureRow = (
             String,
@@ -564,7 +583,7 @@ impl MemoryService {
              WHERE project_id = ?1 AND kind = 'tool_call'
                AND relative_path >= ?2
                AND relative_path < ?2 || char(1114111)
-             ORDER BY occurred_at_ms DESC
+             ORDER BY occurred_at_ms DESC, id DESC
              LIMIT ?3",
         )?;
         let rows = stmt.query_map(
@@ -659,6 +678,7 @@ impl MemoryService {
             b.last_activity_ms
                 .unwrap_or(0)
                 .cmp(&a.last_activity_ms.unwrap_or(0))
+                .then_with(|| a.project_id.cmp(&b.project_id))
         });
         Ok(out)
     }
@@ -680,8 +700,7 @@ impl MemoryService {
     /// runs a journal scan when this is non-empty.
     pub fn chats_with_gaps(&self) -> Result<Vec<String>, MemoryError> {
         let conn = lock(&self.conn);
-        let mut stmt =
-            conn.prepare("SELECT chat_id FROM memory_chat_state WHERE gap_seq IS NOT NULL")?;
+        let mut stmt = conn.prepare("SELECT DISTINCT chat_id FROM memory_chat_gaps")?;
         let rows = stmt
             .query_map([], |r| r.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()?;
@@ -703,12 +722,12 @@ impl MemoryService {
         Ok(rows)
     }
 
-    /// Clear a persisted gap marker without touching the cursor — used when
+    /// Clear persisted gap markers without touching the cursor — used when
     /// the journal backing the gap no longer exists (nothing to replay).
     pub fn clear_gap(&self, chat_id: &str) -> Result<(), MemoryError> {
         let conn = lock(&self.write);
         conn.execute(
-            "UPDATE memory_chat_state SET gap_seq = NULL WHERE chat_id = ?1",
+            "DELETE FROM memory_chat_gaps WHERE chat_id = ?1",
             params![chat_id],
         )?;
         Ok(())
@@ -716,11 +735,17 @@ impl MemoryService {
 
     // ── forget ────────────────────────────────────────────────────────────
 
-    /// Delete every retained record for one chat, leaving a tombstone in
-    /// `memory_chat_state`: `last_seq` is advanced to `through_seq` (the
-    /// journal tail at forget time) so a later catch-up replays only events
-    /// AFTER the forget point instead of resurrecting the deleted range.
-    /// `None` = journal unreadable/gone → keep the existing cursor.
+    /// Delete every retained record for one chat, leaving TWO durable
+    /// markers so nothing can resurrect the deleted range:
+    /// - a `memory_forgotten` tombstone at `through_seq` (the journal tail at
+    ///   forget time, or "forever" when the journal is already gone): the
+    ///   writer skips any record at or below it, queued or replayed;
+    /// - the replay cursor advanced to `through_seq`, so catch-up resumes
+    ///   AFTER the forget point instead of rebuilding the deleted range.
+    ///
+    /// `None` = journal unreadable/gone → the chat is being destroyed, so
+    /// the tombstone covers every seq (no legitimate future event can
+    /// arrive for a chat whose journal was discarded).
     pub fn forget_chat(
         &self,
         chat_id: &str,
@@ -740,34 +765,46 @@ impl MemoryService {
             "DELETE FROM memory_events WHERE chat_id = ?1",
             params![chat_id],
         )?;
-        match through_seq {
-            Some(seq) => {
-                tx.execute(
-                    "INSERT INTO memory_chat_state(chat_id, last_seq) VALUES(?1, ?2)
-                     ON CONFLICT(chat_id) DO UPDATE SET
-                       last_seq = MAX(memory_chat_state.last_seq, excluded.last_seq),
-                       gap_seq = NULL",
-                    params![chat_id, seq as i64],
-                )?;
-            }
-            None => {
-                // Journal gone/unreadable: nothing to resurrect from. Never
-                // create a row for an unknown chat; keep an existing cursor
-                // as is and only drop a pending gap.
-                tx.execute(
-                    "UPDATE memory_chat_state SET gap_seq = NULL WHERE chat_id = ?1",
-                    params![chat_id],
-                )?;
-            }
+        let through = through_seq.unwrap_or(u64::MAX).min(i64::MAX as u64) as i64;
+        // Wildcard project_id '' = every project this chat ever touched.
+        tx.execute(
+            "INSERT INTO memory_forgotten(chat_id, project_id, through_seq)
+             VALUES(?1, '', ?2)
+             ON CONFLICT(chat_id, project_id) DO UPDATE SET
+               through_seq = MAX(memory_forgotten.through_seq, excluded.through_seq)",
+            params![chat_id, through],
+        )?;
+        if through_seq.is_some() {
+            // Real journal tail: advance the replay cursor so catch-up
+            // resumes after the forget point. `None` (journal already
+            // gone) keeps the existing cursor — and never creates a state
+            // row for a chat the index never saw; the tombstone alone
+            // still blocks any queued/replayed record.
+            tx.execute(
+                "INSERT INTO memory_chat_state(chat_id, last_seq) VALUES(?1, ?2)
+                 ON CONFLICT(chat_id) DO UPDATE SET
+                   last_seq = MAX(memory_chat_state.last_seq, excluded.last_seq)",
+                params![chat_id, through],
+            )?;
         }
+        tx.execute(
+            "DELETE FROM memory_chat_gaps WHERE chat_id = ?1",
+            params![chat_id],
+        )?;
         tx.commit()?;
+        // Sweep stragglers a straddling writer batch may have committed
+        // after our delete (queue-ordered; see MemoryItem::PurgeChat).
+        let _ = self.tx.try_send(MemoryItem::PurgeChat {
+            chat_id: chat_id.to_string(),
+        });
         Ok(removed)
     }
 
     /// Delete every retained record for a whole project. `horizons` maps
-    /// each known chat to its journal tail so the tombstone cursors prevent
-    /// catch-up resurrection; project settings (enable flag, exclusions)
-    /// are kept — forgetting activity is not a settings reset.
+    /// each known chat to its journal tail (`u64::MAX` = journal gone, chat
+    /// dead) so per-(chat, project) tombstones prevent catch-up AND queued
+    /// records from resurrecting rows; project settings (enable flag,
+    /// exclusions) are kept — forgetting activity is not a settings reset.
     pub fn forget_project(
         &self,
         project_id: &str,
@@ -788,31 +825,43 @@ impl MemoryService {
             params![project_id],
         )?;
         // Tombstones: jump every known chat's cursor past its journal tail
-        // and clear pending gaps so replay cannot rebuild the deleted rows.
+        // and record the forget horizon so the writer refuses any record at
+        // or below it — queued, replayed, or straddling this transaction.
         for (chat_id, seq) in horizons {
+            let through = (*seq).min(i64::MAX as u64) as i64;
+            tx.execute(
+                "INSERT INTO memory_forgotten(chat_id, project_id, through_seq)
+                 VALUES(?1, ?2, ?3)
+                 ON CONFLICT(chat_id, project_id) DO UPDATE SET
+                   through_seq = MAX(memory_forgotten.through_seq, excluded.through_seq)",
+                params![chat_id, project_id, through],
+            )?;
             tx.execute(
                 "INSERT INTO memory_chat_state(chat_id, project_id, last_seq)
                  VALUES(?1, ?2, ?3)
                  ON CONFLICT(chat_id) DO UPDATE SET
-                   last_seq = MAX(memory_chat_state.last_seq, excluded.last_seq),
-                   gap_seq = NULL",
-                params![chat_id, project_id, *seq as i64],
+                   last_seq = MAX(memory_chat_state.last_seq, excluded.last_seq)",
+                params![chat_id, project_id, through],
+            )?;
+            tx.execute(
+                "DELETE FROM memory_chat_gaps WHERE chat_id = ?1",
+                params![chat_id],
             )?;
         }
-        tx.execute(
-            "UPDATE memory_chat_state SET gap_seq = NULL WHERE project_id = ?1",
-            params![project_id],
-        )?;
         tx.commit()?;
         // Return freed pages to the OS incrementally (auto_vacuum=INCREMENTAL).
         let _ = conn.execute_batch("PRAGMA incremental_vacuum;");
+        let _ = self.tx.try_send(MemoryItem::PurgeProject {
+            project_id: project_id.to_string(),
+        });
         Ok(removed)
     }
 
     /// "Forget all": delete every retained record across every project and
-    /// tombstone every chat in `horizons` at its journal tail so catch-up
-    /// cannot resurrect anything. Project settings rows are kept (enable
-    /// flags, exclusions, roots are preferences, not activity data).
+    /// tombstone every chat in `horizons` at its journal tail so neither
+    /// catch-up nor queued writes can rebuild them. Project settings rows
+    /// are kept (enable flags, exclusions, roots are preferences, not
+    /// activity data).
     pub fn forget_all(&self, horizons: &[(String, u64)]) -> Result<usize, MemoryError> {
         let conn = lock(&self.write);
         let tx = conn.unchecked_transaction()?;
@@ -826,17 +875,25 @@ impl MemoryService {
         }
         let removed = tx.execute("DELETE FROM memory_events", [])?;
         for (chat_id, seq) in horizons {
+            let through = (*seq).min(i64::MAX as u64) as i64;
+            tx.execute(
+                "INSERT INTO memory_forgotten(chat_id, project_id, through_seq)
+                 VALUES(?1, '', ?2)
+                 ON CONFLICT(chat_id, project_id) DO UPDATE SET
+                   through_seq = MAX(memory_forgotten.through_seq, excluded.through_seq)",
+                params![chat_id, through],
+            )?;
             tx.execute(
                 "INSERT INTO memory_chat_state(chat_id, last_seq) VALUES(?1, ?2)
                  ON CONFLICT(chat_id) DO UPDATE SET
-                   last_seq = MAX(memory_chat_state.last_seq, excluded.last_seq),
-                   gap_seq = NULL",
-                params![chat_id, *seq as i64],
+                   last_seq = MAX(memory_chat_state.last_seq, excluded.last_seq)",
+                params![chat_id, through],
             )?;
         }
-        tx.execute("UPDATE memory_chat_state SET gap_seq = NULL", [])?;
+        tx.execute("DELETE FROM memory_chat_gaps", [])?;
         tx.commit()?;
         let _ = conn.execute_batch("PRAGMA incremental_vacuum;");
+        let _ = self.tx.try_send(MemoryItem::PurgeAll);
         Ok(removed)
     }
 
@@ -1069,6 +1126,37 @@ fn migrate(conn: &mut Connection) -> Result<(), MemoryError> {
         }
         conn.execute_batch("PRAGMA user_version = 3;")?;
     }
+    if version < 4 {
+        // v4: two durability fixes for gap/forget handling.
+        //
+        // `memory_chat_gaps` replaces the single `gap_seq` column: every
+        // dropped seq is its own row, so a drop that lands DURING a catch-up
+        // replay is never collapsed into (and then cleared with) the gap the
+        // replay was healing. `Resume` deletes the rows it covered.
+        //
+        // `memory_forgotten` is the anti-resurrection guard: forget_* writes
+        // a per-(chat, project) horizon and the writer skips any record at
+        // or below it — including records still sitting in the queue or
+        // replayed by an in-flight catch-up.
+        conn.execute_batch(
+            "CREATE TABLE memory_chat_gaps (
+               chat_id TEXT NOT NULL,
+               seq INTEGER NOT NULL,
+               PRIMARY KEY(chat_id, seq)
+             );
+             INSERT INTO memory_chat_gaps(chat_id, seq)
+               SELECT chat_id, gap_seq FROM memory_chat_state
+               WHERE gap_seq IS NOT NULL;
+
+             CREATE TABLE memory_forgotten (
+               chat_id TEXT NOT NULL,
+               project_id TEXT NOT NULL DEFAULT '',
+               through_seq INTEGER NOT NULL,
+               PRIMARY KEY(chat_id, project_id)
+             );
+             PRAGMA user_version = 4;",
+        )?;
+    }
     Ok(())
 }
 
@@ -1094,7 +1182,7 @@ fn ensure_fts(conn: &Connection) -> Result<bool, MemoryError> {
 
 // ── writer ────────────────────────────────────────────────────────────────
 
-fn writer_loop(conn: Connection, rx: Receiver<MemoryItem>) {
+fn writer_loop(conn: Connection, rx: Receiver<MemoryItem>, fts: bool) {
     let mut batch: Vec<MemoryItem> = Vec::with_capacity(WRITE_BATCH);
     // Block for the next item; sender loss ends the loop after a final
     // drain + flush.
@@ -1118,25 +1206,25 @@ fn writer_loop(conn: Connection, rx: Receiver<MemoryItem>) {
                     while let Ok(item) = rx.try_recv() {
                         batch.push(item);
                     }
-                    flush(&conn, &mut batch);
+                    flush(&conn, &mut batch, fts);
                     return;
                 }
             }
         }
-        flush(&conn, &mut batch);
+        flush(&conn, &mut batch, fts);
     }
     while let Ok(item) = rx.try_recv() {
         batch.push(item);
     }
-    flush(&conn, &mut batch);
+    flush(&conn, &mut batch, fts);
 }
 
-fn flush(conn: &Connection, batch: &mut Vec<MemoryItem>) {
+fn flush(conn: &Connection, batch: &mut Vec<MemoryItem>, fts: bool) {
     if batch.is_empty() {
         return;
     }
     let items = std::mem::take(batch);
-    if let Err(err) = apply_batch(conn, &items) {
+    if let Err(err) = apply_batch(conn, &items, fts) {
         // Never lose silently: log and DROP is not acceptable for indexed
         // events — but the journal remains authoritative, so the honest move
         // is to mark every affected chat gapped and let catch-up replay.
@@ -1157,20 +1245,21 @@ fn item_chat_seq(item: &MemoryItem) -> Option<(&str, u64)> {
         MemoryItem::Checkpoint { chat_id, seq } | MemoryItem::Resume { chat_id, seq } => {
             Some((chat_id.as_str(), *seq))
         }
+        // Purge items carry no journal seq — a failed batch already rolled
+        // back, so there is nothing for them to sweep.
+        _ => None,
     }
 }
 
 fn note_gap_on(conn: &Connection, chat_id: &str, seq: u64) -> Result<(), MemoryError> {
     conn.execute(
-        "INSERT INTO memory_chat_state(chat_id, gap_seq) VALUES(?1, ?2)
-         ON CONFLICT(chat_id) DO UPDATE SET
-           gap_seq = MIN(COALESCE(memory_chat_state.gap_seq, ?2), ?2)",
+        "INSERT OR IGNORE INTO memory_chat_gaps(chat_id, seq) VALUES(?1, ?2)",
         params![chat_id, seq as i64],
     )?;
     Ok(())
 }
 
-fn apply_batch(conn: &Connection, items: &[MemoryItem]) -> Result<(), MemoryError> {
+fn apply_batch(conn: &Connection, items: &[MemoryItem], fts: bool) -> Result<(), MemoryError> {
     let tx = conn.unchecked_transaction()?;
     // Per-batch settings cache: project enabled flag + exclusions.
     let mut settings: HashMap<String, (bool, Vec<String>)> = HashMap::new();
@@ -1194,14 +1283,34 @@ fn apply_batch(conn: &Connection, items: &[MemoryItem]) -> Result<(), MemoryErro
            project_id = COALESCE(excluded.project_id, memory_chat_state.project_id),
            last_seq = MAX(memory_chat_state.last_seq, excluded.last_seq)",
     )?;
-    let mut gap_clear = tx.prepare(
-        "UPDATE memory_chat_state SET gap_seq = NULL
-         WHERE chat_id = ?1 AND gap_seq IS NOT NULL AND gap_seq <= ?2",
-    )?;
+    // `Resume` heals through `seq`: every persisted gap row at or below it
+    // is covered by the replay and removed. Rows ABOVE it — drops that
+    // landed while the replay ran — survive untouched.
+    let mut gap_clear =
+        tx.prepare("DELETE FROM memory_chat_gaps WHERE chat_id = ?1 AND seq <= ?2")?;
+    // Forget horizons, loaded lazily per chat: (project scope, through_seq).
+    // `project_id = ''` is the chat-wide wildcard written by forget_chat /
+    // forget_all; a project-scoped row only covers its own project.
+    let mut forgotten: HashMap<String, Vec<(String, i64)>> = HashMap::new();
+    let mut forgotten_stmt =
+        tx.prepare("SELECT project_id, through_seq FROM memory_forgotten WHERE chat_id = ?1")?;
 
     for item in items {
         match item {
             MemoryItem::Record(rec) => {
+                if forgotten_covers(
+                    &mut forgotten_stmt,
+                    &mut forgotten,
+                    &rec.chat_id,
+                    &rec.project_id,
+                    rec.source_seq,
+                )? {
+                    // At or below a forget horizon: the row was deleted on
+                    // purpose. Still advance the cursor — the event WAS
+                    // processed, it just must not be stored.
+                    cursor.execute(params![rec.chat_id, rec.project_id, rec.source_seq as i64])?;
+                    continue;
+                }
                 let (enabled, exclusions) = project_settings(&tx, &mut settings, &rec.project_id)?;
                 if enabled {
                     let rel_path = rec
@@ -1247,14 +1356,74 @@ fn apply_batch(conn: &Connection, items: &[MemoryItem]) -> Result<(), MemoryErro
                 cursor.execute(params![chat_id, Option::<String>::None, *seq as i64])?;
                 gap_clear.execute(params![chat_id, *seq as i64])?;
             }
+            MemoryItem::PurgeChat { chat_id } => {
+                purge_events(&tx, fts, "chat_id = ?1", params![chat_id])?;
+            }
+            MemoryItem::PurgeProject { project_id } => {
+                purge_events(&tx, fts, "project_id = ?1", params![project_id])?;
+            }
+            MemoryItem::PurgeAll => {
+                purge_events(&tx, fts, "1 = 1", params![])?;
+            }
         }
     }
     drop(insert);
     drop(fts_insert);
     drop(cursor);
     drop(gap_clear);
+    drop(forgotten_stmt);
     tx.commit()?;
     Ok(())
+}
+
+/// Delete matching `memory_events` rows (and their FTS entries) inside the
+/// batch transaction — shared by the `Purge*` queue items.
+fn purge_events(
+    tx: &Connection,
+    fts: bool,
+    where_clause: &str,
+    params: &[&dyn rusqlite::ToSql],
+) -> Result<(), MemoryError> {
+    let ids: Vec<i64> = {
+        let mut stmt = tx.prepare(&format!(
+            "SELECT id FROM memory_events WHERE {where_clause}"
+        ))?;
+        stmt.query_map(params, |r| r.get::<_, i64>(0))?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    if fts {
+        delete_fts_rows(tx, &ids)?;
+    }
+    if !ids.is_empty() {
+        let mut del = tx.prepare(&format!("DELETE FROM memory_events WHERE {where_clause}"))?;
+        del.execute(params)?;
+    }
+    Ok(())
+}
+
+/// Is `source_seq` covered by a forget horizon for this (chat, project)?
+/// `project_id = ''` tombstones are chat-wide; a project-scoped tombstone
+/// only covers records carrying that same project id. Horizons load once
+/// per chat per batch — forgets are rare, batches are small.
+fn forgotten_covers(
+    stmt: &mut rusqlite::Statement<'_>,
+    cache: &mut HashMap<String, Vec<(String, i64)>>,
+    chat_id: &str,
+    project_id: &str,
+    source_seq: u64,
+) -> Result<bool, MemoryError> {
+    if !cache.contains_key(chat_id) {
+        let rows: Vec<(String, i64)> = stmt
+            .query_map(params![chat_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        cache.insert(chat_id.to_string(), rows);
+    }
+    let seq = source_seq.min(i64::MAX as u64) as i64;
+    Ok(cache
+        .get(chat_id)
+        .into_iter()
+        .flatten()
+        .any(|(scope, through)| (*scope == project_id || scope.is_empty()) && seq <= *through))
 }
 
 fn project_settings(
@@ -1696,5 +1865,102 @@ mod tests {
         let missing = dst.path().join("missing");
         relocate_store(&missing, dst.path()).unwrap();
         assert!(!dst.path().join("memory.sqlite").exists());
+    }
+
+    #[test]
+    fn forget_tombstone_blocks_late_and_replayed_records() {
+        let (svc, _dir) = svc();
+        svc.enqueue(MemoryItem::Record(Box::new(rec(1, "session_start"))))
+            .unwrap();
+        wait_for(|| svc.stats("p_test").unwrap().events == 1);
+        // Journal tail = 10: anything at or below it must never reappear —
+        // queued writes and catch-up replays alike.
+        svc.forget_chat("chat-1", Some(10)).unwrap();
+        assert_eq!(svc.stats("p_test").unwrap().events, 0);
+
+        for seq in [7u64, 10, 12] {
+            svc.enqueue(MemoryItem::Record(Box::new(rec(seq, "session_start"))))
+                .unwrap();
+        }
+        wait_for(|| svc.stats("p_test").unwrap().events == 1);
+        let events = svc.recent("p_test", 10, None).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].source_seq, 12, "only seq > horizon may index");
+    }
+
+    #[test]
+    fn project_scoped_tombstone_does_not_block_other_projects() {
+        let (svc, _dir) = svc();
+        svc.forget_project("p_test", &[("chat-1".to_string(), 10)])
+            .unwrap();
+        // Same chat, same seq, DIFFERENT project: the horizon is scoped.
+        let mut other = rec(5, "session_start");
+        other.project_id = "p_other".into();
+        svc.enqueue(MemoryItem::Record(Box::new(other))).unwrap();
+        // Same project, seq above the horizon: allowed.
+        svc.enqueue(MemoryItem::Record(Box::new(rec(11, "session_start"))))
+            .unwrap();
+        wait_for(|| svc.stats("p_test").unwrap().events == 1);
+        assert_eq!(svc.stats("p_other").unwrap().events, 1);
+    }
+
+    #[test]
+    fn gaps_survive_a_resume_beyond_the_replay_snapshot() {
+        let (svc, _dir) = svc();
+        svc.note_gap("chat-1", 10).unwrap();
+        svc.note_gap("chat-1", 25).unwrap();
+        // Healed through seq 20: gap 10 is covered, gap 25 is NOT — the
+        // single-column gap_seq used to collapse 25 into 10 and lose it.
+        svc.enqueue(MemoryItem::Resume {
+            chat_id: "chat-1".into(),
+            seq: 20,
+        })
+        .unwrap();
+        wait_for(|| svc.chat_cursor("chat-1").unwrap().last_seq == 20);
+        let cursor = svc.chat_cursor("chat-1").unwrap();
+        assert_eq!(cursor.gap_seq, Some(25));
+        assert!(
+            svc.chats_with_gaps()
+                .unwrap()
+                .contains(&"chat-1".to_string())
+        );
+        // A second Resume covering 25 clears it.
+        svc.enqueue(MemoryItem::Resume {
+            chat_id: "chat-1".into(),
+            seq: 30,
+        })
+        .unwrap();
+        wait_for(|| svc.chat_cursor("chat-1").unwrap().gap_seq.is_none());
+    }
+
+    #[test]
+    fn gap_only_chat_is_known_and_curable() {
+        let (svc, _dir) = svc();
+        // Every record dropped before the first flush: only gap rows exist.
+        svc.note_gap("chat-1", 4).unwrap();
+        assert!(svc.known_chats().unwrap().contains(&"chat-1".to_string()));
+        let cursor = svc.chat_cursor("chat-1").unwrap();
+        assert_eq!(cursor.last_seq, 0);
+        assert_eq!(cursor.gap_seq, Some(4));
+        svc.clear_gap("chat-1").unwrap();
+        assert_eq!(svc.chat_cursor("chat-1").unwrap().gap_seq, None);
+    }
+
+    #[test]
+    fn purge_item_sweeps_committed_stragglers() {
+        let (svc, _dir) = svc();
+        svc.enqueue(MemoryItem::Record(Box::new(rec(1, "session_start"))))
+            .unwrap();
+        wait_for(|| svc.stats("p_test").unwrap().events == 1);
+        svc.enqueue(MemoryItem::PurgeChat {
+            chat_id: "chat-1".into(),
+        })
+        .unwrap();
+        wait_for(|| svc.stats("p_test").unwrap().events == 0);
+        assert!(
+            svc.search("p_test", "session_start", 10)
+                .unwrap()
+                .is_empty()
+        );
     }
 }

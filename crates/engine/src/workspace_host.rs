@@ -1025,12 +1025,43 @@ impl WorkspaceHost {
 impl WorkspaceHostInner {
     /// Forget one chat's memory rows (best-effort — derived data, never a
     /// reason to fail a delete). Shared by the host's delete paths and the
-    /// orphan-journal sweep below.
+    /// orphan-journal sweep below. When the indexer is unavailable — or the
+    /// forget itself fails — the intent is appended to
+    /// `memory-forget.pending` beside the journals so the next engine start
+    /// (which opens the indexer and drains the file) still honors the
+    /// delete; the journal is already gone by then, so nothing else could
+    /// repair it.
     fn forget_memory_chat(&self, chat_id: &str) {
-        if let Some(indexer) = lock(&self.memory).as_ref()
-            && let Err(err) = indexer.forget_chat(chat_id)
+        let forgotten = lock(&self.memory)
+            .as_ref()
+            .is_some_and(|indexer| indexer.forget_chat(chat_id).is_ok());
+        if !forgotten {
+            self.pending_memory_forget(chat_id);
+        }
+    }
+
+    /// Record a chat id for the memory indexer's next-open drain. The file
+    /// sits next to the run journals — outside the memory store, which may
+    /// be exactly what failed to open.
+    fn pending_memory_forget(&self, chat_id: &str) {
+        let Some(journal) = lock(&self.journal).clone() else {
+            return;
+        };
+        let path = journal.dir().join("memory-forget.pending");
+        use std::io::Write;
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
         {
-            tracing::warn!(chat = %chat_id, error = %err, "memory forget failed");
+            Ok(mut file) => {
+                if let Err(err) = writeln!(file, "{chat_id}") {
+                    tracing::warn!(chat = %chat_id, error = %err, "pending memory-forget write failed");
+                }
+            }
+            Err(err) => {
+                tracing::warn!(chat = %chat_id, error = %err, "pending memory-forget open failed");
+            }
         }
     }
 
