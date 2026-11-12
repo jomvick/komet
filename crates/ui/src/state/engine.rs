@@ -871,6 +871,12 @@ impl EngineHandle {
         &self.engine_info
     }
 
+    /// Whether two handles point at the same backend connection — used by
+    /// pages that cache per-engine data to detect a workspace/device switch.
+    pub fn same_engine(&self, other: &EngineHandle) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
     pub(crate) fn deferred_state(
         &self,
     ) -> Option<tokio::sync::watch::Receiver<DeferredEngineState>> {

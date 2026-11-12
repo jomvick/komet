@@ -10,7 +10,7 @@
 //! cannot be moved underneath themselves); the page says so instead of
 //! pretending the move is instant.
 
-use gpui::{AnyElement, Context, Entity, SharedString, Task, Window, div, prelude::*, px};
+use gpui::{AnyElement, App, Context, Entity, SharedString, Task, Window, div, prelude::*, px};
 use serde::Deserialize;
 
 use komet_rpc::methods;
@@ -18,7 +18,7 @@ use komet_rpc::methods;
 use crate::composer::{ComposerInput, ComposerInputEvent};
 use crate::popover::Loadable;
 use crate::settings::widgets;
-use crate::state::AppState;
+use crate::state::{AppState, EngineHandle};
 use crate::theme::Theme;
 
 /// Retention choices offered in the UI (days). The engine clamps to its own
@@ -67,6 +67,13 @@ pub struct MemoryPage {
     task: Option<Task<()>>,
     error: Option<SharedString>,
     notice: Option<SharedString>,
+    /// The engine the displayed status belongs to — memory is device-local,
+    /// so a workspace/device switch must reload, never show the old index.
+    engine: Option<EngineHandle>,
+    /// Bumped on every load AND every engine rebind: async results carrying
+    /// an older generation are dropped, so a slow reply from the previous
+    /// engine can't overwrite the new one's status.
+    generation: u64,
     /// Draft for a custom storage folder (empty = the default location).
     location_input: Entity<ComposerInput>,
     /// Project whose detail row is expanded, plus its exclusions draft.
@@ -84,6 +91,8 @@ impl MemoryPage {
             }
         })
         .detach();
+        cx.observe(&state, |this: &mut Self, _, cx| this.on_state_changed(cx))
+            .detach();
         let mut page = Self {
             state,
             status: Loadable::Idle,
@@ -91,6 +100,8 @@ impl MemoryPage {
             task: None,
             error: None,
             notice: None,
+            engine: None,
+            generation: 0,
             location_input,
             expanded: None,
             exclusions_input: None,
@@ -98,6 +109,40 @@ impl MemoryPage {
         };
         page.load(cx);
         page
+    }
+
+    /// Reload when the displayed engine changes (local ↔ paired device, or a
+    /// reconnect that swaps the backend). State notifies on every change, so
+    /// the engine identity — not the notification — is the trigger.
+    fn on_state_changed(&mut self, cx: &mut Context<Self>) {
+        let current = self.state.read(cx).engine().cloned();
+        let same = match (&current, &self.engine) {
+            (Some(a), Some(b)) => a.same_engine(b),
+            (None, None) => true,
+            _ => false,
+        };
+        if same {
+            return;
+        }
+        self.engine = current;
+        self.generation += 1;
+        self.status = Loadable::Idle;
+        self.expanded = None;
+        self.exclusions_input = None;
+        self.confirm = None;
+        self.load(cx);
+    }
+
+    /// Params with the `targetDeviceId` passthrough merged in — inside an
+    /// environment connection the memory RPCs must name the device that owns
+    /// the store (resolved per call like ProvidersPage).
+    fn with_target(&self, value: serde_json::Value, cx: &App) -> serde_json::Value {
+        let mut value = value;
+        let target = self.state.read(cx).harness_target_device();
+        if let (Some(target), Some(object)) = (target, value.as_object_mut()) {
+            object.insert("targetDeviceId".into(), serde_json::json!(target));
+        }
+        value
     }
 
     fn load(&mut self, cx: &mut Context<Self>) {
@@ -108,16 +153,23 @@ impl MemoryPage {
             cx.notify();
             return;
         };
+        self.engine = Some(engine.clone());
+        self.generation += 1;
+        let generation = self.generation;
         if matches!(self.status, Loadable::Idle) {
             self.status = Loadable::Loading;
         }
         self.loading = true;
+        let params = self.with_target(serde_json::json!({}), cx);
         self.task = Some(cx.spawn(async move |this, cx| {
             let result = engine
                 .client()
-                .call(methods::GET_MEMORY_STATUS, serde_json::json!({}))
+                .call(methods::GET_MEMORY_STATUS, params)
                 .await;
             this.update(cx, |page, cx| {
+                if page.generation != generation {
+                    return; // a newer load (or engine switch) superseded this
+                }
                 page.loading = false;
                 page.apply(result, cx);
                 cx.notify();
@@ -166,17 +218,24 @@ impl MemoryPage {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
+        let params = self.with_target(params, cx);
+        let generation = self.generation;
         self.task = Some(cx.spawn(async move |this, cx| {
             let result = engine.client().call(method, params).await;
-            this.update(cx, |page, cx| match result {
-                Ok(_) => {
-                    page.error = None;
-                    page.confirm = None;
-                    page.load(cx);
+            this.update(cx, |page, cx| {
+                if page.generation != generation {
+                    return; // engine switched mid-call: the new page reloads itself
                 }
-                Err(err) => {
-                    page.error = Some(SharedString::from(err.to_string()));
-                    cx.notify();
+                match result {
+                    Ok(_) => {
+                        page.error = None;
+                        page.confirm = None;
+                        page.load(cx);
+                    }
+                    Err(err) => {
+                        page.error = Some(SharedString::from(err.to_string()));
+                        cx.notify();
+                    }
                 }
             })
             .ok();

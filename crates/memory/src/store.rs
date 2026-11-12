@@ -843,10 +843,12 @@ impl MemoryService {
                    last_seq = MAX(memory_chat_state.last_seq, excluded.last_seq)",
                 params![chat_id, project_id, through],
             )?;
-            tx.execute(
-                "DELETE FROM memory_chat_gaps WHERE chat_id = ?1",
-                params![chat_id],
-            )?;
+            // Gap rows are NOT cleared here: they belong to the chat's whole
+            // journal, not to this project. The project tombstone above
+            // already suppresses this project's replayed rows; keeping the
+            // gaps lets catch-up still recover events another project of the
+            // same chat dropped. Only forget_chat / forget_all (whole-chat
+            // wipes) clear them.
         }
         tx.commit()?;
         // Return freed pages to the OS incrementally (auto_vacuum=INCREMENTAL).
@@ -1356,14 +1358,28 @@ fn apply_batch(conn: &Connection, items: &[MemoryItem], fts: bool) -> Result<(),
                 cursor.execute(params![chat_id, Option::<String>::None, *seq as i64])?;
                 gap_clear.execute(params![chat_id, *seq as i64])?;
             }
+            // Purges are scoped by the persisted forget horizons, NOT by
+            // chat/project alone: a record legitimately committed ABOVE a
+            // horizon (queued before the purge, seq > through_seq) must
+            // survive the sweep. The EXISTS mirrors `forgotten_covers`.
             MemoryItem::PurgeChat { chat_id } => {
-                purge_events(&tx, fts, "chat_id = ?1", params![chat_id])?;
+                purge_events(
+                    &tx,
+                    fts,
+                    &format!("chat_id = ?1 AND {TOMBSTONE_COVERED}"),
+                    params![chat_id],
+                )?;
             }
             MemoryItem::PurgeProject { project_id } => {
-                purge_events(&tx, fts, "project_id = ?1", params![project_id])?;
+                purge_events(
+                    &tx,
+                    fts,
+                    &format!("project_id = ?1 AND {TOMBSTONE_COVERED}"),
+                    params![project_id],
+                )?;
             }
             MemoryItem::PurgeAll => {
-                purge_events(&tx, fts, "1 = 1", params![])?;
+                purge_events(&tx, fts, TOMBSTONE_COVERED, params![])?;
             }
         }
     }
@@ -1375,6 +1391,17 @@ fn apply_batch(conn: &Connection, items: &[MemoryItem], fts: bool) -> Result<(),
     tx.commit()?;
     Ok(())
 }
+
+/// SQL fragment: the row is covered by a `memory_forgotten` horizon —
+/// chat-wide (`project_id = ''`) or scoped to the row's own project, at or
+/// below `through_seq`. Used by the `Purge*` sweeps so they delete exactly
+/// what the tombstones forbid, never legitimate post-horizon records.
+const TOMBSTONE_COVERED: &str = "EXISTS (
+    SELECT 1 FROM memory_forgotten f
+    WHERE f.chat_id = memory_events.chat_id
+      AND (f.project_id = '' OR f.project_id = memory_events.project_id)
+      AND memory_events.source_seq <= f.through_seq
+)";
 
 /// Delete matching `memory_events` rows (and their FTS entries) inside the
 /// batch transaction — shared by the `Purge*` queue items.
@@ -1477,26 +1504,55 @@ fn search_text(rec: &MemoryRecord, rel_path: Option<&str>) -> String {
     parts.join(" ")
 }
 
-/// Copy the store files from `src_dir` to `dst_dir` — the "move data to a
-/// new location" step. Runs at engine start BEFORE any connection opens, so
-/// there is no live database to corrupt; idempotent (a no-op when the
-/// destination already has a database or the source has none). The source
-/// is left in place: it is derived data and a free rollback if the new
-/// location misbehaves.
+/// Copy the store files from `src_dir` to `dst_dir`. Runs before the first
+/// open, so there is no live database to corrupt; idempotent (a no-op when
+/// the destination already has a database or the source has none). The
+/// source is left in place: it is derived data and a free rollback if the
+/// new location misbehaves.
+///
+/// Staged: every file is copied into a scratch dir first and published by
+/// rename, `memory.sqlite` LAST — its presence is what marks the
+/// destination "already relocated", so an interrupted copy leaves a
+/// retryable state instead of a db without its WAL.
 pub fn relocate_store(src_dir: &Path, dst_dir: &Path) -> std::io::Result<()> {
     let src_db = src_dir.join(DB_FILE);
     if !src_db.exists() || dst_dir.join(DB_FILE).exists() {
         return Ok(());
     }
     std::fs::create_dir_all(dst_dir)?;
-    for suffix in ["", "-wal", "-shm"] {
-        let name = format!("{DB_FILE}{suffix}");
-        let src = src_dir.join(&name);
-        if src.exists() {
-            std::fs::copy(&src, dst_dir.join(&name))?;
-        }
+    let stage = dst_dir.join(".komet-relocate");
+    if stage.exists() {
+        std::fs::remove_dir_all(&stage)?;
     }
-    Ok(())
+    std::fs::create_dir_all(&stage)?;
+    let publish = (|| -> std::io::Result<()> {
+        for suffix in ["", "-wal", "-shm"] {
+            let name = format!("{DB_FILE}{suffix}");
+            let src = src_dir.join(&name);
+            if src.exists() {
+                std::fs::copy(&src, stage.join(&name))?;
+            }
+        }
+        // WAL/SHM first, the main file last: until `memory.sqlite` lands the
+        // destination still looks un-relocated, so a crash here just retries.
+        for name in [
+            format!("{DB_FILE}-wal"),
+            format!("{DB_FILE}-shm"),
+            DB_FILE.to_string(),
+        ] {
+            let staged = stage.join(&name);
+            if staged.exists() {
+                std::fs::rename(&staged, dst_dir.join(&name))?;
+            } else {
+                // No staged file: drop any orphan left by an earlier attempt
+                // so a stale WAL can't pair with the fresh database.
+                let _ = std::fs::remove_file(dst_dir.join(&name));
+            }
+        }
+        Ok(())
+    })();
+    let _ = std::fs::remove_dir_all(&stage);
+    publish
 }
 
 fn now_ms() -> i64 {
@@ -1947,20 +2003,38 @@ mod tests {
     }
 
     #[test]
-    fn purge_item_sweeps_committed_stragglers() {
+    fn purge_sweep_preserves_post_horizon_records() {
         let (svc, _dir) = svc();
         svc.enqueue(MemoryItem::Record(Box::new(rec(1, "session_start"))))
             .unwrap();
         wait_for(|| svc.stats("p_test").unwrap().events == 1);
-        svc.enqueue(MemoryItem::PurgeChat {
-            chat_id: "chat-1".into(),
-        })
-        .unwrap();
-        wait_for(|| svc.stats("p_test").unwrap().events == 0);
-        assert!(
-            svc.search("p_test", "session_start", 10)
-                .unwrap()
-                .is_empty()
-        );
+        // Forget at journal tail 10: forget_chat enqueues the PurgeChat
+        // barrier itself. Anything at/below 10 is tombstoned; seq 12 is a
+        // legitimate post-forget record and must survive the sweep.
+        svc.forget_chat("chat-1", Some(10)).unwrap();
+        for seq in [5u64, 12] {
+            svc.enqueue(MemoryItem::Record(Box::new(rec(seq, "session_start"))))
+                .unwrap();
+        }
+        wait_for(|| svc.stats("p_test").unwrap().events == 1);
+        let events = svc.recent("p_test", 10, None).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].source_seq, 12, "post-horizon record was purged");
+    }
+
+    #[test]
+    fn project_forget_keeps_chat_gaps_for_other_projects() {
+        let (svc, _dir) = svc();
+        // A gap belongs to the chat's journal, not to one project: dropping
+        // it on forget_project would lose replay coverage for events another
+        // project of the same chat missed.
+        svc.note_gap("chat-1", 8).unwrap();
+        svc.forget_project("p_test", &[("chat-1".to_string(), 10)])
+            .unwrap();
+        let cursor = svc.chat_cursor("chat-1").unwrap();
+        assert_eq!(cursor.gap_seq, Some(8), "project forget must keep gaps");
+        // Whole-chat forget still clears them.
+        svc.forget_chat("chat-1", Some(10)).unwrap();
+        assert_eq!(svc.chat_cursor("chat-1").unwrap().gap_seq, None);
     }
 }

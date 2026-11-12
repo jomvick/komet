@@ -470,32 +470,77 @@ impl MemoryIndexer {
         journal: Arc<RunJournal>,
     ) -> Result<Arc<Self>, komet_memory::MemoryError> {
         let data_dir = data_dir.to_path_buf();
-        let config = komet_memory::MemoryConfig::load(&data_dir);
+        let mut config = komet_memory::MemoryConfig::load(&data_dir);
         let default_dir = data_dir.join("memory");
-        let store_dir = config.store_dir(&data_dir);
-        if store_dir != default_dir
-            && let Err(err) = komet_memory::relocate_store(&default_dir, &store_dir)
+        // `location` is the PENDING destination; `active_dir` is where the
+        // store actually lives (persisted after each successful open). The
+        // migration always runs active → pending — including back to the
+        // default on reset — and the active marker only moves once the new
+        // store opened successfully.
+        let pending_dir = config.store_dir(&data_dir);
+        let active_dir = config
+            .active_dir
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(komet_memory::resolve_location)
+            .unwrap_or_else(|| default_dir.clone());
+        let mut target_dir = pending_dir.clone();
+        if pending_dir != active_dir
+            && let Err(err) = komet_memory::relocate_store(&active_dir, &pending_dir)
         {
+            // Keep using the live store this boot; the pending location
+            // stays configured and the move is retried on the next start.
             tracing::warn!(
                 error = %err,
-                from = %default_dir.display(),
-                to = %store_dir.display(),
-                "memory: store relocation failed; opening destination anyway"
+                from = %active_dir.display(),
+                to = %pending_dir.display(),
+                "memory: store relocation failed; keeping the active store"
             );
+            target_dir = active_dir.clone();
         }
-        let svc = Arc::new(match MemoryService::open(&store_dir) {
-            Ok(svc) => svc,
-            Err(err) if store_dir != default_dir => {
-                tracing::warn!(
-                    error = %err,
-                    dir = %store_dir.display(),
-                    "memory: custom location unavailable, falling back to default"
-                );
-                MemoryService::open(&default_dir)?
+        let svc = Arc::new({
+            // Target first, then the known-active store, then the default —
+            // the first that opens wins.
+            let mut opened = None;
+            let mut last_err = None;
+            let mut candidates: Vec<PathBuf> = vec![target_dir.clone()];
+            if active_dir != target_dir {
+                candidates.push(active_dir.clone());
             }
-            Err(err) => return Err(err),
+            if default_dir != target_dir && default_dir != active_dir {
+                candidates.push(default_dir.clone());
+            }
+            for dir in candidates {
+                match MemoryService::open(&dir) {
+                    Ok(svc) => {
+                        opened = Some(svc);
+                        break;
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            dir = %dir.display(),
+                            "memory: store open failed, trying next candidate"
+                        );
+                        last_err = Some(err);
+                    }
+                }
+            }
+            match opened {
+                Some(svc) => svc,
+                None => return Err(last_err.expect("at least one candidate")),
+            }
         });
         let effective_dir = svc.dir().to_path_buf();
+        // Persist where the store actually ended up — only now, after a
+        // successful open, so a failed relocation never rewrites the source.
+        if effective_dir != active_dir {
+            config.active_dir = Some(effective_dir.display().to_string());
+            if let Err(err) = config.save(&data_dir) {
+                tracing::warn!(error = %err, "memory: active_dir save failed");
+            }
+        }
         // Gap markers are persisted by a dedicated thread: the publish path
         // only does a non-blocking channel send.
         let (gap_tx, gap_rx) = channel::<(String, u64)>();
@@ -598,7 +643,7 @@ impl MemoryIndexer {
         };
         let mut failed = Vec::new();
         for chat_id in content.lines().map(str::trim).filter(|l| !l.is_empty()) {
-            match self.forget_chat(chat_id) {
+            match self.forget_chat(chat_id, false) {
                 Ok(_) => {}
                 Err(err) => {
                     tracing::warn!(chat = %chat_id, error = %err, "memory: pending forget failed");
@@ -738,6 +783,12 @@ impl MemoryIndexer {
                 .collect()
         };
         for chat_id in &chat_ids {
+            // Disabling memory mid-pass stops further replay/enqueueing;
+            // cursors only advance through Resume items actually sent, so
+            // completed work is kept and the rest retries on re-enable.
+            if !self.enabled.load(Ordering::Relaxed) {
+                break;
+            }
             if !import_all && !known.contains(chat_id) {
                 continue;
             }
@@ -832,7 +883,10 @@ impl MemoryIndexer {
                 chats: HashMap::new(),
                 cwd_projects: HashMap::new(),
             };
-            for (seq, ts, event) in &entries {
+            for (i, (seq, ts, event)) in entries.iter().enumerate() {
+                if i % 256 == 0 && !self.enabled.load(Ordering::Relaxed) {
+                    return;
+                }
                 let at = if *ts > 0 { *ts } else { mtime };
                 for item in replay.project(chat_id, *seq, event, at) {
                     if item_seq(&item).is_some_and(|s| s > from) {
@@ -844,16 +898,17 @@ impl MemoryIndexer {
                 let _ = self.svc.touch_project(&project_id, &root);
             }
         }
-        // Enqueue everything; on the first failure stop — the remaining tail
-        // stays unindexed and the next catch-up resumes from the cursor.
+        // Enqueue everything; on the first failure — or a mid-pass disable —
+        // stop: the remaining tail stays unindexed and the next catch-up
+        // resumes from the cursor (never past work actually enqueued).
         let mut complete = true;
         for item in items {
-            if self.svc.enqueue(item).is_err() {
+            if !self.enabled.load(Ordering::Relaxed) || self.svc.enqueue(item).is_err() {
                 complete = false;
                 break;
             }
         }
-        if complete {
+        if complete && self.enabled.load(Ordering::Relaxed) {
             let _ = self.svc.enqueue(MemoryItem::Resume {
                 chat_id: chat_id.to_string(),
                 seq: reached,
@@ -956,9 +1011,20 @@ impl MemoryIndexer {
     /// per-chat cwd cache) for the engine's lifetime. The store keeps a
     /// tombstone cursor at the journal tail so catch-up cannot resurrect
     /// the deleted range.
-    pub fn forget_chat(&self, chat_id: &str) -> Result<usize, komet_memory::MemoryError> {
+    /// `unbounded = true` forces the "forever" tombstone even when the
+    /// journal still exists — used when journal discard FAILED, so events
+    /// appended after the tail stay covered too.
+    pub fn forget_chat(
+        &self,
+        chat_id: &str,
+        unbounded: bool,
+    ) -> Result<usize, komet_memory::MemoryError> {
         lock(&self.projector).chats.remove(chat_id);
-        let through = self.journal.last_seq(chat_id).ok().flatten();
+        let through = if unbounded {
+            None
+        } else {
+            self.journal.last_seq(chat_id).ok().flatten()
+        };
         let removed = self.svc.forget_chat(chat_id, through)?;
         self.invalidate_briefing();
         Ok(removed)
@@ -1031,9 +1097,13 @@ impl MemoryIndexer {
     /// Global kill switch. OFF stops recording/briefing/catch-up; stored
     /// data is kept. Persists to `memory-config.json` immediately.
     pub fn set_global_enabled(&self, enabled: bool) -> Result<(), komet_memory::MemoryError> {
-        self.enabled.store(enabled, Ordering::Relaxed);
         {
             let mut config = lock(&self.config);
+            // Flag first, still under the config lock: a concurrent reader
+            // can never observe config.enabled != the atomic gate. A save
+            // failure keeps the in-memory flip (same as before) — the file
+            // simply catches up on the next successful write.
+            self.enabled.store(enabled, Ordering::Relaxed);
             config.enabled = enabled;
             config.save(&self.data_dir).map_err(|e| {
                 komet_memory::MemoryError::Other(format!("save memory config: {e}"))
@@ -1093,6 +1163,15 @@ impl MemoryIndexer {
     /// [`Self::store_dir`] until the next restart applies it.
     pub fn pending_location(&self) -> Option<String> {
         lock(&self.config).location.clone()
+    }
+
+    /// The store directory the config currently selects, when it differs
+    /// from the one actually open — `Some` means a restart will relocate
+    /// (an explicit custom path AND a reset back to the default both land
+    /// here; `None` = no pending change).
+    pub fn pending_store_dir(&self) -> Option<PathBuf> {
+        let target = lock(&self.config).store_dir(&self.data_dir);
+        (target != self.store_dir).then_some(target)
     }
 
     /// All known projects with settings + footprint (settings page list).

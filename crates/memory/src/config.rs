@@ -28,10 +28,16 @@ pub struct MemoryConfig {
     /// older rows. Cursors only move forward, so pruning cannot resurrect.
     pub retention_days: u32,
     /// Custom store location (absolute path). `None` = `<data_dir>/memory`.
-    /// Applied at engine start: the store files are copied over before the
-    /// first open, so a bad path can never corrupt a live database.
+    /// This is the PENDING destination: applied at engine start by copying
+    /// the ACTIVE store over, so a bad path can never corrupt live data.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub location: Option<String>,
+    /// Where the store actually lives, persisted after each successful
+    /// open/relocate. The next start migrates FROM this directory TO
+    /// `store_dir()` — including back to the default when `location` is
+    /// reset — and only updates it once the move succeeded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_dir: Option<String>,
 }
 
 impl Default for MemoryConfig {
@@ -40,26 +46,45 @@ impl Default for MemoryConfig {
             enabled: true,
             retention_days: DEFAULT_RETENTION_DAYS,
             location: None,
+            active_dir: None,
         }
     }
 }
 
 impl MemoryConfig {
+    /// Load tolerantly, FIELD BY FIELD: a single malformed value (say a
+    /// string where `retentionDays` belongs) must not reset the whole file
+    /// to defaults — that would silently re-enable memory for a user who
+    /// opted out. Each field falls back on its own; a wholly unreadable or
+    /// non-object file still yields defaults.
     pub fn load(data_dir: &Path) -> Self {
-        match std::fs::read_to_string(Self::path(data_dir)) {
-            Ok(text) => match serde_json::from_str::<MemoryConfig>(&text) {
-                Ok(mut config) => {
-                    config.retention_days = config
-                        .retention_days
-                        .clamp(RETENTION_DAYS_MIN, RETENTION_DAYS_MAX);
-                    config
-                }
-                Err(err) => {
-                    tracing::warn!(error = %err, "memory config corrupt; using defaults");
-                    Self::default()
-                }
-            },
-            Err(_) => Self::default(),
+        let Ok(text) = std::fs::read_to_string(Self::path(data_dir)) else {
+            return Self::default();
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+            tracing::warn!("memory config corrupt; using defaults");
+            return Self::default();
+        };
+        let enabled = value
+            .get("enabled")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true);
+        let retention_days = value
+            .get("retentionDays")
+            .and_then(serde_json::Value::as_u64)
+            .map(|days| days.clamp(RETENTION_DAYS_MIN as u64, RETENTION_DAYS_MAX as u64) as u32)
+            .unwrap_or(DEFAULT_RETENTION_DAYS);
+        let string_field = |name: &str| {
+            value
+                .get(name)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        };
+        Self {
+            enabled,
+            retention_days,
+            location: string_field("location"),
+            active_dir: string_field("activeDir"),
         }
     }
 
@@ -128,6 +153,7 @@ mod tests {
             enabled: false,
             retention_days: 30,
             location: Some("/tmp/custom-memory".into()),
+            active_dir: Some("/tmp/custom-memory".into()),
         };
         config.save(dir.path()).unwrap();
         let loaded = MemoryConfig::load(dir.path());
@@ -144,6 +170,22 @@ mod tests {
         assert_eq!(MemoryConfig::load(dir.path()), MemoryConfig::default());
         std::fs::write(MemoryConfig::path(dir.path()), "{nope").unwrap();
         assert_eq!(MemoryConfig::load(dir.path()), MemoryConfig::default());
+    }
+
+    #[test]
+    fn malformed_field_does_not_reset_enabled_opt_out() {
+        let dir = tempfile::tempdir().unwrap();
+        // A type error on ONE field must not drop a valid `enabled: false`
+        // back to the enabled default.
+        std::fs::write(
+            MemoryConfig::path(dir.path()),
+            r#"{"enabled": false, "retentionDays": "bogus", "location": 42}"#,
+        )
+        .unwrap();
+        let loaded = MemoryConfig::load(dir.path());
+        assert!(!loaded.enabled);
+        assert_eq!(loaded.retention_days, DEFAULT_RETENTION_DAYS);
+        assert_eq!(loaded.location, None);
     }
 
     #[test]

@@ -1808,6 +1808,18 @@ impl RpcService for EngineRpc {
             methods::GET_HARNESS_CLI_STATUS,
             methods::MANAGE_HARNESS_CLI,
             methods::SET_HARNESS_ENABLED,
+            // Project memory lives in a device-local SQLite store: inside an
+            // environment the caller must name the device that owns it,
+            // else the answer would describe the controller's own index.
+            methods::GET_MEMORY_STATUS,
+            methods::SET_MEMORY_ENABLED,
+            methods::SET_MEMORY_RETENTION_DAYS,
+            methods::SET_MEMORY_LOCATION,
+            methods::SET_MEMORY_PROJECT_ENABLED,
+            methods::SET_MEMORY_PROJECT_EXCLUSIONS,
+            methods::FORGET_MEMORY_PROJECT,
+            methods::FORGET_ALL_MEMORY,
+            methods::IMPORT_MEMORY_HISTORY,
         ];
         if self.environment.is_some()
             && ENV_TARGETED.contains(&method)
@@ -2161,18 +2173,19 @@ impl RpcService for EngineRpc {
                 let bytes = std::fs::metadata(indexer.store_dir().join("memory.sqlite"))
                     .map(|m| m.len())
                     .unwrap_or(0);
-                let pending = indexer.pending_location();
-                let pending_dir = pending.as_deref().map(komet_memory::resolve_location);
-                let restart_required = pending_dir
-                    .as_ref()
-                    .is_some_and(|dir| *dir != indexer.store_dir());
+                // `pendingDir`/`restartRequired` resolve the EFFECTIVE
+                // configured directory — an explicit custom path and a
+                // reset back to the default are both pending targets;
+                // `None` means the open store already matches the config.
+                let pending_dir = indexer.pending_store_dir();
+                let restart_required = pending_dir.is_some();
                 let projects = indexer.list_projects().unwrap_or_default();
                 RpcReply::value(&serde_json::json!({
                     "available": true,
                     "enabled": indexer.global_enabled(),
                     "retentionDays": indexer.retention_days(),
                     "dir": indexer.store_dir().display().to_string(),
-                    "pendingDir": pending,
+                    "pendingDir": pending_dir.map(|dir| dir.display().to_string()),
                     "restartRequired": restart_required,
                     "events": events,
                     "chats": chats,
@@ -2261,7 +2274,8 @@ impl RpcService for EngineRpc {
                 #[serde(rename_all = "camelCase")]
                 struct P {
                     project_id: String,
-                    #[serde(default)]
+                    // No serde default: clearing exclusions is an explicit
+                    // `[]`, never an accidentally omitted field.
                     exclusions: Vec<String>,
                 }
                 let p: P = parse_params(params)?;
@@ -2305,6 +2319,12 @@ impl RpcService for EngineRpc {
                     .sessions
                     .memory()
                     .ok_or_else(|| RpcError::Failed("memory unavailable".into()))?;
+                // The import flag is only consumed by an enabled catch-up;
+                // accepting it while disabled would silently arm a surprise
+                // backfill on the next re-enable instead of running now.
+                if !indexer.global_enabled() {
+                    return Err(RpcError::Failed("memory indexing is disabled".into()));
+                }
                 indexer.request_history_import();
                 RpcReply::value(&serde_json::json!({ "started": true }))
             }

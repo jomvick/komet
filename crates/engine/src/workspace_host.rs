@@ -837,15 +837,21 @@ impl WorkspaceHost {
     /// returned chat ids; the journals those chats wrote die here with them.
     pub fn delete_space(&self, space_id: &str) -> Result<DeletedSpace, EngineError> {
         let deleted = self.mutate(|doc| doc.delete_space(space_id))?;
+        // Track which journals survived: a failed discard leaves a live
+        // journal that can keep appending seqs, so its memory tombstone
+        // must be unbounded rather than tail-scoped.
+        let mut journal_alive: std::collections::HashSet<String> = std::collections::HashSet::new();
         if let Some(journal) = lock(&self.inner.journal).clone() {
             for chat_id in &deleted.chat_ids {
                 if let Err(err) = journal.discard(chat_id) {
                     tracing::warn!(chat = %chat_id, error = %err, "run journal delete failed");
+                    journal_alive.insert(chat_id.clone());
                 }
             }
         }
         for chat_id in &deleted.chat_ids {
-            self.inner.forget_memory_chat(chat_id);
+            self.inner
+                .forget_memory_chat(chat_id, journal_alive.contains(chat_id));
         }
         Ok(deleted)
     }
@@ -971,12 +977,14 @@ impl WorkspaceHost {
     pub fn delete_chat(&self, chat_id: &str) -> Result<bool, EngineError> {
         let deleted = self.mutate(|doc| doc.delete_chat(chat_id))?;
         if deleted {
+            let mut journal_alive = false;
             if let Some(journal) = lock(&self.inner.journal).as_ref()
                 && let Err(err) = journal.discard(chat_id)
             {
                 tracing::warn!(chat = %chat_id, error = %err, "run journal delete failed");
+                journal_alive = true;
             }
-            self.inner.forget_memory_chat(chat_id);
+            self.inner.forget_memory_chat(chat_id, journal_alive);
         }
         Ok(deleted)
     }
@@ -1031,10 +1039,13 @@ impl WorkspaceHostInner {
     /// (which opens the indexer and drains the file) still honors the
     /// delete; the journal is already gone by then, so nothing else could
     /// repair it.
-    fn forget_memory_chat(&self, chat_id: &str) {
+    /// `journal_alive` = the run journal survived the delete (discard
+    /// failed): it can keep appending seqs, so the memory tombstone must
+    /// cover every seq — not just the tail read at forget time.
+    fn forget_memory_chat(&self, chat_id: &str, journal_alive: bool) {
         let forgotten = lock(&self.memory)
             .as_ref()
-            .is_some_and(|indexer| indexer.forget_chat(chat_id).is_ok());
+            .is_some_and(|indexer| indexer.forget_chat(chat_id, journal_alive).is_ok());
         if !forgotten {
             self.pending_memory_forget(chat_id);
         }
@@ -1092,10 +1103,14 @@ impl WorkspaceHostInner {
             if known.contains(&chat_id) {
                 continue;
             }
-            if let Err(err) = journal.discard(&chat_id) {
-                tracing::warn!(chat = %chat_id, error = %err, "orphan journal delete failed");
-            }
-            self.forget_memory_chat(&chat_id);
+            let journal_alive = match journal.discard(&chat_id) {
+                Ok(()) => false,
+                Err(err) => {
+                    tracing::warn!(chat = %chat_id, error = %err, "orphan journal delete failed");
+                    true
+                }
+            };
+            self.forget_memory_chat(&chat_id, journal_alive);
         }
     }
 
