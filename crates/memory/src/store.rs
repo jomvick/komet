@@ -479,7 +479,7 @@ impl MemoryService {
                SELECT agent, relative_path, MAX(occurred_at_ms) AS last_ms,
                       ROW_NUMBER() OVER (
                         PARTITION BY agent
-                        ORDER BY MAX(occurred_at_ms) DESC
+                        ORDER BY MAX(occurred_at_ms) DESC, relative_path
                       ) AS rn
                FROM memory_events
                WHERE project_id = ?1 AND kind = 'tool_call'

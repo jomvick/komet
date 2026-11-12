@@ -1055,6 +1055,7 @@ impl MemoryIndexer {
             komet_memory::RETENTION_DAYS_MAX,
         );
         self.retention_days.store(days, Ordering::Relaxed);
+        self.invalidate_briefing();
         {
             let mut config = lock(&self.config);
             config.retention_days = days;
