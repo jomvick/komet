@@ -8,6 +8,8 @@ pub enum SettingsSection {
     Providers,
     /// Provider quota windows + Komet-measured token usage (issue #53).
     Usage,
+    /// Local project-memory index controls (issue #78).
+    Memory,
     Appearance,
     Files,
     Notifications,
@@ -19,10 +21,11 @@ pub enum SettingsSection {
 }
 
 impl SettingsSection {
-    pub const ALL: [SettingsSection; 11] = [
+    pub const ALL: [SettingsSection; 12] = [
         SettingsSection::Devices,
         SettingsSection::Providers,
         SettingsSection::Usage,
+        SettingsSection::Memory,
         SettingsSection::Appearance,
         SettingsSection::Files,
         SettingsSection::Notifications,
@@ -40,6 +43,7 @@ impl SettingsSection {
             SettingsSection::Devices => "Devices",
             SettingsSection::Providers => "Providers",
             SettingsSection::Usage => "Usage",
+            SettingsSection::Memory => "Memory",
             SettingsSection::Appearance => "Appearance",
             SettingsSection::Files => "Files",
             SettingsSection::Notifications => "Notifications",
@@ -59,6 +63,7 @@ impl SettingsSection {
             SettingsSection::Devices => icons::MONITOR,
             SettingsSection::Providers => icons::WIDGET,
             SettingsSection::Usage => icons::SORT_VERTICAL,
+            SettingsSection::Memory => icons::HARD_DRIVE,
             SettingsSection::Appearance => icons::TUNING,
             SettingsSection::Files => icons::FOLDER_WITH_FILES,
             SettingsSection::Notifications => icons::BELL,
@@ -424,6 +429,16 @@ impl Shell {
                     page.update(cx, |page, cx| page.on_shown(cx));
                 }
                 match &self.usage_page {
+                    Some(page) => page.clone().into_any_element(),
+                    None => Empty.into_any_element(),
+                }
+            }
+            SettingsSection::Memory => {
+                if self.memory_page.is_none() {
+                    let state = self.state.clone();
+                    self.memory_page = Some(cx.new(|cx| MemoryPage::new(state, cx)));
+                }
+                match &self.memory_page {
                     Some(page) => page.clone().into_any_element(),
                     None => Empty.into_any_element(),
                 }

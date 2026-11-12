@@ -35,6 +35,7 @@ pub mod composer;
 pub mod devices;
 pub mod files;
 pub mod integrations;
+pub mod memory;
 pub mod notifications;
 pub mod prompts;
 pub mod providers;

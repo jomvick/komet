@@ -231,6 +231,31 @@ pub mod methods {
     /// the engine holds the bearer (every other reply is redacted), so copying a
     /// link has to go through it.
     pub const ENVIRONMENT_LINK: &str = "EnvironmentLink";
+    // Project memory (issue #78) — the index is device-local: settings,
+    // per-project controls and forget all live on the machine that owns
+    // the store, so every method is local-connection only.
+    /// Status + project list for Settings → Memory: `{available, enabled,
+    /// retentionDays, dir, pendingDir, events, chats, bytes, fts,
+    /// untrackedChats, projects[]}`.
+    pub const GET_MEMORY_STATUS: &str = "GetMemoryStatus";
+    /// `{enabled}` — global kill switch (recording + briefing injection).
+    pub const SET_MEMORY_ENABLED: &str = "SetMemoryEnabled";
+    /// `{days}` — raw-event retention window.
+    pub const SET_MEMORY_RETENTION_DAYS: &str = "SetMemoryRetentionDays";
+    /// `{path}` — custom store location; `null` resets to the default.
+    /// Applied at next engine start (never moves a live database).
+    pub const SET_MEMORY_LOCATION: &str = "SetMemoryLocation";
+    /// `{projectId, enabled}` — per-project recording switch.
+    pub const SET_MEMORY_PROJECT_ENABLED: &str = "SetMemoryProjectEnabled";
+    /// `{projectId, exclusions}` — per-project path glob exclusions.
+    pub const SET_MEMORY_PROJECT_EXCLUSIONS: &str = "SetMemoryProjectExclusions";
+    /// `{projectId}` — delete one project's derived memory (tombstoned).
+    pub const FORGET_MEMORY_PROJECT: &str = "ForgetMemoryProject";
+    /// Wipe all derived memory across projects (settings kept).
+    pub const FORGET_ALL_MEMORY: &str = "ForgetAllMemory";
+    /// Replay every journal into the index — the explicit "index history"
+    /// action; pre-feature history is never indexed silently.
+    pub const IMPORT_MEMORY_HISTORY: &str = "ImportMemoryHistory";
 }
 
 #[derive(Debug, thiserror::Error)]

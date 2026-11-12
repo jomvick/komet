@@ -103,6 +103,28 @@ pub fn contains_secret_value(text: &str) -> bool {
                 if tail >= *min_tail {
                     return true;
                 }
+                // Dash/underscore-structured tokens (`sk-ant-api03-...`,
+                // `sk-proj-...`, `xoxb-1-2-...`) never form a long alnum run,
+                // so the strict check above misses them. Separator-terminated
+                // prefixes therefore get a LOOSE check as well, gated on the
+                // signature real secrets have and file names rarely do:
+                // mixed case AND a digit. Alpha-terminated prefixes (`asia`,
+                // `akia`) stay strict-only: `Asia-Pacific-Report-2026.md`
+                // must survive.
+                if matches!(prefix.as_bytes().last(), Some(b'-' | b'_' | b'.')) {
+                    let (mut len, mut upper, mut digit) = (0usize, false, false);
+                    for b in text.as_bytes()[start + prefix.len()..]
+                        .iter()
+                        .take_while(|b| b.is_ascii_alphanumeric() || **b == b'-' || **b == b'_')
+                    {
+                        len += 1;
+                        upper |= b.is_ascii_uppercase();
+                        digit |= b.is_ascii_digit();
+                    }
+                    if len >= *min_tail && upper && digit {
+                        return true;
+                    }
+                }
             }
             search_from = start + prefix.len();
         }
@@ -258,6 +280,24 @@ fn absolute_lexical(path: &str) -> String {
             .map(|cwd| cwd.join(&expanded).to_string_lossy().into_owned())
             .unwrap_or(expanded)
     }
+}
+
+/// Display root for a `cwd`: the deepest ancestor containing `.git` — the
+/// worktree/submodule root itself (a `.git` *file* counts), NOT the shared
+/// common dir — else the canonical cwd. Human label only; project identity
+/// stays [`project_id_for`]. Never climbs into `$HOME` (same rule).
+pub fn project_root_for(cwd: &str) -> PathBuf {
+    let base = std::fs::canonicalize(cwd).unwrap_or_else(|_| PathBuf::from(absolute_lexical(cwd)));
+    let home = dirs_home().map(PathBuf::from);
+    for dir in base.ancestors() {
+        if home.as_deref() == Some(dir) {
+            break;
+        }
+        if dir.join(".git").exists() {
+            return dir.to_path_buf();
+        }
+    }
+    base
 }
 
 fn dirs_home() -> Option<String> {
@@ -530,6 +570,17 @@ mod tests {
         assert!(contains_secret_value(
             "token_ghp_abcdefghijklmnopqrstuvwxyz0123456789"
         ));
+        // Modern dash-structured keys have no long alnum run: caught by the
+        // loose rule (separator-terminated prefix + mixed case + digit).
+        assert!(contains_secret_value(
+            "sk-ant-api03-AbCdEfGhIjKlMnOpQrStUvWx"
+        ));
+        assert!(contains_secret_value("sk-proj-Ab12Cd34Ef56Gh78Ij90Kl12"));
+        assert!(contains_secret_value("xoxb-1234567890-AbCdEfGhIjKl"));
+        // Lowercase prose with digits, or an alpha-terminated prefix in
+        // Title-Case, does not trip it.
+        assert!(!contains_secret_value("sk-learn-pipeline-2026-notes.md"));
+        assert!(!contains_secret_value("Asia-Pacific-Report-2026-Final.md"));
     }
 
     #[test]

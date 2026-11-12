@@ -12,20 +12,25 @@
 //! idempotently (`UNIQUE(project_id, chat_id, source_seq)`).
 
 mod briefing;
+pub mod config;
 mod policy;
 mod record;
 mod store;
 
 pub use briefing::build as build_briefing;
+pub use config::{MemoryConfig, RETENTION_DAYS_MAX, RETENTION_DAYS_MIN, resolve_location};
 pub use policy::{
     canonical_cwd, contains_secret_value, is_default_excluded, project_id_for, project_relative,
-    user_excluded,
+    project_root_for, user_excluded,
 };
 pub use record::{
     AgentDigest, BriefingDigest, ChatCursor, FailureDigest, FileTouch, MemoryEvent, MemoryItem,
     MemoryRecord,
 };
-pub use store::{MemoryError, MemoryService, MemoryStats, QUEUE_CAPACITY};
+pub use store::{
+    MemoryError, MemoryService, MemoryStats, ProjectInfo, QUEUE_CAPACITY, RETENTION_MS,
+    relocate_store,
+};
 
 /// Lowercase hex of raw bytes (same shape as `repos::hex` in the engine).
 pub(crate) fn hex(bytes: &[u8]) -> String {

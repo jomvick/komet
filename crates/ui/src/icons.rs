@@ -53,6 +53,8 @@ icon_assets![
     // Solar Icons (Linear), CC BY 4.0 — 480 Design.
     (MONITOR, "monitor"),
     (LAPTOP, "laptop"),
+    // Storage glyph for Settings → Memory (the asset exists; it had no const).
+    (HARD_DRIVE, "hard-drive"),
     (PEN_NEW_SQUARE, "pen-new-square"),
     (SORT_VERTICAL, "sort-vertical"),
     (LIST, "list"),

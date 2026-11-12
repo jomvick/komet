@@ -15,6 +15,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
+use serde::Serialize;
 
 use crate::policy;
 use crate::record::{
@@ -32,6 +33,10 @@ const WRITE_BATCH: usize = 100;
 const WRITE_FLUSH: Duration = Duration::from_millis(100);
 /// Recency window for the handoff briefing.
 pub const BRIEFING_WINDOW_MS: i64 = 30 * 24 * 60 * 60 * 1000;
+/// Raw-event retention. Older rows are pruned by the engine's maintenance
+/// tick; replay cursors only move forward, so catch-up cannot re-create
+/// them.
+pub const RETENTION_MS: i64 = 90 * 24 * 60 * 60 * 1000;
 
 #[derive(Debug, thiserror::Error)]
 pub enum MemoryError {
@@ -383,9 +388,9 @@ impl MemoryService {
         // Per-agent volume + recency.
         let mut stmt = conn.prepare(
             "SELECT agent,
-                    SUM(kind = 'session_start') AS sessions,
-                    SUM(kind = 'tool_call') AS tool_calls,
-                    SUM(kind = 'tool_call' AND tool_name = 'read_file') AS file_reads,
+                    COALESCE(SUM(kind = 'session_start'), 0) AS sessions,
+                    COALESCE(SUM(kind = 'tool_call'), 0) AS tool_calls,
+                    COALESCE(SUM(kind = 'tool_call' AND tool_name = 'read_file'), 0) AS file_reads,
                     MAX(occurred_at_ms) AS last_ms
              FROM memory_events
              WHERE project_id = ?1 AND (?2 IS NULL OR chat_id != ?2)
@@ -569,6 +574,108 @@ impl MemoryService {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    /// Record/refresh a project's display root (first writer wins per row;
+    /// later touches only fill a still-NULL label). Called once per chat by
+    /// the indexer — never on the hot path.
+    pub fn touch_project(&self, project_id: &str, root_path: &str) -> Result<(), MemoryError> {
+        if project_id.is_empty() || root_path.is_empty() {
+            return Ok(());
+        }
+        let conn = lock(&self.write);
+        let now = now_ms();
+        conn.execute(
+            "INSERT INTO memory_projects(project_id, root_path, created_at_ms, updated_at_ms)
+             VALUES(?1, ?2, ?3, ?3)
+             ON CONFLICT(project_id) DO UPDATE SET
+               root_path = COALESCE(memory_projects.root_path, excluded.root_path),
+               updated_at_ms = excluded.updated_at_ms",
+            params![project_id, root_path, now],
+        )?;
+        Ok(())
+    }
+
+    /// Every project the index knows, with its settings and footprint —
+    /// the Settings → Memory project list. Projects seen only through
+    /// events (no settings row yet) are included with defaults.
+    pub fn list_projects(&self) -> Result<Vec<ProjectInfo>, MemoryError> {
+        let conn = lock(&self.conn);
+        let mut projects: HashMap<String, ProjectInfo> = HashMap::new();
+        {
+            let mut stmt = conn.prepare(
+                "SELECT project_id, root_path, enabled, exclusions
+                 FROM memory_projects",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, i64>(2)? != 0,
+                    r.get::<_, String>(3)?,
+                ))
+            })?;
+            for row in rows {
+                let (id, root, enabled, raw) = row?;
+                projects.insert(
+                    id.clone(),
+                    ProjectInfo {
+                        project_id: id,
+                        root_path: root,
+                        enabled,
+                        exclusions: serde_json::from_str(&raw).unwrap_or_default(),
+                        events: 0,
+                        last_activity_ms: None,
+                    },
+                );
+            }
+        }
+        {
+            let mut stmt = conn.prepare(
+                "SELECT project_id, COUNT(*), MAX(occurred_at_ms)
+                 FROM memory_events GROUP BY project_id",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, Option<i64>>(2)?,
+                ))
+            })?;
+            for row in rows {
+                let (id, events, last_ms) = row?;
+                let entry = projects.entry(id.clone()).or_insert_with(|| ProjectInfo {
+                    project_id: id,
+                    root_path: None,
+                    enabled: true,
+                    exclusions: Vec::new(),
+                    events: 0,
+                    last_activity_ms: None,
+                });
+                entry.events = events;
+                entry.last_activity_ms = last_ms;
+            }
+        }
+        let mut out: Vec<ProjectInfo> = projects.into_values().collect();
+        out.sort_by(|a, b| {
+            b.last_activity_ms
+                .unwrap_or(0)
+                .cmp(&a.last_activity_ms.unwrap_or(0))
+        });
+        Ok(out)
+    }
+
+    /// Store-wide footprint for the settings header (events + chats across
+    /// all projects; bytes come from the caller's dir metadata).
+    pub fn totals(&self) -> Result<(i64, i64), MemoryError> {
+        let conn = lock(&self.conn);
+        let events: i64 = conn.query_row("SELECT COUNT(*) FROM memory_events", [], |r| r.get(0))?;
+        let chats: i64 = conn.query_row(
+            "SELECT COUNT(DISTINCT chat_id) FROM memory_events",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok((events, chats))
+    }
+
     /// Chats with a persisted enqueue gap — the periodic catch-up tick only
     /// runs a journal scan when this is non-empty.
     pub fn chats_with_gaps(&self) -> Result<Vec<String>, MemoryError> {
@@ -633,14 +740,26 @@ impl MemoryService {
             "DELETE FROM memory_events WHERE chat_id = ?1",
             params![chat_id],
         )?;
-        tx.execute(
-            "INSERT INTO memory_chat_state(chat_id, last_seq) VALUES(?1, COALESCE(?2, 0))
-             ON CONFLICT(chat_id) DO UPDATE SET
-               last_seq = MAX(memory_chat_state.last_seq,
-                              COALESCE(?2, memory_chat_state.last_seq)),
-               gap_seq = NULL",
-            params![chat_id, through_seq.map(|s| s as i64)],
-        )?;
+        match through_seq {
+            Some(seq) => {
+                tx.execute(
+                    "INSERT INTO memory_chat_state(chat_id, last_seq) VALUES(?1, ?2)
+                     ON CONFLICT(chat_id) DO UPDATE SET
+                       last_seq = MAX(memory_chat_state.last_seq, excluded.last_seq),
+                       gap_seq = NULL",
+                    params![chat_id, seq as i64],
+                )?;
+            }
+            None => {
+                // Journal gone/unreadable: nothing to resurrect from. Never
+                // create a row for an unknown chat; keep an existing cursor
+                // as is and only drop a pending gap.
+                tx.execute(
+                    "UPDATE memory_chat_state SET gap_seq = NULL WHERE chat_id = ?1",
+                    params![chat_id],
+                )?;
+            }
+        }
         tx.commit()?;
         Ok(removed)
     }
@@ -690,6 +809,37 @@ impl MemoryService {
         Ok(removed)
     }
 
+    /// "Forget all": delete every retained record across every project and
+    /// tombstone every chat in `horizons` at its journal tail so catch-up
+    /// cannot resurrect anything. Project settings rows are kept (enable
+    /// flags, exclusions, roots are preferences, not activity data).
+    pub fn forget_all(&self, horizons: &[(String, u64)]) -> Result<usize, MemoryError> {
+        let conn = lock(&self.write);
+        let tx = conn.unchecked_transaction()?;
+        let ids: Vec<i64> = {
+            let mut stmt = tx.prepare("SELECT id FROM memory_events")?;
+            stmt.query_map([], |r| r.get::<_, i64>(0))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        if self.fts {
+            delete_fts_rows(&tx, &ids)?;
+        }
+        let removed = tx.execute("DELETE FROM memory_events", [])?;
+        for (chat_id, seq) in horizons {
+            tx.execute(
+                "INSERT INTO memory_chat_state(chat_id, last_seq) VALUES(?1, ?2)
+                 ON CONFLICT(chat_id) DO UPDATE SET
+                   last_seq = MAX(memory_chat_state.last_seq, excluded.last_seq),
+                   gap_seq = NULL",
+                params![chat_id, *seq as i64],
+            )?;
+        }
+        tx.execute("UPDATE memory_chat_state SET gap_seq = NULL", [])?;
+        tx.commit()?;
+        let _ = conn.execute_batch("PRAGMA incremental_vacuum;");
+        Ok(removed)
+    }
+
     /// Delete one retained record by id (per-fact/session forget granularity
     /// grows in later phases; events are the Phase-1 unit).
     pub fn forget_event(&self, id: i64) -> Result<bool, MemoryError> {
@@ -701,6 +851,44 @@ impl MemoryService {
         let removed = tx.execute("DELETE FROM memory_events WHERE id = ?1", params![id])?;
         tx.commit()?;
         Ok(removed > 0)
+    }
+
+    /// Retention: delete events older than `cutoff_ms` in bounded batches,
+    /// releasing the write lock between them so live indexing is never
+    /// starved for long. Returns the number of rows removed.
+    pub fn prune_older_than(&self, cutoff_ms: i64) -> Result<usize, MemoryError> {
+        const BATCH: i64 = 2000;
+        let mut total = 0usize;
+        loop {
+            let conn = lock(&self.write);
+            let tx = conn.unchecked_transaction()?;
+            let ids: Vec<i64> = {
+                let mut stmt = tx.prepare(
+                    "SELECT id FROM memory_events WHERE occurred_at_ms < ?1 ORDER BY id LIMIT ?2",
+                )?;
+                stmt.query_map(params![cutoff_ms, BATCH], |r| r.get::<_, i64>(0))?
+                    .collect::<Result<Vec<_>, _>>()?
+            };
+            if ids.is_empty() {
+                break;
+            }
+            if self.fts {
+                delete_fts_rows(&tx, &ids)?;
+            }
+            {
+                let mut del = tx.prepare("DELETE FROM memory_events WHERE id = ?1")?;
+                for id in &ids {
+                    del.execute(params![id])?;
+                }
+            }
+            tx.commit()?;
+            total += ids.len();
+        }
+        if total > 0 {
+            let conn = lock(&self.write);
+            let _ = conn.execute_batch("PRAGMA incremental_vacuum;");
+        }
+        Ok(total)
     }
 
     /// Storage footprint for the resource panel (Phase 5 consumes this).
@@ -732,6 +920,22 @@ pub struct MemoryStats {
     pub events: i64,
     pub chats: i64,
     pub bytes: u64,
+}
+
+/// One row of the Settings → Memory project list.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectInfo {
+    pub project_id: String,
+    /// Human label (worktree/repo root or cwd) — `None` until the indexer
+    /// records it via [`MemoryService::touch_project`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub root_path: Option<String>,
+    pub enabled: bool,
+    pub exclusions: Vec<String>,
+    pub events: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_activity_ms: Option<i64>,
 }
 
 /// Escape `LIKE` metacharacters (`%`, `_`, `\`) for `ESCAPE '\'` clauses.
@@ -849,6 +1053,21 @@ fn migrate(conn: &mut Connection) -> Result<(), MemoryError> {
             conn.execute_batch("INSERT INTO memory_fts(memory_fts) VALUES('rebuild');")?;
         }
         conn.execute_batch("PRAGMA user_version = 2;")?;
+    }
+    if version < 3 {
+        // v3: human-readable project root for the settings UI. The project
+        // id is a hash; without this the per-project toggles would be
+        // unlabelled. Guarded so a hand-built v1/v2 schema still migrates.
+        let has_root: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('memory_projects')
+             WHERE name = 'root_path'",
+            [],
+            |r| r.get(0),
+        )?;
+        if has_root == 0 {
+            conn.execute_batch("ALTER TABLE memory_projects ADD COLUMN root_path TEXT")?;
+        }
+        conn.execute_batch("PRAGMA user_version = 3;")?;
     }
     Ok(())
 }
@@ -1087,6 +1306,28 @@ fn search_text(rec: &MemoryRecord, rel_path: Option<&str>) -> String {
         parts.push(o);
     }
     parts.join(" ")
+}
+
+/// Copy the store files from `src_dir` to `dst_dir` — the "move data to a
+/// new location" step. Runs at engine start BEFORE any connection opens, so
+/// there is no live database to corrupt; idempotent (a no-op when the
+/// destination already has a database or the source has none). The source
+/// is left in place: it is derived data and a free rollback if the new
+/// location misbehaves.
+pub fn relocate_store(src_dir: &Path, dst_dir: &Path) -> std::io::Result<()> {
+    let src_db = src_dir.join(DB_FILE);
+    if !src_db.exists() || dst_dir.join(DB_FILE).exists() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(dst_dir)?;
+    for suffix in ["", "-wal", "-shm"] {
+        let name = format!("{DB_FILE}{suffix}");
+        let src = src_dir.join(&name);
+        if src.exists() {
+            std::fs::copy(&src, dst_dir.join(&name))?;
+        }
+    }
+    Ok(())
 }
 
 fn now_ms() -> i64 {
@@ -1345,5 +1586,115 @@ mod tests {
         .unwrap();
         wait_for(|| svc.chat_cursor("chat-9").unwrap().gap_seq.is_none());
         assert_eq!(svc.chat_cursor("chat-9").unwrap().last_seq, 50);
+    }
+
+    #[test]
+    fn prune_removes_old_events_and_their_fts_rows() {
+        let (svc, _dir) = svc();
+        let now = now_ms();
+        let old = now - 100 * 24 * 60 * 60 * 1000;
+        for seq in 1..=3u64 {
+            let mut r = rec(seq, "tool_call");
+            r.tool_name = Some("edit_file".into());
+            r.relative_path = Some(format!("old/file{seq}.rs"));
+            r.occurred_at_ms = old;
+            svc.enqueue(MemoryItem::Record(Box::new(r))).unwrap();
+        }
+        let mut fresh = rec(4, "tool_call");
+        fresh.tool_name = Some("edit_file".into());
+        fresh.relative_path = Some("new/keep.rs".into());
+        svc.enqueue(MemoryItem::Record(Box::new(fresh))).unwrap();
+        wait_for(|| svc.stats("p_test").unwrap().events == 4);
+
+        let removed = svc.prune_older_than(now - RETENTION_MS).unwrap();
+        assert_eq!(removed, 3);
+        assert_eq!(svc.stats("p_test").unwrap().events, 1);
+        assert!(svc.search("p_test", "old/file1.rs", 10).unwrap().is_empty());
+        assert_eq!(svc.search("p_test", "keep.rs", 10).unwrap().len(), 1);
+        // Cursor untouched: pruned rows are not re-created by a replay.
+        assert_eq!(svc.chat_cursor("chat-1").unwrap().last_seq, 4);
+    }
+
+    #[test]
+    fn forgetting_an_unknown_chat_creates_no_state_row() {
+        let (svc, _dir) = svc();
+        assert_eq!(svc.forget_chat("ghost", None).unwrap(), 0);
+        assert!(!svc.known_chats().unwrap().contains(&"ghost".to_string()));
+    }
+
+    #[test]
+    fn projects_list_totals_and_touch_project() {
+        let (svc, _dir) = svc();
+        svc.touch_project("p_test", "/repo/root").unwrap();
+        svc.set_exclusions("p_test", &["target/**".into(), "*.log".into()])
+            .unwrap();
+        svc.enqueue(MemoryItem::Record(Box::new(rec(1, "session_start"))))
+            .unwrap();
+        wait_for(|| svc.stats("p_test").unwrap().events == 1);
+
+        let projects = svc.list_projects().unwrap();
+        assert_eq!(projects.len(), 1);
+        let project = &projects[0];
+        assert_eq!(project.project_id, "p_test");
+        assert_eq!(project.root_path.as_deref(), Some("/repo/root"));
+        assert!(project.enabled);
+        assert_eq!(project.exclusions, vec!["target/**", "*.log"]);
+        assert_eq!(project.events, 1);
+        assert!(project.last_activity_ms.is_some());
+
+        let (events, chats) = svc.totals().unwrap();
+        assert_eq!(events, 1);
+        assert_eq!(chats, 1);
+    }
+
+    #[test]
+    fn forget_all_wipes_events_and_tombstones_chats() {
+        let (svc, _dir) = svc();
+        svc.enqueue(MemoryItem::Record(Box::new(rec(1, "session_start"))))
+            .unwrap();
+        svc.enqueue(MemoryItem::Checkpoint {
+            chat_id: "chat-1".into(),
+            seq: 7,
+        })
+        .unwrap();
+        wait_for(|| svc.totals().unwrap().0 == 1);
+
+        // Horizon = journal tail (7): replay from 7 must not resurrect rows.
+        let removed = svc.forget_all(&[("chat-1".to_string(), 7)]).unwrap();
+        assert_eq!(removed, 1);
+        assert_eq!(svc.totals().unwrap().0, 0);
+        let cursor = svc.chat_cursor("chat-1").unwrap();
+        assert_eq!(cursor.last_seq, 7);
+        assert_eq!(cursor.gap_seq, None);
+        // Project settings survive a wipe.
+        assert!(svc.is_enabled("p_test").unwrap());
+    }
+
+    #[test]
+    fn relocate_copies_db_and_is_idempotent() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let src_dir = src.path().join("memory");
+        let dst_dir = dst.path().join("memory");
+        let svc = MemoryService::open(&src_dir).unwrap();
+        svc.enqueue(MemoryItem::Record(Box::new(rec(1, "session_start"))))
+            .unwrap();
+        wait_for(|| svc.stats("p_test").unwrap().events == 1);
+        drop(svc);
+
+        relocate_store(&src_dir, &dst_dir).unwrap();
+        assert!(dst_dir.join("memory.sqlite").exists());
+        // Second run is a no-op: the destination already has a database.
+        relocate_store(&src_dir, &dst_dir).unwrap();
+        let reopened = MemoryService::open(&dst_dir).unwrap();
+        assert_eq!(reopened.stats("p_test").unwrap().events, 1);
+    }
+
+    #[test]
+    fn relocate_without_source_is_a_noop() {
+        let dst = tempfile::tempdir().unwrap();
+        let missing = dst.path().join("missing");
+        relocate_store(&missing, dst.path()).unwrap();
+        assert!(!dst.path().join("memory.sqlite").exists());
     }
 }

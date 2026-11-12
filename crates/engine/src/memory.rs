@@ -16,7 +16,8 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::mpsc::{Sender, channel};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -34,6 +35,11 @@ struct ChatMemoryCtx {
     /// Canonical cwd, resolved once per chat — `canonicalize` is a syscall
     /// and must not run per tool call on the publish path.
     canon_cwd: PathBuf,
+    /// Human label for the project (repo/worktree root or cwd) — recorded
+    /// once into `memory_projects.root_path` for the settings UI.
+    root: String,
+    /// Whether `root` was already pushed to the store this engine run.
+    root_recorded: bool,
     agent: String,
     model: Option<String>,
     run_started_ms: i64,
@@ -62,6 +68,9 @@ impl MemoryProjector {
     fn note_chat(&mut self, chat_id: &str, cwd: &str, harness: HarnessId) {
         let project_id = self.project_id(cwd);
         let canon_cwd = komet_memory::canonical_cwd(cwd);
+        let root = komet_memory::project_root_for(cwd)
+            .to_string_lossy()
+            .into_owned();
         let ctx = self
             .chats
             .entry(chat_id.to_string())
@@ -69,6 +78,8 @@ impl MemoryProjector {
                 project_id: project_id.clone(),
                 cwd: cwd.to_string(),
                 canon_cwd: canon_cwd.clone(),
+                root: root.clone(),
+                root_recorded: false,
                 agent: harness.as_str().to_string(),
                 model: None,
                 run_started_ms: 0,
@@ -78,8 +89,21 @@ impl MemoryProjector {
             ctx.cwd = cwd.to_string();
             ctx.project_id = project_id;
             ctx.canon_cwd = canon_cwd;
+            ctx.root = root;
+            ctx.root_recorded = false;
         }
         ctx.agent = harness.as_str().to_string();
+    }
+
+    /// Take the pending project-root label for `chat_id` (once per chat per
+    /// engine run) so the indexer can persist it for the settings UI.
+    fn take_root_pending(&mut self, chat_id: &str) -> Option<(String, String)> {
+        let ctx = self.chats.get_mut(chat_id)?;
+        if ctx.root_recorded || ctx.project_id.is_empty() || ctx.root.is_empty() {
+            return None;
+        }
+        ctx.root_recorded = true;
+        Some((ctx.project_id.clone(), ctx.root.clone()))
     }
 
     fn ctx(&mut self, chat_id: &str) -> Option<&mut ChatMemoryCtx> {
@@ -126,6 +150,8 @@ impl MemoryProjector {
                         project_id: project_id.clone(),
                         cwd: String::new(),
                         canon_cwd: komet_memory::canonical_cwd(cwd),
+                        root: String::new(),
+                        root_recorded: true,
                         agent: harness.as_str().to_string(),
                         model: None,
                         run_started_ms: 0,
@@ -135,6 +161,10 @@ impl MemoryProjector {
                 if !cwd.trim().is_empty() {
                     ctx.cwd = cwd.clone();
                     ctx.canon_cwd = komet_memory::canonical_cwd(cwd);
+                    ctx.root = komet_memory::project_root_for(cwd)
+                        .to_string_lossy()
+                        .into_owned();
+                    ctx.root_recorded = false;
                 }
                 ctx.agent = harness.as_str().to_string();
                 ctx.model = Some(model.clone());
@@ -344,6 +374,8 @@ const CATCHUP_MIN_INTERVAL: Duration = Duration::from_secs(5);
 /// Gap-marker tick: how often the indexer checks for persisted enqueue
 /// gaps that need a journal replay (writer failures leave these behind).
 const GAP_TICK_INTERVAL: Duration = Duration::from_secs(60);
+/// Retention maintenance cadence (checked on the gap tick).
+const PRUNE_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 
 /// Briefing results are cached briefly: a dispatch storm (or a retry loop)
 /// must not re-run four aggregate queries per run launch.
@@ -364,15 +396,81 @@ pub struct MemoryIndexer {
     /// (project_id, exclude_chat_id, computed_at, text) — see
     /// [`Self::briefing`].
     briefing_cache: Mutex<Option<BriefingCacheEntry>>,
+    /// Gap markers to persist, sent by the publish path. A channel send
+    /// never blocks, unlike a SQLite write that would wait on the very
+    /// writer (or an admin transaction) that caused the overflow.
+    gap_tx: Sender<(String, u64)>,
+    /// Global kill switch (Settings → Memory). OFF stops recording,
+    /// briefing injection and catch-up; stored data is kept.
+    enabled: AtomicBool,
+    /// Raw-event retention in days (settings-configurable).
+    retention_days: AtomicU32,
+    /// Device-level config (`<data_dir>/memory-config.json`) — mutated by
+    /// the settings RPCs and re-saved on every change.
+    config: Mutex<komet_memory::MemoryConfig>,
+    data_dir: PathBuf,
+    /// The directory the store was actually opened at (may differ from
+    /// `<data_dir>/memory` when a custom location is configured).
+    store_dir: PathBuf,
+    /// Set by "Index history": the next catch-up pass also replays journals
+    /// the index has never seen (pre-feature history is opt-in, not silent).
+    import_untracked: AtomicBool,
 }
 
 impl MemoryIndexer {
-    /// Open the store under `<data_dir>/memory` and wire journal catch-up.
+    /// Open the store and wire journal catch-up. The store location and the
+    /// global switches come from `<data_dir>/memory-config.json`; a custom
+    /// location is applied here — files are copied BEFORE the first open, so
+    /// a bad path falls back to the default dir instead of corrupting data.
     pub fn open(
         data_dir: &std::path::Path,
         journal: Arc<RunJournal>,
     ) -> Result<Arc<Self>, komet_memory::MemoryError> {
-        let svc = Arc::new(MemoryService::open(data_dir.join("memory"))?);
+        let data_dir = data_dir.to_path_buf();
+        let config = komet_memory::MemoryConfig::load(&data_dir);
+        let default_dir = data_dir.join("memory");
+        let store_dir = config.store_dir(&data_dir);
+        if store_dir != default_dir
+            && let Err(err) = komet_memory::relocate_store(&default_dir, &store_dir)
+        {
+            tracing::warn!(
+                error = %err,
+                from = %default_dir.display(),
+                to = %store_dir.display(),
+                "memory: store relocation failed; opening destination anyway"
+            );
+        }
+        let svc = Arc::new(match MemoryService::open(&store_dir) {
+            Ok(svc) => svc,
+            Err(err) if store_dir != default_dir => {
+                tracing::warn!(
+                    error = %err,
+                    dir = %store_dir.display(),
+                    "memory: custom location unavailable, falling back to default"
+                );
+                MemoryService::open(&default_dir)?
+            }
+            Err(err) => return Err(err),
+        });
+        let effective_dir = svc.dir().to_path_buf();
+        // Gap markers are persisted by a dedicated thread: the publish path
+        // only does a non-blocking channel send.
+        let (gap_tx, gap_rx) = channel::<(String, u64)>();
+        let gap_svc = Arc::clone(&svc);
+        std::thread::Builder::new()
+            .name("komet-memory-gapwriter".into())
+            .spawn(move || {
+                for (chat_id, seq) in gap_rx {
+                    if let Err(err) = gap_svc.note_gap(&chat_id, seq) {
+                        tracing::warn!(
+                            chat = %chat_id,
+                            error = %err,
+                            "memory: gap marker write failed"
+                        );
+                    }
+                }
+            })
+            .ok();
         let indexer = Arc::new(Self {
             svc,
             journal,
@@ -384,6 +482,13 @@ impl MemoryIndexer {
             catchup_running: AtomicBool::new(false),
             last_catchup: Mutex::new(None),
             briefing_cache: Mutex::new(None),
+            gap_tx,
+            enabled: AtomicBool::new(config.enabled),
+            retention_days: AtomicU32::new(config.retention_days),
+            config: Mutex::new(config),
+            data_dir,
+            store_dir: effective_dir,
+            import_untracked: AtomicBool::new(false),
         });
         // Periodic gap check: a failed writer batch persists gap markers but
         // nothing re-triggers catch-up until the next overflow or restart.
@@ -392,10 +497,33 @@ impl MemoryIndexer {
         std::thread::Builder::new()
             .name("komet-memory-gaptick".into())
             .spawn(move || {
+                let mut last_prune: Option<Instant> = None;
                 loop {
                     std::thread::sleep(GAP_TICK_INTERVAL);
+                    if last_prune.is_none_or(|t| t.elapsed() >= PRUNE_INTERVAL) {
+                        last_prune = Some(Instant::now());
+                        let retention_ms = i64::from(tick.retention_days.load(Ordering::Relaxed))
+                            * 24
+                            * 60
+                            * 60
+                            * 1000;
+                        match tick.svc.prune_older_than(now_ms() - retention_ms) {
+                            Ok(n) if n > 0 => {
+                                tracing::info!(removed = n, "memory: retention prune")
+                            }
+                            Ok(_) => {}
+                            Err(err) => {
+                                tracing::warn!(error = %err, "memory: retention prune failed")
+                            }
+                        }
+                    }
                     match tick.svc.chats_with_gaps() {
-                        Ok(gaps) if !gaps.is_empty() => tick.catch_up(),
+                        Ok(gaps)
+                            if !gaps.is_empty()
+                                || tick.import_untracked.load(Ordering::Relaxed) =>
+                        {
+                            tick.catch_up();
+                        }
                         Ok(_) => {}
                         Err(err) => {
                             tracing::warn!(error = %err, "memory: gap scan failed")
@@ -419,12 +547,21 @@ impl MemoryIndexer {
 
     /// Offer one journaled event to the index. Called from `Inner::publish`
     /// AFTER the journal append succeeded; never blocks on SQLite.
+    /// No-op while the global switch is off (the journal stays authoritative
+    /// — re-enabling resumes from the cursor, nothing is lost).
     pub fn index_event(self: &Arc<Self>, chat_id: &str, seq: u64, event: &AgentEvent) {
-        if seq == 0 || !projectable(event) {
+        if seq == 0 || !self.enabled.load(Ordering::Relaxed) || !projectable(event) {
             return;
         }
         let now = now_ms();
-        let items = lock(&self.projector).project(chat_id, seq, event, now);
+        let (items, root_pending) = {
+            let mut projector = lock(&self.projector);
+            let items = projector.project(chat_id, seq, event, now);
+            (items, projector.take_root_pending(chat_id))
+        };
+        if let Some((project_id, root)) = root_pending {
+            let _ = self.svc.touch_project(&project_id, &root);
+        }
         for item in items {
             let item_seq = match &item {
                 MemoryItem::Record(r) => r.source_seq,
@@ -453,8 +590,9 @@ impl MemoryIndexer {
                 }
             }
         };
-        if new_low && let Err(err) = self.svc.note_gap(chat_id, seq) {
-            tracing::warn!(chat = %chat_id, error = %err, "memory: gap marker write failed");
+        if new_low {
+            // Non-blocking: the gap writer thread persists it.
+            let _ = self.gap_tx.send((chat_id.to_string(), seq));
         }
         self.maybe_catch_up();
     }
@@ -478,7 +616,9 @@ impl MemoryIndexer {
     /// dedicated thread — journal parsing is blocking IO and must not sit on
     /// the async executor.
     pub fn catch_up(self: &Arc<Self>) {
-        if self.catchup_running.swap(true, Ordering::SeqCst) {
+        if !self.enabled.load(Ordering::Relaxed)
+            || self.catchup_running.swap(true, Ordering::SeqCst)
+        {
             return;
         }
         let this = Arc::clone(self);
@@ -492,6 +632,10 @@ impl MemoryIndexer {
     }
 
     fn catch_up_inner(&self) {
+        // "Index history" is a one-shot expansion: only this pass replays
+        // journals the index has never seen. Everything else — gaps,
+        // cursors, tombstones — is always eligible.
+        let import_all = self.import_untracked.swap(false, Ordering::SeqCst);
         let chat_ids = match self.journal.chat_ids() {
             Ok(ids) => ids,
             Err(err) => {
@@ -499,7 +643,19 @@ impl MemoryIndexer {
                 return;
             }
         };
+        let known: std::collections::HashSet<String> = if import_all {
+            std::collections::HashSet::new()
+        } else {
+            self.svc
+                .known_chats()
+                .unwrap_or_default()
+                .into_iter()
+                .collect()
+        };
         for chat_id in &chat_ids {
+            if !import_all && !known.contains(chat_id) {
+                continue;
+            }
             self.catch_up_chat(chat_id);
         }
         // Gaps whose journal is gone can never be replayed — clear them or
@@ -525,8 +681,15 @@ impl MemoryIndexer {
             Ok(Some(seq)) => seq,
             _ => return, // no journal or empty
         };
-        // Heal from the persisted gap when present, else from the cursor.
-        let from = match cursor.gap_seq {
+        // Heal from the lowest known gap — persisted OR still only in memory
+        // (the gap writer thread may not have flushed it yet) — else from
+        // the cursor.
+        let mem_gap = lock(&self.lag).get(chat_id).copied();
+        let gap = match (cursor.gap_seq, mem_gap) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        let from = match gap {
             Some(g) => g.saturating_sub(1),
             None => cursor.last_seq,
         };
@@ -565,13 +728,22 @@ impl MemoryIndexer {
         // them: a long backfill must not starve live `index_event` calls
         // (which share the same mutex) for its whole duration.
         let mut items: Vec<MemoryItem> = Vec::new();
-        for chunk in events.chunks(256) {
-            {
+        // A journal last written before the retention horizon would be
+        // inserted only to be pruned hours later: skip the projection and
+        // still advance the cursor through the Resume below.
+        let expired = now
+            < now_ms()
+                - i64::from(self.retention_days.load(Ordering::Relaxed)) * 24 * 60 * 60 * 1000;
+        if !expired {
+            for chunk in events.chunks(256) {
                 let mut projector = lock(&self.projector);
                 for (seq, event) in chunk {
                     items.extend(projector.project(chat_id, *seq, event, now));
                 }
             }
+        }
+        if let Some((project_id, root)) = lock(&self.projector).take_root_pending(chat_id) {
+            let _ = self.svc.touch_project(&project_id, &root);
         }
         // Enqueue everything; on the first failure stop — the remaining tail
         // stays unindexed and the next catch-up resumes from the cursor.
@@ -609,6 +781,9 @@ impl MemoryIndexer {
         cwd: &str,
         exclude_chat_id: Option<&str>,
     ) -> Result<Option<String>, komet_memory::MemoryError> {
+        if !self.enabled.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
         let project_id = lock(&self.projector).project_id(cwd);
         let exclude = exclude_chat_id.map(str::to_string);
         {
@@ -626,12 +801,21 @@ impl MemoryIndexer {
         Ok(text)
     }
 
+    /// Drop the cached briefing. Called on every settings/forget mutation:
+    /// a user who disables memory or forgets a project must not get the old
+    /// briefing injected for another 30 seconds.
+    fn invalidate_briefing(&self) {
+        *lock(&self.briefing_cache) = None;
+    }
+
     pub fn set_enabled(
         &self,
         project_id: &str,
         enabled: bool,
     ) -> Result<(), komet_memory::MemoryError> {
-        self.svc.set_enabled(project_id, enabled)
+        self.svc.set_enabled(project_id, enabled)?;
+        self.invalidate_briefing();
+        Ok(())
     }
 
     pub fn is_enabled(&self, project_id: &str) -> Result<bool, komet_memory::MemoryError> {
@@ -643,7 +827,9 @@ impl MemoryIndexer {
         project_id: &str,
         exclusions: &[String],
     ) -> Result<(), komet_memory::MemoryError> {
-        self.svc.set_exclusions(project_id, exclusions)
+        self.svc.set_exclusions(project_id, exclusions)?;
+        self.invalidate_briefing();
+        Ok(())
     }
 
     pub fn search(
@@ -674,7 +860,9 @@ impl MemoryIndexer {
     pub fn forget_chat(&self, chat_id: &str) -> Result<usize, komet_memory::MemoryError> {
         lock(&self.projector).chats.remove(chat_id);
         let through = self.journal.last_seq(chat_id).ok().flatten();
-        self.svc.forget_chat(chat_id, through)
+        let removed = self.svc.forget_chat(chat_id, through)?;
+        self.invalidate_briefing();
+        Ok(removed)
     }
 
     /// Forget a whole project's derived memory. Each known chat gets a
@@ -694,7 +882,9 @@ impl MemoryIndexer {
                 .chats
                 .retain(|_, ctx| ctx.project_id != project_id);
         }
-        self.svc.forget_project(project_id, &horizons)
+        let removed = self.svc.forget_project(project_id, &horizons)?;
+        self.invalidate_briefing();
+        Ok(removed)
     }
 
     pub fn stats(
@@ -702,6 +892,130 @@ impl MemoryIndexer {
         project_id: &str,
     ) -> Result<komet_memory::MemoryStats, komet_memory::MemoryError> {
         self.svc.stats(project_id)
+    }
+
+    // ── settings (Settings → Memory) ─────────────────────────────────────
+
+    /// Journal chats the index has never seen — the "Index history"
+    /// button's reason to exist. `0` once everything is tracked.
+    pub fn untracked_journal_chats(&self) -> usize {
+        let Ok(journals) = self.journal.chat_ids() else {
+            return 0;
+        };
+        let known: std::collections::HashSet<String> = self
+            .svc
+            .known_chats()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        journals.iter().filter(|id| !known.contains(*id)).count()
+    }
+
+    /// "Index history": the next catch-up pass replays every journal,
+    /// including chats the index never tracked (pre-feature history).
+    /// One-shot — the flag is consumed by the pass it triggers.
+    pub fn request_history_import(self: &Arc<Self>) {
+        self.import_untracked.store(true, Ordering::SeqCst);
+        self.catch_up();
+    }
+
+    /// Global kill switch. OFF stops recording/briefing/catch-up; stored
+    /// data is kept. Persists to `memory-config.json` immediately.
+    pub fn set_global_enabled(&self, enabled: bool) -> Result<(), komet_memory::MemoryError> {
+        self.enabled.store(enabled, Ordering::Relaxed);
+        {
+            let mut config = lock(&self.config);
+            config.enabled = enabled;
+            config.save(&self.data_dir).map_err(|e| {
+                komet_memory::MemoryError::Other(format!("save memory config: {e}"))
+            })?;
+        }
+        self.invalidate_briefing();
+        Ok(())
+    }
+
+    pub fn global_enabled(&self) -> bool {
+        self.enabled.load(Ordering::Relaxed)
+    }
+
+    /// Retention in days (clamped to the config bounds). Applies to the
+    /// next prune tick and to replay-expiry checks.
+    pub fn set_retention_days(&self, days: u32) -> Result<(), komet_memory::MemoryError> {
+        let days = days.clamp(
+            komet_memory::RETENTION_DAYS_MIN,
+            komet_memory::RETENTION_DAYS_MAX,
+        );
+        self.retention_days.store(days, Ordering::Relaxed);
+        {
+            let mut config = lock(&self.config);
+            config.retention_days = days;
+            config.save(&self.data_dir).map_err(|e| {
+                komet_memory::MemoryError::Other(format!("save memory config: {e}"))
+            })?;
+        }
+        Ok(())
+    }
+
+    pub fn retention_days(&self) -> u32 {
+        self.retention_days.load(Ordering::Relaxed)
+    }
+
+    /// Point the store at a new location. Persisted to the config file and
+    /// applied at the NEXT engine start (the running store is never moved
+    /// under live connections). `None` resets to `<data_dir>/memory`.
+    pub fn set_location(&self, location: Option<String>) -> Result<(), komet_memory::MemoryError> {
+        {
+            let mut config = lock(&self.config);
+            config.location = location;
+            config.save(&self.data_dir).map_err(|e| {
+                komet_memory::MemoryError::Other(format!("save memory config: {e}"))
+            })?;
+        }
+        Ok(())
+    }
+
+    /// The directory the store is open at right now.
+    pub fn store_dir(&self) -> &std::path::Path {
+        &self.store_dir
+    }
+
+    /// The configured custom location, if any — may differ from
+    /// [`Self::store_dir`] until the next restart applies it.
+    pub fn pending_location(&self) -> Option<String> {
+        lock(&self.config).location.clone()
+    }
+
+    /// All known projects with settings + footprint (settings page list).
+    pub fn list_projects(
+        &self,
+    ) -> Result<Vec<komet_memory::ProjectInfo>, komet_memory::MemoryError> {
+        self.svc.list_projects()
+    }
+
+    /// Store-wide event/chat counts (per-project `stats` exists too).
+    pub fn totals(&self) -> Result<(i64, i64), komet_memory::MemoryError> {
+        self.svc.totals()
+    }
+
+    /// "Forget all": wipe every project's derived rows AND tombstone every
+    /// known chat at its journal tail so catch-up cannot rebuild them.
+    /// Project settings (enable flags, exclusions, location) are kept.
+    pub fn forget_all(&self) -> Result<usize, komet_memory::MemoryError> {
+        let chats = self.svc.known_chats()?;
+        let mut horizons = Vec::with_capacity(chats.len());
+        for chat_id in chats {
+            if let Ok(Some(seq)) = self.journal.last_seq(&chat_id) {
+                horizons.push((chat_id, seq));
+            }
+        }
+        {
+            let mut projector = lock(&self.projector);
+            projector.chats.clear();
+            projector.cwd_projects.clear();
+        }
+        let removed = self.svc.forget_all(&horizons)?;
+        self.invalidate_briefing();
+        Ok(removed)
     }
 }
 

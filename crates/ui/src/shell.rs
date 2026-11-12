@@ -40,6 +40,7 @@ use crate::settings::archived::ArchivedPage;
 use crate::settings::devices::DevicesPage;
 use crate::settings::files::FilesSettingsPage;
 use crate::settings::integrations::IntegrationsPage;
+use crate::settings::memory::MemoryPage;
 use crate::settings::notifications::{NotificationsEvent, NotificationsPage};
 use crate::settings::providers::ProvidersPage;
 use crate::settings::security::{SecurityDefaults, SecurityEvent, SecurityPage};
@@ -335,6 +336,7 @@ pub struct Shell {
     shortcuts_page: Option<Entity<ShortcutsPage>>,
     providers_page: Option<Entity<ProvidersPage>>,
     usage_page: Option<Entity<UsagePage>>,
+    memory_page: Option<Entity<MemoryPage>>,
     security_page: Option<Entity<SecurityPage>>,
     sync_page: Option<Entity<SyncPage>>,
     integrations_page: Option<Entity<IntegrationsPage>>,
@@ -697,6 +699,7 @@ impl Shell {
             shortcuts_page: None,
             providers_page: None,
             usage_page: None,
+            memory_page: None,
             security_page: None,
             sync_page: None,
             integrations_page: None,
