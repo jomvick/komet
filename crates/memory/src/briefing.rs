@@ -101,17 +101,24 @@ fn agent_line(agent: &crate::record::AgentDigest, now_ms: i64) -> String {
     line
 }
 
-/// Strip control characters and line breaks, collapse whitespace — a file
-/// name must never be able to inject a fake briefing line or instruction.
+/// Strip control characters, line breaks, and invisible format characters
+/// (zero-width, bidi overrides, BOM — none covered by `is_control`), collapse
+/// whitespace, and neutralize `<`/`>` so a hostile file name can neither
+/// inject a fake briefing line nor close the `<komet-memory>` block early.
 fn sanitize(text: &str) -> String {
     let cleaned: String = text
         .chars()
-        .map(|c| {
-            if c.is_control() || c.is_whitespace() && c != ' ' {
+        .map(|c| match c {
+            '<' => '‹',
+            '>' => '›',
+            _ if c.is_control()
+                || (c.is_whitespace() && c != ' ')
+                || matches!(c as u32,
+                    0x200B..=0x200F | 0x202A..=0x202E | 0x2066..=0x2069 | 0xFEFF) =>
+            {
                 ' '
-            } else {
-                c
             }
+            _ => c,
         })
         .collect();
     cleaned.split_whitespace().collect::<Vec<_>>().join(" ")

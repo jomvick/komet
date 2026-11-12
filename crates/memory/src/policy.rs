@@ -87,11 +87,18 @@ pub fn contains_secret_value(text: &str) -> bool {
         let mut search_from = 0usize;
         while let Some(pos) = lower[search_from..].find(prefix) {
             let start = search_from + pos;
-            let preceded_ok = start == 0 || !is_token_char(lower.as_bytes()[start - 1]);
+            // Boundary: anything that is not a plain alphanumeric counts —
+            // `token_ghp_…` and `dir/sk-…` are both real embeddings, while
+            // `task-`/`disk-`/`risk-` prefixes fail the TAIL check below.
+            let preceded_ok = start == 0 || !lower.as_bytes()[start - 1].is_ascii_alphanumeric();
             if preceded_ok {
+                // Tail = consecutive [a-z0-9] only: real tokens are alnum
+                // runs, so `sk-learn-pipeline` (tail "learn" = 5) and
+                // `asia-pacific-report` (tail "" = 0) can't reach the
+                // minimum, while `AKIA`+16 and `sk-`+20 still do.
                 let tail: usize = lower.as_bytes()[start + prefix.len()..]
                     .iter()
-                    .take_while(|b| is_token_char(**b))
+                    .take_while(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
                     .count();
                 if tail >= *min_tail {
                     return true;
@@ -101,12 +108,6 @@ pub fn contains_secret_value(text: &str) -> bool {
         }
         false
     })
-}
-
-/// `[a-z0-9_-]` — the charset real tokens are drawn from (and what must
-/// NOT precede a prefix for the boundary check to hold).
-fn is_token_char(b: u8) -> bool {
-    b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-'
 }
 
 /// (prefix, minimum trailing token chars) for well-known credential shapes.
@@ -181,7 +182,13 @@ pub fn project_id_for(cwd: &str) -> String {
 /// `None` outside any git repository.
 fn git_common_dir(cwd: &str) -> Option<PathBuf> {
     let base = std::fs::canonicalize(cwd).unwrap_or_else(|_| PathBuf::from(absolute_lexical(cwd)));
+    let home = dirs_home().map(PathBuf::from);
     for dir in base.ancestors() {
+        // Never climb into $HOME itself: a dotfiles repo (`~/.git`) must not
+        // swallow unrelated projects living under home.
+        if home.as_deref() == Some(dir) {
+            break;
+        }
         let dotgit = dir.join(".git");
         if dotgit.is_dir() {
             return Some(dotgit);
@@ -324,9 +331,8 @@ pub fn is_default_excluded(rel: &str) -> bool {
 /// patterns. Patterns are matched against the whole relative path:
 /// `*` matches any run of characters (including `/`), `?` one character;
 /// a pattern without wildcards matches as a path-prefix on a `/` boundary
-/// (`secrets` excludes `secrets/x` but not `src/secrets/x`? — it DOES match
-/// any component boundary: we match if the pattern equals the path or is a
-/// leading segment sequence).
+/// (`secrets` excludes `secrets/x`), or as a whole segment sequence
+/// anywhere in the path (`api/secrets/x` is excluded too).
 pub fn user_excluded(rel: &str, patterns: &[String]) -> bool {
     patterns.iter().any(|pat| {
         let pat = pat.trim();
@@ -515,6 +521,15 @@ mod tests {
         assert!(!contains_secret_value("risk-model.rs"));
         assert!(!contains_secret_value("asian-markets.md"));
         assert!(!contains_secret_value("sk-short"));
+        // `-`/`_` are boundaries, but the alnum-only tail still rejects
+        // hyphenated prose that happens to start with a prefix.
+        assert!(!contains_secret_value("docs/asian-markets-overview.md"));
+        assert!(!contains_secret_value("asia-pacific-report-2026.md"));
+        assert!(!contains_secret_value("sk-learn-pipeline-notes.md"));
+        // …while a real token embedded after `_` IS caught.
+        assert!(contains_secret_value(
+            "token_ghp_abcdefghijklmnopqrstuvwxyz0123456789"
+        ));
     }
 
     #[test]

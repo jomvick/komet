@@ -77,6 +77,9 @@ impl MemoryService {
         let path = dir.join(DB_FILE);
         let open_conn = |path: &Path| -> Result<Connection, MemoryError> {
             let conn = Connection::open(path)?;
+            // auto_vacuum must be set before any table exists to take
+            // effect; it is a no-op on databases that already have tables.
+            conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
             conn.pragma_update(None, "journal_mode", "WAL")?;
             conn.pragma_update(None, "synchronous", "NORMAL")?;
             conn.pragma_update(None, "foreign_keys", "ON")?;
@@ -86,9 +89,6 @@ impl MemoryService {
             Ok(conn)
         };
         let mut conn = open_conn(&path)?;
-        // Must precede table creation to take effect; a no-op on databases
-        // created before this pragma existed (they'd need a VACUUM).
-        conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
         migrate(&mut conn)?;
         // One-shot planner stats after migrations (cheap on a fresh/small db).
         conn.execute_batch("PRAGMA optimize;")?;
@@ -266,7 +266,18 @@ impl MemoryService {
         let events = if self.fts {
             let match_expr = terms
                 .iter()
-                .map(|t| format!("\"{}\"", t.replace('"', "")))
+                .enumerate()
+                .map(|(i, t)| {
+                    // Last term becomes a prefix query so the FTS
+                    // `prefix='2 3'` index is actually exercised
+                    // ("src/mai"* → src/main.rs).
+                    let quoted = format!("\"{}\"", t.replace('"', ""));
+                    if i + 1 == terms.len() {
+                        format!("{quoted}*")
+                    } else {
+                        quoted
+                    }
+                })
                 .collect::<Vec<_>>()
                 .join(" AND ");
             let mut stmt = conn.prepare(
@@ -408,16 +419,20 @@ impl MemoryService {
             .collect();
         drop(stmt);
 
-        // Latest session_end outcome per agent.
+        // Latest session_end outcome per agent — window function, not a
+        // correlated subquery (O(events) once, and `id` breaks mtime ties:
+        // replayed events share one timestamp).
         let mut stmt = conn.prepare(
-            "SELECT agent, outcome FROM memory_events e
-             WHERE project_id = ?1 AND kind = 'session_end'
-               AND (?2 IS NULL OR chat_id != ?2) AND occurred_at_ms >= ?3
-               AND occurred_at_ms = (
-                 SELECT MAX(occurred_at_ms) FROM memory_events
-                 WHERE project_id = ?1 AND agent = e.agent AND kind = 'session_end'
-                   AND (?2 IS NULL OR chat_id != ?2)
-               )",
+            "SELECT agent, outcome FROM (
+               SELECT agent, outcome,
+                      ROW_NUMBER() OVER (
+                        PARTITION BY agent
+                        ORDER BY occurred_at_ms DESC, id DESC
+                      ) AS rn
+               FROM memory_events
+               WHERE project_id = ?1 AND kind = 'session_end'
+                 AND (?2 IS NULL OR chat_id != ?2) AND occurred_at_ms >= ?3
+             ) WHERE rn = 1",
         )?;
         let statuses: Vec<(String, Option<String>)> = stmt
             .query_map(params![project_id, exclude_chat_id, since_ms], |r| {
@@ -431,18 +446,25 @@ impl MemoryService {
             }
         }
 
-        // Top modified paths per agent (write-ish file ops only — reads are
+        // Top modified paths PER AGENT (write-ish file ops only — reads are
         // counted, not listed; `tool_result` rows never carry paths here).
+        // ROW_NUMBER partition keeps a high-volume agent from crowding the
+        // others out of the briefing.
         let mut stmt = conn.prepare(
-            "SELECT agent, relative_path, MAX(occurred_at_ms) AS last_ms
-             FROM memory_events
-             WHERE project_id = ?1 AND kind = 'tool_call'
-               AND relative_path IS NOT NULL
-               AND tool_name IN ('write_file', 'edit_file', 'apply_patch')
-               AND (?2 IS NULL OR chat_id != ?2) AND occurred_at_ms >= ?3
-             GROUP BY agent, relative_path
-             ORDER BY last_ms DESC
-             LIMIT 200",
+            "SELECT agent, relative_path, last_ms FROM (
+               SELECT agent, relative_path, MAX(occurred_at_ms) AS last_ms,
+                      ROW_NUMBER() OVER (
+                        PARTITION BY agent
+                        ORDER BY MAX(occurred_at_ms) DESC
+                      ) AS rn
+               FROM memory_events
+               WHERE project_id = ?1 AND kind = 'tool_call'
+                 AND relative_path IS NOT NULL
+                 AND tool_name IN ('write_file', 'edit_file', 'apply_patch')
+                 AND (?2 IS NULL OR chat_id != ?2) AND occurred_at_ms >= ?3
+               GROUP BY agent, relative_path
+             ) WHERE rn <= 8
+             ORDER BY last_ms DESC",
         )?;
         let touches: Vec<(String, String, i64)> = stmt
             .query_map(params![project_id, exclude_chat_id, since_ms], |r| {
@@ -451,28 +473,27 @@ impl MemoryService {
             .collect::<Result<Vec<_>, _>>()?;
         drop(stmt);
         for (agent, path, last_ms) in touches {
-            if let Some(d) = agents.iter_mut().find(|a| a.agent == agent)
-                && d.modified_paths.len() < 8
-            {
+            if let Some(d) = agents.iter_mut().find(|a| a.agent == agent) {
                 d.modified_paths.push(FileTouch { path, last_ms });
             }
         }
-        // Keep each agent's paths newest-first.
-        for d in &mut agents {
-            d.modified_paths
-                .sort_by_key(|t| std::cmp::Reverse(t.last_ms));
-        }
 
-        // Recent failures, attributed per agent.
+        // Recent failures PER AGENT — same window-function fairness as the
+        // path query.
         let mut stmt = conn.prepare(
-            "SELECT agent, kind, tool_name, relative_path, outcome, occurred_at_ms
-             FROM memory_events
-             WHERE project_id = ?1
-               AND ((kind = 'tool_result' AND outcome = 'error')
-                 OR (kind = 'session_end' AND outcome IN ('errored', 'interrupted')))
-               AND (?2 IS NULL OR chat_id != ?2) AND occurred_at_ms >= ?3
-             ORDER BY occurred_at_ms DESC
-             LIMIT 30",
+            "SELECT agent, kind, tool_name, relative_path, outcome, occurred_at_ms FROM (
+               SELECT agent, kind, tool_name, relative_path, outcome, occurred_at_ms,
+                      ROW_NUMBER() OVER (
+                        PARTITION BY agent
+                        ORDER BY occurred_at_ms DESC, id DESC
+                      ) AS rn
+               FROM memory_events
+               WHERE project_id = ?1
+                 AND ((kind = 'tool_result' AND outcome = 'error')
+                   OR (kind = 'session_end' AND outcome IN ('errored', 'interrupted')))
+                 AND (?2 IS NULL OR chat_id != ?2) AND occurred_at_ms >= ?3
+             ) WHERE rn <= 5
+             ORDER BY occurred_at_ms DESC",
         )?;
         type FailureRow = (
             String,
@@ -505,9 +526,7 @@ impl MemoryService {
             } else {
                 format!("run {}", outcome.as_deref().unwrap_or("failed"))
             };
-            if let Some(d) = agents.iter_mut().find(|a| a.agent == agent)
-                && d.failures.len() < 5
-            {
+            if let Some(d) = agents.iter_mut().find(|a| a.agent == agent) {
                 d.failures.push(FailureDigest { label, last_ms: ms });
             }
         }
@@ -518,9 +537,12 @@ impl MemoryService {
         })
     }
 
-    /// "Who touched this path?" — the highest-value query for agent
-    /// handoff: every recorded op under `path_prefix` (project-relative),
-    /// newest first.
+    /// "Who touched this path?" — every recorded `tool_call` under
+    /// `path_prefix` (project-relative), newest first. `tool_call` only:
+    /// result rows would double-count each op and carry no extra path info.
+    /// The range comparison (`>= prefix`, `< prefix || U+10FFFF`) is a real
+    /// prefix match that can use `idx_memory_events_project_path` — LIKE
+    /// can't (case-insensitive by default → full project scan).
     pub fn touched(
         &self,
         project_id: &str,
@@ -534,14 +556,14 @@ impl MemoryService {
                     input_tokens, cached_input_tokens, output_tokens,
                     reasoning_tokens, duration_ms
              FROM memory_events
-             WHERE project_id = ?1 AND relative_path IS NOT NULL
-               AND (relative_path = ?2 OR relative_path LIKE ?3 ESCAPE '\\')
+             WHERE project_id = ?1 AND kind = 'tool_call'
+               AND relative_path >= ?2
+               AND relative_path < ?2 || char(1114111)
              ORDER BY occurred_at_ms DESC
-             LIMIT ?4",
+             LIMIT ?3",
         )?;
-        let prefix = format!("{}%", escape_like(path_prefix));
         let rows = stmt.query_map(
-            params![project_id, path_prefix, prefix, limit.clamp(1, 200) as i64],
+            params![project_id, path_prefix, limit.clamp(1, 200) as i64],
             row_to_event,
         )?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -559,10 +581,44 @@ impl MemoryService {
         Ok(rows)
     }
 
+    /// Chats known to belong to a project — used by `forget_project` to
+    /// build per-chat replay horizons so catch-up cannot resurrect rows.
+    pub fn project_chats(&self, project_id: &str) -> Result<Vec<String>, MemoryError> {
+        let conn = lock(&self.conn);
+        let mut stmt = conn.prepare(
+            "SELECT chat_id FROM memory_chat_state WHERE project_id = ?1
+             UNION
+             SELECT chat_id FROM memory_events WHERE project_id = ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![project_id], |r| r.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Clear a persisted gap marker without touching the cursor — used when
+    /// the journal backing the gap no longer exists (nothing to replay).
+    pub fn clear_gap(&self, chat_id: &str) -> Result<(), MemoryError> {
+        let conn = lock(&self.write);
+        conn.execute(
+            "UPDATE memory_chat_state SET gap_seq = NULL WHERE chat_id = ?1",
+            params![chat_id],
+        )?;
+        Ok(())
+    }
+
     // ── forget ────────────────────────────────────────────────────────────
 
-    /// Delete every retained record for one chat (events + FTS rows + cursor).
-    pub fn forget_chat(&self, chat_id: &str) -> Result<usize, MemoryError> {
+    /// Delete every retained record for one chat, leaving a tombstone in
+    /// `memory_chat_state`: `last_seq` is advanced to `through_seq` (the
+    /// journal tail at forget time) so a later catch-up replays only events
+    /// AFTER the forget point instead of resurrecting the deleted range.
+    /// `None` = journal unreadable/gone → keep the existing cursor.
+    pub fn forget_chat(
+        &self,
+        chat_id: &str,
+        through_seq: Option<u64>,
+    ) -> Result<usize, MemoryError> {
         let conn = lock(&self.write);
         let tx = conn.unchecked_transaction()?;
         let ids: Vec<i64> = {
@@ -578,15 +634,26 @@ impl MemoryService {
             params![chat_id],
         )?;
         tx.execute(
-            "DELETE FROM memory_chat_state WHERE chat_id = ?1",
-            params![chat_id],
+            "INSERT INTO memory_chat_state(chat_id, last_seq) VALUES(?1, COALESCE(?2, 0))
+             ON CONFLICT(chat_id) DO UPDATE SET
+               last_seq = MAX(memory_chat_state.last_seq,
+                              COALESCE(?2, memory_chat_state.last_seq)),
+               gap_seq = NULL",
+            params![chat_id, through_seq.map(|s| s as i64)],
         )?;
         tx.commit()?;
         Ok(removed)
     }
 
-    /// Delete every retained record for a whole project (all derived data).
-    pub fn forget_project(&self, project_id: &str) -> Result<usize, MemoryError> {
+    /// Delete every retained record for a whole project. `horizons` maps
+    /// each known chat to its journal tail so the tombstone cursors prevent
+    /// catch-up resurrection; project settings (enable flag, exclusions)
+    /// are kept — forgetting activity is not a settings reset.
+    pub fn forget_project(
+        &self,
+        project_id: &str,
+        horizons: &[(String, u64)],
+    ) -> Result<usize, MemoryError> {
         let conn = lock(&self.write);
         let tx = conn.unchecked_transaction()?;
         let ids: Vec<i64> = {
@@ -601,15 +668,25 @@ impl MemoryService {
             "DELETE FROM memory_events WHERE project_id = ?1",
             params![project_id],
         )?;
+        // Tombstones: jump every known chat's cursor past its journal tail
+        // and clear pending gaps so replay cannot rebuild the deleted rows.
+        for (chat_id, seq) in horizons {
+            tx.execute(
+                "INSERT INTO memory_chat_state(chat_id, project_id, last_seq)
+                 VALUES(?1, ?2, ?3)
+                 ON CONFLICT(chat_id) DO UPDATE SET
+                   last_seq = MAX(memory_chat_state.last_seq, excluded.last_seq),
+                   gap_seq = NULL",
+                params![chat_id, project_id, *seq as i64],
+            )?;
+        }
         tx.execute(
-            "DELETE FROM memory_chat_state WHERE project_id = ?1",
-            params![project_id],
-        )?;
-        tx.execute(
-            "DELETE FROM memory_projects WHERE project_id = ?1",
+            "UPDATE memory_chat_state SET gap_seq = NULL WHERE project_id = ?1",
             params![project_id],
         )?;
         tx.commit()?;
+        // Return freed pages to the OS incrementally (auto_vacuum=INCREMENTAL).
+        let _ = conn.execute_batch("PRAGMA incremental_vacuum;");
         Ok(removed)
     }
 
@@ -756,6 +833,22 @@ fn migrate(conn: &mut Connection) -> Result<(), MemoryError> {
              );
              PRAGMA user_version = 1;",
         )?;
+    }
+    if version < 2 {
+        // v1 → v2: project identity moved from canonical cwd to the git
+        // common dir, so every v1 `project_id` is an unreachable orphan.
+        // Phase 1 has not shipped — wipe rather than migrate.
+        conn.execute_batch(
+            "DELETE FROM memory_events;
+             DELETE FROM memory_chat_state;
+             DELETE FROM memory_projects;",
+        )?;
+        if fts_table_exists(conn)? {
+            // External-content FTS: 'rebuild' re-indexes from the (now
+            // empty) content table, clearing stale rows.
+            conn.execute_batch("INSERT INTO memory_fts(memory_fts) VALUES('rebuild');")?;
+        }
+        conn.execute_batch("PRAGMA user_version = 2;")?;
     }
     Ok(())
 }
@@ -1116,33 +1209,121 @@ mod tests {
     }
 
     #[test]
-    fn forget_removes_events_fts_and_cursor() {
+    fn forget_chat_leaves_tombstone_cursor() {
         let (svc, _dir) = svc();
         svc.enqueue(MemoryItem::Record(Box::new(rec(1, "session_start"))))
             .unwrap();
         wait_for(|| svc.stats("p_test").unwrap().events == 1);
-        assert_eq!(svc.forget_chat("chat-1").unwrap(), 1);
+        // Journal tail is seq 7: the tombstone must land there so a replay
+        // from the cursor cannot resurrect the deleted range.
+        assert_eq!(svc.forget_chat("chat-1", Some(7)).unwrap(), 1);
         assert_eq!(svc.stats("p_test").unwrap().events, 0);
-        // Cursor row is gone: a fresh replay starts from zero again.
-        assert_eq!(svc.chat_cursor("chat-1").unwrap().last_seq, 0);
+        let cursor = svc.chat_cursor("chat-1").unwrap();
+        assert_eq!(cursor.last_seq, 7);
+        assert_eq!(cursor.gap_seq, None);
         // FTS row must be gone too (external-content delete path).
         assert!(
             svc.search("p_test", "session_start", 10)
                 .unwrap()
                 .is_empty()
         );
+        // Re-enqueueing an OLD seq directly is still possible at this layer
+        // (the engine never does it — replay starts at last_seq), but the
+        // tombstone blocks nothing new: seq 8 indexes normally.
+        svc.enqueue(MemoryItem::Record(Box::new(rec(8, "session_start"))))
+            .unwrap();
+        wait_for(|| svc.stats("p_test").unwrap().events == 1);
     }
 
     #[test]
-    fn forget_project_clears_settings_too() {
+    fn forget_project_keeps_settings_and_tombstones_chats() {
         let (svc, _dir) = svc();
         svc.set_enabled("p_test", false).unwrap();
         svc.enqueue(MemoryItem::Record(Box::new(rec(1, "session_start"))))
             .unwrap();
         wait_for(|| svc.chat_cursor("chat-1").unwrap().last_seq == 1);
-        svc.forget_project("p_test").unwrap();
-        assert!(svc.is_enabled("p_test").unwrap(), "default is enabled");
-        assert_eq!(svc.chat_cursor("chat-1").unwrap().last_seq, 0);
+        svc.forget_project("p_test", &[("chat-1".into(), 9)])
+            .unwrap();
+        // Forgetting activity is not a settings reset.
+        assert!(!svc.is_enabled("p_test").unwrap());
+        let cursor = svc.chat_cursor("chat-1").unwrap();
+        assert_eq!(cursor.last_seq, 9);
+        assert_eq!(cursor.gap_seq, None);
+    }
+
+    #[test]
+    fn briefing_digest_is_fair_across_agents() {
+        let (svc, _dir) = svc();
+        // Agent A floods 300 modified paths; agent B touches 2. The global
+        // LIMIT used to starve B entirely — per-agent windows must not.
+        let now = now_ms();
+        for seq in 1..=300u64 {
+            let mut r = rec(seq, "tool_call");
+            r.agent = "agent-a".into();
+            r.tool_name = Some("edit_file".into());
+            r.relative_path = Some(format!("src/a{seq}.rs"));
+            r.occurred_at_ms = now;
+            svc.enqueue(MemoryItem::Record(Box::new(r))).unwrap();
+        }
+        for (i, seq) in [301u64, 302].iter().enumerate() {
+            let mut r = rec(*seq, "tool_call");
+            r.agent = "agent-b".into();
+            r.tool_name = Some("write_file".into());
+            r.relative_path = Some(format!("src/b{}.rs", i + 1));
+            r.occurred_at_ms = now;
+            svc.enqueue(MemoryItem::Record(Box::new(r))).unwrap();
+        }
+        // B also gets a session_end so it has an agent row in the digest.
+        let mut end = rec(303, "session_end");
+        end.agent = "agent-b".into();
+        end.outcome = Some("completed".into());
+        end.occurred_at_ms = now;
+        svc.enqueue(MemoryItem::Record(Box::new(end))).unwrap();
+        wait_for(|| svc.stats("p_test").unwrap().events == 303);
+
+        let digest = svc.briefing_digest("p_test", None, now - 1000).unwrap();
+        let b = digest
+            .agents
+            .iter()
+            .find(|a| a.agent == "agent-b")
+            .expect("agent-b must appear despite agent-a's volume");
+        assert_eq!(b.modified_paths.len(), 2);
+        let a = digest.agents.iter().find(|a| a.agent == "agent-a").unwrap();
+        assert_eq!(a.modified_paths.len(), 8, "per-agent cap is 8");
+    }
+
+    #[test]
+    fn auto_vacuum_is_incremental_on_fresh_db() {
+        let (svc, _dir) = svc();
+        let conn = lock(&svc.conn);
+        let mode: i64 = conn
+            .pragma_query_value(None, "auto_vacuum", |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode, 2, "INCREMENTAL must be set before tables exist");
+    }
+
+    #[test]
+    fn touched_uses_prefix_range_and_lists_calls_once() {
+        let (svc, _dir) = svc();
+        let mut call = rec(1, "tool_call");
+        call.tool_name = Some("edit_file".into());
+        call.relative_path = Some("src/main.rs".into());
+        let mut result = rec(2, "tool_result");
+        result.tool_name = Some("edit_file".into());
+        result.relative_path = Some("src/main.rs".into());
+        result.outcome = Some("ok".into());
+        let mut other = rec(3, "tool_call");
+        other.tool_name = Some("read_file".into());
+        other.relative_path = Some("src/other.rs".into());
+        for r in [call, result, other] {
+            svc.enqueue(MemoryItem::Record(Box::new(r))).unwrap();
+        }
+        wait_for(|| svc.stats("p_test").unwrap().events == 3);
+        let hits = svc.touched("p_test", "src/mai", 10).unwrap();
+        // Prefix match on "src/mai" hits "src/main.rs"; the tool_result row
+        // is filtered out (kind='tool_call') so each op appears once.
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].relative_path.as_deref(), Some("src/main.rs"));
     }
 
     #[test]

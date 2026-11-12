@@ -345,6 +345,13 @@ const CATCHUP_MIN_INTERVAL: Duration = Duration::from_secs(5);
 /// gaps that need a journal replay (writer failures leave these behind).
 const GAP_TICK_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Briefing results are cached briefly: a dispatch storm (or a retry loop)
+/// must not re-run four aggregate queries per run launch.
+const BRIEFING_CACHE_TTL: Duration = Duration::from_secs(30);
+
+/// Cached briefing: (project_id, exclude_chat_id, computed_at, text).
+type BriefingCacheEntry = (String, Option<String>, Instant, Option<String>);
+
 /// The engine-facing memory indexer: projection + queue + journal catch-up.
 pub struct MemoryIndexer {
     svc: Arc<MemoryService>,
@@ -354,6 +361,9 @@ pub struct MemoryIndexer {
     lag: Mutex<HashMap<String, u64>>,
     catchup_running: AtomicBool,
     last_catchup: Mutex<Option<Instant>>,
+    /// (project_id, exclude_chat_id, computed_at, text) — see
+    /// [`Self::briefing`].
+    briefing_cache: Mutex<Option<BriefingCacheEntry>>,
 }
 
 impl MemoryIndexer {
@@ -373,6 +383,7 @@ impl MemoryIndexer {
             lag: Mutex::new(HashMap::new()),
             catchup_running: AtomicBool::new(false),
             last_catchup: Mutex::new(None),
+            briefing_cache: Mutex::new(None),
         });
         // Periodic gap check: a failed writer batch persists gap markers but
         // nothing re-triggers catch-up until the next overflow or restart.
@@ -426,22 +437,23 @@ impl MemoryIndexer {
         }
     }
 
-    /// A queue item failed `try_send`: remember the lowest dropped seq,
-    /// persist the gap marker (tiny write, overflow path only), and schedule
-    /// a throttled catch-up.
+    /// A queue item failed `try_send`: remember the lowest dropped seq and
+    /// schedule a throttled catch-up. The gap marker is persisted only when
+    /// the lag entry is new or moves lower — one tiny write per overflow
+    /// episode, never one per dropped event (the writer is exactly what is
+    /// busy during an overflow, and `note_gap` would wait on it).
     fn note_drop(self: &Arc<Self>, chat_id: &str, seq: u64) {
-        {
+        let new_low = {
             let mut lag = lock(&self.lag);
             match lag.get(chat_id) {
-                Some(existing) if *existing <= seq => {}
+                Some(existing) if *existing <= seq => false,
                 _ => {
                     lag.insert(chat_id.to_string(), seq);
+                    true
                 }
             }
-        }
-        // Persist so a restart doesn't lose the gap (the in-memory map dies
-        // with the engine). Rare path — one small upsert.
-        if let Err(err) = self.svc.note_gap(chat_id, seq) {
+        };
+        if new_low && let Err(err) = self.svc.note_gap(chat_id, seq) {
             tracing::warn!(chat = %chat_id, error = %err, "memory: gap marker write failed");
         }
         self.maybe_catch_up();
@@ -487,8 +499,17 @@ impl MemoryIndexer {
                 return;
             }
         };
-        for chat_id in chat_ids {
-            self.catch_up_chat(&chat_id);
+        for chat_id in &chat_ids {
+            self.catch_up_chat(chat_id);
+        }
+        // Gaps whose journal is gone can never be replayed — clear them or
+        // the 60s tick would rescan forever.
+        if let Ok(gaps) = self.svc.chats_with_gaps() {
+            for chat_id in gaps {
+                if !chat_ids.contains(&chat_id) {
+                    let _ = self.svc.clear_gap(&chat_id);
+                }
+            }
         }
     }
 
@@ -512,6 +533,11 @@ impl MemoryIndexer {
         if journal_last <= from {
             // Nothing new (also guards the journal era-fallback: a cursor
             // ahead of the file's tail must not trigger a full re-replay).
+            // With a gap marker the journal tail doesn't even reach the
+            // dropped seq — the lines are gone, nothing left to heal.
+            if cursor.gap_seq.is_some() {
+                let _ = self.svc.clear_gap(chat_id);
+            }
             return;
         }
         let events = match self.journal.replay(chat_id, from) {
@@ -522,6 +548,9 @@ impl MemoryIndexer {
             }
         };
         if events.is_empty() {
+            if cursor.gap_seq.is_some() {
+                let _ = self.svc.clear_gap(chat_id);
+            }
             return;
         }
         let reached = events.last().map(|(seq, _)| *seq).unwrap_or(from);
@@ -572,14 +601,29 @@ impl MemoryIndexer {
     // ── queries / settings passthroughs ──────────────────────────────────
 
     /// Handoff briefing for a run about to start in `cwd`, excluding the
-    /// receiving chat's own activity, or `None`.
+    /// receiving chat's own activity, or `None`. Cached for
+    /// [`BRIEFING_CACHE_TTL`] — the digest queries are the most expensive
+    /// read in the store and dispatch can be bursty.
     pub fn briefing(
         &self,
         cwd: &str,
         exclude_chat_id: Option<&str>,
     ) -> Result<Option<String>, komet_memory::MemoryError> {
         let project_id = lock(&self.projector).project_id(cwd);
-        self.svc.briefing(&project_id, exclude_chat_id)
+        let exclude = exclude_chat_id.map(str::to_string);
+        {
+            let cache = lock(&self.briefing_cache);
+            if let Some((pid, cid, at, text)) = cache.as_ref()
+                && pid == &project_id
+                && cid == &exclude
+                && at.elapsed() < BRIEFING_CACHE_TTL
+            {
+                return Ok(text.clone());
+            }
+        }
+        let text = self.svc.briefing(&project_id, exclude_chat_id)?;
+        *lock(&self.briefing_cache) = Some((project_id, exclude, Instant::now(), text.clone()));
+        Ok(text)
     }
 
     pub fn set_enabled(
@@ -624,14 +668,33 @@ impl MemoryIndexer {
 
     /// Forget one chat's memory rows AND its projector context — chat
     /// deletion must not leak `ChatMemoryCtx` entries (pending tool pairings,
-    /// per-chat cwd cache) for the engine's lifetime.
+    /// per-chat cwd cache) for the engine's lifetime. The store keeps a
+    /// tombstone cursor at the journal tail so catch-up cannot resurrect
+    /// the deleted range.
     pub fn forget_chat(&self, chat_id: &str) -> Result<usize, komet_memory::MemoryError> {
         lock(&self.projector).chats.remove(chat_id);
-        self.svc.forget_chat(chat_id)
+        let through = self.journal.last_seq(chat_id).ok().flatten();
+        self.svc.forget_chat(chat_id, through)
     }
 
+    /// Forget a whole project's derived memory. Each known chat gets a
+    /// tombstone at its journal tail (same anti-resurrection guarantee as
+    /// [`Self::forget_chat`]); projector contexts for the project go too.
     pub fn forget_project(&self, project_id: &str) -> Result<usize, komet_memory::MemoryError> {
-        self.svc.forget_project(project_id)
+        let chats = self.svc.project_chats(project_id)?;
+        let mut horizons = Vec::with_capacity(chats.len());
+        for chat_id in chats {
+            if let Ok(Some(seq)) = self.journal.last_seq(&chat_id) {
+                horizons.push((chat_id, seq));
+            }
+        }
+        {
+            let mut projector = lock(&self.projector);
+            projector
+                .chats
+                .retain(|_, ctx| ctx.project_id != project_id);
+        }
+        self.svc.forget_project(project_id, &horizons)
     }
 
     pub fn stats(
