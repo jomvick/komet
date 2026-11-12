@@ -159,7 +159,8 @@ komet/
                                  # local project-memory integration and internal MCP tools
     memory/       komet-memory   # per-device SQLite activity/fact store, privacy filters,
                                  # bounded writer, FTS search, handoff briefings, code graph,
-                                 # and one-way Obsidian export (never session/workspace sync)
+                                 # opt-in local semantic search, and one-way Obsidian export
+                                 # (never session/workspace sync)
     rpc/          komet-rpc      # UiRpc/ControlRpc: typed req/resp/stream over WS (tokio-
                                  # tungstenite) + in-memory transport; device-room virtual
                                  # sockets ({s,k,to,from} frames)

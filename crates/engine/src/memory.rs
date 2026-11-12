@@ -1,4 +1,4 @@
-//! Engine glue for komet-memory (issue #78, Phase 1).
+//! Engine glue for komet-memory (issue #78).
 //!
 //! [`MemoryIndexer`] sits on the journal/broadcast boundary: every event
 //! `Inner::publish` journals is offered to the allow-listed projection here.
@@ -15,6 +15,8 @@
 //! catch-up batch) stays correct via `source_seq`.
 
 use std::collections::HashMap;
+#[cfg(feature = "memory-embeddings")]
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{Sender, channel};
@@ -460,6 +462,18 @@ pub struct MemoryIndexer {
     /// Set by "Index history": the next catch-up pass also replays journals
     /// the index has never seen (pre-feature history is opt-in, not silent).
     import_untracked: AtomicBool,
+    #[cfg(feature = "memory-embeddings")]
+    /// Chats with a live agent run. Embedding batches pause while this set
+    /// is non-empty; the model is loaded only after opt-in and while idle.
+    embedding_active_chats: Mutex<HashSet<String>>,
+    #[cfg(feature = "memory-embeddings")]
+    embedding_worker_running: AtomicBool,
+    #[cfg(feature = "memory-embeddings")]
+    embedding_processing: AtomicBool,
+    #[cfg(feature = "memory-embeddings")]
+    embedding_error: Mutex<Option<String>>,
+    #[cfg(feature = "memory-embeddings")]
+    embedding_model: Mutex<Option<komet_memory::LocalEmbedder>>,
 }
 
 impl MemoryIndexer {
@@ -514,7 +528,10 @@ impl MemoryIndexer {
                 candidates.push(default_dir.clone());
             }
             for dir in candidates {
-                match MemoryService::open(&dir) {
+                let embeddings_enabled = cfg!(feature = "memory-embeddings")
+                    && config.enabled
+                    && config.embeddings_enabled;
+                match MemoryService::open_with_embeddings(&dir, embeddings_enabled) {
                     Ok(svc) => {
                         opened = Some(svc);
                         break;
@@ -582,6 +599,16 @@ impl MemoryIndexer {
             data_dir,
             store_dir: effective_dir,
             import_untracked: AtomicBool::new(false),
+            #[cfg(feature = "memory-embeddings")]
+            embedding_active_chats: Mutex::new(HashSet::new()),
+            #[cfg(feature = "memory-embeddings")]
+            embedding_worker_running: AtomicBool::new(false),
+            #[cfg(feature = "memory-embeddings")]
+            embedding_processing: AtomicBool::new(false),
+            #[cfg(feature = "memory-embeddings")]
+            embedding_error: Mutex::new(None),
+            #[cfg(feature = "memory-embeddings")]
+            embedding_model: Mutex::new(None),
         });
         // Periodic gap check: a failed writer batch persists gap markers but
         // nothing re-triggers catch-up until the next overflow or restart.
@@ -634,6 +661,12 @@ impl MemoryIndexer {
         // whose forget failed) left intent in `memory-forget.pending`
         // next to the journals — apply it now that the index exists.
         indexer.drain_pending_forgets();
+        #[cfg(feature = "memory-embeddings")]
+        if indexer.embeddings_enabled() {
+            if let Err(error) = indexer.request_embedding_indexing() {
+                tracing::warn!(error = %error, "failed to start memory embedding worker");
+            }
+        }
         Ok(indexer)
     }
 
@@ -824,11 +857,30 @@ impl MemoryIndexer {
         lock(&self.projector).note_chat(chat_id, cwd, harness);
     }
 
+    #[cfg(feature = "memory-embeddings")]
+    pub fn set_agent_active(&self, chat_id: &str, active: bool) {
+        let mut chats = lock(&self.embedding_active_chats);
+        if active {
+            chats.insert(chat_id.to_string());
+        } else {
+            chats.remove(chat_id);
+        }
+    }
+
+    #[cfg(not(feature = "memory-embeddings"))]
+    pub fn set_agent_active(&self, _chat_id: &str, _active: bool) {}
+
     /// Offer one journaled event to the index. Called from `Inner::publish`
     /// AFTER the journal append succeeded; never blocks on SQLite.
     /// No-op while the global switch is off (the journal stays authoritative
     /// — re-enabling resumes from the cursor, nothing is lost).
     pub fn index_event(self: &Arc<Self>, chat_id: &str, seq: u64, event: &AgentEvent) {
+        #[cfg(feature = "memory-embeddings")]
+        match event {
+            AgentEvent::SessionStarted { .. } => self.set_agent_active(chat_id, true),
+            AgentEvent::Done { .. } => self.set_agent_active(chat_id, false),
+            _ => {}
+        }
         if seq == 0 || !self.enabled.load(Ordering::Relaxed) || !projectable(event) {
             return;
         }
@@ -1096,19 +1148,60 @@ impl MemoryIndexer {
         }
         let project_id = lock(&self.projector).project_id(cwd);
         let exclude = exclude_chat_id.map(str::to_string);
-        {
+        let cached = {
             let cache = lock(&self.briefing_cache);
             if let Some((pid, cid, at, text)) = cache.as_ref()
                 && pid == &project_id
                 && cid == &exclude
                 && at.elapsed() < BRIEFING_CACHE_TTL
             {
-                return Ok(text.clone());
+                text.clone()
+            } else {
+                None
+            }
+        };
+        let text = if let Some(cached) = cached {
+            Some(cached)
+        } else {
+            let text = self.svc.briefing(&project_id, exclude_chat_id)?;
+            *lock(&self.briefing_cache) =
+                Some((project_id.clone(), exclude, Instant::now(), text.clone()));
+            text
+        };
+        let Some(text) = text else {
+            return Ok(None);
+        };
+
+        let branch = current_branch(cwd);
+        let issue = branch.as_deref().and_then(issue_reference);
+        let exclusions = self.svc.exclusions(&project_id)?;
+        let recent = self.svc.recent(&project_id, 50, None)?;
+        let mut files = Vec::new();
+        for event in recent {
+            if exclude_chat_id == Some(event.chat_id.as_str()) {
+                continue;
+            }
+            let Some(path) = event.relative_path else {
+                continue;
+            };
+            if komet_memory::is_default_excluded(&path)
+                || komet_memory::user_excluded(&path, &exclusions)
+                || komet_memory::contains_secret_value(&path)
+                || files.contains(&path)
+            {
+                continue;
+            }
+            files.push(path);
+            if files.len() == 5 {
+                break;
             }
         }
-        let text = self.svc.briefing(&project_id, exclude_chat_id)?;
-        *lock(&self.briefing_cache) = Some((project_id, exclude, Instant::now(), text.clone()));
-        Ok(text)
+        Ok(Some(komet_memory::append_predictive_context(
+            &text,
+            branch.as_deref(),
+            issue.as_deref(),
+            &files,
+        )))
     }
 
     /// Drop the cached briefing. Called on every settings/forget mutation:
@@ -1287,6 +1380,17 @@ impl MemoryIndexer {
         self.svc.stats(project_id)
     }
 
+    pub fn resource_stats(
+        &self,
+    ) -> Result<(u64, Option<u64>, Option<u64>), komet_memory::MemoryError> {
+        let disk_bytes = memory_disk_bytes(&[
+            self.store_dir.clone(),
+            self.data_dir.join("models").join("memory"),
+        ])?;
+        let (process_cpu_ms, peak_rss_bytes) = process_resource_metrics();
+        Ok((disk_bytes, process_cpu_ms, peak_rss_bytes))
+    }
+
     // ── settings (Settings → Memory) ─────────────────────────────────────
 
     /// Journal chats the index has never seen — the "Index history"
@@ -1314,7 +1418,10 @@ impl MemoryIndexer {
 
     /// Global kill switch. OFF stops recording/briefing/catch-up; stored
     /// data is kept. Persists to `memory-config.json` immediately.
-    pub fn set_global_enabled(&self, enabled: bool) -> Result<(), komet_memory::MemoryError> {
+    pub fn set_global_enabled(
+        self: &Arc<Self>,
+        enabled: bool,
+    ) -> Result<(), komet_memory::MemoryError> {
         {
             let mut config = lock(&self.config);
             // Flag first, still under the config lock: a concurrent reader
@@ -1327,12 +1434,289 @@ impl MemoryIndexer {
                 komet_memory::MemoryError::Other(format!("save memory config: {e}"))
             })?;
         }
+        #[cfg(feature = "memory-embeddings")]
+        if !enabled {
+            *lock(&self.embedding_model) = None;
+        }
+        #[cfg(feature = "memory-embeddings")]
+        if enabled && self.embeddings_enabled() {
+            self.svc.enable_embeddings()?;
+            self.request_embedding_indexing()?;
+        }
         self.invalidate_briefing();
         Ok(())
     }
 
     pub fn global_enabled(&self) -> bool {
         self.enabled.load(Ordering::Relaxed)
+    }
+
+    #[cfg(feature = "memory-embeddings")]
+    pub fn embeddings_enabled(&self) -> bool {
+        lock(&self.config).embeddings_enabled
+    }
+
+    #[cfg(feature = "memory-embeddings")]
+    pub fn set_embeddings_enabled(
+        self: &Arc<Self>,
+        enabled: bool,
+    ) -> Result<(), komet_memory::MemoryError> {
+        if enabled && self.global_enabled() {
+            self.svc.enable_embeddings()?;
+        }
+        {
+            let mut config = lock(&self.config);
+            let mut updated = config.clone();
+            updated.embeddings_enabled = enabled;
+            updated.save(&self.data_dir).map_err(|error| {
+                komet_memory::MemoryError::Other(format!("save memory config: {error}"))
+            })?;
+            *config = updated;
+        }
+        if enabled {
+            self.request_embedding_indexing()?;
+        } else {
+            *lock(&self.embedding_model) = None;
+            *lock(&self.embedding_error) = None;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "memory-embeddings")]
+    pub fn embedding_status(
+        &self,
+    ) -> Result<(u64, u64, bool, Option<String>), komet_memory::MemoryError> {
+        if !self.embeddings_enabled() || !self.global_enabled() {
+            return Ok((0, 0, false, None));
+        }
+        let (indexed, total) = self.svc.embedding_counts()?;
+        Ok((
+            indexed,
+            total,
+            self.embedding_processing.load(Ordering::Relaxed),
+            lock(&self.embedding_error).clone(),
+        ))
+    }
+
+    #[cfg(feature = "memory-embeddings")]
+    pub fn semantic_search(
+        &self,
+        project_id: &str,
+        query: &str,
+    ) -> Result<Vec<komet_memory::SemanticMemoryMatch>, komet_memory::MemoryError> {
+        if !self.embeddings_enabled() {
+            return Err(komet_memory::MemoryError::Other(
+                "semantic search is not enabled".into(),
+            ));
+        }
+        if !self.global_enabled() {
+            return Err(komet_memory::MemoryError::Other(
+                "memory is disabled".into(),
+            ));
+        }
+        if !lock(&self.embedding_active_chats).is_empty() {
+            return Err(komet_memory::MemoryError::Other(
+                "semantic search is paused while an agent run is active".into(),
+            ));
+        }
+        let query = query.trim();
+        if query.is_empty() || query.len() > 512 {
+            return Err(komet_memory::MemoryError::Other(
+                "semantic search query must contain 1 to 512 bytes".into(),
+            ));
+        }
+        let mut model = lock(&self.embedding_model);
+        if model.is_none() {
+            let cache_dir = self.data_dir.join("models").join("memory");
+            *model = Some(komet_memory::LocalEmbedder::load(&cache_dir)?);
+        }
+        let active_chats = lock(&self.embedding_active_chats);
+        if !active_chats.is_empty() {
+            return Err(komet_memory::MemoryError::Other(
+                "semantic search is paused while an agent run is active".into(),
+            ));
+        }
+        let vectors = model
+            .as_mut()
+            .ok_or_else(|| {
+                komet_memory::MemoryError::Other("embedding model is unavailable".into())
+            })?
+            .embed(&[query.to_string()])?;
+        let embedding = vectors.first().ok_or_else(|| {
+            komet_memory::MemoryError::Other("embedding model returned no search vector".into())
+        })?;
+        self.svc.semantic_search_facts(project_id, embedding, 10)
+    }
+
+    #[cfg(feature = "memory-embeddings")]
+    pub fn request_embedding_indexing(self: &Arc<Self>) -> Result<(), komet_memory::MemoryError> {
+        if !self.embeddings_enabled() {
+            return Err(komet_memory::MemoryError::Other(
+                "semantic indexing is not enabled".into(),
+            ));
+        }
+        self.svc.enable_embeddings()?;
+        if self
+            .embedding_worker_running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            return Ok(());
+        }
+        *lock(&self.embedding_error) = None;
+        let indexer = Arc::downgrade(self);
+        let spawn = std::thread::Builder::new()
+            .name("komet-memory-embeddings".into())
+            .spawn(move || {
+                let mut failure = None;
+                loop {
+                    let Some(indexer) = indexer.upgrade() else {
+                        break;
+                    };
+                    if !indexer.embeddings_enabled() || !indexer.global_enabled() {
+                        drop(indexer);
+                        break;
+                    }
+                    if !lock(&indexer.embedding_active_chats).is_empty() {
+                        drop(indexer);
+                        std::thread::sleep(Duration::from_millis(500));
+                        continue;
+                    }
+                    let batch = match indexer.svc.facts_missing_embeddings(16) {
+                        Ok(batch) => batch,
+                        Err(error) => {
+                            failure = Some(error);
+                            break;
+                        }
+                    };
+                    if batch.is_empty() {
+                        drop(indexer);
+                        std::thread::sleep(Duration::from_secs(2));
+                        continue;
+                    }
+                    indexer.embedding_processing.store(true, Ordering::Release);
+                    if lock(&indexer.embedding_model).is_none() {
+                        let cache_dir = indexer.data_dir.join("models").join("memory");
+                        match komet_memory::LocalEmbedder::load(&cache_dir) {
+                            Ok(model) => *lock(&indexer.embedding_model) = Some(model),
+                            Err(error) => {
+                                failure = Some(error);
+                                break;
+                            }
+                        }
+                    }
+                    let texts: Vec<String> = batch.iter().map(|(_, text)| text.clone()).collect();
+                    let mut model = lock(&indexer.embedding_model);
+                    let active_chats = lock(&indexer.embedding_active_chats);
+                    if !active_chats.is_empty() {
+                        drop(active_chats);
+                        drop(model);
+                        indexer.embedding_processing.store(false, Ordering::Release);
+                        drop(indexer);
+                        std::thread::sleep(Duration::from_millis(500));
+                        continue;
+                    }
+                    let vectors = match model
+                        .as_mut()
+                        .ok_or_else(|| {
+                            komet_memory::MemoryError::Other(
+                                "embedding model initialization failed".into(),
+                            )
+                        })
+                        .and_then(|model| model.embed(&texts))
+                    {
+                        Ok(vectors) => vectors,
+                        Err(error) => {
+                            failure = Some(error);
+                            break;
+                        }
+                    };
+                    let embeddings: Vec<_> = batch
+                        .into_iter()
+                        .zip(vectors)
+                        .map(|((id, _), vector)| (id, vector))
+                        .collect();
+                    if let Err(error) = indexer.svc.store_fact_embeddings(&embeddings) {
+                        failure = Some(error);
+                        break;
+                    }
+                    drop(active_chats);
+                    drop(model);
+                    indexer.embedding_processing.store(false, Ordering::Release);
+                    drop(indexer);
+                }
+                if let Some(indexer) = indexer.upgrade() {
+                    let restart = failure.is_none()
+                        && indexer.embeddings_enabled()
+                        && indexer.global_enabled();
+                    if !indexer.embeddings_enabled() || !indexer.global_enabled() {
+                        *lock(&indexer.embedding_model) = None;
+                    }
+                    indexer.embedding_processing.store(false, Ordering::Release);
+                    if let Some(error) = failure {
+                        *lock(&indexer.embedding_error) = Some(error.to_string());
+                        tracing::warn!(error = %error, "memory embedding worker failed");
+                    }
+                    indexer
+                        .embedding_worker_running
+                        .store(false, Ordering::Release);
+                    if restart && let Err(error) = indexer.request_embedding_indexing() {
+                        tracing::warn!(error = %error, "memory embedding worker restart failed");
+                    }
+                }
+            });
+        if let Err(error) = spawn {
+            self.embedding_worker_running
+                .store(false, Ordering::Release);
+            let message = format!("start memory embedding worker: {error}");
+            *lock(&self.embedding_error) = Some(message.clone());
+            return Err(komet_memory::MemoryError::Other(message));
+        }
+        Ok(())
+    }
+
+    #[cfg(not(feature = "memory-embeddings"))]
+    pub fn embeddings_enabled(&self) -> bool {
+        false
+    }
+
+    #[cfg(not(feature = "memory-embeddings"))]
+    pub fn set_embeddings_enabled(
+        self: &Arc<Self>,
+        enabled: bool,
+    ) -> Result<(), komet_memory::MemoryError> {
+        if enabled {
+            Err(komet_memory::MemoryError::Other(
+                "semantic embeddings are unavailable in this build".into(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    #[cfg(not(feature = "memory-embeddings"))]
+    pub fn embedding_status(
+        &self,
+    ) -> Result<(u64, u64, bool, Option<String>), komet_memory::MemoryError> {
+        Ok((0, 0, false, None))
+    }
+
+    #[cfg(not(feature = "memory-embeddings"))]
+    pub fn request_embedding_indexing(self: &Arc<Self>) -> Result<(), komet_memory::MemoryError> {
+        Err(komet_memory::MemoryError::Other(
+            "semantic embeddings are unavailable in this build".into(),
+        ))
+    }
+
+    #[cfg(not(feature = "memory-embeddings"))]
+    pub fn semantic_search(
+        &self,
+        _project_id: &str,
+        _query: &str,
+    ) -> Result<Vec<komet_memory::SemanticMemoryMatch>, komet_memory::MemoryError> {
+        Err(komet_memory::MemoryError::Other(
+            "semantic embeddings are unavailable in this build".into(),
+        ))
     }
 
     /// Retention in days (clamped to the config bounds). Applies to the
@@ -1439,6 +1823,139 @@ impl MemoryIndexer {
         self.invalidate_briefing();
         Ok(removed)
     }
+}
+
+fn current_branch(cwd: &str) -> Option<String> {
+    let root = komet_memory::project_root_for(cwd);
+    let git_path = root.join(".git");
+    let git_dir = if git_path.is_dir() {
+        git_path
+    } else {
+        let pointer = std::fs::read_to_string(git_path).ok()?;
+        let target = pointer.trim().strip_prefix("gitdir: ")?;
+        let target = PathBuf::from(target);
+        if target.is_absolute() {
+            target
+        } else {
+            root.join(target)
+        }
+    };
+    let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
+    let branch = head.trim().strip_prefix("ref: refs/heads/")?;
+    let branch = branch.trim();
+    (!branch.is_empty() && !komet_memory::contains_secret_value(branch)).then(|| branch.to_string())
+}
+
+fn issue_reference(branch: &str) -> Option<String> {
+    for marker in ["#", "issue/", "issue-"] {
+        let Some((_, suffix)) = branch.split_once(marker) else {
+            continue;
+        };
+        let digits: String = suffix.chars().take_while(char::is_ascii_digit).collect();
+        if !digits.is_empty() {
+            return Some(format!("#{digits}"));
+        }
+    }
+    None
+}
+
+fn memory_disk_bytes(roots: &[PathBuf]) -> Result<u64, komet_memory::MemoryError> {
+    const MAX_ENTRIES: usize = 20_000;
+    let mut pending = roots.to_vec();
+    let mut visited = 0;
+    let mut seen_files = std::collections::HashSet::new();
+    let mut bytes = 0u64;
+    while let Some(path) = pending.pop() {
+        visited += 1;
+        if visited > MAX_ENTRIES {
+            return Err(komet_memory::MemoryError::Other(
+                "memory disk-usage scan exceeded its entry limit".into(),
+            ));
+        }
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        if metadata.is_file() {
+            let canonical = std::fs::canonicalize(&path)?;
+            if seen_files.insert(canonical) {
+                bytes = bytes.saturating_add(metadata.len());
+            }
+        } else if metadata.is_dir() {
+            for entry in std::fs::read_dir(path)? {
+                pending.push(entry?.path());
+            }
+        }
+    }
+    Ok(bytes)
+}
+
+#[cfg(unix)]
+fn process_resource_metrics() -> (Option<u64>, Option<u64>) {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) } != 0 {
+        return (None, None);
+    }
+    let usage = unsafe { usage.assume_init() };
+    let time_ms = |time: libc::timeval| {
+        u64::try_from(time.tv_sec)
+            .unwrap_or_default()
+            .saturating_mul(1000)
+            .saturating_add(u64::try_from(time.tv_usec).unwrap_or_default() / 1000)
+    };
+    let cpu_ms = time_ms(usage.ru_utime).saturating_add(time_ms(usage.ru_stime));
+    let peak = u64::try_from(usage.ru_maxrss)
+        .ok()
+        .filter(|value| *value > 0);
+    #[cfg(target_os = "macos")]
+    let peak_bytes = peak;
+    #[cfg(not(target_os = "macos"))]
+    let peak_bytes = peak.map(|kilobytes| kilobytes.saturating_mul(1024));
+    (Some(cpu_ms), peak_bytes)
+}
+
+#[cfg(windows)]
+fn process_resource_metrics() -> (Option<u64>, Option<u64>) {
+    use windows_sys::Win32::System::ProcessStatus::{
+        GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+
+    let process = unsafe { GetCurrentProcess() };
+    let mut created = std::mem::MaybeUninit::uninit();
+    let mut exited = std::mem::MaybeUninit::uninit();
+    let mut kernel = std::mem::MaybeUninit::uninit();
+    let mut user = std::mem::MaybeUninit::uninit();
+    let cpu_ms = (unsafe {
+        GetProcessTimes(
+            process,
+            created.as_mut_ptr(),
+            exited.as_mut_ptr(),
+            kernel.as_mut_ptr(),
+            user.as_mut_ptr(),
+        )
+    } != 0)
+        .then(|| unsafe {
+            let ticks = |time: windows_sys::Win32::Foundation::FILETIME| {
+                (u64::from(time.dwHighDateTime) << 32) | u64::from(time.dwLowDateTime)
+            };
+            ticks(kernel.assume_init()).saturating_add(ticks(user.assume_init())) / 10_000
+        });
+    let mut counters: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
+    let counter_size = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+    counters.cb = counter_size;
+    let peak_rss = (unsafe { GetProcessMemoryInfo(process, &mut counters, counter_size) } != 0)
+        .then_some(counters.PeakWorkingSetSize as u64);
+    (cpu_ms, peak_rss)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn process_resource_metrics() -> (Option<u64>, Option<u64>) {
+    (None, None)
 }
 
 /// Wrap a raw briefing in the delimited context block injected at the
@@ -1824,6 +2341,39 @@ mod tests {
                 .graph_neighbors(&project_id, "src/lib.rs", 10)
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn checkout_hints_read_branch_and_issue_from_git_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("project");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(
+            root.join(".git/HEAD"),
+            "ref: refs/heads/feature/issue-78-memory\n",
+        )
+        .unwrap();
+        let cwd = root.to_string_lossy();
+        let branch = current_branch(&cwd).unwrap();
+        assert_eq!(branch, "feature/issue-78-memory");
+        assert_eq!(issue_reference(&branch).as_deref(), Some("#78"));
+        assert_eq!(issue_reference("release/1.3.4"), None);
+    }
+
+    #[test]
+    fn memory_disk_usage_counts_store_and_model_cache_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("memory");
+        let model = dir.path().join("models/memory/model");
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::create_dir_all(model.parent().unwrap()).unwrap();
+        std::fs::write(store.join("memory.sqlite"), b"sqlite").unwrap();
+        std::fs::write(store.join("memory.sqlite-wal"), b"wal").unwrap();
+        std::fs::write(&model, b"model").unwrap();
+        assert_eq!(
+            memory_disk_bytes(&[store, dir.path().join("models/memory")]).unwrap(),
+            14
         );
     }
 

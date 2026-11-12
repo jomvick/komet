@@ -96,6 +96,11 @@ uuid = { version = "1", features = ["v4", "serde"] }
 
 # storage
 rusqlite = { version = "0.32", features = ["bundled"] }
+fastembed = { version = "7.7.0", default-features = false, features = [
+    "hf-hub-rustls-tls",
+    "ort-download-binaries-rustls-tls",
+] }
+sqlite-vec = "=0.1.9"
 
 # misc
 base64 = "0.22"

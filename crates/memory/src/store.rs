@@ -17,6 +17,8 @@ use std::time::{Duration, Instant};
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use serde::Serialize;
 
+#[cfg(feature = "embeddings")]
+use crate::facts::SemanticMemoryMatch;
 use crate::facts::{FactKind, FactScope, FactSource, MemoryFact, NewMemoryFact};
 use crate::graph::{GraphNeighbor, MemorySymbol};
 use crate::policy;
@@ -237,6 +239,8 @@ pub struct MemoryService {
     dir: PathBuf,
     fts: bool,
     facts_fts: bool,
+    #[cfg(feature = "embeddings")]
+    vector_enabled: Mutex<bool>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -263,11 +267,26 @@ impl MemoryService {
     /// `<data_dir>/memory`. Creates the schema, enables WAL, and spawns the
     /// single writer thread.
     pub fn open(dir: impl AsRef<Path>) -> Result<Self, MemoryError> {
+        Self::open_with_embeddings(dir, false)
+    }
+
+    pub fn open_with_embeddings(
+        dir: impl AsRef<Path>,
+        embeddings_enabled: bool,
+    ) -> Result<Self, MemoryError> {
+        #[cfg(not(feature = "embeddings"))]
+        if embeddings_enabled {
+            return Err(MemoryError::Other(
+                "semantic embeddings are unavailable in this build".into(),
+            ));
+        }
         let dir = dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&dir)?;
         let path = dir.join(DB_FILE);
         let open_conn = |path: &Path| -> Result<Connection, MemoryError> {
             let conn = Connection::open(path)?;
+            #[cfg(feature = "embeddings")]
+            register_vector_extension(&conn)?;
             // auto_vacuum must be set before any table exists to take
             // effect; it is a no-op on databases that already have tables.
             conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
@@ -281,6 +300,10 @@ impl MemoryService {
         };
         let mut conn = open_conn(&path)?;
         migrate(&mut conn)?;
+        #[cfg(feature = "embeddings")]
+        if embeddings_enabled {
+            ensure_vector_table(&conn)?;
+        }
         // One-shot planner stats after migrations (cheap on a fresh/small db).
         conn.execute_batch("PRAGMA optimize;")?;
         let fts = ensure_fts(&conn)?;
@@ -300,7 +323,21 @@ impl MemoryService {
             dir,
             fts,
             facts_fts,
+            #[cfg(feature = "embeddings")]
+            vector_enabled: Mutex::new(embeddings_enabled),
         })
+    }
+
+    #[cfg(feature = "embeddings")]
+    pub fn enable_embeddings(&self) -> Result<(), MemoryError> {
+        let mut enabled = lock(&self.vector_enabled);
+        if *enabled {
+            return Ok(());
+        }
+        let conn = lock(&self.conn);
+        ensure_vector_table(&conn)?;
+        *enabled = true;
+        Ok(())
     }
 
     pub fn dir(&self) -> &Path {
@@ -1089,6 +1126,116 @@ impl MemoryService {
                 limit.clamp(1, 200) as i64
             ],
             row_to_fact,
+        )?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    #[cfg(feature = "embeddings")]
+    pub fn facts_missing_embeddings(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<(i64, String)>, MemoryError> {
+        let conn = lock(&self.conn);
+        let mut stmt = conn.prepare(
+            "SELECT fact.id, fact.content
+             FROM memory_facts fact
+             LEFT JOIN memory_fact_vectors vector ON vector.rowid = fact.id
+             WHERE fact.stale_at_ms IS NULL AND vector.rowid IS NULL
+             ORDER BY fact.id
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([limit.clamp(1, 100) as i64], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    #[cfg(feature = "embeddings")]
+    pub fn store_fact_embeddings(&self, embeddings: &[(i64, Vec<f32>)]) -> Result<(), MemoryError> {
+        let conn = lock(&self.write);
+        let tx = conn.unchecked_transaction()?;
+        for (fact_id, vector) in embeddings {
+            if vector.len() != crate::EMBEDDING_DIMENSIONS
+                || vector.iter().any(|value| !value.is_finite())
+            {
+                return Err(MemoryError::Other("invalid fact embedding".into()));
+            }
+            let encoded = serde_json::to_string(vector)
+                .map_err(|error| MemoryError::Other(format!("encode fact embedding: {error}")))?;
+            tx.execute(
+                "INSERT OR REPLACE INTO memory_fact_vectors(
+                   rowid, embedding, project_id, scope
+                 )
+                 SELECT id, ?2, project_id, scope FROM memory_facts
+                 WHERE id = ?1 AND stale_at_ms IS NULL",
+                params![fact_id, encoded],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    #[cfg(feature = "embeddings")]
+    pub fn embedding_counts(&self) -> Result<(u64, u64), MemoryError> {
+        let conn = lock(&self.conn);
+        let total: u64 = conn.query_row(
+            "SELECT COUNT(*) FROM memory_facts WHERE stale_at_ms IS NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        let indexed: u64 = conn.query_row(
+            "SELECT COUNT(*)
+             FROM memory_fact_vectors vector
+             JOIN memory_facts fact ON fact.id = vector.rowid
+             WHERE fact.stale_at_ms IS NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok((indexed, total))
+    }
+
+    #[cfg(feature = "embeddings")]
+    pub fn semantic_search_facts(
+        &self,
+        project_id: &str,
+        query_embedding: &[f32],
+        limit: usize,
+    ) -> Result<Vec<SemanticMemoryMatch>, MemoryError> {
+        if query_embedding.len() != crate::EMBEDDING_DIMENSIONS
+            || query_embedding.iter().any(|value| !value.is_finite())
+        {
+            return Err(MemoryError::Other("invalid search embedding".into()));
+        }
+        let encoded = serde_json::to_string(query_embedding)
+            .map_err(|error| MemoryError::Other(format!("encode search embedding: {error}")))?;
+        let conn = lock(&self.conn);
+        let mut stmt = conn.prepare(
+            "WITH vector_matches AS (
+               SELECT rowid, distance FROM memory_fact_vectors
+               WHERE embedding MATCH ?1 AND k = ?3
+                 AND project_id = ?2 AND scope != 'global' AND scope != 'session'
+               UNION ALL
+               SELECT rowid, distance FROM memory_fact_vectors
+               WHERE embedding MATCH ?1 AND k = ?3 AND scope = 'global'
+             )
+             SELECT fact.id, fact.project_id, fact.chat_id, fact.kind, fact.scope,
+                    fact.content, fact.source, fact.source_agent, fact.source_model,
+                    fact.source_event_seq, fact.source_path, fact.confidence,
+                    fact.user_confirmed, fact.valid_from_ms, fact.stale_at_ms,
+                    fact.replaced_by, vector.distance
+             FROM vector_matches vector
+             JOIN memory_facts fact ON fact.id = vector.rowid
+             ORDER BY vector.distance
+             LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(
+            params![encoded, project_id, limit.clamp(1, 20) as i64],
+            |row| {
+                Ok(SemanticMemoryMatch {
+                    fact: row_to_fact(row)?,
+                    distance: row.get(16)?,
+                })
+            },
         )?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
@@ -2261,6 +2408,61 @@ fn ensure_facts_fts(conn: &Connection) -> Result<bool, MemoryError> {
     }
 }
 
+#[cfg(feature = "embeddings")]
+fn register_vector_extension(conn: &Connection) -> Result<(), MemoryError> {
+    use std::ffi::{CStr, c_char, c_int, c_void};
+
+    type ExtensionInit =
+        unsafe extern "C" fn(*mut rusqlite::ffi::sqlite3, *mut *mut c_char, *const c_void) -> c_int;
+    let init: ExtensionInit =
+        unsafe { std::mem::transmute(sqlite_vec::sqlite3_vec_init as *const ()) };
+    let mut error_message = std::ptr::null_mut();
+    let result = unsafe { init(conn.handle(), &mut error_message, std::ptr::null()) };
+    if result == rusqlite::ffi::SQLITE_OK {
+        Ok(())
+    } else {
+        let detail = if error_message.is_null() {
+            String::new()
+        } else {
+            let detail = unsafe { CStr::from_ptr(error_message) }
+                .to_string_lossy()
+                .into_owned();
+            unsafe { rusqlite::ffi::sqlite3_free(error_message.cast()) };
+            detail
+        };
+        Err(MemoryError::Other(format!(
+            "register sqlite-vec extension: SQLite error {result}: {detail}"
+        )))
+    }
+}
+
+#[cfg(feature = "embeddings")]
+fn ensure_vector_table(conn: &Connection) -> Result<(), MemoryError> {
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS memory_fact_vectors USING vec0(
+           embedding FLOAT[384],
+           project_id TEXT,
+           scope TEXT
+         );
+         CREATE TRIGGER IF NOT EXISTS memory_fact_vectors_ad
+           AFTER DELETE ON memory_facts BEGIN
+           DELETE FROM memory_fact_vectors WHERE rowid = old.id;
+         END;
+         CREATE TRIGGER IF NOT EXISTS memory_fact_vectors_stale
+           AFTER UPDATE OF stale_at_ms ON memory_facts
+           WHEN new.stale_at_ms IS NOT NULL BEGIN
+           DELETE FROM memory_fact_vectors WHERE rowid = old.id;
+         END;
+         CREATE TRIGGER IF NOT EXISTS memory_fact_vectors_scope
+           AFTER UPDATE OF project_id, scope ON memory_facts BEGIN
+           UPDATE memory_fact_vectors
+           SET project_id = new.project_id, scope = new.scope
+           WHERE rowid = old.id;
+         END;",
+    )?;
+    Ok(())
+}
+
 // ── writer ────────────────────────────────────────────────────────────────
 
 fn writer_loop(conn: Connection, rx: Receiver<MemoryItem>, fts: bool) {
@@ -2757,6 +2959,83 @@ mod tests {
         let cursor = svc.chat_cursor("chat-1").unwrap();
         assert_eq!(cursor.last_seq, 2);
         assert_eq!(cursor.gap_seq, None);
+    }
+
+    #[test]
+    #[cfg(feature = "embeddings")]
+    fn sqlite_vec_returns_nearest_valid_facts_and_deletes_forgotten_vectors() {
+        let (svc, _dir) = svc();
+        svc.enable_embeddings().unwrap();
+        let first = svc.create_fact(&fact("Use SQLite")).unwrap();
+        let second = svc.create_fact(&fact("Use Rust")).unwrap();
+        let mut first_vector = vec![0.0; crate::EMBEDDING_DIMENSIONS];
+        first_vector[0] = 1.0;
+        let mut second_vector = vec![0.0; crate::EMBEDDING_DIMENSIONS];
+        second_vector[1] = 1.0;
+        svc.store_fact_embeddings(&[(first, first_vector.clone()), (second, second_vector)])
+            .unwrap();
+        assert_eq!(svc.embedding_counts().unwrap(), (2, 2));
+        assert!(svc.store_fact_embeddings(&[(first, vec![0.0; 3])]).is_err());
+        assert!(svc.semantic_search_facts("p_test", &[0.0; 3], 5).is_err());
+
+        let results = svc
+            .semantic_search_facts("p_test", &first_vector, 5)
+            .unwrap();
+        assert_eq!(results.first().map(|result| result.fact.id), Some(first));
+        assert_eq!(results.len(), 2);
+
+        assert!(svc.forget_fact(first).unwrap());
+        let results = svc
+            .semantic_search_facts("p_test", &first_vector, 5)
+            .unwrap();
+        assert!(results.iter().all(|result| result.fact.id != first));
+        assert_eq!(svc.embedding_counts().unwrap(), (1, 1));
+        assert!(svc.mark_fact_stale(second, 123).unwrap());
+        assert_eq!(svc.embedding_counts().unwrap(), (0, 0));
+        assert!(
+            svc.semantic_search_facts("p_test", &first_vector, 5)
+                .unwrap()
+                .is_empty()
+        );
+        let global = svc.create_fact(&fact("Use shared conventions")).unwrap();
+        svc.store_fact_embeddings(&[(global, first_vector.clone())])
+            .unwrap();
+        assert!(svc.promote_fact_to_global(global, true).unwrap());
+        assert_eq!(
+            svc.semantic_search_facts("p_other", &first_vector, 5)
+                .unwrap()
+                .first()
+                .map(|result| result.fact.id),
+            Some(global)
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "embeddings")]
+    fn sqlite_vec_is_opt_in_and_existing_vectors_remain_readable_when_reopened() {
+        let (svc, dir) = svc();
+        let has_vector_table = |service: &MemoryService| {
+            lock(&service.conn)
+                .query_row(
+                    "SELECT EXISTS(
+                       SELECT 1 FROM sqlite_master WHERE type = 'table'
+                         AND name = 'memory_fact_vectors'
+                     )",
+                    [],
+                    |row| row.get::<_, bool>(0),
+                )
+                .unwrap()
+        };
+
+        assert!(!has_vector_table(&svc));
+        svc.enable_embeddings().unwrap();
+        assert!(has_vector_table(&svc));
+        drop(svc);
+
+        let reopened = MemoryService::open(dir.path().join("memory")).unwrap();
+        assert!(has_vector_table(&reopened));
+        reopened.enable_embeddings().unwrap();
+        assert_eq!(reopened.stats("p_test").unwrap().events, 0);
     }
 
     #[test]

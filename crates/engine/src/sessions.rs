@@ -1559,6 +1559,7 @@ impl SessionsEngine {
         // owns the chat: overwriting its cwd/project here would re-attribute
         // the run's remaining events (and its Done) to the steer's cwd.
         if let Some(indexer) = self.inner.memory.get() {
+            indexer.set_agent_active(chat_id, true);
             indexer.note_chat(chat_id, &request.cwd, harness_id);
             indexer.index_workspace(&request.cwd);
         }
@@ -2504,12 +2505,22 @@ impl Inner {
     }
 
     fn remove_run(&self, chat_id: &str, run_id: &str) {
-        let mut runs = lock(&self.runs);
-        if runs.get(chat_id).is_some_and(|h| h.run_id == run_id) {
-            runs.remove(chat_id);
+        let removed = {
+            let mut runs = lock(&self.runs);
+            if runs.get(chat_id).is_some_and(|h| h.run_id == run_id) {
+                runs.remove(chat_id);
+                true
+            } else {
+                false
+            }
+        };
+        if removed {
             // The live counters describe a turn that is over: whatever the
             // chips kept at their terminal write is the doc's record now.
             self.subagent_feeds.clear(chat_id);
+            if let Some(indexer) = self.memory.get() {
+                indexer.set_agent_active(chat_id, false);
+            }
         }
     }
 }

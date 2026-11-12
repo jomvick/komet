@@ -24,6 +24,9 @@ pub struct MemoryConfig {
     /// `false` stops recording, briefing injection and catch-up — stored
     /// data is kept (forget is a separate, explicit action).
     pub enabled: bool,
+    /// Semantic search is explicitly opt-in. The model is downloaded only
+    /// after the user enables this setting.
+    pub embeddings_enabled: bool,
     /// Raw-event retention in days; the engine's maintenance tick prunes
     /// older rows. Cursors only move forward, so pruning cannot resurrect.
     pub retention_days: u32,
@@ -44,6 +47,7 @@ impl Default for MemoryConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            embeddings_enabled: false,
             retention_days: DEFAULT_RETENTION_DAYS,
             location: None,
             active_dir: None,
@@ -69,6 +73,10 @@ impl MemoryConfig {
             .get("enabled")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(true);
+        let embeddings_enabled = value
+            .get("embeddingsEnabled")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
         let retention_days = value
             .get("retentionDays")
             .and_then(serde_json::Value::as_u64)
@@ -82,6 +90,7 @@ impl MemoryConfig {
         };
         Self {
             enabled,
+            embeddings_enabled,
             retention_days,
             location: string_field("location"),
             active_dir: string_field("activeDir"),
@@ -142,6 +151,7 @@ mod tests {
     fn defaults_are_enabled_with_default_retention() {
         let config = MemoryConfig::default();
         assert!(config.enabled);
+        assert!(!config.embeddings_enabled);
         assert_eq!(config.retention_days, DEFAULT_RETENTION_DAYS);
         assert_eq!(config.location, None);
     }
@@ -151,6 +161,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = MemoryConfig {
             enabled: false,
+            embeddings_enabled: true,
             retention_days: 30,
             location: Some("/tmp/custom-memory".into()),
             active_dir: Some("/tmp/custom-memory".into()),
@@ -184,6 +195,7 @@ mod tests {
         .unwrap();
         let loaded = MemoryConfig::load(dir.path());
         assert!(!loaded.enabled);
+        assert!(!loaded.embeddings_enabled);
         assert_eq!(loaded.retention_days, DEFAULT_RETENTION_DAYS);
         assert_eq!(loaded.location, None);
     }

@@ -13,15 +13,19 @@
 
 mod briefing;
 pub mod config;
+#[cfg(feature = "embeddings")]
+mod embeddings;
 mod facts;
 mod graph;
 mod policy;
 mod record;
 mod store;
 
-pub use briefing::build as build_briefing;
+pub use briefing::{append_predictive_context, build as build_briefing};
 pub use config::{MemoryConfig, RETENTION_DAYS_MAX, RETENTION_DAYS_MIN, resolve_location};
-pub use facts::{FactKind, FactScope, FactSource, MemoryFact, NewMemoryFact};
+#[cfg(feature = "embeddings")]
+pub use embeddings::{EMBEDDING_DIMENSIONS, LocalEmbedder};
+pub use facts::{FactKind, FactScope, FactSource, MemoryFact, NewMemoryFact, SemanticMemoryMatch};
 pub use graph::{GraphNeighbor, MemorySymbol};
 pub use policy::{
     canonical_cwd, contains_secret_value, is_default_excluded, project_id_for, project_relative,

@@ -236,10 +236,17 @@ pub mod methods {
     // the store, so every method is local-connection only.
     /// Status + project list for Settings → Memory: `{available, enabled,
     /// retentionDays, dir, pendingDir, events, chats, bytes, fts,
-    /// untrackedChats, projects[]}`.
+    /// untrackedChats, projects[], embeddingsEnabled, embeddingsIndexed,
+    /// embeddingsTotal, embeddingsWorking, embeddingsError}`.
     pub const GET_MEMORY_STATUS: &str = "GetMemoryStatus";
     /// `{enabled}` — global kill switch (recording + briefing injection).
     pub const SET_MEMORY_ENABLED: &str = "SetMemoryEnabled";
+    /// `{enabled}` — opt in/out of local semantic indexing.
+    pub const SET_MEMORY_EMBEDDINGS_ENABLED: &str = "SetMemoryEmbeddingsEnabled";
+    /// Retry opt-in local embedding indexing after an error.
+    pub const RETRY_MEMORY_EMBEDDINGS: &str = "RetryMemoryEmbeddings";
+    /// `{projectId, query}` — explicit local semantic search.
+    pub const SEARCH_MEMORY_SEMANTIC: &str = "SearchMemorySemantic";
     /// `{days}` — raw-event retention window.
     pub const SET_MEMORY_RETENTION_DAYS: &str = "SetMemoryRetentionDays";
     /// `{path}` — custom store location; `null` resets to the default.

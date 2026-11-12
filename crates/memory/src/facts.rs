@@ -132,6 +132,13 @@ pub struct MemoryFact {
     pub replaced_by: Option<i64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SemanticMemoryMatch {
+    pub fact: MemoryFact,
+    pub distance: f32,
+}
+
 impl NewMemoryFact {
     pub(crate) fn validate(&self) -> Result<(), &'static str> {
         if self.project_id.trim().is_empty() {

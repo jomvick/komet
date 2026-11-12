@@ -1,4 +1,4 @@
-//! Settings → Memory: local project memory (issue #78, phases 1–5 and 7).
+//! Settings → Memory: local project memory (issue #78, phases 1–7).
 //!
 //! The index is device-local and allow-listed — it never leaves this machine
 //! and never stores prompts, commands, file contents or credentials. This page
@@ -31,6 +31,13 @@ const RETENTION_PRESETS: [u32; 5] = [7, 30, 90, 180, 365];
 pub struct MemoryStatus {
     pub available: bool,
     pub enabled: bool,
+    pub embeddings_enabled: bool,
+    pub embeddings_indexed: u64,
+    pub embeddings_total: u64,
+    pub embeddings_working: bool,
+    pub embeddings_error: Option<String>,
+    pub process_cpu_ms: Option<u64>,
+    pub process_peak_rss_bytes: Option<u64>,
     pub retention_days: u32,
     pub dir: Option<String>,
     pub pending_dir: Option<String>,
@@ -73,6 +80,13 @@ pub struct MemoryFact {
     pub valid_from_ms: i64,
     pub stale_at_ms: Option<i64>,
     pub replaced_by: Option<i64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemorySemanticResult {
+    pub fact: MemoryFact,
+    pub distance: f32,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -140,10 +154,14 @@ pub struct MemoryPage {
     /// Draft for a custom storage folder (empty = the default location).
     location_input: Entity<ComposerInput>,
     export_input: Entity<ComposerInput>,
+    semantic_query_input: Entity<ComposerInput>,
     /// Project whose detail row is expanded, plus its exclusions draft.
     expanded: Option<String>,
     exclusions_input: Option<Entity<ComposerInput>>,
     facts: Vec<MemoryFact>,
+    semantic_results: Vec<MemorySemanticResult>,
+    semantic_loading: bool,
+    semantic_generation: u64,
     graph_files: Vec<MemoryGraphFile>,
     activity: Vec<MemoryActivity>,
     facts_loading: bool,
@@ -156,9 +174,16 @@ impl MemoryPage {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let location_input = cx.new(|cx| ComposerInput::new("Custom folder…", cx));
         let export_input = cx.new(|cx| ComposerInput::new("New or Komet-owned export folder…", cx));
+        let semantic_query_input = cx.new(|cx| ComposerInput::new("Search project memory…", cx));
         cx.subscribe(&location_input, |this: &mut Self, _, event, cx| {
             if matches!(event, ComposerInputEvent::Submitted) {
                 this.apply_location(cx);
+            }
+        })
+        .detach();
+        cx.subscribe(&semantic_query_input, |this: &mut Self, _, event, cx| {
+            if matches!(event, ComposerInputEvent::Submitted) {
+                this.search_semantic(cx);
             }
         })
         .detach();
@@ -175,9 +200,13 @@ impl MemoryPage {
             generation: 0,
             location_input,
             export_input,
+            semantic_query_input,
             expanded: None,
             exclusions_input: None,
             facts: Vec::new(),
+            semantic_results: Vec::new(),
+            semantic_loading: false,
+            semantic_generation: 0,
             graph_files: Vec::new(),
             activity: Vec::new(),
             facts_loading: false,
@@ -208,6 +237,9 @@ impl MemoryPage {
         self.expanded = None;
         self.exclusions_input = None;
         self.facts.clear();
+        self.semantic_results.clear();
+        self.semantic_loading = false;
+        self.semantic_generation += 1;
         self.graph_files.clear();
         self.activity.clear();
         self.facts_loading = false;
@@ -341,6 +373,84 @@ impl MemoryPage {
         );
     }
 
+    fn toggle_embeddings(&mut self, cx: &mut Context<Self>) {
+        let Some(status) = self.status.ready() else {
+            return;
+        };
+        self.call(
+            methods::SET_MEMORY_EMBEDDINGS_ENABLED,
+            serde_json::json!({ "enabled": !status.embeddings_enabled }),
+            cx,
+        );
+    }
+
+    fn retry_embeddings(&mut self, cx: &mut Context<Self>) {
+        self.call(methods::RETRY_MEMORY_EMBEDDINGS, serde_json::json!({}), cx);
+    }
+
+    fn search_semantic(&mut self, cx: &mut Context<Self>) {
+        let Some(project_id) = self.expanded.clone() else {
+            self.notice = Some(SharedString::from(
+                "Open a project below before searching its semantic memory.",
+            ));
+            cx.notify();
+            return;
+        };
+        let query = self.semantic_query_input.read(cx).text().trim().to_string();
+        if query.is_empty() {
+            self.notice = Some(SharedString::from("Enter a search query first."));
+            cx.notify();
+            return;
+        }
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            self.error = Some(SharedString::from("Engine not connected."));
+            cx.notify();
+            return;
+        };
+        self.notice = None;
+        self.semantic_results.clear();
+        self.semantic_loading = true;
+        self.semantic_generation += 1;
+        let generation = self.semantic_generation;
+        let params = self.with_target(
+            serde_json::json!({ "projectId": project_id, "query": query }),
+            cx,
+        );
+        self.task = Some(cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(methods::SEARCH_MEMORY_SEMANTIC, params)
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|value| {
+                    value
+                        .get("results")
+                        .cloned()
+                        .ok_or_else(|| "semantic search reply omitted results".to_string())
+                })
+                .and_then(|value| {
+                    serde_json::from_value::<Vec<MemorySemanticResult>>(value)
+                        .map_err(|error| error.to_string())
+                });
+            this.update(cx, |page, cx| {
+                if page.semantic_generation != generation {
+                    return;
+                }
+                page.semantic_loading = false;
+                match result {
+                    Ok(results) => {
+                        page.error = None;
+                        page.semantic_results = results;
+                    }
+                    Err(error) => page.error = Some(SharedString::from(error)),
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
     fn set_retention(&mut self, days: u32, cx: &mut Context<Self>) {
         self.call(
             methods::SET_MEMORY_RETENTION_DAYS,
@@ -395,9 +505,13 @@ impl MemoryPage {
             self.expanded = None;
             self.exclusions_input = None;
             self.facts.clear();
+            self.semantic_results.clear();
+            self.semantic_generation += 1;
             self.facts_generation += 1;
         } else {
             self.expanded = Some(project.project_id.clone());
+            self.semantic_results.clear();
+            self.semantic_generation += 1;
             let input = cx.new(|cx| ComposerInput::new("Path exclusions (one per line)", cx));
             input.update(cx, |input, cx| {
                 input.set_text(project.exclusions.join("\n"), cx)
@@ -703,6 +817,20 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
+fn format_cpu_duration(ms: u64) -> String {
+    let seconds = ms / 1000;
+    let hours = seconds / 3600;
+    let minutes = (seconds % 3600) / 60;
+    let seconds = seconds % 60;
+    if hours > 0 {
+        format!("{hours}h {minutes}m")
+    } else if minutes > 0 {
+        format!("{minutes}m {seconds}s")
+    } else {
+        format!("{seconds}s")
+    }
+}
+
 fn project_label(project: &MemoryProject) -> String {
     project
         .root_path
@@ -847,6 +975,21 @@ impl MemoryPage {
             vec![SharedString::from(
                 "Resource guardrails: one background scan per project, at most 5,000 workspace entries and 512 KiB per source file, with one file parsed at a time. No continuous graph simulation.",
             )
+            .into_any_element()],
+        )));
+        let process_usage = match (status.process_cpu_ms, status.process_peak_rss_bytes) {
+            (Some(cpu_ms), Some(rss_bytes)) => format!(
+                "Komet engine lifetime: {} CPU · {} peak RAM",
+                format_cpu_duration(cpu_ms),
+                format_bytes(rss_bytes)
+            ),
+            _ => "Komet engine CPU/RAM metrics unavailable on this device.".into(),
+        };
+        card = card.child(widgets::card_row(theme, false).child(widgets::meta_line(
+            theme,
+            vec![SharedString::from(format!(
+                "{process_usage}. Disk usage includes the memory database, WAL files, and local model cache; CPU/RAM are engine-wide, not attributed only to memory."
+            ))
             .into_any_element()],
         )));
         if status.restart_required
@@ -994,6 +1137,156 @@ impl MemoryPage {
                     ))
                 }),
         );
+        card.into_any_element()
+    }
+
+    fn embeddings_card(
+        &self,
+        status: &MemoryStatus,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let query_input = self.semantic_query_input.clone();
+        let mut card = widgets::section_card(theme)
+            .child(
+                widgets::card_row(theme, true)
+                    .child(widgets::row_tile(theme, crate::icons::EYE))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .child(widgets::row_title(theme, "Semantic memory"))
+                            .child(widgets::meta_line(
+                                theme,
+                                vec![SharedString::from(if status.embeddings_working {
+                                    format!(
+                                        "Indexing {} of {} facts locally…",
+                                        status.embeddings_indexed, status.embeddings_total
+                                    )
+                                } else {
+                                    format!(
+                                        "{} of {} facts indexed · local model, no network search",
+                                        status.embeddings_indexed, status.embeddings_total
+                                    )
+                                })
+                                .into_any_element()],
+                            )),
+                    )
+                    .child(
+                        widgets::toggle_switch(theme, status.embeddings_enabled)
+                            .id("memory-embeddings-toggle")
+                            .cursor_pointer()
+                            .on_click(cx.listener(|this, _, _, cx| this.toggle_embeddings(cx))),
+                    ),
+            )
+            .child(widgets::card_row(theme, false).child(widgets::meta_line(
+                theme,
+                vec![SharedString::from(
+                    "Optional local model (~23 MB), downloaded only after opt-in. Embedding batches pause during agent runs; FTS and graph remain available when off.",
+                )
+                .into_any_element()],
+            )));
+
+        if status.embeddings_enabled {
+            card = card.child(
+                div()
+                    .px(px(20.0))
+                    .py(px(10.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.0))
+                    .child(widgets::field_label(
+                        theme,
+                        "Semantic search (open a project below first)",
+                    ))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(8.0))
+                            .child(div().flex_1().min_w_0().child(query_input))
+                            .child(
+                                widgets::ghost_action(theme)
+                                    .id("memory-semantic-search")
+                                    .flex_none()
+                                    .text_size(px(12.0))
+                                    .hover(|s| widgets::ghost_hover(theme, s))
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.search_semantic(cx)),
+                                    )
+                                    .child(SharedString::from(if self.semantic_loading {
+                                        "Searching…"
+                                    } else {
+                                        "Search"
+                                    })),
+                            )
+                            .child(
+                                widgets::ghost_action(theme)
+                                    .id("memory-embeddings-refresh")
+                                    .flex_none()
+                                    .text_size(px(12.0))
+                                    .hover(|s| widgets::ghost_hover(theme, s))
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.retry_embeddings(cx)),
+                                    )
+                                    .child(SharedString::from("Refresh")),
+                            ),
+                    ),
+            );
+            if let Some(error) = &status.embeddings_error {
+                card = card.child(widgets::card_row(theme, false).child(widgets::error_strip(
+                    theme,
+                    SharedString::from(error.clone()),
+                )));
+            }
+            for result in &self.semantic_results {
+                card = card.child(
+                    widgets::card_row(theme, false).child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap(px(3.0))
+                            .child(
+                                div()
+                                    .text_size(px(12.5))
+                                    .text_color(theme.text)
+                                    .child(SharedString::from(result.fact.content.clone())),
+                            )
+                            .child(widgets::meta_line(
+                                theme,
+                                vec![
+                                    SharedString::from(format!(
+                                        "{} · distance {:.3} · confidence {:.0}%",
+                                        result.fact.source,
+                                        result.distance,
+                                        result.fact.confidence * 100.0
+                                    ))
+                                    .into_any_element(),
+                                ],
+                            )),
+                    ),
+                );
+            }
+            if !self.semantic_loading && self.semantic_results.is_empty() {
+                card = card.child(widgets::card_row(theme, false).child(widgets::meta_line(
+                    theme,
+                    vec![SharedString::from(
+                        "Select a project, enter a query, and search. Query text is embedded locally and is not stored.",
+                    )
+                    .into_any_element()],
+                )));
+            }
+        } else if let Some(error) = &status.embeddings_error {
+            card = card.child(widgets::card_row(theme, false).child(widgets::error_strip(
+                theme,
+                SharedString::from(error.clone()),
+            )));
+        }
         card.into_any_element()
     }
 
@@ -1495,6 +1788,7 @@ impl Render for MemoryPage {
                 page = page
                     .child(self.storage_card(status, &theme, cx))
                     .child(self.control_card(status, &theme, cx))
+                    .child(self.embeddings_card(status, &theme, cx))
                     .child(self.projects_card(status, &theme, cx))
                     .when_some(self.history_card(status, &theme, cx), |el, card| {
                         el.child(card)
@@ -1549,6 +1843,13 @@ mod tests {
         assert_eq!(format_bytes(512), "512 B");
         assert_eq!(format_bytes(2048), "2.0 KB");
         assert_eq!(format_bytes(5 * 1024 * 1024), "5.0 MB");
+    }
+
+    #[test]
+    fn cpu_duration_format() {
+        assert_eq!(format_cpu_duration(59_000), "59s");
+        assert_eq!(format_cpu_duration(65_000), "1m 5s");
+        assert_eq!(format_cpu_duration(3_661_000), "1h 1m");
     }
 
     #[test]

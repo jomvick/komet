@@ -1327,6 +1327,9 @@ fn forwardable(method: &str) -> bool {
             // the machine that owns the store.
             | methods::GET_MEMORY_STATUS
             | methods::SET_MEMORY_ENABLED
+            | methods::SET_MEMORY_EMBEDDINGS_ENABLED
+            | methods::RETRY_MEMORY_EMBEDDINGS
+            | methods::SEARCH_MEMORY_SEMANTIC
             | methods::SET_MEMORY_RETENTION_DAYS
             | methods::SET_MEMORY_LOCATION
             | methods::SET_MEMORY_PROJECT_ENABLED
@@ -1813,6 +1816,9 @@ impl RpcService for EngineRpc {
             // else the answer would describe the controller's own index.
             methods::GET_MEMORY_STATUS,
             methods::SET_MEMORY_ENABLED,
+            methods::SET_MEMORY_EMBEDDINGS_ENABLED,
+            methods::RETRY_MEMORY_EMBEDDINGS,
+            methods::SEARCH_MEMORY_SEMANTIC,
             methods::SET_MEMORY_RETENTION_DAYS,
             methods::SET_MEMORY_LOCATION,
             methods::SET_MEMORY_PROJECT_ENABLED,
@@ -2164,22 +2170,37 @@ impl RpcService for EngineRpc {
                         "events": 0,
                         "chats": 0,
                         "bytes": 0,
+                        "processCpuMs": null,
+                        "processPeakRssBytes": null,
                         "fts": false,
                         "untrackedChats": 0,
+                        "embeddingsEnabled": false,
+                        "embeddingsIndexed": 0,
+                        "embeddingsTotal": 0,
+                        "embeddingsWorking": false,
+                        "embeddingsError": null,
                         "projects": [],
                     }));
                 };
-                let (events, chats) = indexer.totals().unwrap_or((0, 0));
-                let bytes = std::fs::metadata(indexer.store_dir().join("memory.sqlite"))
-                    .map(|m| m.len())
-                    .unwrap_or(0);
+                let (events, chats) = indexer
+                    .totals()
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                let (embeddings_indexed, embeddings_total, embeddings_working, embeddings_error) =
+                    indexer
+                        .embedding_status()
+                        .map_err(|error| RpcError::Failed(error.to_string()))?;
+                let (bytes, process_cpu_ms, process_peak_rss_bytes) = indexer
+                    .resource_stats()
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
                 // `pendingDir`/`restartRequired` resolve the EFFECTIVE
                 // configured directory — an explicit custom path and a
                 // reset back to the default are both pending targets;
                 // `None` means the open store already matches the config.
                 let pending_dir = indexer.pending_store_dir();
                 let restart_required = pending_dir.is_some();
-                let projects = indexer.list_projects().unwrap_or_default();
+                let projects = indexer
+                    .list_projects()
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
                 RpcReply::value(&serde_json::json!({
                     "available": true,
                     "enabled": indexer.global_enabled(),
@@ -2190,8 +2211,15 @@ impl RpcService for EngineRpc {
                     "events": events,
                     "chats": chats,
                     "bytes": bytes,
+                    "processCpuMs": process_cpu_ms,
+                    "processPeakRssBytes": process_peak_rss_bytes,
                     "fts": indexer.service().fts_enabled(),
                     "untrackedChats": indexer.untracked_journal_chats(),
+                    "embeddingsEnabled": indexer.embeddings_enabled(),
+                    "embeddingsIndexed": embeddings_indexed,
+                    "embeddingsTotal": embeddings_total,
+                    "embeddingsWorking": embeddings_working,
+                    "embeddingsError": embeddings_error,
                     "projects": projects,
                 }))
             }
@@ -2210,6 +2238,54 @@ impl RpcService for EngineRpc {
                     .set_global_enabled(p.enabled)
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "enabled": p.enabled }))
+            }
+            methods::SET_MEMORY_EMBEDDINGS_ENABLED => {
+                #[derive(serde::Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct P {
+                    enabled: bool,
+                }
+                let p: P = parse_params(params)?;
+                let indexer = self
+                    .sessions
+                    .memory()
+                    .ok_or_else(|| RpcError::Failed("memory unavailable".into()))?;
+                indexer
+                    .set_embeddings_enabled(p.enabled)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                RpcReply::value(&serde_json::json!({
+                    "embeddingsEnabled": indexer.embeddings_enabled()
+                }))
+            }
+            methods::RETRY_MEMORY_EMBEDDINGS => {
+                let indexer = self
+                    .sessions
+                    .memory()
+                    .ok_or_else(|| RpcError::Failed("memory unavailable".into()))?;
+                indexer
+                    .request_embedding_indexing()
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "started": true }))
+            }
+            methods::SEARCH_MEMORY_SEMANTIC => {
+                #[derive(serde::Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct P {
+                    project_id: String,
+                    query: String,
+                }
+                let p: P = parse_params(params)?;
+                let indexer = self
+                    .sessions
+                    .memory()
+                    .ok_or_else(|| RpcError::Failed("memory unavailable".into()))?;
+                let results = tokio::task::spawn_blocking(move || {
+                    indexer.semantic_search(&p.project_id, &p.query)
+                })
+                .await
+                .map_err(|error| RpcError::Failed(format!("semantic search task failed: {error}")))?
+                .map_err(|error| RpcError::Failed(error.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "results": results }))
             }
             methods::SET_MEMORY_RETENTION_DAYS => {
                 #[derive(serde::Deserialize)]
