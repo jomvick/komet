@@ -9,6 +9,9 @@ use komet_memory::{FactKind, FactScope, FactSource, MemoryService, NewMemoryFact
 use komet_proto::{TerminalCommand, TerminalDelta, TerminalInfo, TerminalScreen, TerminalTail};
 
 const MAX_MEMORY_CLAIMS: usize = 100;
+/// One run cannot fill the shared blackboard: without a per-run cap a single
+/// (possibly misbehaving) agent could lock every other run out of publishing.
+const MAX_MEMORY_CLAIMS_PER_RUN: usize = 10;
 const MEMORY_CLAIM_TTL: Duration = Duration::from_secs(30 * 60);
 const MAX_MEMORY_TEXT_CHARS: usize = 4000;
 
@@ -40,6 +43,16 @@ impl MemoryBlackboard {
                 || existing.key != claim.key
                 || existing.run_id != claim.run_id
         });
+        if claims
+            .iter()
+            .filter(|(existing, _)| existing.run_id == claim.run_id)
+            .count()
+            >= MAX_MEMORY_CLAIMS_PER_RUN
+        {
+            return Err(CatalogError::ExecutionFailed(format!(
+                "a run may publish at most {MAX_MEMORY_CLAIMS_PER_RUN} claims; reuse a key to update one"
+            )));
+        }
         if claims.len() >= MAX_MEMORY_CLAIMS {
             return Err(CatalogError::ExecutionFailed(
                 "memory blackboard is full; wait for stale claims to expire".into(),
@@ -76,11 +89,27 @@ impl MemoryBlackboard {
 
 struct MemoryToolContext {
     service: Arc<MemoryService>,
+    /// Present when memory indexing is live: enables the hybrid (text +
+    /// semantic) fact search. `None` keeps the pure text ranking.
+    indexer: Option<Arc<crate::memory::MemoryIndexer>>,
     blackboard: Arc<MemoryBlackboard>,
     project_id: String,
     chat_id: String,
     agent: String,
     run_id: String,
+}
+
+/// Everything a run needs to expose the `memory.*` tools.
+pub struct MemoryToolParams {
+    pub service: Arc<MemoryService>,
+    /// Present when memory indexing is live: enables the hybrid (text +
+    /// semantic) fact search. `None` keeps the pure text ranking.
+    pub indexer: Option<Arc<crate::memory::MemoryIndexer>>,
+    pub blackboard: Arc<MemoryBlackboard>,
+    pub project_id: String,
+    pub chat_id: String,
+    pub agent: String,
+    pub run_id: String,
 }
 
 impl Drop for MemoryToolContext {
@@ -255,15 +284,7 @@ impl McpCatalog {
         }
     }
 
-    pub fn with_memory(
-        mut self,
-        service: Arc<MemoryService>,
-        blackboard: Arc<MemoryBlackboard>,
-        project_id: String,
-        chat_id: String,
-        agent: String,
-        run_id: String,
-    ) -> Self {
+    pub fn with_memory(mut self, params: MemoryToolParams) -> Self {
         let defs = memory_tool_definitions();
         self.order
             .extend(defs.iter().map(|definition| definition.name.clone()));
@@ -272,12 +293,13 @@ impl McpCatalog {
                 .map(|definition| (definition.name.clone(), definition)),
         );
         self.memory = Some(MemoryToolContext {
-            service,
-            blackboard,
-            project_id,
-            chat_id,
-            agent,
-            run_id,
+            service: params.service,
+            indexer: params.indexer,
+            blackboard: params.blackboard,
+            project_id: params.project_id,
+            chat_id: params.chat_id,
+            agent: params.agent,
+            run_id: params.run_id,
         });
         self
     }
@@ -494,10 +516,15 @@ fn execute_memory_tool(
                 .service
                 .search(&context.project_id, query, limit)
                 .map_err(memory_tool_error)?;
-            let facts = context
-                .service
-                .search_facts(&context.project_id, Some(&context.chat_id), query, limit)
-                .map_err(memory_tool_error)?;
+            let facts = match &context.indexer {
+                Some(indexer) => indexer
+                    .hybrid_search_facts(&context.project_id, &context.chat_id, query, limit)
+                    .map_err(memory_tool_error)?,
+                None => context
+                    .service
+                    .search_facts(&context.project_id, Some(&context.chat_id), query, limit)
+                    .map_err(memory_tool_error)?,
+            };
             Ok(serde_json::json!({
                 "events": events.iter().map(memory_event_json).collect::<Vec<_>>(),
                 "facts": facts,
@@ -552,13 +579,18 @@ fn execute_memory_tool(
         }
         "memory.why" => {
             let decision = string_arg(&input, "decision")?;
-            let facts = context
-                .service
-                .search_facts(&context.project_id, Some(&context.chat_id), decision, limit)
-                .map_err(memory_tool_error)?
-                .into_iter()
-                .filter(|fact| fact.kind == FactKind::Decision)
-                .collect::<Vec<_>>();
+            let facts = match &context.indexer {
+                Some(indexer) => indexer
+                    .hybrid_search_facts(&context.project_id, &context.chat_id, decision, limit)
+                    .map_err(memory_tool_error)?,
+                None => context
+                    .service
+                    .search_facts(&context.project_id, Some(&context.chat_id), decision, limit)
+                    .map_err(memory_tool_error)?,
+            }
+            .into_iter()
+            .filter(|fact| fact.kind == FactKind::Decision)
+            .collect::<Vec<_>>();
             Ok(serde_json::json!({"decisions": facts}))
         }
         "memory.note" => {
@@ -1297,14 +1329,15 @@ mod tests {
     fn memory_tools_are_readonly_or_approval_gated_as_appropriate() {
         let dir = tempfile::tempdir().unwrap();
         let service = Arc::new(MemoryService::open(dir.path()).unwrap());
-        let catalog = McpCatalog::komet_default(Arc::new(FakeHost)).with_memory(
+        let catalog = McpCatalog::komet_default(Arc::new(FakeHost)).with_memory(MemoryToolParams {
             service,
-            Arc::new(MemoryBlackboard::default()),
-            "project".into(),
-            "chat".into(),
-            "codex".into(),
-            "run".into(),
-        );
+            indexer: None,
+            blackboard: Arc::new(MemoryBlackboard::default()),
+            project_id: "project".into(),
+            chat_id: "chat".into(),
+            agent: "codex".into(),
+            run_id: "run".into(),
+        });
         for name in [
             "memory.search",
             "memory.recent",
@@ -1325,6 +1358,7 @@ mod tests {
         let blackboard = Arc::new(MemoryBlackboard::default());
         let context = MemoryToolContext {
             service,
+            indexer: None,
             blackboard: blackboard.clone(),
             project_id: "project".into(),
             chat_id: "chat".into(),
@@ -1344,11 +1378,32 @@ mod tests {
     }
 
     #[test]
+    fn one_run_cannot_fill_the_whole_blackboard() {
+        let blackboard = MemoryBlackboard::default();
+        let make = |run: &str, key: String| MemoryClaim {
+            project_id: "p".into(),
+            key,
+            run_id: run.into(),
+            agent: "codex".into(),
+            summary: "x".into(),
+            expires_at_ms: 0,
+        };
+        for i in 0..MAX_MEMORY_CLAIMS_PER_RUN {
+            blackboard.claim(make("run-a", format!("k{i}"))).unwrap();
+        }
+        assert!(blackboard.claim(make("run-a", "overflow".into())).is_err());
+        // Re-claiming an existing key replaces it; other runs are unaffected.
+        blackboard.claim(make("run-a", "k0".into())).unwrap();
+        blackboard.claim(make("run-b", "k0".into())).unwrap();
+    }
+
+    #[test]
     fn memory_note_creates_a_provenance_marked_fact() {
         let dir = tempfile::tempdir().unwrap();
         let service = Arc::new(MemoryService::open(dir.path()).unwrap());
         let context = MemoryToolContext {
             service: service.clone(),
+            indexer: None,
             blackboard: Arc::new(MemoryBlackboard::default()),
             project_id: "project".into(),
             chat_id: "chat".into(),

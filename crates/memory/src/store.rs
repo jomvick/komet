@@ -1,6 +1,8 @@
-//! The local SQLite memory store: one database per device data dir
-//! (`<data_dir>/memory/memory.sqlite`), WAL mode, FTS5 when the bundled
-//! SQLite provides it.
+//! The local SQLite memory store: one database per store directory
+//! (`<data_dir>/memory/memory.sqlite` by default, or the custom location in
+//! `memory-config.json`), WAL mode, FTS5 when the bundled SQLite provides it.
+//! With the `embeddings` feature the fact table also carries sqlite-vec
+//! vectors; text search stays authoritative, vectors only re-rank.
 //!
 //! Writers go through a single background thread fed by a bounded channel —
 //! the engine's publish path only ever does a `try_send`. All reads
@@ -56,6 +58,11 @@ pub enum MemoryError {
 
 /// One-way export into an explicitly chosen new or previously-owned
 /// directory. A marker prevents overwriting an unrelated existing vault.
+/// A manifest (`.komet-memory-export.json`) records, per project, which
+/// notes this tool wrote: a re-export deletes exactly the notes it listed
+/// that no longer exist in the store (a forgotten fact must not outlive
+/// itself in the vault), never a file it did not write and never a note
+/// another project's export still lists.
 pub fn export_obsidian(
     service: &MemoryService,
     project_id: &str,
@@ -78,12 +85,13 @@ pub fn export_obsidian(
         std::fs::write(destination.join(MARKER), "Komet one-way memory export\n")?;
     }
 
-    let facts = service.facts(project_id, None, true, 10_000)?;
-    let events = service.recent(project_id, 10_000, None)?;
+    let (facts, events) = service.export_snapshot(project_id)?;
     let facts_dir = destination.join("Facts");
     let sessions_dir = destination.join("Sessions");
     ensure_export_directory(&facts_dir)?;
     ensure_export_directory(&sessions_dir)?;
+    let mut fact_names: Vec<String> = Vec::new();
+    let mut session_names: Vec<String> = Vec::new();
 
     for fact in &facts {
         let path_link = fact
@@ -112,10 +120,9 @@ pub fn export_obsidian(
             yaml_optional(fact.source_model.as_deref()),
             fact.replaced_by.map_or("null".into(), |id| id.to_string()),
         );
-        write_export_file(
-            &facts_dir.join(format!("{}-{}.md", fact.kind.as_str(), fact.id)),
-            &content,
-        )?;
+        let name = format!("{}-{}.md", fact.kind.as_str(), fact.id);
+        write_export_file(&facts_dir.join(&name), &content)?;
+        fact_names.push(name);
     }
 
     let mut chats: HashMap<String, Vec<MemoryEvent>> = HashMap::new();
@@ -160,15 +167,119 @@ pub fn export_obsidian(
                 path_link
             ));
         }
-        write_export_file(
-            &sessions_dir.join(format!("{}.md", stable_export_slug(chat_id))),
-            &markdown,
-        )?;
+        let name = format!("{}.md", stable_export_slug(chat_id));
+        write_export_file(&sessions_dir.join(&name), &markdown)?;
+        session_names.push(name);
     }
+
+    // Forgotten facts and vanished sessions: drop the notes THIS project's
+    // previous export wrote that are gone from the store. Notes another
+    // project's export still lists (global facts appear in every project's
+    // export) stay. Written last, so a failure above deletes nothing.
+    let mut manifest = load_export_manifest(&destination);
+    let previous = manifest.projects.remove(project_id).unwrap_or_default();
+    let current = ExportedNotes {
+        facts: fact_names,
+        sessions: session_names,
+    };
+    let stale_facts: Vec<String> = previous
+        .facts
+        .iter()
+        .filter(|name| !current.facts.contains(name))
+        .filter(|name| {
+            !manifest
+                .projects
+                .values()
+                .any(|notes| notes.facts.contains(name))
+        })
+        .cloned()
+        .collect();
+    let stale_sessions: Vec<String> = previous
+        .sessions
+        .iter()
+        .filter(|name| !current.sessions.contains(name))
+        .filter(|name| {
+            !manifest
+                .projects
+                .values()
+                .any(|notes| notes.sessions.contains(name))
+        })
+        .cloned()
+        .collect();
+    prune_export_notes(&facts_dir, &stale_facts);
+    prune_export_notes(&sessions_dir, &stale_sessions);
+    manifest.projects.insert(project_id.to_string(), current);
+    save_export_manifest(&destination, &manifest)?;
+
     Ok(ObsidianExportReport {
         facts: facts.len(),
         sessions: chats.len(),
     })
+}
+
+const EXPORT_MANIFEST_FILE: &str = ".komet-memory-export.json";
+
+/// What a previous export wrote, per project. Lives inside the destination
+/// next to the ownership marker.
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct ExportManifest {
+    #[serde(default)]
+    projects: std::collections::BTreeMap<String, ExportedNotes>,
+}
+
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct ExportedNotes {
+    #[serde(default)]
+    facts: Vec<String>,
+    #[serde(default)]
+    sessions: Vec<String>,
+}
+
+/// A missing or unreadable manifest means "nothing known": nothing is
+/// deleted, which is the safe direction.
+fn load_export_manifest(destination: &Path) -> ExportManifest {
+    std::fs::read_to_string(destination.join(EXPORT_MANIFEST_FILE))
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+fn save_export_manifest(destination: &Path, manifest: &ExportManifest) -> Result<(), MemoryError> {
+    let path = destination.join(EXPORT_MANIFEST_FILE);
+    if std::fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return Err(MemoryError::Other(
+            "refusing to write through an export symlink".into(),
+        ));
+    }
+    let temporary = destination.join(format!("{EXPORT_MANIFEST_FILE}.tmp"));
+    std::fs::write(&temporary, serde_json::to_string_pretty(manifest)?)?;
+    std::fs::rename(temporary, path)?;
+    Ok(())
+}
+
+/// A manifest entry is only ever a bare `*.md` file name: the manifest sits
+/// in a user-writable folder and must not be able to point a delete at a
+/// path outside the notes directories.
+fn is_owned_note_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && name.ends_with(".md")
+        && !name.starts_with('.')
+        && !name.contains(['/', '\\'])
+}
+
+/// Delete the listed notes from `dir`: regular files only (never a symlink,
+/// never a directory), best effort.
+fn prune_export_notes(dir: &Path, stale: &[String]) {
+    for name in stale {
+        if !is_owned_note_name(name) {
+            continue;
+        }
+        let path = dir.join(name);
+        if std::fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_file()) {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
 }
 
 fn yaml_scalar(value: &str) -> String {
@@ -261,6 +372,46 @@ impl MemoryService {
         destination: &Path,
     ) -> Result<ObsidianExportReport, MemoryError> {
         export_obsidian(self, project_id, destination)
+    }
+
+    /// Everything an export needs WITHOUT the readers' display caps (`facts`
+    /// clamps to 200 rows, `recent` to 1000 — an export built on them would
+    /// silently truncate). Still bounded so a runaway store cannot exhaust
+    /// memory.
+    fn export_snapshot(
+        &self,
+        project_id: &str,
+    ) -> Result<(Vec<MemoryFact>, Vec<MemoryEvent>), MemoryError> {
+        const EXPORT_MAX_ROWS: i64 = 50_000;
+        let conn = lock(&self.conn);
+        let facts = {
+            let mut stmt = conn.prepare(
+                "SELECT id, project_id, chat_id, kind, scope, content, source,
+                        source_agent, source_model, source_event_seq, source_path,
+                        confidence, user_confirmed, valid_from_ms, stale_at_ms, replaced_by
+                 FROM memory_facts
+                 WHERE project_id = ?1 OR scope = 'global'
+                 ORDER BY stale_at_ms IS NOT NULL, valid_from_ms DESC, id DESC
+                 LIMIT ?2",
+            )?;
+            stmt.query_map(params![project_id, EXPORT_MAX_ROWS], row_to_fact)?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let events = {
+            let mut stmt = conn.prepare(
+                "SELECT id, project_id, chat_id, source_seq, agent, model, kind,
+                        occurred_at_ms, tool_name, relative_path, outcome,
+                        input_tokens, cached_input_tokens, output_tokens,
+                        reasoning_tokens, duration_ms
+                 FROM memory_events
+                 WHERE project_id = ?1
+                 ORDER BY occurred_at_ms DESC, id DESC
+                 LIMIT ?2",
+            )?;
+            stmt.query_map(params![project_id, EXPORT_MAX_ROWS], row_to_event)?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        Ok((facts, events))
     }
 
     /// Open (or create) the store under `dir` — typically
@@ -598,36 +749,48 @@ impl MemoryService {
 
     /// Deterministic 300–500-token handoff briefing, or `None` when the
     /// project has no useful memory (disabled, empty, or all stale).
-    /// `exclude_chat_id` drops the receiving chat's own activity — the agent
-    /// already knows its own work.
+    /// `exclude` is the receiving (chat_id, agent) pair — see
+    /// [`Self::briefing_digest`].
     pub fn briefing(
         &self,
         project_id: &str,
-        exclude_chat_id: Option<&str>,
+        exclude: Option<(&str, &str)>,
     ) -> Result<Option<String>, MemoryError> {
         if !self.is_enabled(project_id)? {
             return Ok(None);
         }
         let since = now_ms().saturating_sub(BRIEFING_WINDOW_MS);
-        let digest = self.briefing_digest(project_id, exclude_chat_id, since)?;
+        let digest = self.briefing_digest(project_id, exclude, since)?;
         Ok(crate::briefing::build(&digest, now_ms()))
     }
 
     /// SQL-aggregated briefing input: per-agent rollups, top modified paths
     /// and recent failures. Grouped queries mean one high-volume agent
     /// cannot consume the whole row budget.
+    ///
+    /// `exclude` is the receiving (chat_id, agent) pair: only that pair's
+    /// rows are dropped — the agent already knows its own work in this
+    /// chat. The same chat under ANOTHER agent, and the same agent in
+    /// another chat, still count as project context (an agent switch
+    /// mid-chat must not blind the newcomer to what the previous agent
+    /// did). Session-scoped facts stay chat-scoped: they are keyed by
+    /// chat alone, not by agent.
     pub fn briefing_digest(
         &self,
         project_id: &str,
-        exclude_chat_id: Option<&str>,
+        exclude: Option<(&str, &str)>,
         since_ms: i64,
     ) -> Result<BriefingDigest, MemoryError> {
         let conn = lock(&self.conn);
+        let (exclude_chat, exclude_agent) = match exclude {
+            Some((chat, agent)) => (Some(chat), Some(agent)),
+            None => (None, None),
+        };
         let chats: i64 = conn.query_row(
             "SELECT COUNT(DISTINCT chat_id) FROM memory_events
-             WHERE project_id = ?1 AND (?2 IS NULL OR chat_id != ?2)
+             WHERE project_id = ?1 AND (?2 IS NULL OR NOT (chat_id = ?2 AND agent = ?4))
                AND occurred_at_ms >= ?3",
-            params![project_id, exclude_chat_id, since_ms],
+            params![project_id, exclude_chat, since_ms, exclude_agent],
             |r| r.get(0),
         )?;
 
@@ -639,20 +802,23 @@ impl MemoryService {
                     COALESCE(SUM(kind = 'tool_call' AND tool_name = 'read_file'), 0) AS file_reads,
                     MAX(occurred_at_ms) AS last_ms
              FROM memory_events
-             WHERE project_id = ?1 AND (?2 IS NULL OR chat_id != ?2)
+             WHERE project_id = ?1 AND (?2 IS NULL OR NOT (chat_id = ?2 AND agent = ?4))
                AND occurred_at_ms >= ?3
              GROUP BY agent",
         )?;
         let mut agents: Vec<AgentDigest> = stmt
-            .query_map(params![project_id, exclude_chat_id, since_ms], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, i64>(1)? as u32,
-                    r.get::<_, i64>(2)? as u32,
-                    r.get::<_, i64>(3)? as u32,
-                    r.get::<_, i64>(4)?,
-                ))
-            })?
+            .query_map(
+                params![project_id, exclude_chat, since_ms, exclude_agent],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, i64>(1)? as u32,
+                        r.get::<_, i64>(2)? as u32,
+                        r.get::<_, i64>(3)? as u32,
+                        r.get::<_, i64>(4)?,
+                    ))
+                },
+            )?
             .collect::<Result<Vec<_>, _>>()?
             .into_iter()
             .map(
@@ -682,13 +848,15 @@ impl MemoryService {
                       ) AS rn
                FROM memory_events
                WHERE project_id = ?1 AND kind = 'session_end'
-                 AND (?2 IS NULL OR chat_id != ?2) AND occurred_at_ms >= ?3
+                 AND (?2 IS NULL OR NOT (chat_id = ?2 AND agent = ?4))
+                 AND occurred_at_ms >= ?3
              ) WHERE rn = 1",
         )?;
         let statuses: Vec<(String, Option<String>)> = stmt
-            .query_map(params![project_id, exclude_chat_id, since_ms], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })?
+            .query_map(
+                params![project_id, exclude_chat, since_ms, exclude_agent],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?
             .collect::<Result<Vec<_>, _>>()?;
         drop(stmt);
         for (agent, status) in statuses {
@@ -712,15 +880,17 @@ impl MemoryService {
                WHERE project_id = ?1 AND kind = 'tool_call'
                  AND relative_path IS NOT NULL
                  AND tool_name IN ('write_file', 'edit_file', 'apply_patch')
-                 AND (?2 IS NULL OR chat_id != ?2) AND occurred_at_ms >= ?3
+                 AND (?2 IS NULL OR NOT (chat_id = ?2 AND agent = ?4))
+                 AND occurred_at_ms >= ?3
                GROUP BY agent, relative_path
              ) WHERE rn <= 8
              ORDER BY last_ms DESC, agent, relative_path",
         )?;
         let touches: Vec<(String, String, i64)> = stmt
-            .query_map(params![project_id, exclude_chat_id, since_ms], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-            })?
+            .query_map(
+                params![project_id, exclude_chat, since_ms, exclude_agent],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )?
             .collect::<Result<Vec<_>, _>>()?;
         drop(stmt);
         for (agent, path, last_ms) in touches {
@@ -742,7 +912,8 @@ impl MemoryService {
                WHERE project_id = ?1
                  AND ((kind = 'tool_result' AND outcome = 'error')
                    OR (kind = 'session_end' AND outcome IN ('errored', 'interrupted')))
-                 AND (?2 IS NULL OR chat_id != ?2) AND occurred_at_ms >= ?3
+                 AND (?2 IS NULL OR NOT (chat_id = ?2 AND agent = ?4))
+                 AND occurred_at_ms >= ?3
              ) WHERE rn <= 5
              ORDER BY occurred_at_ms DESC, id DESC",
         )?;
@@ -755,16 +926,19 @@ impl MemoryService {
             i64,
         );
         let failures: Vec<FailureRow> = stmt
-            .query_map(params![project_id, exclude_chat_id, since_ms], |r| {
-                Ok((
-                    r.get(0)?,
-                    r.get(1)?,
-                    r.get(2)?,
-                    r.get(3)?,
-                    r.get(4)?,
-                    r.get(5)?,
-                ))
-            })?
+            .query_map(
+                params![project_id, exclude_chat, since_ms, exclude_agent],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                },
+            )?
             .collect::<Result<Vec<_>, _>>()?;
         drop(stmt);
         for (agent, kind, tool_name, rel_path, outcome, ms) in failures {
@@ -786,13 +960,13 @@ impl MemoryService {
             "SELECT kind, content, source, source_agent, source_path, confidence, stale_at_ms
              FROM memory_facts
              WHERE (project_id = ?1 OR scope = 'global')
-               AND (scope != 'session' OR ?2 IS NULL OR chat_id != ?2)
+               AND (scope != 'session' OR chat_id = ?2)
                AND (stale_at_ms IS NULL OR stale_at_ms >= ?3)
              ORDER BY stale_at_ms IS NOT NULL, confidence DESC, valid_from_ms DESC, id DESC
              LIMIT 8",
         )?;
         let facts = stmt
-            .query_map(params![project_id, exclude_chat_id, since_ms], |r| {
+            .query_map(params![project_id, exclude_chat, since_ms], |r| {
                 Ok(FactDigest {
                     kind: r.get(0)?,
                     content: r.get(1)?,
@@ -1506,6 +1680,27 @@ impl MemoryService {
             .query_map(params![project_id], |r| r.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    /// Synchronously move a chat's replay cursor forward and clear gap rows
+    /// at or below `seq` — the same effect as a queued `Resume`, applied
+    /// immediately on the write connection. The global memory switch needs
+    /// this: an async `Resume` could still sit in the writer queue when a
+    /// catch-up reads the cursor, replaying the very window being sealed.
+    pub fn advance_cursor(&self, chat_id: &str, seq: u64) -> Result<(), MemoryError> {
+        let conn = lock(&self.write);
+        conn.execute(
+            "INSERT INTO memory_chat_state(chat_id, project_id, last_seq)
+             VALUES(?1, NULL, ?2)
+             ON CONFLICT(chat_id) DO UPDATE SET
+               last_seq = MAX(memory_chat_state.last_seq, excluded.last_seq)",
+            params![chat_id, seq as i64],
+        )?;
+        conn.execute(
+            "DELETE FROM memory_chat_gaps WHERE chat_id = ?1 AND seq <= ?2",
+            params![chat_id, seq as i64],
+        )?;
+        Ok(())
     }
 
     /// Clear persisted gap markers without touching the cursor — used when
@@ -2810,7 +3005,9 @@ fn search_text(rec: &MemoryRecord, rel_path: Option<&str>) -> String {
 
 /// Copy the store files from `src_dir` to `dst_dir`. Runs before the first
 /// open, so there is no live database to corrupt; idempotent (a no-op when
-/// the destination already has a database or the source has none). The
+/// the source has none, or the destination already holds a store at least
+/// as new as the source — a NEWER source replaces a stale destination,
+/// whose files are kept in a `.komet-relocate-backup-*` folder). The
 /// source is left in place: it is derived data and a free rollback if the
 /// new location misbehaves.
 ///
@@ -2820,8 +3017,27 @@ fn search_text(rec: &MemoryRecord, rel_path: Option<&str>) -> String {
 /// retryable state instead of a db without its WAL.
 pub fn relocate_store(src_dir: &Path, dst_dir: &Path) -> std::io::Result<()> {
     let src_db = src_dir.join(DB_FILE);
-    if !src_db.exists() || dst_dir.join(DB_FILE).exists() {
+    if !src_db.exists() {
         return Ok(());
+    }
+    if dst_dir.join(DB_FILE).exists() {
+        // The source is deliberately kept after a move, so moving A -> B -> A
+        // finds an OLD store at A. Silently adopting it would drop months of
+        // data that lives at B: when the source is newer, back the stale
+        // destination up and relocate over it; otherwise keep it as is.
+        if newest_store_mtime(src_dir) > newest_store_mtime(dst_dir) {
+            let backup = dst_dir.join(format!(".komet-relocate-backup-{}", now_ms()));
+            std::fs::create_dir_all(&backup)?;
+            for suffix in ["", "-wal", "-shm"] {
+                let name = format!("{DB_FILE}{suffix}");
+                let path = dst_dir.join(&name);
+                if path.exists() {
+                    std::fs::rename(&path, backup.join(&name))?;
+                }
+            }
+        } else {
+            return Ok(());
+        }
     }
     std::fs::create_dir_all(dst_dir)?;
     let stage = dst_dir.join(".komet-relocate");
@@ -2830,11 +3046,33 @@ pub fn relocate_store(src_dir: &Path, dst_dir: &Path) -> std::io::Result<()> {
     }
     std::fs::create_dir_all(&stage)?;
     let publish = (|| -> std::io::Result<()> {
-        for suffix in ["", "-wal", "-shm"] {
-            let name = format!("{DB_FILE}{suffix}");
-            let src = src_dir.join(&name);
-            if src.exists() {
-                std::fs::copy(&src, stage.join(&name))?;
+        // Fold the source into ONE consistent file first: a crash can leave
+        // committed rows in the WAL only, and a three-file copy pairs a
+        // database with a WAL that may not match it. VACUUM INTO reads
+        // through the WAL, so the copy is complete and self-contained.
+        // Falls back to the file copy when the source cannot be vacuumed
+        // (corrupt, a loaded extension missing, disk too full).
+        let vacuumed = stage.join(DB_FILE);
+        let _ = std::fs::remove_file(&vacuumed);
+        let vac: Result<(), String> = (|| {
+            let conn = Connection::open(&src_db).map_err(|err| err.to_string())?;
+            #[cfg(feature = "embeddings")]
+            register_vector_extension(&conn).map_err(|err| err.to_string())?;
+            conn.busy_timeout(Duration::from_secs(5))
+                .map_err(|err| err.to_string())?;
+            conn.execute("VACUUM INTO ?1", [vacuumed.to_string_lossy().as_ref()])
+                .map(|_| ())
+                .map_err(|err| err.to_string())
+        })();
+        if let Err(err) = vac {
+            tracing::warn!(error = %err, "memory: VACUUM INTO failed, copying files instead");
+            let _ = std::fs::remove_file(&vacuumed);
+            for suffix in ["", "-wal", "-shm"] {
+                let name = format!("{DB_FILE}{suffix}");
+                let src = src_dir.join(&name);
+                if src.exists() {
+                    std::fs::copy(&src, stage.join(&name))?;
+                }
             }
         }
         // WAL/SHM first, the main file last: until `memory.sqlite` lands the
@@ -2859,8 +3097,123 @@ pub fn relocate_store(src_dir: &Path, dst_dir: &Path) -> std::io::Result<()> {
     publish
 }
 
+/// The files a relocation may leave behind in the directory it moved FROM:
+/// the store's own database files and the `.komet-relocate-backup-*`
+/// folders `relocate_store` creates. Nothing else in that directory is
+/// ever touched — the folder may hold unrelated user files.
+fn previous_copy_entries(dir: &Path) -> std::io::Result<Vec<std::path::PathBuf>> {
+    let mut paths = Vec::new();
+    for suffix in ["", "-wal", "-shm"] {
+        let path = dir.join(format!("{DB_FILE}{suffix}"));
+        if std::fs::symlink_metadata(&path).is_ok_and(|meta| !meta.file_type().is_symlink()) {
+            paths.push(path);
+        }
+    }
+    match std::fs::read_dir(dir) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry = entry?;
+                let name = entry.file_name();
+                let is_backup = name
+                    .to_str()
+                    .is_some_and(|name| name.starts_with(".komet-relocate-backup-"));
+                if is_backup && entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                    paths.push(entry.path());
+                }
+            }
+        }
+        // A vanished directory means nothing left to clean.
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
+    }
+    Ok(paths)
+}
+
+/// Bytes a previous relocation left in `dir` (0 = nothing to clean).
+pub fn previous_copy_bytes(dir: &Path) -> u64 {
+    previous_copy_entries(dir)
+        .map(|paths| {
+            paths
+                .iter()
+                .map(|path| {
+                    if path.is_dir() {
+                        dir_bytes(path)
+                    } else {
+                        std::fs::symlink_metadata(path)
+                            .map(|meta| meta.len())
+                            .unwrap_or(0)
+                    }
+                })
+                .sum()
+        })
+        .unwrap_or(0)
+}
+
+/// Delete only what [`previous_copy_bytes`] counted. Returns bytes freed.
+pub fn delete_previous_copy(dir: &Path) -> std::io::Result<u64> {
+    let paths = previous_copy_entries(dir)?;
+    let mut freed = 0;
+    for path in paths {
+        let bytes = if path.is_dir() {
+            dir_bytes(&path)
+        } else {
+            std::fs::symlink_metadata(&path)
+                .map(|meta| meta.len())
+                .unwrap_or(0)
+        };
+        let removed = if path.is_dir() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+        if let Err(err) = removed
+            && err.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(err);
+        }
+        freed += bytes;
+    }
+    Ok(freed)
+}
+
+/// Recursive byte total of a directory, symlinks not followed.
+fn dir_bytes(dir: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut total = 0;
+    for entry in entries.flatten() {
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        if kind.is_symlink() {
+            continue;
+        }
+        if kind.is_dir() {
+            total += dir_bytes(&entry.path());
+        } else if let Ok(meta) = entry.metadata() {
+            total += meta.len();
+        }
+    }
+    total
+}
+
 fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
+}
+
+/// Newest modification time among the store's database and WAL files — the
+/// WAL carries the latest committed writes until a checkpoint.
+fn newest_store_mtime(dir: &Path) -> Option<std::time::SystemTime> {
+    ["", "-wal"]
+        .iter()
+        .filter_map(|suffix| {
+            std::fs::metadata(dir.join(format!("{DB_FILE}{suffix}")))
+                .ok()?
+                .modified()
+                .ok()
+        })
+        .max()
 }
 
 #[cfg(test)]
@@ -3517,6 +3870,79 @@ mod tests {
     }
 
     #[test]
+    fn relocate_keeps_rows_that_only_live_in_an_uncheckpointed_wal() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let src_dir = src.path().join("memory");
+        let dst_dir = dst.path().join("memory");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let db = src_dir.join("memory.sqlite");
+        // Snapshot db+WAL while the connection is open, then restore that
+        // snapshot: it is exactly what a crash leaves — rows committed in the
+        // WAL, never checkpointed into the database file.
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+            conn.pragma_update(None, "wal_autocheckpoint", 0i64)
+                .unwrap();
+            conn.execute_batch("CREATE TABLE t (v TEXT); INSERT INTO t VALUES ('in-wal');")
+                .unwrap();
+            for suffix in ["", "-wal"] {
+                std::fs::copy(
+                    src_dir.join(format!("memory.sqlite{suffix}")),
+                    src.path().join(format!("keep{suffix}")),
+                )
+                .unwrap();
+            }
+        }
+        for suffix in ["", "-wal"] {
+            std::fs::copy(
+                src.path().join(format!("keep{suffix}")),
+                src_dir.join(format!("memory.sqlite{suffix}")),
+            )
+            .unwrap();
+        }
+        let _ = std::fs::remove_file(src_dir.join("memory.sqlite-shm"));
+        assert!(
+            std::fs::metadata(src_dir.join("memory.sqlite-wal"))
+                .unwrap()
+                .len()
+                > 0,
+            "the row must live in the WAL, not the database file"
+        );
+
+        relocate_store(&src_dir, &dst_dir).unwrap();
+        let conn = Connection::open(dst_dir.join("memory.sqlite")).unwrap();
+        let value: String = conn
+            .query_row("SELECT v FROM t", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(value, "in-wal");
+    }
+
+    #[test]
+    fn delete_previous_copy_only_touches_store_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("memory.sqlite"), b"db").unwrap();
+        std::fs::write(root.join("memory.sqlite-wal"), b"wal").unwrap();
+        std::fs::write(root.join("notes.txt"), b"keep me").unwrap();
+        let backup = root.join(".komet-relocate-backup-1");
+        std::fs::create_dir_all(&backup).unwrap();
+        std::fs::write(backup.join("memory.sqlite"), b"old").unwrap();
+
+        assert_eq!(previous_copy_bytes(root), 8);
+        assert_eq!(delete_previous_copy(root).unwrap(), 8);
+        assert!(!root.join("memory.sqlite").exists());
+        assert!(!root.join("memory.sqlite-wal").exists());
+        assert!(!backup.exists());
+        assert!(
+            root.join("notes.txt").exists(),
+            "unrelated files in that folder must survive"
+        );
+        assert_eq!(previous_copy_bytes(root), 0);
+    }
+
+    #[test]
     fn forget_tombstone_blocks_late_and_replayed_records() {
         let (svc, _dir) = svc();
         svc.enqueue(MemoryItem::Record(Box::new(rec(1, "session_start"))))
@@ -3629,5 +4055,188 @@ mod tests {
         // Whole-chat forget still clears them.
         svc.forget_chat("chat-1", Some(10)).unwrap();
         assert_eq!(svc.chat_cursor("chat-1").unwrap().gap_seq, None);
+    }
+
+    #[test]
+    fn briefing_excludes_only_the_receiving_chat_agent_pair() {
+        let (svc, _dir) = svc();
+        let now = now_ms();
+        // Receiver = (chat-1, agent-a). Its own rows in chat-1 drop out;
+        // agent-b in the SAME chat and agent-a in ANOTHER chat stay.
+        let mut own = rec(1, "session_start");
+        own.chat_id = "chat-1".into();
+        own.agent = "agent-a".into();
+        own.occurred_at_ms = now;
+        let mut other_agent = rec(2, "session_start");
+        other_agent.chat_id = "chat-1".into();
+        other_agent.agent = "agent-b".into();
+        other_agent.occurred_at_ms = now;
+        let mut other_chat = rec(3, "session_start");
+        other_chat.chat_id = "chat-2".into();
+        other_chat.agent = "agent-a".into();
+        other_chat.occurred_at_ms = now;
+        for r in [own, other_agent, other_chat] {
+            svc.enqueue(MemoryItem::Record(Box::new(r))).unwrap();
+        }
+        wait_for(|| svc.stats("p_test").unwrap().events == 3);
+
+        let digest = svc
+            .briefing_digest("p_test", Some(("chat-1", "agent-a")), now - 1000)
+            .unwrap();
+        assert_eq!(digest.chats, 2, "chat-1 still counts via agent-b");
+        let a = digest
+            .agents
+            .iter()
+            .find(|d| d.agent == "agent-a")
+            .expect("agent-a's other-chat work remains");
+        assert_eq!(a.sessions, 1, "only chat-2's session_start survives");
+        assert!(
+            digest.agents.iter().any(|d| d.agent == "agent-b"),
+            "the previous agent in the same chat must stay visible"
+        );
+    }
+
+    #[test]
+    fn briefing_facts_never_leak_other_chats_session_scope() {
+        let (svc, _dir) = svc();
+        let mut mine = fact("Mine: keep the cursor monotonic");
+        mine.scope = FactScope::Session;
+        mine.chat_id = Some("chat-me".into());
+        let mut theirs = fact("Theirs: private scratch note");
+        theirs.scope = FactScope::Session;
+        theirs.chat_id = Some("chat-other".into());
+        let project = fact("Project: use a bounded queue");
+        for f in [&mine, &theirs, &project] {
+            svc.create_fact(f).unwrap();
+        }
+        let digest = svc
+            .briefing_digest("p_test", Some(("chat-me", "agent-x")), now_ms() - 1000)
+            .unwrap();
+        let contents: Vec<&str> = digest.facts.iter().map(|f| f.content.as_str()).collect();
+        assert!(contents.iter().any(|c| c.starts_with("Project:")));
+        assert!(contents.iter().any(|c| c.starts_with("Mine:")));
+        assert!(
+            !contents.iter().any(|c| c.starts_with("Theirs:")),
+            "another chat's session-scoped fact leaked: {contents:?}"
+        );
+        // No receiving chat known: session-scoped facts stay out entirely.
+        let digest = svc
+            .briefing_digest("p_test", None, now_ms() - 1000)
+            .unwrap();
+        assert!(
+            digest
+                .facts
+                .iter()
+                .all(|f| !f.content.starts_with("Mine:") && !f.content.starts_with("Theirs:"))
+        );
+    }
+
+    #[test]
+    fn export_is_not_truncated_by_reader_caps() {
+        let (svc, dir) = svc();
+        for i in 0..250 {
+            svc.create_fact(&fact(&format!("Fact number {i}"))).unwrap();
+        }
+        let report = svc
+            .export_obsidian("p_test", &dir.path().join("vault"))
+            .unwrap();
+        assert_eq!(
+            report.facts, 250,
+            "export must not stop at the 200-row reader cap"
+        );
+    }
+
+    #[test]
+    fn relocate_replaces_a_stale_destination_and_keeps_a_backup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a");
+        let b = tmp.path().join("b");
+        // An old store left at `a` by an earlier move away from it.
+        drop(MemoryService::open(&a).unwrap());
+        std::thread::sleep(Duration::from_millis(50));
+        // The live store moved on at `b` and holds newer data.
+        let live = MemoryService::open(&b).unwrap();
+        live.enqueue(MemoryItem::Record(Box::new(rec(1, "session_start"))))
+            .unwrap();
+        wait_for(|| live.stats("p_test").unwrap().events == 1);
+        drop(live);
+
+        relocate_store(&b, &a).unwrap();
+        let reopened = MemoryService::open(&a).unwrap();
+        assert_eq!(
+            reopened.stats("p_test").unwrap().events,
+            1,
+            "the newer store must win over the stale destination"
+        );
+        let backups = std::fs::read_dir(&a)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(".komet-relocate-backup-")
+            })
+            .count();
+        assert_eq!(backups, 1, "the stale store must be backed up, not deleted");
+    }
+
+    #[test]
+    fn re_export_removes_notes_for_forgotten_facts_but_not_user_files() {
+        let (svc, dir) = svc();
+        let keep = svc.create_fact(&fact("Keep this decision")).unwrap();
+        let gone = svc.create_fact(&fact("Forget this decision")).unwrap();
+        let vault = dir.path().join("vault");
+        svc.export_obsidian("p_test", &vault).unwrap();
+        let note = |id: i64| vault.join(format!("Facts/decision-{id}.md"));
+        assert!(note(keep).exists() && note(gone).exists());
+        // A note the user added by hand must never be touched.
+        std::fs::write(vault.join("Facts/my-own-note.md"), "mine").unwrap();
+
+        assert!(svc.forget_fact(gone).unwrap());
+        svc.export_obsidian("p_test", &vault).unwrap();
+        assert!(note(keep).exists());
+        assert!(!note(gone).exists(), "a forgotten fact survived re-export");
+        assert_eq!(
+            std::fs::read_to_string(vault.join("Facts/my-own-note.md")).unwrap(),
+            "mine"
+        );
+    }
+
+    #[test]
+    fn shared_export_folder_keeps_other_projects_notes() {
+        let (svc, dir) = svc();
+        let mine = svc.create_fact(&fact("Project A decision")).unwrap();
+        let mut other_fact = fact("Project B decision");
+        other_fact.project_id = "p_other".into();
+        let theirs = svc.create_fact(&other_fact).unwrap();
+        let vault = dir.path().join("vault");
+        svc.export_obsidian("p_test", &vault).unwrap();
+        svc.export_obsidian("p_other", &vault).unwrap();
+
+        assert!(svc.forget_fact(mine).unwrap());
+        svc.export_obsidian("p_test", &vault).unwrap();
+        assert!(!vault.join(format!("Facts/decision-{mine}.md")).exists());
+        assert!(
+            vault.join(format!("Facts/decision-{theirs}.md")).exists(),
+            "another project's note was deleted"
+        );
+    }
+
+    #[test]
+    fn tampered_manifest_cannot_delete_outside_the_notes_folders() {
+        let (svc, dir) = svc();
+        let id = svc.create_fact(&fact("A decision")).unwrap();
+        let vault = dir.path().join("vault");
+        svc.export_obsidian("p_test", &vault).unwrap();
+        let victim = dir.path().join("victim.md");
+        std::fs::write(&victim, "precious").unwrap();
+        std::fs::write(
+            vault.join(".komet-memory-export.json"),
+            r#"{"projects":{"p_test":{"facts":["../../victim.md"],"sessions":[]}}}"#,
+        )
+        .unwrap();
+        assert!(svc.forget_fact(id).unwrap());
+        svc.export_obsidian("p_test", &vault).unwrap();
+        assert!(victim.exists(), "a manifest entry escaped the notes folder");
     }
 }

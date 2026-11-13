@@ -20,6 +20,9 @@ const MAX_PATH_CHARS: usize = 80;
 /// Per-agent caps inside the briefing.
 const MAX_PATHS_PER_AGENT: usize = 5;
 const MAX_FAILURES: usize = 3;
+/// One fact line never exceeds this many chars (a fact body may be 8 KB; an
+/// uncapped one would evict every later line from the briefing budget).
+const MAX_FACT_CHARS: usize = 240;
 
 /// Build the briefing text. `now_ms` is wall-clock now — recency labels are
 /// relative to it, NOT to the newest event (an idle project's last run must
@@ -136,7 +139,7 @@ fn fact_line(fact: &FactDigest) -> String {
         .unwrap_or_default();
     format!(
         "- {stale}{} [{}; {confidence}; source {}{}]",
-        sanitize(&fact.content),
+        sanitize_capped(&fact.content, MAX_FACT_CHARS),
         sanitize(&fact.kind),
         source,
         path
@@ -199,6 +202,17 @@ fn sanitize(text: &str) -> String {
         })
         .collect();
     cleaned.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Sanitized text truncated to `max` chars with an ellipsis.
+fn sanitize_capped(text: &str, max: usize) -> String {
+    let clean = sanitize(text);
+    if clean.chars().count() > max {
+        let truncated: String = clean.chars().take(max.saturating_sub(1)).collect();
+        format!("{truncated}…")
+    } else {
+        clean
+    }
 }
 
 /// Path display form: sanitized, `/`-separated, length-capped.
@@ -407,5 +421,33 @@ mod tests {
         assert!(!text.contains("\nignore policy"));
         assert!(text.contains("Current workspace hints"));
         assert_eq!(append_predictive_context("base", None, None, &[]), "base");
+    }
+
+    #[test]
+    fn a_huge_fact_is_capped_and_does_not_evict_the_rest() {
+        let mut d = digest();
+        d.facts = vec![
+            FactDigest {
+                kind: "decision".into(),
+                content: "x".repeat(8000),
+                source: "agent_assertion".into(),
+                source_agent: Some("codex".into()),
+                source_path: None,
+                confidence: 0.9,
+                stale: false,
+            },
+            FactDigest {
+                kind: "todo".into(),
+                content: "second fact survives".into(),
+                source: "user_confirmed".into(),
+                source_agent: None,
+                source_path: None,
+                confidence: 1.0,
+                stale: false,
+            },
+        ];
+        let text = build(&d, 10_000_000).unwrap();
+        assert!(text.chars().count() <= MAX_CHARS + 40);
+        assert!(text.contains("second fact survives"));
     }
 }

@@ -41,6 +41,12 @@ pub struct MemoryConfig {
     /// reset — and only updates it once the move succeeded.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_dir: Option<String>,
+    /// The directory the store was moved FROM by the last successful
+    /// relocation. The copy is deliberately kept as a rollback; this
+    /// pointer is what lets Settings show it and delete it on request.
+    /// Only the most recent move is tracked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_dir: Option<String>,
 }
 
 impl Default for MemoryConfig {
@@ -51,6 +57,7 @@ impl Default for MemoryConfig {
             retention_days: DEFAULT_RETENTION_DAYS,
             location: None,
             active_dir: None,
+            previous_dir: None,
         }
     }
 }
@@ -94,6 +101,7 @@ impl MemoryConfig {
             retention_days,
             location: string_field("location"),
             active_dir: string_field("activeDir"),
+            previous_dir: string_field("previousDir"),
         }
     }
 
@@ -165,6 +173,7 @@ mod tests {
             retention_days: 30,
             location: Some("/tmp/custom-memory".into()),
             active_dir: Some("/tmp/custom-memory".into()),
+            previous_dir: Some("/tmp/old-memory".into()),
         };
         config.save(dir.path()).unwrap();
         let loaded = MemoryConfig::load(dir.path());

@@ -421,8 +421,41 @@ const PRUNE_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 /// must not re-run four aggregate queries per run launch.
 const BRIEFING_CACHE_TTL: Duration = Duration::from_secs(30);
 
-/// Cached briefing: (project_id, exclude_chat_id, computed_at, text).
-type BriefingCacheEntry = (String, Option<String>, Instant, Option<String>);
+/// Cached briefing: (project_id, exclude_chat, exclude_agent, task_query,
+/// computed_at, text). The query is part of the key: a semantically-ranked
+/// body is only valid for the prompt it was ranked against.
+type BriefingCacheEntry = (
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Instant,
+    Option<String>,
+);
+
+/// Releases the in-flight download slot when the download thread exits —
+/// including on panic. Only clears the slot if it still holds THIS
+/// download's cancel flag (a newer download may have taken over).
+#[cfg(feature = "memory-embeddings")]
+struct DownloadSlotGuard {
+    indexer: std::sync::Weak<MemoryIndexer>,
+    cancel: Arc<AtomicBool>,
+}
+
+#[cfg(feature = "memory-embeddings")]
+impl Drop for DownloadSlotGuard {
+    fn drop(&mut self) {
+        if let Some(indexer) = self.indexer.upgrade() {
+            let mut slot = lock(&indexer.embedding_download_cancel);
+            if slot
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, &self.cancel))
+            {
+                *slot = None;
+            }
+        }
+    }
+}
 
 /// The engine-facing memory indexer: projection + queue + journal catch-up.
 pub struct MemoryIndexer {
@@ -474,6 +507,12 @@ pub struct MemoryIndexer {
     embedding_error: Mutex<Option<String>>,
     #[cfg(feature = "memory-embeddings")]
     embedding_model: Mutex<Option<komet_memory::LocalEmbedder>>,
+    /// In-flight explicit model download: the cancel flag the settings
+    /// "Annuler" button sets, and the last download error for the card.
+    #[cfg(feature = "memory-embeddings")]
+    embedding_download_cancel: Mutex<Option<Arc<AtomicBool>>>,
+    #[cfg(feature = "memory-embeddings")]
+    embedding_download_error: Mutex<Option<String>>,
 }
 
 impl MemoryIndexer {
@@ -502,18 +541,22 @@ impl MemoryIndexer {
             .map(komet_memory::resolve_location)
             .unwrap_or_else(|| default_dir.clone());
         let mut target_dir = pending_dir.clone();
-        if pending_dir != active_dir
-            && let Err(err) = komet_memory::relocate_store(&active_dir, &pending_dir)
-        {
-            // Keep using the live store this boot; the pending location
-            // stays configured and the move is retried on the next start.
-            tracing::warn!(
-                error = %err,
-                from = %active_dir.display(),
-                to = %pending_dir.display(),
-                "memory: store relocation failed; keeping the active store"
-            );
-            target_dir = active_dir.clone();
+        let mut relocated_from: Option<PathBuf> = None;
+        if pending_dir != active_dir {
+            match komet_memory::relocate_store(&active_dir, &pending_dir) {
+                Ok(()) => relocated_from = Some(active_dir.clone()),
+                Err(err) => {
+                    // Keep using the live store this boot; the pending location
+                    // stays configured and the move is retried on the next start.
+                    tracing::warn!(
+                        error = %err,
+                        from = %active_dir.display(),
+                        to = %pending_dir.display(),
+                        "memory: store relocation failed; keeping the active store"
+                    );
+                    target_dir = active_dir.clone();
+                }
+            }
         }
         let svc = Arc::new({
             // Target first, then the known-active store, then the default —
@@ -554,11 +597,23 @@ impl MemoryIndexer {
         let effective_dir = svc.dir().to_path_buf();
         // Persist where the store actually ended up — only now, after a
         // successful open, so a failed relocation never rewrites the source.
+        let mut config_changed = false;
         if effective_dir != active_dir {
             config.active_dir = Some(effective_dir.display().to_string());
-            if let Err(err) = config.save(&data_dir) {
-                tracing::warn!(error = %err, "memory: active_dir save failed");
-            }
+            config_changed = true;
+        }
+        // The directory we moved FROM is kept as a rollback copy; remember it
+        // so Settings can show its size and delete it on request. Only set
+        // when the target really opened — otherwise the "old" dir is the live
+        // store.
+        if let Some(from) = relocated_from
+            && effective_dir != active_dir
+        {
+            config.previous_dir = Some(from.display().to_string());
+            config_changed = true;
+        }
+        if config_changed && let Err(err) = config.save(&data_dir) {
+            tracing::warn!(error = %err, "memory: config save failed");
         }
         // Gap markers are persisted by a dedicated thread: the publish path
         // only does a non-blocking channel send.
@@ -609,6 +664,10 @@ impl MemoryIndexer {
             embedding_error: Mutex::new(None),
             #[cfg(feature = "memory-embeddings")]
             embedding_model: Mutex::new(None),
+            #[cfg(feature = "memory-embeddings")]
+            embedding_download_cancel: Mutex::new(None),
+            #[cfg(feature = "memory-embeddings")]
+            embedding_download_error: Mutex::new(None),
         });
         // Periodic gap check: a failed writer batch persists gap markers but
         // nothing re-triggers catch-up until the next overflow or restart.
@@ -661,11 +720,27 @@ impl MemoryIndexer {
         // whose forget failed) left intent in `memory-forget.pending`
         // next to the journals — apply it now that the index exists.
         indexer.drain_pending_forgets();
+        // A `.staging` dir with no download running is the leftover of a
+        // crash or kill mid-download: without this the card would show
+        // "Downloading" forever, with a Cancel that has nothing to cancel.
         #[cfg(feature = "memory-embeddings")]
-        if indexer.embeddings_enabled() {
-            if let Err(error) = indexer.request_embedding_indexing() {
-                tracing::warn!(error = %error, "failed to start memory embedding worker");
-            }
+        if matches!(
+            komet_memory::model_state(&indexer.model_dir()),
+            komet_memory::ModelState::Downloading
+        ) {
+            let _ = komet_memory::remove_model(&indexer.model_dir());
+            *lock(&indexer.embedding_download_error) =
+                Some("the previous model download was interrupted; start it again".into());
+        }
+        #[cfg(feature = "memory-embeddings")]
+        if indexer.embeddings_enabled()
+            && matches!(
+                komet_memory::model_state(&indexer.model_dir()),
+                komet_memory::ModelState::Ready { .. }
+            )
+            && let Err(error) = indexer.request_embedding_indexing()
+        {
+            tracing::warn!(error = %error, "failed to start memory embedding worker");
         }
         Ok(indexer)
     }
@@ -997,7 +1072,10 @@ impl MemoryIndexer {
             if !self.enabled.load(Ordering::Relaxed) {
                 break;
             }
-            if !import_all && !known.contains(chat_id) {
+            // A chat whose first records were all dropped is known only
+            // through the in-memory lag (the gap writer may not have
+            // persisted its marker yet) — still eligible.
+            if !import_all && !known.contains(chat_id) && !lock(&self.lag).contains_key(chat_id) {
                 continue;
             }
             self.catch_up_chat(chat_id);
@@ -1134,25 +1212,182 @@ impl MemoryIndexer {
 
     // ── queries / settings passthroughs ──────────────────────────────────
 
+    /// Briefing body text: the deterministic SQL digest by default, or —
+    /// only when the embedding model is ALREADY loaded and the feature is
+    /// on — the same digest with facts re-ordered by cosine proximity to
+    /// the run's prompt. The ranking is bounded (~150 ms budget); any
+    /// miss falls back to the SQL order, which is the palier-1 behaviour.
+    #[cfg(feature = "memory-embeddings")]
+    fn briefing_text(
+        &self,
+        project_id: &str,
+        exclude: Option<(&str, &str)>,
+        task_query: Option<&str>,
+    ) -> Result<Option<String>, komet_memory::MemoryError> {
+        let query = task_query
+            .map(str::trim)
+            .filter(|q| !q.is_empty() && q.len() <= 512);
+        let ready = matches!(
+            komet_memory::model_state(&self.model_dir()),
+            komet_memory::ModelState::Ready { .. }
+        );
+        let Some(query) = query.filter(|_| ready) else {
+            return self.svc.briefing(project_id, exclude);
+        };
+        // `try_lock`: the embedding worker (or a hybrid search loading the
+        // model) can hold this lock for hundreds of ms, and run dispatch must
+        // never wait on it — a busy model means the SQL order.
+        let mut model = match self.embedding_model.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return self.svc.briefing(project_id, exclude);
+            }
+        };
+        if model.is_none() {
+            return self.svc.briefing(project_id, exclude);
+        }
+        if !self.svc.is_enabled(project_id)? {
+            return Ok(None);
+        }
+        let since = crate::now_ms().saturating_sub(komet_memory::BRIEFING_WINDOW_MS);
+        let mut digest = self.svc.briefing_digest(project_id, exclude, since)?;
+        if digest.facts.is_empty() {
+            return Ok(komet_memory::build_briefing(&digest, crate::now_ms()));
+        }
+        // One batch: query vector + every candidate fact content.
+        let started = Instant::now();
+        let texts: Vec<String> = std::iter::once(query.to_string())
+            .chain(digest.facts.iter().map(|fact| fact.content.clone()))
+            .collect();
+        let vectors = match model.as_mut().map(|m| m.embed(&texts)) {
+            Some(Ok(vectors)) if vectors.len() == texts.len() => vectors,
+            _ => return self.svc.briefing(project_id, exclude),
+        };
+        if started.elapsed() > Duration::from_millis(150) {
+            return self.svc.briefing(project_id, exclude);
+        }
+        let query_vector = &vectors[0];
+        let mut order: Vec<usize> = (0..digest.facts.len()).collect();
+        order.sort_by(|&a, &b| {
+            let sa = cosine(query_vector, &vectors[a + 1]);
+            let sb = cosine(query_vector, &vectors[b + 1]);
+            sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        digest.facts = order.into_iter().map(|i| digest.facts[i].clone()).collect();
+        Ok(komet_memory::build_briefing(&digest, crate::now_ms()))
+    }
+
+    #[cfg(not(feature = "memory-embeddings"))]
+    fn briefing_text(
+        &self,
+        project_id: &str,
+        exclude: Option<(&str, &str)>,
+        _task_query: Option<&str>,
+    ) -> Result<Option<String>, komet_memory::MemoryError> {
+        self.svc.briefing(project_id, exclude)
+    }
+
+    /// Hybrid fact search for the MCP tools: text candidates fused with
+    /// semantic vectors by RRF (k=60). The semantic leg runs only when the
+    /// model is Ready; ANY failure — no model, busy mutex, embed error —
+    /// falls back to the pure text ranking, which is exactly the palier-1
+    /// result. The query vector is computed locally and never stored.
+    #[cfg(feature = "memory-embeddings")]
+    pub fn hybrid_search_facts(
+        &self,
+        project_id: &str,
+        chat_id: &str,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<komet_memory::MemoryFact>, komet_memory::MemoryError> {
+        let fetch = (limit * 3).clamp(10, 60);
+        let text = self
+            .svc
+            .search_facts(project_id, Some(chat_id), query, fetch)?;
+        // Feature off (or memory off) = palier 1, even if the model files are
+        // still on disk: nothing may load a model the user switched off.
+        if !self.embeddings_enabled() || !self.global_enabled() {
+            return Ok(text.into_iter().take(limit).collect());
+        }
+        let ready = matches!(
+            komet_memory::model_state(&self.model_dir()),
+            komet_memory::ModelState::Ready { .. }
+        );
+        if !ready {
+            return Ok(text.into_iter().take(limit).collect());
+        }
+        let semantic = (|| -> Result<Vec<komet_memory::MemoryFact>, komet_memory::MemoryError> {
+            let mut model = lock(&self.embedding_model);
+            if model.is_none() {
+                let dir = self.model_dir();
+                *model = Some(komet_memory::LocalEmbedder::load(&dir)?);
+            }
+            let vectors = model
+                .as_mut()
+                .ok_or_else(|| {
+                    komet_memory::MemoryError::Other("embedding model unavailable".into())
+                })?
+                .embed(&[query.to_string()])?;
+            let query_vector = vectors.first().ok_or_else(|| {
+                komet_memory::MemoryError::Other("embedding model returned no vector".into())
+            })?;
+            Ok(self
+                .svc
+                .semantic_search_facts(project_id, query_vector, fetch)?
+                .into_iter()
+                .map(|m| m.fact)
+                .collect())
+        })();
+        let semantic = match semantic {
+            Ok(facts) => facts,
+            Err(_) => return Ok(text.into_iter().take(limit).collect()),
+        };
+        Ok(rrf_merge_facts(&text, &semantic, limit))
+    }
+
+    #[cfg(not(feature = "memory-embeddings"))]
+    pub fn hybrid_search_facts(
+        &self,
+        project_id: &str,
+        chat_id: &str,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<komet_memory::MemoryFact>, komet_memory::MemoryError> {
+        self.svc
+            .search_facts(project_id, Some(chat_id), query, limit)
+    }
+
     /// Handoff briefing for a run about to start in `cwd`, excluding the
-    /// receiving chat's own activity, or `None`. Cached for
-    /// [`BRIEFING_CACHE_TTL`] — the digest queries are the most expensive
-    /// read in the store and dispatch can be bursty.
+    /// receiving (chat, agent) pair's own activity — the agent knows its
+    /// own work in this chat, but a DIFFERENT agent's work in the same
+    /// chat (an agent switch) stays visible. `task_query` is the run's
+    /// prompt: when the embedding model is already loaded, the digest's
+    /// facts are re-ordered by semantic proximity to it (bounded, with
+    /// fallback to the SQL order). `None` exclusion = show all.
+    /// Cached for [`BRIEFING_CACHE_TTL`] — the digest queries are the most
+    /// expensive read in the store and dispatch can be bursty.
     pub fn briefing(
         &self,
         cwd: &str,
-        exclude_chat_id: Option<&str>,
+        exclude: Option<(&str, &str)>,
+        task_query: Option<&str>,
     ) -> Result<Option<String>, komet_memory::MemoryError> {
         if !self.enabled.load(Ordering::Relaxed) {
             return Ok(None);
         }
         let project_id = lock(&self.projector).project_id(cwd);
-        let exclude = exclude_chat_id.map(str::to_string);
+        let (exclude_chat, exclude_agent) = exclude
+            .map(|(chat, agent)| (Some(chat.to_string()), Some(agent.to_string())))
+            .unwrap_or_default();
+        let query_key = task_query.map(str::to_string);
         let cached = {
             let cache = lock(&self.briefing_cache);
-            if let Some((pid, cid, at, text)) = cache.as_ref()
+            if let Some((pid, cid, aid, qid, at, text)) = cache.as_ref()
                 && pid == &project_id
-                && cid == &exclude
+                && cid == &exclude_chat
+                && aid == &exclude_agent
+                && qid == &query_key
                 && at.elapsed() < BRIEFING_CACHE_TTL
             {
                 text.clone()
@@ -1163,9 +1398,15 @@ impl MemoryIndexer {
         let text = if let Some(cached) = cached {
             Some(cached)
         } else {
-            let text = self.svc.briefing(&project_id, exclude_chat_id)?;
-            *lock(&self.briefing_cache) =
-                Some((project_id.clone(), exclude, Instant::now(), text.clone()));
+            let text = self.briefing_text(&project_id, exclude, task_query)?;
+            *lock(&self.briefing_cache) = Some((
+                project_id.clone(),
+                exclude_chat,
+                exclude_agent,
+                query_key,
+                Instant::now(),
+                text.clone(),
+            ));
             text
         };
         let Some(text) = text else {
@@ -1178,7 +1419,10 @@ impl MemoryIndexer {
         let recent = self.svc.recent(&project_id, 50, None)?;
         let mut files = Vec::new();
         for event in recent {
-            if exclude_chat_id == Some(event.chat_id.as_str()) {
+            if let Some((chat, agent)) = exclude
+                && event.chat_id == chat
+                && event.agent == agent
+            {
                 continue;
             }
             let Some(path) = event.relative_path else {
@@ -1417,11 +1661,22 @@ impl MemoryIndexer {
     }
 
     /// Global kill switch. OFF stops recording/briefing/catch-up; stored
-    /// data is kept. Persists to `memory-config.json` immediately.
+    /// data is kept. Disabling is a STOP, not a pause: every known chat's
+    /// replay cursor is sealed at its journal tail and all gap markers are
+    /// dropped, so events journaled while OFF are never replayed — not on
+    /// re-enable, not on the next catch-up. Chats the index never tracked
+    /// stay untracked ("Index history" remains the explicit opt-in).
+    /// Persists to `memory-config.json` immediately.
     pub fn set_global_enabled(
         self: &Arc<Self>,
         enabled: bool,
     ) -> Result<(), komet_memory::MemoryError> {
+        if enabled {
+            // Seal BEFORE flipping the flag: catch-up is gated on `enabled`,
+            // so no pass can slip between the cursor jump and the flip and
+            // replay the disabled window.
+            self.seal_journal_cursors();
+        }
         {
             let mut config = lock(&self.config);
             // Flag first, still under the config lock: a concurrent reader
@@ -1433,6 +1688,12 @@ impl MemoryIndexer {
             config.save(&self.data_dir).map_err(|e| {
                 komet_memory::MemoryError::Other(format!("save memory config: {e}"))
             })?;
+        }
+        if !enabled {
+            self.seal_journal_cursors();
+            // A pending "Index history" must not fire later and replay the
+            // whole disabled window.
+            self.import_untracked.store(false, Ordering::SeqCst);
         }
         #[cfg(feature = "memory-embeddings")]
         if !enabled {
@@ -1447,6 +1708,38 @@ impl MemoryIndexer {
         Ok(())
     }
 
+    /// Advance every store-known chat's replay cursor to its journal tail
+    /// (which also clears that chat's persisted gap rows at or below the
+    /// tail) and drop every remaining gap marker plus the in-memory lag
+    /// mirror. The cursor write is SYNCHRONOUS — a queued `Resume` could
+    /// still be in flight when the next catch-up reads the cursor and
+    /// replays the sealed window. `advance_cursor` upserts
+    /// `memory_chat_state`, so only chats the index already knows are
+    /// touched — a journal-only chat must stay "untracked" for the
+    /// explicit history import.
+    fn seal_journal_cursors(&self) {
+        let Ok(chats) = self.svc.known_chats() else {
+            return;
+        };
+        for chat_id in chats {
+            // No journal (or unreadable): the chat cannot produce future
+            // events — its gap rows are cleared below regardless.
+            if let Ok(Some(seq)) = self.journal.last_seq(&chat_id)
+                && let Err(err) = self.svc.advance_cursor(&chat_id, seq)
+            {
+                tracing::warn!(chat = %chat_id, error = %err, "memory: cursor seal failed");
+            }
+        }
+        // Gap rows surviving the cursor seals belong to chats without a
+        // replayable journal tail; they can never heal, so drop them.
+        if let Ok(gaps) = self.svc.chats_with_gaps() {
+            for chat_id in gaps {
+                let _ = self.svc.clear_gap(&chat_id);
+            }
+        }
+        lock(&self.lag).clear();
+    }
+
     pub fn global_enabled(&self) -> bool {
         self.enabled.load(Ordering::Relaxed)
     }
@@ -1454,6 +1747,137 @@ impl MemoryIndexer {
     #[cfg(feature = "memory-embeddings")]
     pub fn embeddings_enabled(&self) -> bool {
         lock(&self.config).embeddings_enabled
+    }
+
+    /// `<data_dir>/models/memory` — the live model dir (staging is its
+    /// `.staging` sibling, managed inside komet-memory).
+    #[cfg(feature = "memory-embeddings")]
+    fn model_dir(&self) -> PathBuf {
+        self.data_dir.join("models").join("memory")
+    }
+
+    /// Model lifecycle for the settings card: state name, bytes (live size
+    /// when ready, staging size while downloading), and the last error.
+    pub fn embedding_model_status(&self) -> serde_json::Value {
+        #[cfg(feature = "memory-embeddings")]
+        {
+            let dir = self.model_dir();
+            let state = komet_memory::model_state(&dir);
+            let (name, bytes) = match &state {
+                komet_memory::ModelState::Absent => ("absent", 0),
+                komet_memory::ModelState::Downloading => {
+                    ("downloading", komet_memory::staging_bytes(&dir))
+                }
+                komet_memory::ModelState::Ready { bytes } => ("ready", *bytes),
+                komet_memory::ModelState::Failed(_) => ("failed", 0),
+            };
+            serde_json::json!({
+                "state": name,
+                "bytes": bytes,
+                "error": match &state {
+                    komet_memory::ModelState::Failed(error) => Some(error.clone()),
+                    _ => None,
+                },
+                "downloadError": lock(&self.embedding_download_error).clone(),
+            })
+        }
+        #[cfg(not(feature = "memory-embeddings"))]
+        {
+            serde_json::json!({
+                "state": "unavailable",
+                "bytes": 0,
+                "error": null,
+                "downloadError": null,
+            })
+        }
+    }
+
+    /// Explicit one-shot model download (the ONLY network path). Runs on a
+    /// dedicated thread; publishes atomically on success and kicks the
+    /// indexing worker when the feature is enabled.
+    #[cfg(feature = "memory-embeddings")]
+    pub fn download_embedding_model(self: &Arc<Self>) -> Result<(), komet_memory::MemoryError> {
+        // The flow is: enable the feature, THEN download. The UI already
+        // gates the button; the engine enforces it so no RPC caller can pull
+        // the model for a feature the user has not turned on.
+        if !self.embeddings_enabled() {
+            return Err(komet_memory::MemoryError::Other(
+                "enable semantic memory before downloading the model".into(),
+            ));
+        }
+        if matches!(
+            komet_memory::model_state(&self.model_dir()),
+            komet_memory::ModelState::Ready { .. }
+        ) {
+            return Ok(());
+        }
+        {
+            let mut slot = lock(&self.embedding_download_cancel);
+            if slot.is_some() {
+                return Ok(()); // already in flight
+            }
+            *slot = Some(Arc::new(AtomicBool::new(false)));
+        }
+        *lock(&self.embedding_download_error) = None;
+        let indexer = Arc::downgrade(self);
+        let dir = self.model_dir();
+        let cancel = lock(&self.embedding_download_cancel)
+            .as_ref()
+            .expect("slot just filled")
+            .clone();
+        let spawn = std::thread::Builder::new()
+            .name("komet-memory-model-dl".into())
+            .spawn(move || {
+                // RAII: the in-flight slot is released on ANY exit —
+                // success, error, cancel or panic — so a crashed download
+                // can never wedge the "already downloading" guard forever.
+                let _slot_guard = DownloadSlotGuard {
+                    indexer: indexer.clone(),
+                    cancel: cancel.clone(),
+                };
+                let result = komet_memory::download_model(&dir, &cancel);
+                if let Some(indexer) = indexer.upgrade() {
+                    match result {
+                        Ok(_) => {
+                            *lock(&indexer.embedding_model) = None;
+                            if indexer.embeddings_enabled()
+                                && indexer.global_enabled()
+                                && let Err(error) = indexer.request_embedding_indexing()
+                            {
+                                tracing::warn!(error = %error, "embedding worker restart after model download failed");
+                            }
+                        }
+                        Err(error) => {
+                            *lock(&indexer.embedding_download_error) = Some(error.to_string());
+                        }
+                    }
+                }
+            });
+        if let Err(error) = spawn {
+            *lock(&self.embedding_download_cancel) = None;
+            return Err(komet_memory::MemoryError::Other(format!(
+                "start model download: {error}"
+            )));
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "memory-embeddings")]
+    pub fn cancel_embedding_download(&self) {
+        if let Some(cancel) = lock(&self.embedding_download_cancel).as_ref() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Remove the model files and drop any loaded instance. In-flight
+    /// indexing keeps its already-computed vectors; the next batch fails
+    /// to reload and surfaces the "not ready" error until re-download.
+    #[cfg(feature = "memory-embeddings")]
+    pub fn delete_embedding_model(&self) -> Result<u64, komet_memory::MemoryError> {
+        self.cancel_embedding_download();
+        *lock(&self.embedding_model) = None;
+        *lock(&self.embedding_download_error) = None;
+        komet_memory::remove_model(&self.model_dir())
     }
 
     #[cfg(feature = "memory-embeddings")]
@@ -1473,9 +1897,16 @@ impl MemoryIndexer {
             })?;
             *config = updated;
         }
-        if enabled {
+        // Indexing only starts when the model is actually on disk — enabling
+        // the feature without a downloaded model must not hit the network.
+        if enabled
+            && matches!(
+                komet_memory::model_state(&self.model_dir()),
+                komet_memory::ModelState::Ready { .. }
+            )
+        {
             self.request_embedding_indexing()?;
-        } else {
+        } else if !enabled {
             *lock(&self.embedding_model) = None;
             *lock(&self.embedding_error) = None;
         }
@@ -1555,6 +1986,14 @@ impl MemoryIndexer {
                 "semantic indexing is not enabled".into(),
             ));
         }
+        if !matches!(
+            komet_memory::model_state(&self.model_dir()),
+            komet_memory::ModelState::Ready { .. }
+        ) {
+            return Err(komet_memory::MemoryError::Other(
+                "embedding model is not downloaded".into(),
+            ));
+        }
         self.svc.enable_embeddings()?;
         if self
             .embedding_worker_running
@@ -1607,9 +2046,13 @@ impl MemoryIndexer {
                     }
                     let texts: Vec<String> = batch.iter().map(|(_, text)| text.clone()).collect();
                     let mut model = lock(&indexer.embedding_model);
-                    let active_chats = lock(&indexer.embedding_active_chats);
-                    if !active_chats.is_empty() {
-                        drop(active_chats);
+                    // Check, then RELEASE: holding the active-chats lock for the
+                    // whole embed would make `set_agent_active` (called from the
+                    // publish path on SessionStarted/Done) wait for the batch.
+                    // A run starting mid-batch is harmless: the batch is small
+                    // and the next one pauses.
+                    let busy = !lock(&indexer.embedding_active_chats).is_empty();
+                    if busy {
                         drop(model);
                         indexer.embedding_processing.store(false, Ordering::Release);
                         drop(indexer);
@@ -1640,7 +2083,6 @@ impl MemoryIndexer {
                         failure = Some(error);
                         break;
                     }
-                    drop(active_chats);
                     drop(model);
                     indexer.embedding_processing.store(false, Ordering::Release);
                     drop(indexer);
@@ -1719,6 +2161,23 @@ impl MemoryIndexer {
         ))
     }
 
+    #[cfg(not(feature = "memory-embeddings"))]
+    pub fn download_embedding_model(self: &Arc<Self>) -> Result<(), komet_memory::MemoryError> {
+        Err(komet_memory::MemoryError::Other(
+            "semantic embeddings are unavailable in this build".into(),
+        ))
+    }
+
+    #[cfg(not(feature = "memory-embeddings"))]
+    pub fn cancel_embedding_download(&self) {}
+
+    #[cfg(not(feature = "memory-embeddings"))]
+    pub fn delete_embedding_model(&self) -> Result<u64, komet_memory::MemoryError> {
+        Err(komet_memory::MemoryError::Other(
+            "semantic embeddings are unavailable in this build".into(),
+        ))
+    }
+
     /// Retention in days (clamped to the config bounds). Applies to the
     /// next prune tick and to replay-expiry checks.
     pub fn set_retention_days(&self, days: u32) -> Result<(), komet_memory::MemoryError> {
@@ -1746,6 +2205,15 @@ impl MemoryIndexer {
     /// applied at the NEXT engine start (the running store is never moved
     /// under live connections). `None` resets to `<data_dir>/memory`.
     pub fn set_location(&self, location: Option<String>) -> Result<(), komet_memory::MemoryError> {
+        // Blank means "reset to the default location". Anything else is
+        // checked NOW, while the user can still fix it — not silently at the
+        // next restart.
+        let location = location
+            .map(|raw| raw.trim().to_string())
+            .filter(|raw| !raw.is_empty());
+        if let Some(raw) = location.as_deref() {
+            validate_store_location(raw)?;
+        }
         {
             let mut config = lock(&self.config);
             config.location = location;
@@ -1774,6 +2242,42 @@ impl MemoryIndexer {
     pub fn pending_store_dir(&self) -> Option<PathBuf> {
         let target = lock(&self.config).store_dir(&self.data_dir);
         (target != self.store_dir).then_some(target)
+    }
+
+    /// The directory a previous relocation left a copy in — `None` when
+    /// nothing is left to show (never relocated, already cleaned, or the
+    /// marker points at the live store).
+    pub fn previous_copy_dir(&self) -> Option<PathBuf> {
+        let dir = lock(&self.config)
+            .previous_dir
+            .as_deref()
+            .map(str::trim)
+            .filter(|raw| !raw.is_empty())
+            .map(komet_memory::resolve_location)?;
+        (dir != self.store_dir).then_some(dir)
+    }
+
+    /// Bytes the previous copy still occupies (0 = nothing to delete).
+    pub fn previous_copy_bytes(&self) -> u64 {
+        self.previous_copy_dir()
+            .map(|dir| komet_memory::previous_copy_bytes(&dir))
+            .unwrap_or(0)
+    }
+
+    /// Delete the previous copy's store files (bounded to the database files
+    /// and relocation backups — never other files in that folder) and forget
+    /// the marker. Returns bytes freed.
+    pub fn delete_previous_copy(&self) -> Result<u64, komet_memory::MemoryError> {
+        let freed = match self.previous_copy_dir() {
+            Some(dir) => komet_memory::delete_previous_copy(&dir)?,
+            None => 0,
+        };
+        let mut config = lock(&self.config);
+        config.previous_dir = None;
+        config
+            .save(&self.data_dir)
+            .map_err(|e| komet_memory::MemoryError::Other(format!("save memory config: {e}")))?;
+        Ok(freed)
     }
 
     /// All known projects with settings + footprint (settings page list).
@@ -1823,6 +2327,25 @@ impl MemoryIndexer {
         self.invalidate_briefing();
         Ok(removed)
     }
+}
+
+/// Reject a store location that cannot work: it must be absolute (or
+/// `~/...`), creatable and writable.
+fn validate_store_location(raw: &str) -> Result<(), komet_memory::MemoryError> {
+    let path = komet_memory::resolve_location(raw);
+    if !path.is_absolute() {
+        return Err(komet_memory::MemoryError::Other(
+            "memory location must be an absolute path".into(),
+        ));
+    }
+    let unusable = |error: std::io::Error| {
+        komet_memory::MemoryError::Other(format!("memory location is not usable: {error}"))
+    };
+    std::fs::create_dir_all(&path).map_err(unusable)?;
+    let probe = path.join(".komet-write-probe");
+    std::fs::write(&probe, b"ok").map_err(unusable)?;
+    let _ = std::fs::remove_file(&probe);
+    Ok(())
 }
 
 fn current_branch(cwd: &str) -> Option<String> {
@@ -1963,6 +2486,56 @@ fn process_resource_metrics() -> (Option<u64>, Option<u64>) {
 /// happens before this is appended to the run request's prompt.
 pub fn memory_context_block(briefing: &str) -> String {
     format!("<komet-memory>\n{briefing}\n</komet-memory>")
+}
+
+/// Cosine similarity over two equal-length embedding vectors.
+#[cfg(feature = "memory-embeddings")]
+fn cosine(a: &[f32], b: &[f32]) -> f32 {
+    let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
+    for (x, y) in a.iter().zip(b.iter()) {
+        let (x, y) = (*x as f64, *y as f64);
+        dot += x * y;
+        na += x * x;
+        nb += y * y;
+    }
+    if na == 0.0 || nb == 0.0 {
+        0.0
+    } else {
+        (dot / (na.sqrt() * nb.sqrt())) as f32
+    }
+}
+
+/// Reciprocal-rank fusion (k=60) of two fact orderings: a fact present in
+/// both lists outranks one found by a single leg; ties break on the lower
+/// fact id for determinism.
+#[cfg(feature = "memory-embeddings")]
+fn rrf_merge_facts(
+    text: &[komet_memory::MemoryFact],
+    semantic: &[komet_memory::MemoryFact],
+    limit: usize,
+) -> Vec<komet_memory::MemoryFact> {
+    use std::collections::HashMap;
+    let mut scores: HashMap<i64, f64> = HashMap::new();
+    let mut facts: HashMap<i64, komet_memory::MemoryFact> = HashMap::new();
+    for (rank, fact) in text.iter().enumerate() {
+        *scores.entry(fact.id).or_default() += 1.0 / (61.0 + rank as f64);
+        facts.entry(fact.id).or_insert_with(|| fact.clone());
+    }
+    for (rank, fact) in semantic.iter().enumerate() {
+        *scores.entry(fact.id).or_default() += 1.0 / (61.0 + rank as f64);
+        facts.entry(fact.id).or_insert_with(|| fact.clone());
+    }
+    let mut ranked: Vec<(i64, f64)> = scores.into_iter().collect();
+    ranked.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.0.cmp(&b.0))
+    });
+    ranked
+        .into_iter()
+        .take(limit)
+        .filter_map(|(id, _)| facts.remove(&id))
+        .collect()
 }
 
 #[cfg(test)]
@@ -2406,5 +2979,133 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert!(projectable(&wrapped));
         assert!(!projectable(&AgentEvent::TextDelta { text: "x".into() }));
+    }
+
+    /// Disabling memory is a STOP, not a pause: the replay cursors are
+    /// sealed at the journal tails and gap markers dropped, so events
+    /// journaled while OFF are never indexed — not by catch-up, not after
+    /// re-enable. Chats the index never tracked stay untracked.
+    #[test]
+    fn disabling_memory_is_a_stop_not_a_pause() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Arc::new(RunJournal::open(dir.path().join("journals")).unwrap());
+        let indexer = MemoryIndexer::open(dir.path(), journal.clone()).unwrap();
+        let cwd = "/repo";
+        let project_id = komet_memory::project_id_for(cwd);
+        indexer.note_chat("c1", cwd, HarnessId::ClaudeCode);
+
+        let start = AgentEvent::SessionStarted {
+            harness: HarnessId::ClaudeCode,
+            model: "opus".into(),
+            tools: vec![],
+            cwd: cwd.into(),
+            session_id: "s1".into(),
+            assistant_message_id: "m1".into(),
+        };
+        let seq1 = journal.append("c1", &start).unwrap();
+        indexer.index_event("c1", seq1, &start);
+        wait_for(|| indexer.service().stats(&project_id).unwrap().events == 1);
+
+        // A persisted gap must not survive the stop either.
+        indexer.service().note_gap("c1", seq1 + 1).unwrap();
+        indexer.set_global_enabled(false).unwrap();
+        assert!(indexer.service().chats_with_gaps().unwrap().is_empty());
+
+        // Events journaled while OFF: index_event is gated, the journal
+        // keeps them (it is authoritative), but nothing may be stored.
+        let call = AgentEvent::ToolCall {
+            id: "t1".into(),
+            call: ProtoToolCall::ReadFile {
+                path: "/repo/a.rs".into(),
+            },
+        };
+        let seq2 = journal.append("c1", &call).unwrap();
+        indexer.index_event("c1", seq2, &call);
+        let done = AgentEvent::Done {
+            status: DoneStatus::Completed,
+            result: None,
+            error: None,
+            session_id: None,
+            reason: None,
+        };
+        let seq3 = journal.append("c1", &done).unwrap();
+        indexer.index_event("c1", seq3, &done);
+        // A never-tracked chat keeps journaling too: it must stay untracked.
+        journal.append("c2", &start).unwrap();
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(indexer.service().stats(&project_id).unwrap().events, 1);
+
+        // Re-enable seals again at the new tail, then catch-up runs: the
+        // disabled window (seq2..=seq3) must not be replayed.
+        indexer.set_global_enabled(true).unwrap();
+        indexer.catch_up_inner();
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(
+            indexer.service().stats(&project_id).unwrap().events,
+            1,
+            "events journaled while memory was OFF were indexed"
+        );
+        assert!(
+            !indexer
+                .service()
+                .known_chats()
+                .unwrap()
+                .contains(&"c2".to_string()),
+            "an untracked chat became known without an explicit import"
+        );
+
+        // A live event after reactivation indexes normally.
+        let call2 = AgentEvent::ToolCall {
+            id: "t2".into(),
+            call: ProtoToolCall::ReadFile {
+                path: "/repo/b.rs".into(),
+            },
+        };
+        let seq4 = journal.append("c1", &call2).unwrap();
+        indexer.index_event("c1", seq4, &call2);
+        wait_for(|| indexer.service().stats(&project_id).unwrap().events == 2);
+    }
+
+    /// The download command is gated on the embeddings feature flag, not
+    /// just the UI button: `embeddings_enabled` defaults to false.
+    #[cfg(feature = "memory-embeddings")]
+    #[test]
+    fn model_download_requires_embeddings_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Arc::new(RunJournal::open(dir.path().join("journals")).unwrap());
+        let indexer = MemoryIndexer::open(dir.path(), journal.clone()).unwrap();
+        assert!(!indexer.embeddings_enabled());
+        assert!(indexer.download_embedding_model().is_err());
+    }
+
+    /// With the feature compiled in but the semantic leg off, hybrid fact
+    /// search must return exactly the palier-1 text ranking.
+    #[cfg(feature = "memory-embeddings")]
+    #[test]
+    fn hybrid_search_falls_back_to_text_without_embeddings() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Arc::new(RunJournal::open(dir.path().join("journals")).unwrap());
+        let indexer = MemoryIndexer::open(dir.path(), journal.clone()).unwrap();
+        let project_id = komet_memory::project_id_for("/repo");
+        indexer.note_chat("c1", "/repo", HarnessId::ClaudeCode);
+        let start = AgentEvent::SessionStarted {
+            harness: HarnessId::ClaudeCode,
+            model: "opus".into(),
+            tools: vec![],
+            cwd: "/repo".into(),
+            session_id: "s1".into(),
+            assistant_message_id: "m1".into(),
+        };
+        let seq = journal.append("c1", &start).unwrap();
+        indexer.index_event("c1", seq, &start);
+        wait_for(|| indexer.service().stats(&project_id).unwrap().events == 1);
+        let hybrid = indexer
+            .hybrid_search_facts(&project_id, "c1", "anything", 10)
+            .unwrap();
+        let text = indexer
+            .service()
+            .search_facts(&project_id, Some("c1"), "anything", 10)
+            .unwrap();
+        assert_eq!(hybrid.len(), text.len());
     }
 }

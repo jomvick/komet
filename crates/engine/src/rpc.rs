@@ -1329,6 +1329,10 @@ fn forwardable(method: &str) -> bool {
             | methods::SET_MEMORY_ENABLED
             | methods::SET_MEMORY_EMBEDDINGS_ENABLED
             | methods::RETRY_MEMORY_EMBEDDINGS
+            | methods::DOWNLOAD_MEMORY_MODEL
+            | methods::CANCEL_MEMORY_MODEL_DOWNLOAD
+            | methods::DELETE_MEMORY_MODEL
+            | methods::DELETE_MEMORY_PREVIOUS_COPY
             | methods::SEARCH_MEMORY_SEMANTIC
             | methods::SET_MEMORY_RETENTION_DAYS
             | methods::SET_MEMORY_LOCATION
@@ -1818,6 +1822,10 @@ impl RpcService for EngineRpc {
             methods::SET_MEMORY_ENABLED,
             methods::SET_MEMORY_EMBEDDINGS_ENABLED,
             methods::RETRY_MEMORY_EMBEDDINGS,
+            methods::DOWNLOAD_MEMORY_MODEL,
+            methods::CANCEL_MEMORY_MODEL_DOWNLOAD,
+            methods::DELETE_MEMORY_MODEL,
+            methods::DELETE_MEMORY_PREVIOUS_COPY,
             methods::SEARCH_MEMORY_SEMANTIC,
             methods::SET_MEMORY_RETENTION_DAYS,
             methods::SET_MEMORY_LOCATION,
@@ -2167,6 +2175,8 @@ impl RpcService for EngineRpc {
                         "dir": null,
                         "pendingDir": null,
                         "restartRequired": false,
+                        "previousDir": null,
+                        "previousBytes": 0,
                         "events": 0,
                         "chats": 0,
                         "bytes": 0,
@@ -2198,6 +2208,8 @@ impl RpcService for EngineRpc {
                 // `None` means the open store already matches the config.
                 let pending_dir = indexer.pending_store_dir();
                 let restart_required = pending_dir.is_some();
+                let previous_dir = indexer.previous_copy_dir();
+                let previous_bytes = indexer.previous_copy_bytes();
                 let projects = indexer
                     .list_projects()
                     .map_err(|error| RpcError::Failed(error.to_string()))?;
@@ -2208,6 +2220,8 @@ impl RpcService for EngineRpc {
                     "dir": indexer.store_dir().display().to_string(),
                     "pendingDir": pending_dir.map(|dir| dir.display().to_string()),
                     "restartRequired": restart_required,
+                    "previousDir": previous_dir.map(|dir| dir.display().to_string()),
+                    "previousBytes": previous_bytes,
                     "events": events,
                     "chats": chats,
                     "bytes": bytes,
@@ -2220,6 +2234,7 @@ impl RpcService for EngineRpc {
                     "embeddingsTotal": embeddings_total,
                     "embeddingsWorking": embeddings_working,
                     "embeddingsError": embeddings_error,
+                    "embeddingsModel": indexer.embedding_model_status(),
                     "projects": projects,
                 }))
             }
@@ -2266,6 +2281,44 @@ impl RpcService for EngineRpc {
                     .request_embedding_indexing()
                     .map_err(|error| RpcError::Failed(error.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "started": true }))
+            }
+            methods::DOWNLOAD_MEMORY_MODEL => {
+                let indexer = self
+                    .sessions
+                    .memory()
+                    .ok_or_else(|| RpcError::Failed("memory unavailable".into()))?;
+                indexer
+                    .download_embedding_model()
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "started": true }))
+            }
+            methods::CANCEL_MEMORY_MODEL_DOWNLOAD => {
+                let indexer = self
+                    .sessions
+                    .memory()
+                    .ok_or_else(|| RpcError::Failed("memory unavailable".into()))?;
+                indexer.cancel_embedding_download();
+                RpcReply::value(&serde_json::json!({ "cancelled": true }))
+            }
+            methods::DELETE_MEMORY_MODEL => {
+                let indexer = self
+                    .sessions
+                    .memory()
+                    .ok_or_else(|| RpcError::Failed("memory unavailable".into()))?;
+                let freed = indexer
+                    .delete_embedding_model()
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "removedBytes": freed }))
+            }
+            methods::DELETE_MEMORY_PREVIOUS_COPY => {
+                let indexer = self
+                    .sessions
+                    .memory()
+                    .ok_or_else(|| RpcError::Failed("memory unavailable".into()))?;
+                let freed = indexer
+                    .delete_previous_copy()
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "removedBytes": freed }))
             }
             methods::SEARCH_MEMORY_SEMANTIC => {
                 #[derive(serde::Deserialize)]

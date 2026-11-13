@@ -771,14 +771,15 @@ impl SessionsEngine {
             let project_id = komet_memory::project_id_for(cwd);
             match indexer.is_enabled(&project_id) {
                 Ok(true) => {
-                    catalog = catalog.with_memory(
-                        indexer.service().clone(),
-                        indexer.blackboard().clone(),
+                    catalog = catalog.with_memory(crate::mcp::catalog::MemoryToolParams {
+                        service: indexer.service().clone(),
+                        indexer: Some(indexer.clone()),
+                        blackboard: indexer.blackboard().clone(),
                         project_id,
-                        chat_id.to_string(),
-                        agent.to_string(),
-                        run_id.to_string(),
-                    );
+                        chat_id: chat_id.to_string(),
+                        agent: agent.to_string(),
+                        run_id: run_id.to_string(),
+                    });
                 }
                 Ok(false) => {}
                 Err(error) => {
@@ -1341,7 +1342,11 @@ impl SessionsEngine {
             let fresh_or_switched = request.resume.is_none() || switched_from.is_some();
             if fresh_or_switched
                 && let Some(indexer) = self.inner.memory.get()
-                && let Ok(Some(text)) = indexer.briefing(&request.cwd, Some(chat_id))
+                && let Ok(Some(text)) = indexer.briefing(
+                    &request.cwd,
+                    Some((chat_id, harness_id.as_str())),
+                    Some(request.prompt.as_str()),
+                )
             {
                 Some(crate::memory::memory_context_block(&text))
             } else {

@@ -36,11 +36,16 @@ pub struct MemoryStatus {
     pub embeddings_total: u64,
     pub embeddings_working: bool,
     pub embeddings_error: Option<String>,
+    #[serde(default)]
+    pub embeddings_model: EmbeddingsModel,
     pub process_cpu_ms: Option<u64>,
     pub process_peak_rss_bytes: Option<u64>,
     pub retention_days: u32,
     pub dir: Option<String>,
     pub pending_dir: Option<String>,
+    /// Store copy left behind by the last relocation, and its size.
+    pub previous_dir: Option<String>,
+    pub previous_bytes: u64,
     pub restart_required: bool,
     pub events: u64,
     pub chats: u64,
@@ -48,6 +53,19 @@ pub struct MemoryStatus {
     pub fts: bool,
     pub untracked_chats: u64,
     pub projects: Vec<MemoryProject>,
+}
+
+/// Local embedding-model lifecycle reported by the engine: `state` is one
+/// of absent / downloading / ready / failed / unavailable (build without
+/// the feature). `bytes` is the live size when ready, staging bytes while
+/// downloading.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct EmbeddingsModel {
+    pub state: String,
+    pub bytes: u64,
+    pub error: Option<String>,
+    pub download_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -125,6 +143,11 @@ enum Confirm {
     ForgetAll,
     ForgetFact(i64),
     PromoteFact(i64),
+    DeleteModel,
+    /// The directory holding the copy a previous relocation left behind.
+    DeletePreviousCopy(String),
+    /// A location that looks like a synced/network drive, awaiting "use anyway".
+    UseRiskyLocation(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -168,6 +191,12 @@ pub struct MemoryPage {
     facts_generation: u64,
     fact_filter: FactFilter,
     confirm: Option<Confirm>,
+    /// A status poll is already running while the model downloads —
+    /// prevents one poller per status reload.
+    polling_model: bool,
+    /// Cancel was clicked; the engine stops on its next chunk, so the card
+    /// says "Cancelling…" until the state actually leaves `downloading`.
+    cancelling_model: bool,
 }
 
 impl MemoryPage {
@@ -213,6 +242,8 @@ impl MemoryPage {
             facts_generation: 0,
             fact_filter: FactFilter::Current,
             confirm: None,
+            polling_model: false,
+            cancelling_model: false,
         };
         page.load(cx);
         page
@@ -246,6 +277,8 @@ impl MemoryPage {
         self.facts_generation += 1;
         self.fact_filter = FactFilter::Current;
         self.confirm = None;
+        self.polling_model = false;
+        self.cancelling_model = false;
         self.load(cx);
     }
 
@@ -326,6 +359,10 @@ impl MemoryPage {
                     self.location_input
                         .update(cx, |input, cx| input.set_text(draft, cx));
                 }
+                if status.embeddings_model.state == "downloading" && !self.polling_model {
+                    self.polling_model = true;
+                    self.poll_model_download(cx);
+                }
                 Loadable::Ready(status)
             }
             Err(message) => Loadable::Error(message),
@@ -386,6 +423,61 @@ impl MemoryPage {
 
     fn retry_embeddings(&mut self, cx: &mut Context<Self>) {
         self.call(methods::RETRY_MEMORY_EMBEDDINGS, serde_json::json!({}), cx);
+    }
+
+    /// Refresh the status every second while the model download is in
+    /// flight so the progress bytes move; stops on any other state.
+    fn poll_model_download(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(1))
+                    .await;
+                let downloading = this
+                    .update(cx, |page, cx| {
+                        let downloading = page
+                            .status
+                            .ready()
+                            .map(|status| status.embeddings_model.state == "downloading")
+                            .unwrap_or(false);
+                        if downloading {
+                            page.load(cx);
+                        } else {
+                            page.polling_model = false;
+                            page.cancelling_model = false;
+                        }
+                        downloading
+                    })
+                    .unwrap_or(false);
+                if !downloading {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn download_model(&mut self, cx: &mut Context<Self>) {
+        self.cancelling_model = false;
+        self.call(methods::DOWNLOAD_MEMORY_MODEL, serde_json::json!({}), cx);
+        self.notice = Some(SharedString::from(
+            "Downloading the local model — the network is used only for this one-shot fetch.",
+        ));
+        cx.notify();
+    }
+
+    fn cancel_model_download(&mut self, cx: &mut Context<Self>) {
+        self.cancelling_model = true;
+        self.call(
+            methods::CANCEL_MEMORY_MODEL_DOWNLOAD,
+            serde_json::json!({}),
+            cx,
+        );
+    }
+
+    fn ask_delete_model(&mut self, cx: &mut Context<Self>) {
+        self.confirm = Some(Confirm::DeleteModel);
+        cx.notify();
     }
 
     fn search_semantic(&mut self, cx: &mut Context<Self>) {
@@ -471,9 +563,9 @@ impl MemoryPage {
             return;
         }
         if looks_risky_location(&draft) {
-            self.error = Some(SharedString::from(
-                "That folder looks like a synced or network drive — SQLite in WAL mode can corrupt there. Pick a local folder instead.",
-            ));
+            // Warn, don't refuse: the user may know their mount is fine.
+            // Second click in the strip applies it anyway.
+            self.confirm = Some(Confirm::UseRiskyLocation(draft));
             cx.notify();
             return;
         }
@@ -722,6 +814,12 @@ impl MemoryPage {
         cx.notify();
     }
 
+    /// Second click deletes the old store copy — the live store is untouched.
+    fn ask_delete_previous_copy(&mut self, dir: String, cx: &mut Context<Self>) {
+        self.confirm = Some(Confirm::DeletePreviousCopy(dir));
+        cx.notify();
+    }
+
     fn cancel_confirm(&mut self, cx: &mut Context<Self>) {
         self.confirm = None;
         cx.notify();
@@ -750,6 +848,23 @@ impl MemoryPage {
                 self.call(
                     methods::PROMOTE_MEMORY_FACT,
                     serde_json::json!({ "id": id, "confirmed": true }),
+                    cx,
+                );
+            }
+            Some(Confirm::DeleteModel) => {
+                self.call(methods::DELETE_MEMORY_MODEL, serde_json::json!({}), cx);
+            }
+            Some(Confirm::DeletePreviousCopy(_)) => {
+                self.call(
+                    methods::DELETE_MEMORY_PREVIOUS_COPY,
+                    serde_json::json!({}),
+                    cx,
+                );
+            }
+            Some(Confirm::UseRiskyLocation(path)) => {
+                self.call(
+                    methods::SET_MEMORY_LOCATION,
+                    serde_json::json!({ "path": path }),
                     cx,
                 );
             }
@@ -817,6 +932,102 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
+/// One-line model status under the "Semantic memory" title.
+fn model_status_line(status: &MemoryStatus, cancelling: bool) -> String {
+    let model = &status.embeddings_model;
+    if !status.embeddings_enabled {
+        return "Local semantic search — optional, fully on-device.".into();
+    }
+    match model.state.as_str() {
+        "downloading" if cancelling => "Cancelling the download…".into(),
+        "downloading" => format!(
+            "Downloading local model… {} so far",
+            format_bytes(model.bytes)
+        ),
+        "ready" => {
+            if status.embeddings_working {
+                format!(
+                    "Indexing {} of {} facts locally…",
+                    status.embeddings_indexed, status.embeddings_total
+                )
+            } else {
+                format!(
+                    "{} of {} facts indexed · local model, no network search",
+                    status.embeddings_indexed, status.embeddings_total
+                )
+            }
+        }
+        "failed" => "Model download failed — memory keeps working without it.".into(),
+        "unavailable" => "Semantic memory is not available in this build.".into(),
+        _ => {
+            "Local model required (~23 MB) — semantic indexing starts after the one-time download."
+                .into()
+        }
+    }
+}
+
+/// Download / cancel / remove buttons matching the reported model state.
+fn model_action_row(
+    status: &MemoryStatus,
+    cancelling: bool,
+    theme: &Theme,
+    cx: &mut Context<MemoryPage>,
+) -> AnyElement {
+    let state = status.embeddings_model.state.as_str();
+    let mut row = div().flex().flex_row().gap(px(8.0));
+    match state {
+        "downloading" => {
+            row = row.child(if cancelling {
+                div()
+                    .id("memory-model-cancelling")
+                    .text_size(px(12.0))
+                    .text_color(theme.text_muted)
+                    .child(SharedString::from("Cancelling…"))
+            } else {
+                widgets::ghost_action(theme)
+                    .id("memory-model-cancel")
+                    .text_size(px(12.0))
+                    .hover(|s| widgets::ghost_hover(theme, s))
+                    .on_click(cx.listener(|this, _, _, cx| this.cancel_model_download(cx)))
+                    .child(SharedString::from(format!(
+                        "Cancel ({})",
+                        format_bytes(status.embeddings_model.bytes)
+                    )))
+            });
+        }
+        "ready" => {
+            row = row.child(
+                widgets::ghost_action(theme)
+                    .id("memory-model-delete")
+                    .text_size(px(12.0))
+                    .hover(|s| widgets::ghost_hover(theme, s))
+                    .on_click(cx.listener(|this, _, _, cx| this.ask_delete_model(cx)))
+                    .child(SharedString::from("Remove model")),
+            );
+        }
+        "unavailable" => {}
+        _ => {
+            row = row.child(
+                widgets::ghost_action(theme)
+                    .id("memory-model-download")
+                    .text_size(px(12.0))
+                    .hover(|s| widgets::ghost_hover(theme, s))
+                    .on_click(cx.listener(|this, _, _, cx| this.download_model(cx)))
+                    .child(SharedString::from(
+                        if state == "failed" || status.embeddings_model.download_error.is_some() {
+                            "Retry download"
+                        } else {
+                            "Download model"
+                        },
+                    )),
+            );
+        }
+    }
+    widgets::card_row(theme, false)
+        .child(row)
+        .into_any_element()
+}
+
 fn format_cpu_duration(ms: u64) -> String {
     let seconds = ms / 1000;
     let hours = seconds / 3600;
@@ -843,20 +1054,36 @@ fn project_label(project: &MemoryProject) -> String {
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| {
             // git-common-dir ids are `git:<sha256>` — show a stable short form.
+            // `get` keeps non-ASCII hand-edited ids from panicking on a slice.
             let id = &project.project_id;
             let short = id.len().min(12);
-            format!("{}…", &id[..short])
+            format!("{}…", id.get(..short).unwrap_or(id))
         })
 }
 
 impl MemoryPage {
+    /// Human name for a project id — the raw `git:<sha256>` id is unreadable
+    /// in a confirmation prompt.
+    fn project_display_name(&self, project_id: &str) -> String {
+        self.status
+            .ready()
+            .and_then(|status| {
+                status
+                    .projects
+                    .iter()
+                    .find(|project| project.project_id == project_id)
+            })
+            .map(project_label)
+            .unwrap_or_else(|| project_id.to_string())
+    }
+
     fn confirm_strip(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
         let confirm = self.confirm.clone()?;
         let (message, danger_id, action_label) = match &confirm {
             Confirm::ForgetProject(project_id) => (
                 SharedString::from(format!(
                     "Forget every retained activity record for {}? This cannot be undone.",
-                    project_id
+                    self.project_display_name(project_id)
                 )),
                 "memory-forget-project-confirm",
                 "Forget",
@@ -879,6 +1106,27 @@ impl MemoryPage {
                 )),
                 "memory-promote-fact-confirm",
                 "Promote",
+            ),
+            Confirm::DeleteModel => (
+                SharedString::from(
+                    "Delete the local embedding model? Semantic search stops until it is downloaded again.",
+                ),
+                "memory-delete-model-confirm",
+                "Delete",
+            ),
+            Confirm::DeletePreviousCopy(dir) => (
+                SharedString::from(format!(
+                    "Delete the old copy at {dir}? The memory store in use is not affected."
+                )),
+                "memory-delete-previous-confirm",
+                "Delete",
+            ),
+            Confirm::UseRiskyLocation(path) => (
+                SharedString::from(format!(
+                    "{path} looks like a synced or network drive — SQLite in WAL mode can corrupt there. Use it anyway?"
+                )),
+                "memory-risky-location-confirm",
+                "Use anyway",
             ),
         };
         Some(
@@ -1003,6 +1251,45 @@ impl MemoryPage {
                     .into_any_element()],
             )));
         }
+        if status.previous_bytes > 0
+            && let Some(previous) = &status.previous_dir
+        {
+            let previous = previous.clone();
+            let ask = previous.clone();
+            card = card.child(
+                widgets::card_row(theme, false)
+                    .child(widgets::row_tile(theme, crate::icons::HARD_DRIVE))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .child(widgets::row_title(theme, "Old copy"))
+                            .child(widgets::meta_line(
+                                theme,
+                                vec![SharedString::from(format!(
+                                    "{} ({}) — left behind by the move; the store in use is not affected.",
+                                    previous,
+                                    format_bytes(status.previous_bytes)
+                                ))
+                                .into_any_element()],
+                            )),
+                    )
+                    .child(
+                        widgets::ghost_action(theme)
+                            .id("memory-delete-previous-copy")
+                            .flex_none()
+                            .text_size(px(12.0))
+                            .text_color(theme.danger)
+                            .hover(|s| s.bg(crate::theme::ink(0.06)))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.ask_delete_previous_copy(ask.clone(), cx)
+                            }))
+                            .child(SharedString::from("Delete")),
+                    ),
+            );
+        }
         card.into_any_element()
     }
 
@@ -1027,7 +1314,7 @@ impl MemoryPage {
                             .child(widgets::meta_line(
                                 theme,
                                 vec![SharedString::from(
-                                    "Local activity index shared by agents on this device. Turning it off keeps the data but stops recording and briefings.",
+                                    "Local activity index shared by agents on this device. Turning it off stops recording — activity from the off period is never indexed later. Existing data is kept.",
                                 )
                                 .into_any_element()],
                             )),
@@ -1160,17 +1447,10 @@ impl MemoryPage {
                             .child(widgets::row_title(theme, "Semantic memory"))
                             .child(widgets::meta_line(
                                 theme,
-                                vec![SharedString::from(if status.embeddings_working {
-                                    format!(
-                                        "Indexing {} of {} facts locally…",
-                                        status.embeddings_indexed, status.embeddings_total
-                                    )
-                                } else {
-                                    format!(
-                                        "{} of {} facts indexed · local model, no network search",
-                                        status.embeddings_indexed, status.embeddings_total
-                                    )
-                                })
+                                vec![SharedString::from(model_status_line(
+                                    status,
+                                    self.cancelling_model
+                                ))
                                 .into_any_element()],
                             )),
                     )
@@ -1184,12 +1464,27 @@ impl MemoryPage {
             .child(widgets::card_row(theme, false).child(widgets::meta_line(
                 theme,
                 vec![SharedString::from(
-                    "Optional local model (~23 MB), downloaded only after opt-in. Embedding batches pause during agent runs; FTS and graph remain available when off.",
+                    "Optional local model (~23 MB), downloaded only on demand — the network is used once, for the download itself. FTS and graph remain available when off.",
                 )
                 .into_any_element()],
             )));
 
         if status.embeddings_enabled {
+            card = card.child(model_action_row(status, self.cancelling_model, theme, cx));
+            if let Some(error) = status
+                .embeddings_model
+                .download_error
+                .clone()
+                .or_else(|| status.embeddings_model.error.clone())
+            {
+                card = card.child(
+                    widgets::card_row(theme, false)
+                        .child(widgets::error_strip(theme, SharedString::from(error))),
+                );
+            }
+        }
+
+        if status.embeddings_enabled && status.embeddings_model.state == "ready" {
             card = card.child(
                 div()
                     .px(px(20.0))
@@ -1421,6 +1716,13 @@ impl MemoryPage {
                 theme,
                 vec![SharedString::from(
                     "One-way Markdown with YAML frontmatter and wikilinks. Choose a new folder; existing folders are only updated when already owned by Komet.",
+                )
+                .into_any_element()],
+            ))
+            .child(widgets::meta_line(
+                theme,
+                vec![SharedString::from(
+                    "Re-exporting deletes the notes of facts you have forgotten — only notes Komet wrote are affected. Exports made by an older version are not cleaned up automatically.",
                 )
                 .into_any_element()],
             ));
@@ -1770,7 +2072,7 @@ impl Render for MemoryPage {
             .child(widgets::page_header(&theme, "Memory", None))
             .child(widgets::page_subtitle(
                 &theme,
-                "A local activity index shared by agents on this device — what ran, which files were touched, and how sessions ended. It stores metadata only: never prompts, commands, file contents or credentials, and it never leaves this machine.",
+                "A local activity index shared by agents on this device — what ran, which files were touched, and how sessions ended. Activity is stored as metadata only (never prompts, commands, file contents or credentials). Typed facts exist only when you approve an agent's note, and the code graph keeps symbol names, never source text. Nothing leaves this machine.",
             ));
 
         if let Some(error) = self.error.clone() {
@@ -1865,5 +2167,24 @@ mod tests {
             ..Default::default()
         };
         assert!(project_label(&bare).starts_with("git:abcdef01"));
+        // A hand-edited multi-byte id must not panic on the slice boundary.
+        let multibyte = MemoryProject {
+            project_id: "proj-éééééééé".into(),
+            ..Default::default()
+        };
+        assert!(project_label(&multibyte).starts_with("proj-"));
+    }
+
+    #[test]
+    fn cancelling_state_reads_as_cancelling() {
+        let mut status = MemoryStatus {
+            enabled: true,
+            embeddings_enabled: true,
+            ..Default::default()
+        };
+        status.embeddings_model.state = "downloading".into();
+        status.embeddings_model.bytes = 1024;
+        assert!(model_status_line(&status, false).contains("Downloading"));
+        assert_eq!(model_status_line(&status, true), "Cancelling the download…");
     }
 }

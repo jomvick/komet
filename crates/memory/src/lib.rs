@@ -24,7 +24,10 @@ mod store;
 pub use briefing::{append_predictive_context, build as build_briefing};
 pub use config::{MemoryConfig, RETENTION_DAYS_MAX, RETENTION_DAYS_MIN, resolve_location};
 #[cfg(feature = "embeddings")]
-pub use embeddings::{EMBEDDING_DIMENSIONS, LocalEmbedder};
+pub use embeddings::{
+    EMBEDDING_DIMENSIONS, LocalEmbedder, ModelState, download_model, model_state, remove_model,
+    staging_bytes,
+};
 pub use facts::{FactKind, FactScope, FactSource, MemoryFact, NewMemoryFact, SemanticMemoryMatch};
 pub use graph::{GraphNeighbor, MemorySymbol};
 pub use policy::{
@@ -36,8 +39,8 @@ pub use record::{
     MemoryItem, MemoryRecord,
 };
 pub use store::{
-    MemoryError, MemoryService, MemoryStats, ObsidianExportReport, ProjectInfo, QUEUE_CAPACITY,
-    RETENTION_MS, relocate_store,
+    BRIEFING_WINDOW_MS, MemoryError, MemoryService, MemoryStats, ObsidianExportReport, ProjectInfo,
+    QUEUE_CAPACITY, RETENTION_MS, delete_previous_copy, previous_copy_bytes, relocate_store,
 };
 
 /// Lowercase hex of raw bytes (same shape as `repos::hex` in the engine).

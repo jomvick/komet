@@ -95,6 +95,14 @@ fn is_read_tool(tool: &str) -> bool {
         || tool.starts_with("read_")
 }
 
+/// Memory writes are injected into OTHER agents' prompts (briefings, fact
+/// search): a session-level "allow" is never enough — every call needs a
+/// fresh human decision. Explicit durable rules still apply (Deny wins);
+/// only the per-session memo is bypassed.
+fn always_asks(server: &str, tool: &str) -> bool {
+    server == "komet" && matches!(tool, "memory.note" | "memory.claim")
+}
+
 impl Default for McpPolicy {
     fn default() -> Self {
         Self::komet_default()
@@ -135,6 +143,9 @@ impl McpPolicy {
         if let Some(d) = self.rules.get(&key) {
             return *d;
         }
+        if always_asks(server, tool) {
+            return Decision::Ask;
+        }
         if let Some(d) = self.session_memo.get(&key) {
             return *d;
         }
@@ -152,6 +163,9 @@ impl McpPolicy {
         let key = (server.to_string(), tool.to_string());
         if let Some(d) = self.rules.get(&key) {
             return *d;
+        }
+        if always_asks(server, tool) {
+            return Decision::Ask;
         }
         if let Some(d) = self.session_memo.get(&key) {
             return *d;
