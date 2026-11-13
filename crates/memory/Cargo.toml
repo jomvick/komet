@@ -1,0 +1,23 @@
+[package]
+name = "komet-memory"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+embeddings = ["dep:fastembed", "dep:sqlite-vec"]
+
+[dependencies]
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+sha2.workspace = true
+chrono.workspace = true
+fastembed = { workspace = true, optional = true }
+sqlite-vec = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile.workspace = true

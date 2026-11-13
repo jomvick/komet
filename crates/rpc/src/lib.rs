@@ -231,6 +231,60 @@ pub mod methods {
     /// the engine holds the bearer (every other reply is redacted), so copying a
     /// link has to go through it.
     pub const ENVIRONMENT_LINK: &str = "EnvironmentLink";
+    // Project memory (issue #78) — the index is device-local: settings,
+    // per-project controls and forget all live on the machine that owns
+    // the store, so every method is local-connection only.
+    /// Status + project list for Settings → Memory: `{available, enabled,
+    /// retentionDays, dir, pendingDir, previousDir, previousBytes, events,
+    /// chats, bytes, fts, untrackedChats, projects[], embeddingsEnabled,
+    /// embeddingsIndexed, embeddingsTotal, embeddingsWorking,
+    /// embeddingsError, embeddingsModel}`.
+    pub const GET_MEMORY_STATUS: &str = "GetMemoryStatus";
+    /// `{enabled}` — global kill switch (recording + briefing injection).
+    pub const SET_MEMORY_ENABLED: &str = "SetMemoryEnabled";
+    /// `{enabled}` — opt in/out of local semantic indexing.
+    pub const SET_MEMORY_EMBEDDINGS_ENABLED: &str = "SetMemoryEmbeddingsEnabled";
+    /// Retry opt-in local embedding indexing after an error.
+    pub const RETRY_MEMORY_EMBEDDINGS: &str = "RetryMemoryEmbeddings";
+    /// Explicit one-shot download of the local embedding model (~23 MB);
+    /// the ONLY path that touches the network for memory embeddings.
+    pub const DOWNLOAD_MEMORY_MODEL: &str = "DownloadMemoryModel";
+    /// Cancel an in-flight model download.
+    pub const CANCEL_MEMORY_MODEL_DOWNLOAD: &str = "CancelMemoryModelDownload";
+    /// Remove the downloaded model and free its disk space.
+    pub const DELETE_MEMORY_MODEL: &str = "DeleteMemoryModel";
+    /// Delete the store copy a previous relocation left behind.
+    pub const DELETE_MEMORY_PREVIOUS_COPY: &str = "DeleteMemoryPreviousCopy";
+    /// `{projectId, query}` — explicit local semantic search.
+    pub const SEARCH_MEMORY_SEMANTIC: &str = "SearchMemorySemantic";
+    /// `{days}` — raw-event retention window.
+    pub const SET_MEMORY_RETENTION_DAYS: &str = "SetMemoryRetentionDays";
+    /// `{path}` — custom store location; `null` resets to the default.
+    /// Applied at next engine start (never moves a live database).
+    pub const SET_MEMORY_LOCATION: &str = "SetMemoryLocation";
+    /// `{projectId, enabled}` — per-project recording switch.
+    pub const SET_MEMORY_PROJECT_ENABLED: &str = "SetMemoryProjectEnabled";
+    /// `{projectId, exclusions}` — per-project path glob exclusions.
+    pub const SET_MEMORY_PROJECT_EXCLUSIONS: &str = "SetMemoryProjectExclusions";
+    /// `{projectId}` — delete one project's derived memory (tombstoned).
+    pub const FORGET_MEMORY_PROJECT: &str = "ForgetMemoryProject";
+    /// Wipe all derived memory across projects (settings kept).
+    pub const FORGET_ALL_MEMORY: &str = "ForgetAllMemory";
+    /// Replay every journal into the index — the explicit "index history"
+    /// action; pre-feature history is never indexed silently.
+    pub const IMPORT_MEMORY_HISTORY: &str = "ImportMemoryHistory";
+    /// `{projectId, chatId?, includeStale?, limit?}` — typed facts with provenance.
+    pub const GET_MEMORY_FACTS: &str = "GetMemoryFacts";
+    /// `{id}` — forget one retained fact.
+    pub const FORGET_MEMORY_FACT: &str = "ForgetMemoryFact";
+    /// `{id, confirmed}` — explicitly promote one fact to device-global scope.
+    pub const PROMOTE_MEMORY_FACT: &str = "PromoteMemoryFact";
+    /// `{projectId, destination}` — one-way Obsidian Markdown export.
+    pub const EXPORT_MEMORY_OBSIDIAN: &str = "ExportMemoryObsidian";
+    /// `{projectId, limit?}` — bounded project graph for the native memory panel.
+    pub const GET_MEMORY_PROJECT_GRAPH: &str = "GetMemoryProjectGraph";
+    /// `{projectId, limit?}` — per-agent project activity timeline.
+    pub const GET_MEMORY_ACTIVITY: &str = "GetMemoryActivity";
 }
 
 #[derive(Debug, thiserror::Error)]

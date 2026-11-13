@@ -155,7 +155,12 @@ komet/
                                  # checkout-diff sync, terminals (portable-pty; text mirror
                                  # via komet-term on every terminal), uploads,
                                  # agent accounts (cred swap), auth (bearer via sync server),
-                                 # device-room host/peers, identity, single-instance lock
+                                 # device-room host/peers, identity, single-instance lock,
+                                 # local project-memory integration and internal MCP tools
+    memory/       komet-memory   # per-device SQLite activity/fact store, privacy filters,
+                                 # bounded writer, FTS search, handoff briefings, code graph,
+                                 # opt-in local semantic search, and one-way Obsidian export
+                                 # (never session/workspace sync)
     rpc/          komet-rpc      # UiRpc/ControlRpc: typed req/resp/stream over WS (tokio-
                                  # tungstenite) + in-memory transport; device-room virtual
                                  # sockets ({s,k,to,from} frames)

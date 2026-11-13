@@ -1,0 +1,3111 @@
+//! Engine glue for komet-memory (issue #78).
+//!
+//! [`MemoryIndexer`] sits on the journal/broadcast boundary: every event
+//! `Inner::publish` journals is offered to the allow-listed projection here.
+//! The projection is synchronous and allocation-light — it only builds a
+//! compact [`MemoryRecord`] and `try_send`s it to the store's bounded queue.
+//! Nothing on this path touches SQLite; on queue overflow the journal stays
+//! authoritative and [`MemoryIndexer::catch_up`] replays the gap.
+//!
+//! Replay caveat: journal lines carry no wall-clock timestamp, so events
+//! recovered by catch-up get `occurred_at_ms` ≈ the journal file's mtime
+//! (its last write — a good approximation of the run's end, and far better
+//! than stamping a months-old backfill "now"). Live events get real
+//! publish-time stamps. Ordering (and therefore briefing recency within a
+//! catch-up batch) stays correct via `source_seq`.
+
+use std::collections::HashMap;
+#[cfg(feature = "memory-embeddings")]
+use std::collections::HashSet;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::mpsc::{Sender, channel};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
+
+use komet_memory::{MemoryItem, MemoryRecord, MemoryService};
+use komet_proto::{AgentEvent, HarnessId};
+
+use crate::now_ms;
+use crate::run_journal::RunJournal;
+
+/// Per-chat projection state: project identity plus in-flight tool calls
+/// (needed to attach name/path/outcome to `ToolResult` rows).
+struct ChatMemoryCtx {
+    project_id: String,
+    cwd: String,
+    /// Canonical cwd, resolved once per chat — `canonicalize` is a syscall
+    /// and must not run per tool call on the publish path.
+    canon_cwd: PathBuf,
+    /// Human label for the project (repo/worktree root or cwd) — recorded
+    /// once into `memory_projects.root_path` for the settings UI.
+    root: String,
+    /// Whether `root` was already pushed to the store this engine run.
+    root_recorded: bool,
+    agent: String,
+    model: Option<String>,
+    run_started_ms: i64,
+    /// tool_call_id → (tool_name, relative_path) for pairing results.
+    /// `tool_name` is `None` when the harness-supplied name was
+    /// credential-shaped and got filtered out.
+    pending_tools: HashMap<String, (Option<String>, Option<String>)>,
+}
+
+/// cwd → project_id memo (canonicalize is a syscall; chats reuse cwds).
+struct MemoryProjector {
+    chats: HashMap<String, ChatMemoryCtx>,
+    cwd_projects: HashMap<String, String>,
+}
+
+impl MemoryProjector {
+    fn project_id(&mut self, cwd: &str) -> String {
+        if let Some(id) = self.cwd_projects.get(cwd) {
+            return id.clone();
+        }
+        let id = komet_memory::project_id_for(cwd);
+        self.cwd_projects.insert(cwd.to_string(), id.clone());
+        id
+    }
+
+    /// Seed/refresh chat context at dispatch time (cwd + harness are known
+    /// before the first `SessionStarted` arrives).
+    fn note_chat(&mut self, chat_id: &str, cwd: &str, harness: HarnessId) {
+        let project_id = self.project_id(cwd);
+        let canon_cwd = komet_memory::canonical_cwd(cwd);
+        let root = komet_memory::project_root_for(cwd)
+            .to_string_lossy()
+            .into_owned();
+        let ctx = self
+            .chats
+            .entry(chat_id.to_string())
+            .or_insert_with(|| ChatMemoryCtx {
+                project_id: project_id.clone(),
+                cwd: cwd.to_string(),
+                canon_cwd: canon_cwd.clone(),
+                root: root.clone(),
+                root_recorded: false,
+                agent: harness.as_str().to_string(),
+                model: None,
+                run_started_ms: 0,
+                pending_tools: HashMap::new(),
+            });
+        if ctx.cwd != cwd {
+            ctx.cwd = cwd.to_string();
+            ctx.project_id = project_id;
+            ctx.canon_cwd = canon_cwd;
+            ctx.root = root;
+            ctx.root_recorded = false;
+        }
+        ctx.agent = harness.as_str().to_string();
+    }
+
+    /// Take the pending project-root label for `chat_id` (once per chat per
+    /// engine run) so the indexer can persist it for the settings UI.
+    fn take_root_pending(&mut self, chat_id: &str) -> Option<(String, String)> {
+        let ctx = self.chats.get_mut(chat_id)?;
+        if ctx.root_recorded || ctx.project_id.is_empty() || ctx.root.is_empty() {
+            return None;
+        }
+        ctx.root_recorded = true;
+        Some((ctx.project_id.clone(), ctx.root.clone()))
+    }
+
+    fn ctx(&mut self, chat_id: &str) -> Option<&mut ChatMemoryCtx> {
+        self.chats.get_mut(chat_id)
+    }
+
+    /// Chat ids whose live projection context belongs to `project_id` —
+    /// covers chats with records still sitting in the writer queue (no
+    /// `memory_chat_state` row exists for them yet).
+    fn chats_for_project(&self, project_id: &str) -> Vec<String> {
+        self.chats
+            .iter()
+            .filter(|(_, ctx)| ctx.project_id == project_id)
+            .map(|(chat_id, _)| chat_id.clone())
+            .collect()
+    }
+
+    /// Project one journaled event into 0..=2 queue items. `now_ms` is the
+    /// caller's clock (publish time live, catch-up time on replay).
+    fn project(
+        &mut self,
+        chat_id: &str,
+        seq: u64,
+        event: &AgentEvent,
+        now: i64,
+    ) -> Vec<MemoryItem> {
+        match event {
+            AgentEvent::SessionStarted {
+                harness,
+                model,
+                cwd,
+                ..
+            } => {
+                // Catch-up replays journals for chats this engine instance
+                // never dispatched: seed the ctx from the event itself so the
+                // whole tail can project. Live path already has a ctx from
+                // `note_chat`.
+                if !cwd.trim().is_empty() {
+                    self.project_id(cwd);
+                }
+                let project_id = if cwd.trim().is_empty() {
+                    self.ctx(chat_id)
+                        .map(|c| c.project_id.clone())
+                        .unwrap_or_default()
+                } else {
+                    self.project_id(cwd)
+                };
+                if project_id.is_empty() {
+                    return Vec::new();
+                }
+                let ctx = self
+                    .chats
+                    .entry(chat_id.to_string())
+                    .or_insert_with(|| ChatMemoryCtx {
+                        project_id: project_id.clone(),
+                        cwd: String::new(),
+                        canon_cwd: komet_memory::canonical_cwd(cwd),
+                        root: String::new(),
+                        root_recorded: true,
+                        agent: harness.as_str().to_string(),
+                        model: None,
+                        run_started_ms: 0,
+                        pending_tools: HashMap::new(),
+                    });
+                ctx.project_id = project_id.clone();
+                if !cwd.trim().is_empty() {
+                    ctx.cwd = cwd.clone();
+                    ctx.canon_cwd = komet_memory::canonical_cwd(cwd);
+                    ctx.root = komet_memory::project_root_for(cwd)
+                        .to_string_lossy()
+                        .into_owned();
+                    ctx.root_recorded = false;
+                }
+                ctx.agent = harness.as_str().to_string();
+                ctx.model = clean_meta(model);
+                ctx.run_started_ms = now;
+                ctx.pending_tools.clear();
+                let (agent, model_out) = (ctx.agent.clone(), ctx.model.clone());
+                if project_id.is_empty() {
+                    return Vec::new();
+                }
+                vec![MemoryItem::Record(Box::new(MemoryRecord {
+                    project_id,
+                    chat_id: chat_id.to_string(),
+                    source_seq: seq,
+                    agent,
+                    model: model_out,
+                    kind: "session_start",
+                    occurred_at_ms: now,
+                    tool_name: None,
+                    relative_path: None,
+                    outcome: None,
+                    input_tokens: None,
+                    cached_input_tokens: None,
+                    output_tokens: None,
+                    reasoning_tokens: None,
+                    duration_ms: None,
+                }))]
+            }
+            AgentEvent::Done { status, .. } => {
+                let Some(ctx) = self.ctx(chat_id) else {
+                    return Vec::new();
+                };
+                let duration = (ctx.run_started_ms > 0).then(|| now - ctx.run_started_ms);
+                let mut items = vec![MemoryItem::Record(Box::new(MemoryRecord {
+                    project_id: ctx.project_id.clone(),
+                    chat_id: chat_id.to_string(),
+                    source_seq: seq,
+                    agent: ctx.agent.clone(),
+                    model: ctx.model.clone(),
+                    kind: "session_end",
+                    occurred_at_ms: now,
+                    tool_name: None,
+                    relative_path: None,
+                    outcome: Some(done_status_slug(*status).to_string()),
+                    input_tokens: None,
+                    cached_input_tokens: None,
+                    output_tokens: None,
+                    reasoning_tokens: None,
+                    duration_ms: duration,
+                }))];
+                // Run boundary: advance the replay cursor past whatever
+                // non-indexed tail this run produced.
+                items.push(MemoryItem::Checkpoint {
+                    chat_id: chat_id.to_string(),
+                    seq,
+                });
+                items
+            }
+            AgentEvent::ToolCall { id, call } => {
+                let Some(ctx) = self.ctx(chat_id) else {
+                    return Vec::new();
+                };
+                let (tool_name, rel_path) = project_tool_call(call, &ctx.cwd, &ctx.canon_cwd);
+                if ctx.pending_tools.len() >= 512 {
+                    ctx.pending_tools.clear();
+                }
+                ctx.pending_tools
+                    .insert(id.clone(), (tool_name.clone(), rel_path.clone()));
+                vec![MemoryItem::Record(Box::new(MemoryRecord {
+                    project_id: ctx.project_id.clone(),
+                    chat_id: chat_id.to_string(),
+                    source_seq: seq,
+                    agent: ctx.agent.clone(),
+                    model: ctx.model.clone(),
+                    kind: "tool_call",
+                    occurred_at_ms: now,
+                    tool_name,
+                    relative_path: rel_path,
+                    outcome: None,
+                    input_tokens: None,
+                    cached_input_tokens: None,
+                    output_tokens: None,
+                    reasoning_tokens: None,
+                    duration_ms: None,
+                }))]
+            }
+            AgentEvent::ToolResult { id, is_error, .. } => {
+                let Some(ctx) = self.ctx(chat_id) else {
+                    return Vec::new();
+                };
+                let (tool_name, rel_path) = ctx
+                    .pending_tools
+                    .remove(id)
+                    .unwrap_or_else(|| (Some("unknown".to_string()), None));
+                vec![MemoryItem::Record(Box::new(MemoryRecord {
+                    project_id: ctx.project_id.clone(),
+                    chat_id: chat_id.to_string(),
+                    source_seq: seq,
+                    agent: ctx.agent.clone(),
+                    model: ctx.model.clone(),
+                    kind: "tool_result",
+                    occurred_at_ms: now,
+                    tool_name,
+                    relative_path: rel_path,
+                    outcome: Some(if *is_error { "error" } else { "ok" }.to_string()),
+                    input_tokens: None,
+                    cached_input_tokens: None,
+                    output_tokens: None,
+                    reasoning_tokens: None,
+                    duration_ms: None,
+                }))]
+            }
+            AgentEvent::Usage {
+                input_tokens,
+                cached_input_tokens,
+                output_tokens,
+                reasoning_tokens,
+                ..
+            } => {
+                let Some(ctx) = self.ctx(chat_id) else {
+                    return Vec::new();
+                };
+                vec![MemoryItem::Record(Box::new(MemoryRecord {
+                    project_id: ctx.project_id.clone(),
+                    chat_id: chat_id.to_string(),
+                    source_seq: seq,
+                    agent: ctx.agent.clone(),
+                    model: ctx.model.clone(),
+                    kind: "usage",
+                    occurred_at_ms: now,
+                    tool_name: None,
+                    relative_path: None,
+                    outcome: None,
+                    input_tokens: Some(*input_tokens as i64),
+                    cached_input_tokens: Some(*cached_input_tokens as i64),
+                    output_tokens: Some(*output_tokens as i64),
+                    reasoning_tokens: Some(*reasoning_tokens as i64),
+                    duration_ms: None,
+                }))]
+            }
+            AgentEvent::Subagent { event, .. } => self.project(chat_id, seq, event, now),
+            _ => Vec::new(),
+        }
+    }
+}
+
+/// Cheap pre-filter so the hot path (text deltas etc.) never touches the
+/// projector lock. Mirrors the allow-list in [`MemoryProjector::project`].
+fn projectable(event: &AgentEvent) -> bool {
+    match event {
+        AgentEvent::SessionStarted { .. }
+        | AgentEvent::Done { .. }
+        | AgentEvent::ToolCall { .. }
+        | AgentEvent::ToolResult { .. }
+        | AgentEvent::Usage { .. } => true,
+        AgentEvent::Subagent { event, .. } => projectable(event),
+        _ => false,
+    }
+}
+
+/// Free-form metadata (model ids, MCP/unknown tool names) is harness-
+/// supplied text: it can carry a credential (`mcp:svc/ghp_…`) straight into
+/// the store and `search_text`. Drop anything the secret filter flags —
+/// `None` reads as "not recorded", which is the honest answer.
+fn clean_meta(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() || komet_memory::contains_secret_value(value) {
+        return None;
+    }
+    Some(value.chars().take(128).collect())
+}
+
+/// Reduce a [`ToolCall`] to (tool_name, project-relative path?). Command
+/// text, patterns, queries, URLs and MCP inputs are never carried over.
+/// `tool_name` is `None` when the harness-supplied name was credential-
+/// shaped. `canon_cwd` is the chat's cached canonical cwd.
+fn project_tool_call(
+    call: &komet_proto::ToolCall,
+    cwd: &str,
+    canon_cwd: &std::path::Path,
+) -> (Option<String>, Option<String>) {
+    use komet_proto::ToolCall as T;
+    let file_path = |p: &str| komet_memory::project_relative(cwd, canon_cwd, p);
+    match call {
+        T::Exec { .. } => (Some("exec".into()), None),
+        T::ReadFile { path } => (Some("read_file".into()), file_path(path)),
+        T::WriteFile { path, .. } => (Some("write_file".into()), file_path(path)),
+        T::EditFile { path, .. } => (Some("edit_file".into()), file_path(path)),
+        T::ApplyPatch { path } => (
+            Some("apply_patch".into()),
+            path.as_deref().and_then(file_path),
+        ),
+        T::Search { .. } => (Some("search".into()), None),
+        T::Glob { .. } => (Some("glob".into()), None),
+        T::WebFetch { .. } => (Some("web_fetch".into()), None),
+        T::WebSearch { .. } => (Some("web_search".into()), None),
+        T::Todo { .. } => (Some("todo".into()), None),
+        T::Mcp { server, tool, .. } => (clean_meta(&format!("mcp:{server}/{tool}")), None),
+        T::Unknown { name, .. } => {
+            let name = name.trim();
+            (
+                clean_meta(if name.is_empty() { "unknown" } else { name }),
+                None,
+            )
+        }
+    }
+}
+
+/// Journal seq a queue item was projected from. `None` for the purge
+/// barriers (they never come out of [`MemoryProjector::project`] anyway).
+fn item_seq(item: &MemoryItem) -> Option<u64> {
+    match item {
+        MemoryItem::Record(r) => Some(r.source_seq),
+        MemoryItem::Checkpoint { seq, .. } | MemoryItem::Resume { seq, .. } => Some(*seq),
+        _ => None,
+    }
+}
+
+fn done_status_slug(status: komet_proto::DoneStatus) -> &'static str {
+    match status {
+        komet_proto::DoneStatus::Completed => "completed",
+        komet_proto::DoneStatus::Interrupted => "interrupted",
+        komet_proto::DoneStatus::Errored => "errored",
+    }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Catch-up throttle: after a queue overflow, replay at most this often.
+const CATCHUP_MIN_INTERVAL: Duration = Duration::from_secs(5);
+/// Gap-marker tick: how often the indexer checks for persisted enqueue
+/// gaps that need a journal replay (writer failures leave these behind).
+const GAP_TICK_INTERVAL: Duration = Duration::from_secs(60);
+/// Retention maintenance cadence (checked on the gap tick).
+const PRUNE_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+
+/// Briefing results are cached briefly: a dispatch storm (or a retry loop)
+/// must not re-run four aggregate queries per run launch.
+const BRIEFING_CACHE_TTL: Duration = Duration::from_secs(30);
+
+/// Cached briefing: (project_id, exclude_chat, exclude_agent, task_query,
+/// computed_at, text). The query is part of the key: a semantically-ranked
+/// body is only valid for the prompt it was ranked against.
+type BriefingCacheEntry = (
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Instant,
+    Option<String>,
+);
+
+/// Releases the in-flight download slot when the download thread exits —
+/// including on panic. Only clears the slot if it still holds THIS
+/// download's cancel flag (a newer download may have taken over).
+#[cfg(feature = "memory-embeddings")]
+struct DownloadSlotGuard {
+    indexer: std::sync::Weak<MemoryIndexer>,
+    cancel: Arc<AtomicBool>,
+}
+
+#[cfg(feature = "memory-embeddings")]
+impl Drop for DownloadSlotGuard {
+    fn drop(&mut self) {
+        if let Some(indexer) = self.indexer.upgrade() {
+            let mut slot = lock(&indexer.embedding_download_cancel);
+            if slot
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, &self.cancel))
+            {
+                *slot = None;
+            }
+        }
+    }
+}
+
+/// The engine-facing memory indexer: projection + queue + journal catch-up.
+pub struct MemoryIndexer {
+    svc: Arc<MemoryService>,
+    journal: Arc<RunJournal>,
+    blackboard: Arc<crate::mcp::catalog::MemoryBlackboard>,
+    graph_jobs: Mutex<HashMap<String, bool>>,
+    projector: Mutex<MemoryProjector>,
+    /// chat_id → lowest seq that failed `try_send` (first drop wins).
+    lag: Mutex<HashMap<String, u64>>,
+    catchup_running: AtomicBool,
+    /// A `catch_up` request arrived while a pass was running: the pass
+    /// re-triggers itself once instead of dropping the request (the 60s
+    /// gap tick would eventually cover it, but a live overflow shouldn't
+    /// wait that long).
+    catchup_pending: AtomicBool,
+    last_catchup: Mutex<Option<Instant>>,
+    /// (project_id, exclude_chat_id, computed_at, text) — see
+    /// [`Self::briefing`].
+    briefing_cache: Mutex<Option<BriefingCacheEntry>>,
+    /// Gap markers to persist, sent by the publish path. A channel send
+    /// never blocks, unlike a SQLite write that would wait on the very
+    /// writer (or an admin transaction) that caused the overflow.
+    gap_tx: Sender<(String, u64)>,
+    /// Global kill switch (Settings → Memory). OFF stops recording,
+    /// briefing injection and catch-up; stored data is kept.
+    enabled: AtomicBool,
+    /// Raw-event retention in days (settings-configurable).
+    retention_days: AtomicU32,
+    /// Device-level config (`<data_dir>/memory-config.json`) — mutated by
+    /// the settings RPCs and re-saved on every change.
+    config: Mutex<komet_memory::MemoryConfig>,
+    data_dir: PathBuf,
+    /// The directory the store was actually opened at (may differ from
+    /// `<data_dir>/memory` when a custom location is configured).
+    store_dir: PathBuf,
+    /// Set by "Index history": the next catch-up pass also replays journals
+    /// the index has never seen (pre-feature history is opt-in, not silent).
+    import_untracked: AtomicBool,
+    #[cfg(feature = "memory-embeddings")]
+    /// Chats with a live agent run. Embedding batches pause while this set
+    /// is non-empty; the model is loaded only after opt-in and while idle.
+    embedding_active_chats: Mutex<HashSet<String>>,
+    #[cfg(feature = "memory-embeddings")]
+    embedding_worker_running: AtomicBool,
+    #[cfg(feature = "memory-embeddings")]
+    embedding_processing: AtomicBool,
+    #[cfg(feature = "memory-embeddings")]
+    embedding_error: Mutex<Option<String>>,
+    #[cfg(feature = "memory-embeddings")]
+    embedding_model: Mutex<Option<komet_memory::LocalEmbedder>>,
+    /// In-flight explicit model download: the cancel flag the settings
+    /// "Annuler" button sets, and the last download error for the card.
+    #[cfg(feature = "memory-embeddings")]
+    embedding_download_cancel: Mutex<Option<Arc<AtomicBool>>>,
+    #[cfg(feature = "memory-embeddings")]
+    embedding_download_error: Mutex<Option<String>>,
+}
+
+impl MemoryIndexer {
+    /// Open the store and wire journal catch-up. The store location and the
+    /// global switches come from `<data_dir>/memory-config.json`; a custom
+    /// location is applied here — files are copied BEFORE the first open, so
+    /// a bad path falls back to the default dir instead of corrupting data.
+    pub fn open(
+        data_dir: &std::path::Path,
+        journal: Arc<RunJournal>,
+    ) -> Result<Arc<Self>, komet_memory::MemoryError> {
+        let data_dir = data_dir.to_path_buf();
+        let mut config = komet_memory::MemoryConfig::load(&data_dir);
+        let default_dir = data_dir.join("memory");
+        // `location` is the PENDING destination; `active_dir` is where the
+        // store actually lives (persisted after each successful open). The
+        // migration always runs active → pending — including back to the
+        // default on reset — and the active marker only moves once the new
+        // store opened successfully.
+        let pending_dir = config.store_dir(&data_dir);
+        let active_dir = config
+            .active_dir
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(komet_memory::resolve_location)
+            .unwrap_or_else(|| default_dir.clone());
+        let mut target_dir = pending_dir.clone();
+        let mut relocated_from: Option<PathBuf> = None;
+        if pending_dir != active_dir {
+            match komet_memory::relocate_store(&active_dir, &pending_dir) {
+                Ok(()) => relocated_from = Some(active_dir.clone()),
+                Err(err) => {
+                    // Keep using the live store this boot; the pending location
+                    // stays configured and the move is retried on the next start.
+                    tracing::warn!(
+                        error = %err,
+                        from = %active_dir.display(),
+                        to = %pending_dir.display(),
+                        "memory: store relocation failed; keeping the active store"
+                    );
+                    target_dir = active_dir.clone();
+                }
+            }
+        }
+        let svc = Arc::new({
+            // Target first, then the known-active store, then the default —
+            // the first that opens wins.
+            let mut opened = None;
+            let mut last_err = None;
+            let mut candidates: Vec<PathBuf> = vec![target_dir.clone()];
+            if active_dir != target_dir {
+                candidates.push(active_dir.clone());
+            }
+            if default_dir != target_dir && default_dir != active_dir {
+                candidates.push(default_dir.clone());
+            }
+            for dir in candidates {
+                let embeddings_enabled = cfg!(feature = "memory-embeddings")
+                    && config.enabled
+                    && config.embeddings_enabled;
+                match MemoryService::open_with_embeddings(&dir, embeddings_enabled) {
+                    Ok(svc) => {
+                        opened = Some(svc);
+                        break;
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            dir = %dir.display(),
+                            "memory: store open failed, trying next candidate"
+                        );
+                        last_err = Some(err);
+                    }
+                }
+            }
+            match opened {
+                Some(svc) => svc,
+                None => return Err(last_err.expect("at least one candidate")),
+            }
+        });
+        let effective_dir = svc.dir().to_path_buf();
+        // Persist where the store actually ended up — only now, after a
+        // successful open, so a failed relocation never rewrites the source.
+        let mut config_changed = false;
+        if effective_dir != active_dir {
+            config.active_dir = Some(effective_dir.display().to_string());
+            config_changed = true;
+        }
+        // The directory we moved FROM is kept as a rollback copy; remember it
+        // so Settings can show its size and delete it on request. Only set
+        // when the target really opened — otherwise the "old" dir is the live
+        // store.
+        if let Some(from) = relocated_from
+            && effective_dir != active_dir
+        {
+            config.previous_dir = Some(from.display().to_string());
+            config_changed = true;
+        }
+        if config_changed && let Err(err) = config.save(&data_dir) {
+            tracing::warn!(error = %err, "memory: config save failed");
+        }
+        // Gap markers are persisted by a dedicated thread: the publish path
+        // only does a non-blocking channel send.
+        let (gap_tx, gap_rx) = channel::<(String, u64)>();
+        let gap_svc = Arc::clone(&svc);
+        std::thread::Builder::new()
+            .name("komet-memory-gapwriter".into())
+            .spawn(move || {
+                for (chat_id, seq) in gap_rx {
+                    if let Err(err) = gap_svc.note_gap(&chat_id, seq) {
+                        tracing::warn!(
+                            chat = %chat_id,
+                            error = %err,
+                            "memory: gap marker write failed"
+                        );
+                    }
+                }
+            })
+            .ok();
+        let indexer = Arc::new(Self {
+            svc,
+            journal,
+            blackboard: Arc::new(crate::mcp::catalog::MemoryBlackboard::default()),
+            graph_jobs: Mutex::new(HashMap::new()),
+            projector: Mutex::new(MemoryProjector {
+                chats: HashMap::new(),
+                cwd_projects: HashMap::new(),
+            }),
+            lag: Mutex::new(HashMap::new()),
+            catchup_running: AtomicBool::new(false),
+            catchup_pending: AtomicBool::new(false),
+            last_catchup: Mutex::new(None),
+            briefing_cache: Mutex::new(None),
+            gap_tx,
+            enabled: AtomicBool::new(config.enabled),
+            retention_days: AtomicU32::new(config.retention_days),
+            config: Mutex::new(config),
+            data_dir,
+            store_dir: effective_dir,
+            import_untracked: AtomicBool::new(false),
+            #[cfg(feature = "memory-embeddings")]
+            embedding_active_chats: Mutex::new(HashSet::new()),
+            #[cfg(feature = "memory-embeddings")]
+            embedding_worker_running: AtomicBool::new(false),
+            #[cfg(feature = "memory-embeddings")]
+            embedding_processing: AtomicBool::new(false),
+            #[cfg(feature = "memory-embeddings")]
+            embedding_error: Mutex::new(None),
+            #[cfg(feature = "memory-embeddings")]
+            embedding_model: Mutex::new(None),
+            #[cfg(feature = "memory-embeddings")]
+            embedding_download_cancel: Mutex::new(None),
+            #[cfg(feature = "memory-embeddings")]
+            embedding_download_error: Mutex::new(None),
+        });
+        // Periodic gap check: a failed writer batch persists gap markers but
+        // nothing re-triggers catch-up until the next overflow or restart.
+        // The tick only scans the journal when gaps actually exist. It holds
+        // only a Weak ref: when the engine drops the indexer the thread must
+        // exit instead of pinning the store open forever.
+        let tick = Arc::downgrade(&indexer);
+        std::thread::Builder::new()
+            .name("komet-memory-gaptick".into())
+            .spawn(move || {
+                let mut last_prune: Option<Instant> = None;
+                loop {
+                    std::thread::sleep(GAP_TICK_INTERVAL);
+                    let Some(tick) = tick.upgrade() else {
+                        return;
+                    };
+                    if last_prune.is_none_or(|t| t.elapsed() >= PRUNE_INTERVAL) {
+                        last_prune = Some(Instant::now());
+                        let retention_ms = i64::from(tick.retention_days.load(Ordering::Relaxed))
+                            * 24
+                            * 60
+                            * 60
+                            * 1000;
+                        match tick.svc.prune_older_than(now_ms() - retention_ms) {
+                            Ok(n) if n > 0 => {
+                                tracing::info!(removed = n, "memory: retention prune")
+                            }
+                            Ok(_) => {}
+                            Err(err) => {
+                                tracing::warn!(error = %err, "memory: retention prune failed")
+                            }
+                        }
+                    }
+                    match tick.svc.chats_with_gaps() {
+                        Ok(gaps)
+                            if !gaps.is_empty()
+                                || tick.import_untracked.load(Ordering::Relaxed) =>
+                        {
+                            tick.catch_up();
+                        }
+                        Ok(_) => {}
+                        Err(err) => {
+                            tracing::warn!(error = %err, "memory: gap scan failed")
+                        }
+                    }
+                }
+            })
+            .ok();
+        // Chat deletes that arrived while the store was unavailable (or
+        // whose forget failed) left intent in `memory-forget.pending`
+        // next to the journals — apply it now that the index exists.
+        indexer.drain_pending_forgets();
+        // A `.staging` dir with no download running is the leftover of a
+        // crash or kill mid-download: without this the card would show
+        // "Downloading" forever, with a Cancel that has nothing to cancel.
+        #[cfg(feature = "memory-embeddings")]
+        if matches!(
+            komet_memory::model_state(&indexer.model_dir()),
+            komet_memory::ModelState::Downloading
+        ) {
+            let _ = komet_memory::remove_model(&indexer.model_dir());
+            *lock(&indexer.embedding_download_error) =
+                Some("the previous model download was interrupted; start it again".into());
+        }
+        #[cfg(feature = "memory-embeddings")]
+        if indexer.embeddings_enabled()
+            && matches!(
+                komet_memory::model_state(&indexer.model_dir()),
+                komet_memory::ModelState::Ready { .. }
+            )
+            && let Err(error) = indexer.request_embedding_indexing()
+        {
+            tracing::warn!(error = %error, "failed to start memory embedding worker");
+        }
+        Ok(indexer)
+    }
+
+    /// Apply forget intents recorded while this indexer was unavailable.
+    /// The file lives beside the journals (`{journals}/memory-forget.pending`,
+    /// one chat id per line); failures stay in the file for the next start.
+    fn drain_pending_forgets(&self) {
+        let path = self.journal.dir().join("memory-forget.pending");
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            return;
+        };
+        let mut failed = Vec::new();
+        for chat_id in content.lines().map(str::trim).filter(|l| !l.is_empty()) {
+            match self.forget_chat(chat_id, false) {
+                Ok(_) => {}
+                Err(err) => {
+                    tracing::warn!(chat = %chat_id, error = %err, "memory: pending forget failed");
+                    failed.push(chat_id.to_string());
+                }
+            }
+        }
+        if failed.is_empty() {
+            let _ = std::fs::remove_file(&path);
+        } else if let Err(err) = std::fs::write(&path, failed.join("\n") + "\n") {
+            tracing::warn!(error = %err, "memory: pending-forget rewrite failed");
+        }
+    }
+
+    pub fn service(&self) -> &Arc<MemoryService> {
+        &self.svc
+    }
+
+    pub fn blackboard(&self) -> &Arc<crate::mcp::catalog::MemoryBlackboard> {
+        &self.blackboard
+    }
+
+    /// Incrementally parse indexable files on an explicit workspace turn.
+    /// This work is serialized per project, capped, and kept off the event
+    /// publishing path. Source bytes are hashed and parsed in memory only.
+    pub fn index_workspace(self: &Arc<Self>, cwd: &str) {
+        if !self.global_enabled() {
+            return;
+        }
+        let project_id = komet_memory::project_id_for(cwd);
+        match self.svc.is_enabled(&project_id) {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(error) => {
+                tracing::warn!(project = %project_id, error = %error, "memory graph scan disabled");
+                return;
+            }
+        }
+        let should_spawn = {
+            let mut jobs = lock(&self.graph_jobs);
+            if let Some(rescan) = jobs.get_mut(&project_id) {
+                *rescan = true;
+                false
+            } else {
+                jobs.insert(project_id.clone(), false);
+                true
+            }
+        };
+        if !should_spawn {
+            return;
+        }
+        let indexer = Arc::clone(self);
+        let cwd_owned = cwd.to_string();
+        let project_for_thread = project_id.clone();
+        let spawn = std::thread::Builder::new()
+            .name("komet-memory-graph-scan".into())
+            .spawn(move || {
+                loop {
+                    if let Err(error) = indexer.scan_workspace(&cwd_owned, &project_for_thread) {
+                        tracing::warn!(
+                            project = %project_for_thread,
+                            error = %error,
+                            "memory graph scan failed"
+                        );
+                    }
+                    let mut jobs = lock(&indexer.graph_jobs);
+                    if let Some(rescan) = jobs.get_mut(&project_for_thread)
+                        && *rescan
+                    {
+                        *rescan = false;
+                        continue;
+                    }
+                    jobs.remove(&project_for_thread);
+                    break;
+                }
+            });
+        if let Err(error) = spawn {
+            lock(&self.graph_jobs).remove(&project_id);
+            tracing::warn!(error = %error, "failed to start memory graph scan");
+        }
+    }
+
+    fn scan_workspace(&self, cwd: &str, project_id: &str) -> Result<(), komet_memory::MemoryError> {
+        use sha2::{Digest, Sha256};
+        use std::io::Read;
+
+        const MAX_ENTRIES_PER_SCAN: usize = 5000;
+        const MAX_FILE_BYTES: u64 = 512 * 1024;
+        let root = komet_memory::project_root_for(cwd);
+        let root = std::fs::canonicalize(&root)?;
+        let existing: HashMap<String, String> =
+            self.svc.file_indexes(project_id)?.into_iter().collect();
+        let mut unchanged = existing;
+        let exclusions = self.svc.exclusions(project_id)?;
+        let walker = ignore::WalkBuilder::new(&root)
+            .hidden(true)
+            .follow_links(false)
+            .max_depth(Some(32))
+            .build();
+        let mut scan_truncated = false;
+        for (visited, entry) in walker.enumerate() {
+            if visited >= MAX_ENTRIES_PER_SCAN {
+                scan_truncated = true;
+                break;
+            }
+            let entry = entry.map_err(|error| {
+                komet_memory::MemoryError::Other(format!("workspace walk: {error}"))
+            })?;
+            if !entry.file_type().is_some_and(|kind| kind.is_file()) {
+                continue;
+            }
+            let Some(path) = entry.path().to_str() else {
+                continue;
+            };
+            let Ok(relative) = entry.path().strip_prefix(&root) else {
+                continue;
+            };
+            let relative = relative.to_string_lossy().replace('\\', "/");
+            if relative.is_empty()
+                || komet_memory::is_default_excluded(&relative)
+                || komet_memory::user_excluded(&relative, &exclusions)
+                || komet_memory::contains_secret_value(&relative)
+                || komet_syntax::language_for_path(&relative).is_none()
+            {
+                continue;
+            }
+            let metadata = std::fs::symlink_metadata(path)?;
+            if metadata.file_type().is_symlink()
+                || !metadata.is_file()
+                || metadata.len() > MAX_FILE_BYTES
+            {
+                continue;
+            }
+            let file = std::fs::File::open(entry.path())?;
+            let mut bytes = Vec::with_capacity(metadata.len() as usize);
+            file.take(MAX_FILE_BYTES + 1).read_to_end(&mut bytes)?;
+            if bytes.len() as u64 > MAX_FILE_BYTES {
+                continue;
+            }
+            let hash = crate::repos::hex(&Sha256::digest(&bytes));
+            if unchanged.get(&relative) == Some(&hash) {
+                unchanged.remove(&relative);
+                continue;
+            }
+            unchanged.remove(&relative);
+            let Ok(source) = std::str::from_utf8(&bytes) else {
+                continue;
+            };
+            let symbols = komet_syntax::extract_symbols(source, &relative)
+                .map_err(|error| komet_memory::MemoryError::Other(error.to_string()))?;
+            let symbols: Vec<_> = symbols
+                .into_iter()
+                .map(|symbol| komet_memory::MemorySymbol {
+                    name: symbol.name,
+                    kind: symbol.kind,
+                    start_byte: symbol.start_byte.min(u32::MAX as usize) as u32,
+                    end_byte: symbol.end_byte.min(u32::MAX as usize) as u32,
+                })
+                .collect();
+            self.svc
+                .index_file_symbols(project_id, &relative, &hash, &symbols)?;
+        }
+        if !scan_truncated {
+            for (path, _) in unchanged {
+                self.svc.remove_file_index(project_id, &path)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Record the chat's run context at dispatch (cwd + harness known before
+    /// `SessionStarted`). Cheap; called once per dispatch.
+    pub fn note_chat(&self, chat_id: &str, cwd: &str, harness: HarnessId) {
+        lock(&self.projector).note_chat(chat_id, cwd, harness);
+    }
+
+    #[cfg(feature = "memory-embeddings")]
+    pub fn set_agent_active(&self, chat_id: &str, active: bool) {
+        let mut chats = lock(&self.embedding_active_chats);
+        if active {
+            chats.insert(chat_id.to_string());
+        } else {
+            chats.remove(chat_id);
+        }
+    }
+
+    #[cfg(not(feature = "memory-embeddings"))]
+    pub fn set_agent_active(&self, _chat_id: &str, _active: bool) {}
+
+    /// Offer one journaled event to the index. Called from `Inner::publish`
+    /// AFTER the journal append succeeded; never blocks on SQLite.
+    /// No-op while the global switch is off (the journal stays authoritative
+    /// — re-enabling resumes from the cursor, nothing is lost).
+    pub fn index_event(self: &Arc<Self>, chat_id: &str, seq: u64, event: &AgentEvent) {
+        #[cfg(feature = "memory-embeddings")]
+        match event {
+            AgentEvent::SessionStarted { .. } => self.set_agent_active(chat_id, true),
+            AgentEvent::Done { .. } => self.set_agent_active(chat_id, false),
+            _ => {}
+        }
+        if seq == 0 || !self.enabled.load(Ordering::Relaxed) || !projectable(event) {
+            return;
+        }
+        let now = now_ms();
+        let (items, root_pending) = {
+            let mut projector = lock(&self.projector);
+            let items = projector.project(chat_id, seq, event, now);
+            (items, projector.take_root_pending(chat_id))
+        };
+        if let Some((project_id, root)) = root_pending {
+            let _ = self.svc.touch_project(&project_id, &root);
+        }
+        for item in items {
+            let Some(item_seq) = item_seq(&item) else {
+                continue;
+            };
+            if !self.svc.try_enqueue(item) {
+                self.note_drop(chat_id, item_seq);
+                return;
+            }
+        }
+    }
+
+    /// A queue item failed `try_send`: remember the lowest dropped seq and
+    /// schedule a throttled catch-up. The gap marker is persisted only when
+    /// the lag entry is new or moves lower — one tiny write per overflow
+    /// episode, never one per dropped event (the writer is exactly what is
+    /// busy during an overflow, and `note_gap` would wait on it).
+    fn note_drop(self: &Arc<Self>, chat_id: &str, seq: u64) {
+        let new_low = {
+            let mut lag = lock(&self.lag);
+            match lag.get(chat_id) {
+                Some(existing) if *existing <= seq => false,
+                _ => {
+                    lag.insert(chat_id.to_string(), seq);
+                    true
+                }
+            }
+        };
+        if new_low {
+            // Non-blocking: the gap writer thread persists it.
+            let _ = self.gap_tx.send((chat_id.to_string(), seq));
+        }
+        self.maybe_catch_up();
+    }
+
+    fn maybe_catch_up(self: &Arc<Self>) {
+        let due = {
+            let mut last = lock(&self.last_catchup);
+            let now = Instant::now();
+            let due = last.is_none_or(|t| now.duration_since(t) >= CATCHUP_MIN_INTERVAL);
+            if due {
+                *last = Some(now);
+            }
+            due
+        };
+        if due {
+            self.catch_up();
+        }
+    }
+
+    /// Replay journal tails the queue missed (overflow or restart). Runs on a
+    /// dedicated thread — journal parsing is blocking IO and must not sit on
+    /// the async executor.
+    pub fn catch_up(self: &Arc<Self>) {
+        if !self.enabled.load(Ordering::Relaxed) {
+            return;
+        }
+        if self.catchup_running.swap(true, Ordering::SeqCst) {
+            // A pass is already running: flag a rerun instead of dropping
+            // the request — drops that land mid-pass would otherwise wait
+            // for the 60s gap tick.
+            self.catchup_pending.store(true, Ordering::SeqCst);
+            return;
+        }
+        let this = Arc::clone(self);
+        std::thread::Builder::new()
+            .name("komet-memory-catchup".into())
+            .spawn(move || {
+                this.catch_up_inner();
+                this.catchup_running.store(false, Ordering::SeqCst);
+                if this.catchup_pending.swap(false, Ordering::SeqCst) {
+                    this.catch_up();
+                }
+            })
+            .ok();
+    }
+
+    fn catch_up_inner(&self) {
+        // "Index history" is a one-shot expansion: only this pass replays
+        // journals the index has never seen. Everything else — gaps,
+        // cursors, tombstones — is always eligible.
+        let import_all = self.import_untracked.swap(false, Ordering::SeqCst);
+        let chat_ids = match self.journal.chat_ids() {
+            Ok(ids) => ids,
+            Err(err) => {
+                tracing::warn!(error = %err, "memory: journal chat list failed");
+                return;
+            }
+        };
+        let known: std::collections::HashSet<String> = if import_all {
+            std::collections::HashSet::new()
+        } else {
+            self.svc
+                .known_chats()
+                .unwrap_or_default()
+                .into_iter()
+                .collect()
+        };
+        for chat_id in &chat_ids {
+            // Disabling memory mid-pass stops further replay/enqueueing;
+            // cursors only advance through Resume items actually sent, so
+            // completed work is kept and the rest retries on re-enable.
+            if !self.enabled.load(Ordering::Relaxed) {
+                break;
+            }
+            // A chat whose first records were all dropped is known only
+            // through the in-memory lag (the gap writer may not have
+            // persisted its marker yet) — still eligible.
+            if !import_all && !known.contains(chat_id) && !lock(&self.lag).contains_key(chat_id) {
+                continue;
+            }
+            self.catch_up_chat(chat_id);
+        }
+        // Gaps whose journal is gone can never be replayed — clear them or
+        // the 60s tick would rescan forever.
+        if let Ok(gaps) = self.svc.chats_with_gaps() {
+            for chat_id in gaps {
+                if !chat_ids.contains(&chat_id) {
+                    let _ = self.svc.clear_gap(&chat_id);
+                }
+            }
+        }
+    }
+
+    fn catch_up_chat(&self, chat_id: &str) {
+        let cursor = match self.svc.chat_cursor(chat_id) {
+            Ok(c) => c,
+            Err(err) => {
+                tracing::warn!(chat = %chat_id, error = %err, "memory: cursor read failed");
+                return;
+            }
+        };
+        let journal_last = match self.journal.last_seq(chat_id) {
+            Ok(Some(seq)) => seq,
+            _ => return, // no journal or empty
+        };
+        // Heal from the lowest known gap — persisted OR still only in memory
+        // (the gap writer thread may not have flushed it yet) — else from
+        // the cursor.
+        let mem_gap = lock(&self.lag).get(chat_id).copied();
+        let gap = match (cursor.gap_seq, mem_gap) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        let from = match gap {
+            Some(g) => g.saturating_sub(1),
+            None => cursor.last_seq,
+        };
+        if journal_last <= from {
+            // Nothing new (also guards the journal era-fallback: a cursor
+            // ahead of the file's tail must not trigger a full re-replay).
+            // With a gap marker the journal tail doesn't even reach the
+            // dropped seq — the lines are gone, nothing left to heal.
+            if cursor.gap_seq.is_some() {
+                let _ = self.svc.clear_gap(chat_id);
+            }
+            return;
+        }
+        // Replay the WHOLE journal through a throwaway projector, keeping
+        // only items past `from`. Two correctness requirements force the
+        // full pass:
+        // - Context: the chat's SessionStarted (project, agent, model) and
+        //   in-flight ToolCalls usually sit BEFORE the cursor — a tail-only
+        //   replay would drop every ToolResult/Done for want of a ctx.
+        // - Isolation: replaying stale history through the LIVE projector
+        //   would overwrite the running chat's cwd/agent/model and its
+        //   pending-tool pairings, mis-attributing subsequent live events.
+        let entries = match self.journal.replay_ts(chat_id, 0) {
+            Ok(entries) => entries,
+            Err(err) => {
+                tracing::warn!(chat = %chat_id, error = %err, "memory: journal replay failed");
+                return;
+            }
+        };
+        if entries.is_empty() {
+            if cursor.gap_seq.is_some() {
+                let _ = self.svc.clear_gap(chat_id);
+            }
+            return;
+        }
+        let reached = entries.last().map(|(seq, _, _)| *seq).unwrap_or(from);
+        // Lines written before journal timestamps existed (ts_ms = 0) fall
+        // back to the file's mtime (≈ the run's end) rather than catch-up
+        // time, so an old backfill doesn't look like it happened today.
+        let mtime = self
+            .journal
+            .journal_mtime_ms(chat_id)
+            .unwrap_or_else(now_ms);
+        let mut items: Vec<MemoryItem> = Vec::new();
+        // A journal last written before the retention horizon would be
+        // inserted only to be pruned hours later: skip the projection and
+        // still advance the cursor through the Resume below.
+        let expired = mtime
+            < now_ms()
+                - i64::from(self.retention_days.load(Ordering::Relaxed)) * 24 * 60 * 60 * 1000;
+        if !expired {
+            // Local projector: no lock, no shared state — live index_event
+            // calls are completely unaffected by the replay.
+            let mut replay = MemoryProjector {
+                chats: HashMap::new(),
+                cwd_projects: HashMap::new(),
+            };
+            for (i, (seq, ts, event)) in entries.iter().enumerate() {
+                if i % 256 == 0 && !self.enabled.load(Ordering::Relaxed) {
+                    return;
+                }
+                let at = if *ts > 0 { *ts } else { mtime };
+                for item in replay.project(chat_id, *seq, event, at) {
+                    if item_seq(&item).is_some_and(|s| s > from) {
+                        items.push(item);
+                    }
+                }
+            }
+            if let Some((project_id, root)) = replay.take_root_pending(chat_id) {
+                let _ = self.svc.touch_project(&project_id, &root);
+            }
+        }
+        // Enqueue everything; on the first failure — or a mid-pass disable —
+        // stop: the remaining tail stays unindexed and the next catch-up
+        // resumes from the cursor (never past work actually enqueued).
+        let mut complete = true;
+        for item in items {
+            if !self.enabled.load(Ordering::Relaxed) || self.svc.enqueue(item).is_err() {
+                complete = false;
+                break;
+            }
+        }
+        if complete && self.enabled.load(Ordering::Relaxed) {
+            let _ = self.svc.enqueue(MemoryItem::Resume {
+                chat_id: chat_id.to_string(),
+                seq: reached,
+            });
+            // Heal any in-memory lag entries this replay covered.
+            let mut lag = lock(&self.lag);
+            lag.retain(|_, seq| *seq > reached);
+        } else {
+            // Queue rejected mid-replay: leave lag markers so the next pass
+            // retries this chat.
+            let mut lag = lock(&self.lag);
+            lag.entry(chat_id.to_string()).or_insert(from + 1);
+        }
+    }
+
+    // ── queries / settings passthroughs ──────────────────────────────────
+
+    /// Briefing body text: the deterministic SQL digest by default, or —
+    /// only when the embedding model is ALREADY loaded and the feature is
+    /// on — the same digest with facts re-ordered by cosine proximity to
+    /// the run's prompt. The ranking is bounded (~150 ms budget); any
+    /// miss falls back to the SQL order, which is the palier-1 behaviour.
+    #[cfg(feature = "memory-embeddings")]
+    fn briefing_text(
+        &self,
+        project_id: &str,
+        exclude: Option<(&str, &str)>,
+        task_query: Option<&str>,
+    ) -> Result<Option<String>, komet_memory::MemoryError> {
+        let query = task_query
+            .map(str::trim)
+            .filter(|q| !q.is_empty() && q.len() <= 512);
+        let ready = matches!(
+            komet_memory::model_state(&self.model_dir()),
+            komet_memory::ModelState::Ready { .. }
+        );
+        let Some(query) = query.filter(|_| ready) else {
+            return self.svc.briefing(project_id, exclude);
+        };
+        // `try_lock`: the embedding worker (or a hybrid search loading the
+        // model) can hold this lock for hundreds of ms, and run dispatch must
+        // never wait on it — a busy model means the SQL order.
+        let mut model = match self.embedding_model.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return self.svc.briefing(project_id, exclude);
+            }
+        };
+        if model.is_none() {
+            return self.svc.briefing(project_id, exclude);
+        }
+        if !self.svc.is_enabled(project_id)? {
+            return Ok(None);
+        }
+        let since = crate::now_ms().saturating_sub(komet_memory::BRIEFING_WINDOW_MS);
+        let mut digest = self.svc.briefing_digest(project_id, exclude, since)?;
+        if digest.facts.is_empty() {
+            return Ok(komet_memory::build_briefing(&digest, crate::now_ms()));
+        }
+        // One batch: query vector + every candidate fact content.
+        let started = Instant::now();
+        let texts: Vec<String> = std::iter::once(query.to_string())
+            .chain(digest.facts.iter().map(|fact| fact.content.clone()))
+            .collect();
+        let vectors = match model.as_mut().map(|m| m.embed(&texts)) {
+            Some(Ok(vectors)) if vectors.len() == texts.len() => vectors,
+            _ => return self.svc.briefing(project_id, exclude),
+        };
+        if started.elapsed() > Duration::from_millis(150) {
+            return self.svc.briefing(project_id, exclude);
+        }
+        let query_vector = &vectors[0];
+        let mut order: Vec<usize> = (0..digest.facts.len()).collect();
+        order.sort_by(|&a, &b| {
+            let sa = cosine(query_vector, &vectors[a + 1]);
+            let sb = cosine(query_vector, &vectors[b + 1]);
+            sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        digest.facts = order.into_iter().map(|i| digest.facts[i].clone()).collect();
+        Ok(komet_memory::build_briefing(&digest, crate::now_ms()))
+    }
+
+    #[cfg(not(feature = "memory-embeddings"))]
+    fn briefing_text(
+        &self,
+        project_id: &str,
+        exclude: Option<(&str, &str)>,
+        _task_query: Option<&str>,
+    ) -> Result<Option<String>, komet_memory::MemoryError> {
+        self.svc.briefing(project_id, exclude)
+    }
+
+    /// Hybrid fact search for the MCP tools: text candidates fused with
+    /// semantic vectors by RRF (k=60). The semantic leg runs only when the
+    /// model is Ready; ANY failure — no model, busy mutex, embed error —
+    /// falls back to the pure text ranking, which is exactly the palier-1
+    /// result. The query vector is computed locally and never stored.
+    #[cfg(feature = "memory-embeddings")]
+    pub fn hybrid_search_facts(
+        &self,
+        project_id: &str,
+        chat_id: &str,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<komet_memory::MemoryFact>, komet_memory::MemoryError> {
+        let fetch = (limit * 3).clamp(10, 60);
+        let text = self
+            .svc
+            .search_facts(project_id, Some(chat_id), query, fetch)?;
+        // Feature off (or memory off) = palier 1, even if the model files are
+        // still on disk: nothing may load a model the user switched off.
+        if !self.embeddings_enabled() || !self.global_enabled() {
+            return Ok(text.into_iter().take(limit).collect());
+        }
+        let ready = matches!(
+            komet_memory::model_state(&self.model_dir()),
+            komet_memory::ModelState::Ready { .. }
+        );
+        if !ready {
+            return Ok(text.into_iter().take(limit).collect());
+        }
+        let semantic = (|| -> Result<Vec<komet_memory::MemoryFact>, komet_memory::MemoryError> {
+            let mut model = lock(&self.embedding_model);
+            if model.is_none() {
+                let dir = self.model_dir();
+                *model = Some(komet_memory::LocalEmbedder::load(&dir)?);
+            }
+            let vectors = model
+                .as_mut()
+                .ok_or_else(|| {
+                    komet_memory::MemoryError::Other("embedding model unavailable".into())
+                })?
+                .embed(&[query.to_string()])?;
+            let query_vector = vectors.first().ok_or_else(|| {
+                komet_memory::MemoryError::Other("embedding model returned no vector".into())
+            })?;
+            Ok(self
+                .svc
+                .semantic_search_facts(project_id, query_vector, fetch)?
+                .into_iter()
+                .map(|m| m.fact)
+                .collect())
+        })();
+        let semantic = match semantic {
+            Ok(facts) => facts,
+            Err(_) => return Ok(text.into_iter().take(limit).collect()),
+        };
+        Ok(rrf_merge_facts(&text, &semantic, limit))
+    }
+
+    #[cfg(not(feature = "memory-embeddings"))]
+    pub fn hybrid_search_facts(
+        &self,
+        project_id: &str,
+        chat_id: &str,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<komet_memory::MemoryFact>, komet_memory::MemoryError> {
+        self.svc
+            .search_facts(project_id, Some(chat_id), query, limit)
+    }
+
+    /// Handoff briefing for a run about to start in `cwd`, excluding the
+    /// receiving (chat, agent) pair's own activity — the agent knows its
+    /// own work in this chat, but a DIFFERENT agent's work in the same
+    /// chat (an agent switch) stays visible. `task_query` is the run's
+    /// prompt: when the embedding model is already loaded, the digest's
+    /// facts are re-ordered by semantic proximity to it (bounded, with
+    /// fallback to the SQL order). `None` exclusion = show all.
+    /// Cached for [`BRIEFING_CACHE_TTL`] — the digest queries are the most
+    /// expensive read in the store and dispatch can be bursty.
+    pub fn briefing(
+        &self,
+        cwd: &str,
+        exclude: Option<(&str, &str)>,
+        task_query: Option<&str>,
+    ) -> Result<Option<String>, komet_memory::MemoryError> {
+        if !self.enabled.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+        let project_id = lock(&self.projector).project_id(cwd);
+        let (exclude_chat, exclude_agent) = exclude
+            .map(|(chat, agent)| (Some(chat.to_string()), Some(agent.to_string())))
+            .unwrap_or_default();
+        let query_key = task_query.map(str::to_string);
+        let cached = {
+            let cache = lock(&self.briefing_cache);
+            if let Some((pid, cid, aid, qid, at, text)) = cache.as_ref()
+                && pid == &project_id
+                && cid == &exclude_chat
+                && aid == &exclude_agent
+                && qid == &query_key
+                && at.elapsed() < BRIEFING_CACHE_TTL
+            {
+                text.clone()
+            } else {
+                None
+            }
+        };
+        let text = if let Some(cached) = cached {
+            Some(cached)
+        } else {
+            let text = self.briefing_text(&project_id, exclude, task_query)?;
+            *lock(&self.briefing_cache) = Some((
+                project_id.clone(),
+                exclude_chat,
+                exclude_agent,
+                query_key,
+                Instant::now(),
+                text.clone(),
+            ));
+            text
+        };
+        let Some(text) = text else {
+            return Ok(None);
+        };
+
+        let branch = current_branch(cwd);
+        let issue = branch.as_deref().and_then(issue_reference);
+        let exclusions = self.svc.exclusions(&project_id)?;
+        let recent = self.svc.recent(&project_id, 50, None)?;
+        let mut files = Vec::new();
+        for event in recent {
+            if let Some((chat, agent)) = exclude
+                && event.chat_id == chat
+                && event.agent == agent
+            {
+                continue;
+            }
+            let Some(path) = event.relative_path else {
+                continue;
+            };
+            if komet_memory::is_default_excluded(&path)
+                || komet_memory::user_excluded(&path, &exclusions)
+                || komet_memory::contains_secret_value(&path)
+                || files.contains(&path)
+            {
+                continue;
+            }
+            files.push(path);
+            if files.len() == 5 {
+                break;
+            }
+        }
+        Ok(Some(komet_memory::append_predictive_context(
+            &text,
+            branch.as_deref(),
+            issue.as_deref(),
+            &files,
+        )))
+    }
+
+    /// Drop the cached briefing. Called on every settings/forget mutation:
+    /// a user who disables memory or forgets a project must not get the old
+    /// briefing injected for another 30 seconds.
+    fn invalidate_briefing(&self) {
+        *lock(&self.briefing_cache) = None;
+    }
+
+    pub fn set_enabled(
+        &self,
+        project_id: &str,
+        enabled: bool,
+    ) -> Result<(), komet_memory::MemoryError> {
+        self.svc.set_enabled(project_id, enabled)?;
+        self.invalidate_briefing();
+        Ok(())
+    }
+
+    pub fn is_enabled(&self, project_id: &str) -> Result<bool, komet_memory::MemoryError> {
+        self.svc.is_enabled(project_id)
+    }
+
+    pub fn set_exclusions(
+        &self,
+        project_id: &str,
+        exclusions: &[String],
+    ) -> Result<(), komet_memory::MemoryError> {
+        self.svc.set_exclusions(project_id, exclusions)?;
+        self.invalidate_briefing();
+        Ok(())
+    }
+
+    pub fn search(
+        &self,
+        project_id: &str,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<komet_memory::MemoryEvent>, komet_memory::MemoryError> {
+        self.svc.search(project_id, query, limit)
+    }
+
+    pub fn facts(
+        &self,
+        project_id: &str,
+        chat_id: Option<&str>,
+        include_stale: bool,
+        limit: usize,
+    ) -> Result<Vec<komet_memory::MemoryFact>, komet_memory::MemoryError> {
+        self.svc.facts(project_id, chat_id, include_stale, limit)
+    }
+
+    pub fn project_graph(
+        &self,
+        project_id: &str,
+        limit: usize,
+    ) -> Result<Vec<serde_json::Value>, komet_memory::MemoryError> {
+        let files = self.svc.file_indexes(project_id)?;
+        files
+            .into_iter()
+            .take(limit.clamp(1, 50))
+            .map(|(path, _)| {
+                let neighbors = self.svc.graph_neighbors(project_id, &path, 50)?;
+                Ok(serde_json::json!({"path": path, "neighbors": neighbors}))
+            })
+            .collect()
+    }
+
+    pub fn recent_activity(
+        &self,
+        project_id: &str,
+        limit: usize,
+    ) -> Result<Vec<komet_memory::MemoryEvent>, komet_memory::MemoryError> {
+        self.svc.recent(project_id, limit.clamp(1, 100), None)
+    }
+
+    pub fn forget_fact(&self, id: i64) -> Result<bool, komet_memory::MemoryError> {
+        let removed = self.svc.forget_fact(id)?;
+        if removed {
+            self.invalidate_briefing();
+        }
+        Ok(removed)
+    }
+
+    pub fn export_obsidian(
+        &self,
+        project_id: &str,
+        destination: &std::path::Path,
+    ) -> Result<komet_memory::ObsidianExportReport, komet_memory::MemoryError> {
+        self.svc.export_obsidian(project_id, destination)
+    }
+
+    pub fn promote_fact_to_global(
+        &self,
+        id: i64,
+        confirmed: bool,
+    ) -> Result<bool, komet_memory::MemoryError> {
+        let promoted = self.svc.promote_fact_to_global(id, confirmed)?;
+        if promoted {
+            self.invalidate_briefing();
+        }
+        Ok(promoted)
+    }
+
+    /// "Who touched this path?" — recorded ops under a project-relative
+    /// path prefix, newest first.
+    pub fn touched(
+        &self,
+        project_id: &str,
+        path_prefix: &str,
+        limit: usize,
+    ) -> Result<Vec<komet_memory::MemoryEvent>, komet_memory::MemoryError> {
+        self.svc.touched(project_id, path_prefix, limit)
+    }
+
+    /// Forget one chat's memory rows AND its projector context — chat
+    /// deletion must not leak `ChatMemoryCtx` entries (pending tool pairings,
+    /// per-chat cwd cache) for the engine's lifetime. The store keeps a
+    /// tombstone cursor at the journal tail so catch-up cannot resurrect
+    /// the deleted range.
+    /// `unbounded = true` forces the "forever" tombstone even when the
+    /// journal still exists — used when journal discard FAILED, so events
+    /// appended after the tail stay covered too.
+    pub fn forget_chat(
+        &self,
+        chat_id: &str,
+        unbounded: bool,
+    ) -> Result<usize, komet_memory::MemoryError> {
+        lock(&self.projector).chats.remove(chat_id);
+        let through = if unbounded {
+            None
+        } else {
+            self.journal.last_seq(chat_id).ok().flatten()
+        };
+        let removed = self.svc.forget_chat(chat_id, through)?;
+        self.invalidate_briefing();
+        Ok(removed)
+    }
+
+    /// Forget a whole project's derived memory. The horizon covers every
+    /// chat that could still produce rows for the project: chats the store
+    /// knows, chats with live projector context (queued records included),
+    /// and — via `u64::MAX` for journal-less chats — chats whose journal is
+    /// already gone. Each gets a tombstone so neither catch-up nor queued
+    /// writes can resurrect rows; projector contexts go too.
+    pub fn forget_project(&self, project_id: &str) -> Result<usize, komet_memory::MemoryError> {
+        let mut chats: std::collections::HashSet<String> =
+            self.svc.project_chats(project_id)?.into_iter().collect();
+        chats.extend(lock(&self.projector).chats_for_project(project_id));
+        let mut horizons = Vec::with_capacity(chats.len());
+        for chat_id in chats {
+            match self.journal.last_seq(&chat_id) {
+                Ok(Some(seq)) => horizons.push((chat_id, seq)),
+                // Journal gone/empty: the chat cannot produce future events,
+                // so the horizon covers every seq it ever had.
+                Ok(None) => horizons.push((chat_id, u64::MAX)),
+                // Unreadable journal: skip rather than risk a wrong horizon.
+                Err(_) => {}
+            }
+        }
+        {
+            let mut projector = lock(&self.projector);
+            projector
+                .chats
+                .retain(|_, ctx| ctx.project_id != project_id);
+        }
+        let removed = self.svc.forget_project(project_id, &horizons)?;
+        self.invalidate_briefing();
+        Ok(removed)
+    }
+
+    pub fn stats(
+        &self,
+        project_id: &str,
+    ) -> Result<komet_memory::MemoryStats, komet_memory::MemoryError> {
+        self.svc.stats(project_id)
+    }
+
+    pub fn resource_stats(
+        &self,
+    ) -> Result<(u64, Option<u64>, Option<u64>), komet_memory::MemoryError> {
+        let disk_bytes = memory_disk_bytes(&[
+            self.store_dir.clone(),
+            self.data_dir.join("models").join("memory"),
+        ])?;
+        let (process_cpu_ms, peak_rss_bytes) = process_resource_metrics();
+        Ok((disk_bytes, process_cpu_ms, peak_rss_bytes))
+    }
+
+    // ── settings (Settings → Memory) ─────────────────────────────────────
+
+    /// Journal chats the index has never seen — the "Index history"
+    /// button's reason to exist. `0` once everything is tracked.
+    pub fn untracked_journal_chats(&self) -> usize {
+        let Ok(journals) = self.journal.chat_ids() else {
+            return 0;
+        };
+        let known: std::collections::HashSet<String> = self
+            .svc
+            .known_chats()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        journals.iter().filter(|id| !known.contains(*id)).count()
+    }
+
+    /// "Index history": the next catch-up pass replays every journal,
+    /// including chats the index never tracked (pre-feature history).
+    /// One-shot — the flag is consumed by the pass it triggers.
+    pub fn request_history_import(self: &Arc<Self>) {
+        self.import_untracked.store(true, Ordering::SeqCst);
+        self.catch_up();
+    }
+
+    /// Global kill switch. OFF stops recording/briefing/catch-up; stored
+    /// data is kept. Disabling is a STOP, not a pause: every known chat's
+    /// replay cursor is sealed at its journal tail and all gap markers are
+    /// dropped, so events journaled while OFF are never replayed — not on
+    /// re-enable, not on the next catch-up. Chats the index never tracked
+    /// stay untracked ("Index history" remains the explicit opt-in).
+    /// Persists to `memory-config.json` immediately.
+    pub fn set_global_enabled(
+        self: &Arc<Self>,
+        enabled: bool,
+    ) -> Result<(), komet_memory::MemoryError> {
+        if enabled {
+            // Seal BEFORE flipping the flag: catch-up is gated on `enabled`,
+            // so no pass can slip between the cursor jump and the flip and
+            // replay the disabled window.
+            self.seal_journal_cursors();
+        }
+        {
+            let mut config = lock(&self.config);
+            // Flag first, still under the config lock: a concurrent reader
+            // can never observe config.enabled != the atomic gate. A save
+            // failure keeps the in-memory flip (same as before) — the file
+            // simply catches up on the next successful write.
+            self.enabled.store(enabled, Ordering::Relaxed);
+            config.enabled = enabled;
+            config.save(&self.data_dir).map_err(|e| {
+                komet_memory::MemoryError::Other(format!("save memory config: {e}"))
+            })?;
+        }
+        if !enabled {
+            self.seal_journal_cursors();
+            // A pending "Index history" must not fire later and replay the
+            // whole disabled window.
+            self.import_untracked.store(false, Ordering::SeqCst);
+        }
+        #[cfg(feature = "memory-embeddings")]
+        if !enabled {
+            *lock(&self.embedding_model) = None;
+        }
+        #[cfg(feature = "memory-embeddings")]
+        if enabled && self.embeddings_enabled() {
+            self.svc.enable_embeddings()?;
+            self.request_embedding_indexing()?;
+        }
+        self.invalidate_briefing();
+        Ok(())
+    }
+
+    /// Advance every store-known chat's replay cursor to its journal tail
+    /// (which also clears that chat's persisted gap rows at or below the
+    /// tail) and drop every remaining gap marker plus the in-memory lag
+    /// mirror. The cursor write is SYNCHRONOUS — a queued `Resume` could
+    /// still be in flight when the next catch-up reads the cursor and
+    /// replays the sealed window. `advance_cursor` upserts
+    /// `memory_chat_state`, so only chats the index already knows are
+    /// touched — a journal-only chat must stay "untracked" for the
+    /// explicit history import.
+    fn seal_journal_cursors(&self) {
+        let Ok(chats) = self.svc.known_chats() else {
+            return;
+        };
+        for chat_id in chats {
+            // No journal (or unreadable): the chat cannot produce future
+            // events — its gap rows are cleared below regardless.
+            if let Ok(Some(seq)) = self.journal.last_seq(&chat_id)
+                && let Err(err) = self.svc.advance_cursor(&chat_id, seq)
+            {
+                tracing::warn!(chat = %chat_id, error = %err, "memory: cursor seal failed");
+            }
+        }
+        // Gap rows surviving the cursor seals belong to chats without a
+        // replayable journal tail; they can never heal, so drop them.
+        if let Ok(gaps) = self.svc.chats_with_gaps() {
+            for chat_id in gaps {
+                let _ = self.svc.clear_gap(&chat_id);
+            }
+        }
+        lock(&self.lag).clear();
+    }
+
+    pub fn global_enabled(&self) -> bool {
+        self.enabled.load(Ordering::Relaxed)
+    }
+
+    #[cfg(feature = "memory-embeddings")]
+    pub fn embeddings_enabled(&self) -> bool {
+        lock(&self.config).embeddings_enabled
+    }
+
+    /// `<data_dir>/models/memory` — the live model dir (staging is its
+    /// `.staging` sibling, managed inside komet-memory).
+    #[cfg(feature = "memory-embeddings")]
+    fn model_dir(&self) -> PathBuf {
+        self.data_dir.join("models").join("memory")
+    }
+
+    /// Model lifecycle for the settings card: state name, bytes (live size
+    /// when ready, staging size while downloading), and the last error.
+    pub fn embedding_model_status(&self) -> serde_json::Value {
+        #[cfg(feature = "memory-embeddings")]
+        {
+            let dir = self.model_dir();
+            let state = komet_memory::model_state(&dir);
+            let (name, bytes) = match &state {
+                komet_memory::ModelState::Absent => ("absent", 0),
+                komet_memory::ModelState::Downloading => {
+                    ("downloading", komet_memory::staging_bytes(&dir))
+                }
+                komet_memory::ModelState::Ready { bytes } => ("ready", *bytes),
+                komet_memory::ModelState::Failed(_) => ("failed", 0),
+            };
+            serde_json::json!({
+                "state": name,
+                "bytes": bytes,
+                "error": match &state {
+                    komet_memory::ModelState::Failed(error) => Some(error.clone()),
+                    _ => None,
+                },
+                "downloadError": lock(&self.embedding_download_error).clone(),
+            })
+        }
+        #[cfg(not(feature = "memory-embeddings"))]
+        {
+            serde_json::json!({
+                "state": "unavailable",
+                "bytes": 0,
+                "error": null,
+                "downloadError": null,
+            })
+        }
+    }
+
+    /// Explicit one-shot model download (the ONLY network path). Runs on a
+    /// dedicated thread; publishes atomically on success and kicks the
+    /// indexing worker when the feature is enabled.
+    #[cfg(feature = "memory-embeddings")]
+    pub fn download_embedding_model(self: &Arc<Self>) -> Result<(), komet_memory::MemoryError> {
+        // The flow is: enable the feature, THEN download. The UI already
+        // gates the button; the engine enforces it so no RPC caller can pull
+        // the model for a feature the user has not turned on.
+        if !self.embeddings_enabled() {
+            return Err(komet_memory::MemoryError::Other(
+                "enable semantic memory before downloading the model".into(),
+            ));
+        }
+        if matches!(
+            komet_memory::model_state(&self.model_dir()),
+            komet_memory::ModelState::Ready { .. }
+        ) {
+            return Ok(());
+        }
+        {
+            let mut slot = lock(&self.embedding_download_cancel);
+            if slot.is_some() {
+                return Ok(()); // already in flight
+            }
+            *slot = Some(Arc::new(AtomicBool::new(false)));
+        }
+        *lock(&self.embedding_download_error) = None;
+        let indexer = Arc::downgrade(self);
+        let dir = self.model_dir();
+        let cancel = lock(&self.embedding_download_cancel)
+            .as_ref()
+            .expect("slot just filled")
+            .clone();
+        let spawn = std::thread::Builder::new()
+            .name("komet-memory-model-dl".into())
+            .spawn(move || {
+                // RAII: the in-flight slot is released on ANY exit —
+                // success, error, cancel or panic — so a crashed download
+                // can never wedge the "already downloading" guard forever.
+                let _slot_guard = DownloadSlotGuard {
+                    indexer: indexer.clone(),
+                    cancel: cancel.clone(),
+                };
+                let result = komet_memory::download_model(&dir, &cancel);
+                if let Some(indexer) = indexer.upgrade() {
+                    match result {
+                        Ok(_) => {
+                            *lock(&indexer.embedding_model) = None;
+                            if indexer.embeddings_enabled()
+                                && indexer.global_enabled()
+                                && let Err(error) = indexer.request_embedding_indexing()
+                            {
+                                tracing::warn!(error = %error, "embedding worker restart after model download failed");
+                            }
+                        }
+                        Err(error) => {
+                            *lock(&indexer.embedding_download_error) = Some(error.to_string());
+                        }
+                    }
+                }
+            });
+        if let Err(error) = spawn {
+            *lock(&self.embedding_download_cancel) = None;
+            return Err(komet_memory::MemoryError::Other(format!(
+                "start model download: {error}"
+            )));
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "memory-embeddings")]
+    pub fn cancel_embedding_download(&self) {
+        if let Some(cancel) = lock(&self.embedding_download_cancel).as_ref() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Remove the model files and drop any loaded instance. In-flight
+    /// indexing keeps its already-computed vectors; the next batch fails
+    /// to reload and surfaces the "not ready" error until re-download.
+    #[cfg(feature = "memory-embeddings")]
+    pub fn delete_embedding_model(&self) -> Result<u64, komet_memory::MemoryError> {
+        self.cancel_embedding_download();
+        *lock(&self.embedding_model) = None;
+        *lock(&self.embedding_download_error) = None;
+        komet_memory::remove_model(&self.model_dir())
+    }
+
+    #[cfg(feature = "memory-embeddings")]
+    pub fn set_embeddings_enabled(
+        self: &Arc<Self>,
+        enabled: bool,
+    ) -> Result<(), komet_memory::MemoryError> {
+        if enabled && self.global_enabled() {
+            self.svc.enable_embeddings()?;
+        }
+        {
+            let mut config = lock(&self.config);
+            let mut updated = config.clone();
+            updated.embeddings_enabled = enabled;
+            updated.save(&self.data_dir).map_err(|error| {
+                komet_memory::MemoryError::Other(format!("save memory config: {error}"))
+            })?;
+            *config = updated;
+        }
+        // Indexing only starts when the model is actually on disk — enabling
+        // the feature without a downloaded model must not hit the network.
+        if enabled
+            && matches!(
+                komet_memory::model_state(&self.model_dir()),
+                komet_memory::ModelState::Ready { .. }
+            )
+        {
+            self.request_embedding_indexing()?;
+        } else if !enabled {
+            *lock(&self.embedding_model) = None;
+            *lock(&self.embedding_error) = None;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "memory-embeddings")]
+    pub fn embedding_status(
+        &self,
+    ) -> Result<(u64, u64, bool, Option<String>), komet_memory::MemoryError> {
+        if !self.embeddings_enabled() || !self.global_enabled() {
+            return Ok((0, 0, false, None));
+        }
+        let (indexed, total) = self.svc.embedding_counts()?;
+        Ok((
+            indexed,
+            total,
+            self.embedding_processing.load(Ordering::Relaxed),
+            lock(&self.embedding_error).clone(),
+        ))
+    }
+
+    #[cfg(feature = "memory-embeddings")]
+    pub fn semantic_search(
+        &self,
+        project_id: &str,
+        query: &str,
+    ) -> Result<Vec<komet_memory::SemanticMemoryMatch>, komet_memory::MemoryError> {
+        if !self.embeddings_enabled() {
+            return Err(komet_memory::MemoryError::Other(
+                "semantic search is not enabled".into(),
+            ));
+        }
+        if !self.global_enabled() {
+            return Err(komet_memory::MemoryError::Other(
+                "memory is disabled".into(),
+            ));
+        }
+        if !lock(&self.embedding_active_chats).is_empty() {
+            return Err(komet_memory::MemoryError::Other(
+                "semantic search is paused while an agent run is active".into(),
+            ));
+        }
+        let query = query.trim();
+        if query.is_empty() || query.len() > 512 {
+            return Err(komet_memory::MemoryError::Other(
+                "semantic search query must contain 1 to 512 bytes".into(),
+            ));
+        }
+        let mut model = lock(&self.embedding_model);
+        if model.is_none() {
+            let cache_dir = self.data_dir.join("models").join("memory");
+            *model = Some(komet_memory::LocalEmbedder::load(&cache_dir)?);
+        }
+        let active_chats = lock(&self.embedding_active_chats);
+        if !active_chats.is_empty() {
+            return Err(komet_memory::MemoryError::Other(
+                "semantic search is paused while an agent run is active".into(),
+            ));
+        }
+        let vectors = model
+            .as_mut()
+            .ok_or_else(|| {
+                komet_memory::MemoryError::Other("embedding model is unavailable".into())
+            })?
+            .embed(&[query.to_string()])?;
+        let embedding = vectors.first().ok_or_else(|| {
+            komet_memory::MemoryError::Other("embedding model returned no search vector".into())
+        })?;
+        self.svc.semantic_search_facts(project_id, embedding, 10)
+    }
+
+    #[cfg(feature = "memory-embeddings")]
+    pub fn request_embedding_indexing(self: &Arc<Self>) -> Result<(), komet_memory::MemoryError> {
+        if !self.embeddings_enabled() {
+            return Err(komet_memory::MemoryError::Other(
+                "semantic indexing is not enabled".into(),
+            ));
+        }
+        if !matches!(
+            komet_memory::model_state(&self.model_dir()),
+            komet_memory::ModelState::Ready { .. }
+        ) {
+            return Err(komet_memory::MemoryError::Other(
+                "embedding model is not downloaded".into(),
+            ));
+        }
+        self.svc.enable_embeddings()?;
+        if self
+            .embedding_worker_running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            return Ok(());
+        }
+        *lock(&self.embedding_error) = None;
+        let indexer = Arc::downgrade(self);
+        let spawn = std::thread::Builder::new()
+            .name("komet-memory-embeddings".into())
+            .spawn(move || {
+                let mut failure = None;
+                loop {
+                    let Some(indexer) = indexer.upgrade() else {
+                        break;
+                    };
+                    if !indexer.embeddings_enabled() || !indexer.global_enabled() {
+                        drop(indexer);
+                        break;
+                    }
+                    if !lock(&indexer.embedding_active_chats).is_empty() {
+                        drop(indexer);
+                        std::thread::sleep(Duration::from_millis(500));
+                        continue;
+                    }
+                    let batch = match indexer.svc.facts_missing_embeddings(16) {
+                        Ok(batch) => batch,
+                        Err(error) => {
+                            failure = Some(error);
+                            break;
+                        }
+                    };
+                    if batch.is_empty() {
+                        drop(indexer);
+                        std::thread::sleep(Duration::from_secs(2));
+                        continue;
+                    }
+                    indexer.embedding_processing.store(true, Ordering::Release);
+                    if lock(&indexer.embedding_model).is_none() {
+                        let cache_dir = indexer.data_dir.join("models").join("memory");
+                        match komet_memory::LocalEmbedder::load(&cache_dir) {
+                            Ok(model) => *lock(&indexer.embedding_model) = Some(model),
+                            Err(error) => {
+                                failure = Some(error);
+                                break;
+                            }
+                        }
+                    }
+                    let texts: Vec<String> = batch.iter().map(|(_, text)| text.clone()).collect();
+                    let mut model = lock(&indexer.embedding_model);
+                    // Check, then RELEASE: holding the active-chats lock for the
+                    // whole embed would make `set_agent_active` (called from the
+                    // publish path on SessionStarted/Done) wait for the batch.
+                    // A run starting mid-batch is harmless: the batch is small
+                    // and the next one pauses.
+                    let busy = !lock(&indexer.embedding_active_chats).is_empty();
+                    if busy {
+                        drop(model);
+                        indexer.embedding_processing.store(false, Ordering::Release);
+                        drop(indexer);
+                        std::thread::sleep(Duration::from_millis(500));
+                        continue;
+                    }
+                    let vectors = match model
+                        .as_mut()
+                        .ok_or_else(|| {
+                            komet_memory::MemoryError::Other(
+                                "embedding model initialization failed".into(),
+                            )
+                        })
+                        .and_then(|model| model.embed(&texts))
+                    {
+                        Ok(vectors) => vectors,
+                        Err(error) => {
+                            failure = Some(error);
+                            break;
+                        }
+                    };
+                    let embeddings: Vec<_> = batch
+                        .into_iter()
+                        .zip(vectors)
+                        .map(|((id, _), vector)| (id, vector))
+                        .collect();
+                    if let Err(error) = indexer.svc.store_fact_embeddings(&embeddings) {
+                        failure = Some(error);
+                        break;
+                    }
+                    drop(model);
+                    indexer.embedding_processing.store(false, Ordering::Release);
+                    drop(indexer);
+                }
+                if let Some(indexer) = indexer.upgrade() {
+                    let restart = failure.is_none()
+                        && indexer.embeddings_enabled()
+                        && indexer.global_enabled();
+                    if !indexer.embeddings_enabled() || !indexer.global_enabled() {
+                        *lock(&indexer.embedding_model) = None;
+                    }
+                    indexer.embedding_processing.store(false, Ordering::Release);
+                    if let Some(error) = failure {
+                        *lock(&indexer.embedding_error) = Some(error.to_string());
+                        tracing::warn!(error = %error, "memory embedding worker failed");
+                    }
+                    indexer
+                        .embedding_worker_running
+                        .store(false, Ordering::Release);
+                    if restart && let Err(error) = indexer.request_embedding_indexing() {
+                        tracing::warn!(error = %error, "memory embedding worker restart failed");
+                    }
+                }
+            });
+        if let Err(error) = spawn {
+            self.embedding_worker_running
+                .store(false, Ordering::Release);
+            let message = format!("start memory embedding worker: {error}");
+            *lock(&self.embedding_error) = Some(message.clone());
+            return Err(komet_memory::MemoryError::Other(message));
+        }
+        Ok(())
+    }
+
+    #[cfg(not(feature = "memory-embeddings"))]
+    pub fn embeddings_enabled(&self) -> bool {
+        false
+    }
+
+    #[cfg(not(feature = "memory-embeddings"))]
+    pub fn set_embeddings_enabled(
+        self: &Arc<Self>,
+        enabled: bool,
+    ) -> Result<(), komet_memory::MemoryError> {
+        if enabled {
+            Err(komet_memory::MemoryError::Other(
+                "semantic embeddings are unavailable in this build".into(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    #[cfg(not(feature = "memory-embeddings"))]
+    pub fn embedding_status(
+        &self,
+    ) -> Result<(u64, u64, bool, Option<String>), komet_memory::MemoryError> {
+        Ok((0, 0, false, None))
+    }
+
+    #[cfg(not(feature = "memory-embeddings"))]
+    pub fn request_embedding_indexing(self: &Arc<Self>) -> Result<(), komet_memory::MemoryError> {
+        Err(komet_memory::MemoryError::Other(
+            "semantic embeddings are unavailable in this build".into(),
+        ))
+    }
+
+    #[cfg(not(feature = "memory-embeddings"))]
+    pub fn semantic_search(
+        &self,
+        _project_id: &str,
+        _query: &str,
+    ) -> Result<Vec<komet_memory::SemanticMemoryMatch>, komet_memory::MemoryError> {
+        Err(komet_memory::MemoryError::Other(
+            "semantic embeddings are unavailable in this build".into(),
+        ))
+    }
+
+    #[cfg(not(feature = "memory-embeddings"))]
+    pub fn download_embedding_model(self: &Arc<Self>) -> Result<(), komet_memory::MemoryError> {
+        Err(komet_memory::MemoryError::Other(
+            "semantic embeddings are unavailable in this build".into(),
+        ))
+    }
+
+    #[cfg(not(feature = "memory-embeddings"))]
+    pub fn cancel_embedding_download(&self) {}
+
+    #[cfg(not(feature = "memory-embeddings"))]
+    pub fn delete_embedding_model(&self) -> Result<u64, komet_memory::MemoryError> {
+        Err(komet_memory::MemoryError::Other(
+            "semantic embeddings are unavailable in this build".into(),
+        ))
+    }
+
+    /// Retention in days (clamped to the config bounds). Applies to the
+    /// next prune tick and to replay-expiry checks.
+    pub fn set_retention_days(&self, days: u32) -> Result<(), komet_memory::MemoryError> {
+        let days = days.clamp(
+            komet_memory::RETENTION_DAYS_MIN,
+            komet_memory::RETENTION_DAYS_MAX,
+        );
+        self.retention_days.store(days, Ordering::Relaxed);
+        self.invalidate_briefing();
+        {
+            let mut config = lock(&self.config);
+            config.retention_days = days;
+            config.save(&self.data_dir).map_err(|e| {
+                komet_memory::MemoryError::Other(format!("save memory config: {e}"))
+            })?;
+        }
+        Ok(())
+    }
+
+    pub fn retention_days(&self) -> u32 {
+        self.retention_days.load(Ordering::Relaxed)
+    }
+
+    /// Point the store at a new location. Persisted to the config file and
+    /// applied at the NEXT engine start (the running store is never moved
+    /// under live connections). `None` resets to `<data_dir>/memory`.
+    pub fn set_location(&self, location: Option<String>) -> Result<(), komet_memory::MemoryError> {
+        // Blank means "reset to the default location". Anything else is
+        // checked NOW, while the user can still fix it — not silently at the
+        // next restart.
+        let location = location
+            .map(|raw| raw.trim().to_string())
+            .filter(|raw| !raw.is_empty());
+        if let Some(raw) = location.as_deref() {
+            validate_store_location(raw)?;
+        }
+        {
+            let mut config = lock(&self.config);
+            config.location = location;
+            config.save(&self.data_dir).map_err(|e| {
+                komet_memory::MemoryError::Other(format!("save memory config: {e}"))
+            })?;
+        }
+        Ok(())
+    }
+
+    /// The directory the store is open at right now.
+    pub fn store_dir(&self) -> &std::path::Path {
+        &self.store_dir
+    }
+
+    /// The configured custom location, if any — may differ from
+    /// [`Self::store_dir`] until the next restart applies it.
+    pub fn pending_location(&self) -> Option<String> {
+        lock(&self.config).location.clone()
+    }
+
+    /// The store directory the config currently selects, when it differs
+    /// from the one actually open — `Some` means a restart will relocate
+    /// (an explicit custom path AND a reset back to the default both land
+    /// here; `None` = no pending change).
+    pub fn pending_store_dir(&self) -> Option<PathBuf> {
+        let target = lock(&self.config).store_dir(&self.data_dir);
+        (target != self.store_dir).then_some(target)
+    }
+
+    /// The directory a previous relocation left a copy in — `None` when
+    /// nothing is left to show (never relocated, already cleaned, or the
+    /// marker points at the live store).
+    pub fn previous_copy_dir(&self) -> Option<PathBuf> {
+        let dir = lock(&self.config)
+            .previous_dir
+            .as_deref()
+            .map(str::trim)
+            .filter(|raw| !raw.is_empty())
+            .map(komet_memory::resolve_location)?;
+        (dir != self.store_dir).then_some(dir)
+    }
+
+    /// Bytes the previous copy still occupies (0 = nothing to delete).
+    pub fn previous_copy_bytes(&self) -> u64 {
+        self.previous_copy_dir()
+            .map(|dir| komet_memory::previous_copy_bytes(&dir))
+            .unwrap_or(0)
+    }
+
+    /// Delete the previous copy's store files (bounded to the database files
+    /// and relocation backups — never other files in that folder) and forget
+    /// the marker. Returns bytes freed.
+    pub fn delete_previous_copy(&self) -> Result<u64, komet_memory::MemoryError> {
+        let freed = match self.previous_copy_dir() {
+            Some(dir) => komet_memory::delete_previous_copy(&dir)?,
+            None => 0,
+        };
+        let mut config = lock(&self.config);
+        config.previous_dir = None;
+        config
+            .save(&self.data_dir)
+            .map_err(|e| komet_memory::MemoryError::Other(format!("save memory config: {e}")))?;
+        Ok(freed)
+    }
+
+    /// All known projects with settings + footprint (settings page list).
+    pub fn list_projects(
+        &self,
+    ) -> Result<Vec<komet_memory::ProjectInfo>, komet_memory::MemoryError> {
+        self.svc.list_projects()
+    }
+
+    /// Store-wide event/chat counts (per-project `stats` exists too).
+    pub fn totals(&self) -> Result<(i64, i64), komet_memory::MemoryError> {
+        self.svc.totals()
+    }
+
+    /// "Forget all": wipe every project's derived rows AND tombstone every
+    /// chat that could still produce rows — journal-backed chats at their
+    /// tail, journal-less chats (queued records, gap markers, cursor rows)
+    /// at `u64::MAX`. Live chats keep recording: their NEXT events carry
+    /// seqs above the horizon. Project settings are kept.
+    pub fn forget_all(&self) -> Result<usize, komet_memory::MemoryError> {
+        let mut chats: std::collections::HashSet<String> = std::collections::HashSet::new();
+        if let Ok(journals) = self.journal.chat_ids() {
+            chats.extend(journals);
+        }
+        if let Ok(known) = self.svc.known_chats() {
+            chats.extend(known);
+        }
+        chats.extend(lock(&self.lag).keys().cloned());
+        chats.extend(lock(&self.projector).chats.keys().cloned());
+        let mut horizons = Vec::with_capacity(chats.len());
+        for chat_id in chats {
+            match self.journal.last_seq(&chat_id) {
+                Ok(Some(seq)) => horizons.push((chat_id, seq)),
+                // Journal confirmed gone/empty → no future events → cover
+                // every seq it ever had. An unreadable journal is skipped
+                // rather than risking a wrong horizon on a live chat.
+                Ok(None) => horizons.push((chat_id, u64::MAX)),
+                Err(_) => {}
+            }
+        }
+        {
+            let mut projector = lock(&self.projector);
+            projector.chats.clear();
+            projector.cwd_projects.clear();
+        }
+        let removed = self.svc.forget_all(&horizons)?;
+        self.invalidate_briefing();
+        Ok(removed)
+    }
+}
+
+/// Reject a store location that cannot work: it must be absolute (or
+/// `~/...`), creatable and writable.
+fn validate_store_location(raw: &str) -> Result<(), komet_memory::MemoryError> {
+    let path = komet_memory::resolve_location(raw);
+    if !path.is_absolute() {
+        return Err(komet_memory::MemoryError::Other(
+            "memory location must be an absolute path".into(),
+        ));
+    }
+    let unusable = |error: std::io::Error| {
+        komet_memory::MemoryError::Other(format!("memory location is not usable: {error}"))
+    };
+    std::fs::create_dir_all(&path).map_err(unusable)?;
+    let probe = path.join(".komet-write-probe");
+    std::fs::write(&probe, b"ok").map_err(unusable)?;
+    let _ = std::fs::remove_file(&probe);
+    Ok(())
+}
+
+fn current_branch(cwd: &str) -> Option<String> {
+    let root = komet_memory::project_root_for(cwd);
+    let git_path = root.join(".git");
+    let git_dir = if git_path.is_dir() {
+        git_path
+    } else {
+        let pointer = std::fs::read_to_string(git_path).ok()?;
+        let target = pointer.trim().strip_prefix("gitdir: ")?;
+        let target = PathBuf::from(target);
+        if target.is_absolute() {
+            target
+        } else {
+            root.join(target)
+        }
+    };
+    let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
+    let branch = head.trim().strip_prefix("ref: refs/heads/")?;
+    let branch = branch.trim();
+    (!branch.is_empty() && !komet_memory::contains_secret_value(branch)).then(|| branch.to_string())
+}
+
+fn issue_reference(branch: &str) -> Option<String> {
+    for marker in ["#", "issue/", "issue-"] {
+        let Some((_, suffix)) = branch.split_once(marker) else {
+            continue;
+        };
+        let digits: String = suffix.chars().take_while(char::is_ascii_digit).collect();
+        if !digits.is_empty() {
+            return Some(format!("#{digits}"));
+        }
+    }
+    None
+}
+
+fn memory_disk_bytes(roots: &[PathBuf]) -> Result<u64, komet_memory::MemoryError> {
+    const MAX_ENTRIES: usize = 20_000;
+    let mut pending = roots.to_vec();
+    let mut visited = 0;
+    let mut seen_files = std::collections::HashSet::new();
+    let mut bytes = 0u64;
+    while let Some(path) = pending.pop() {
+        visited += 1;
+        if visited > MAX_ENTRIES {
+            return Err(komet_memory::MemoryError::Other(
+                "memory disk-usage scan exceeded its entry limit".into(),
+            ));
+        }
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        if metadata.is_file() {
+            let canonical = std::fs::canonicalize(&path)?;
+            if seen_files.insert(canonical) {
+                bytes = bytes.saturating_add(metadata.len());
+            }
+        } else if metadata.is_dir() {
+            for entry in std::fs::read_dir(path)? {
+                pending.push(entry?.path());
+            }
+        }
+    }
+    Ok(bytes)
+}
+
+#[cfg(unix)]
+fn process_resource_metrics() -> (Option<u64>, Option<u64>) {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) } != 0 {
+        return (None, None);
+    }
+    let usage = unsafe { usage.assume_init() };
+    let time_ms = |time: libc::timeval| {
+        u64::try_from(time.tv_sec)
+            .unwrap_or_default()
+            .saturating_mul(1000)
+            .saturating_add(u64::try_from(time.tv_usec).unwrap_or_default() / 1000)
+    };
+    let cpu_ms = time_ms(usage.ru_utime).saturating_add(time_ms(usage.ru_stime));
+    let peak = u64::try_from(usage.ru_maxrss)
+        .ok()
+        .filter(|value| *value > 0);
+    #[cfg(target_os = "macos")]
+    let peak_bytes = peak;
+    #[cfg(not(target_os = "macos"))]
+    let peak_bytes = peak.map(|kilobytes| kilobytes.saturating_mul(1024));
+    (Some(cpu_ms), peak_bytes)
+}
+
+#[cfg(windows)]
+fn process_resource_metrics() -> (Option<u64>, Option<u64>) {
+    use windows_sys::Win32::System::ProcessStatus::{
+        GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+
+    let process = unsafe { GetCurrentProcess() };
+    let mut created = std::mem::MaybeUninit::uninit();
+    let mut exited = std::mem::MaybeUninit::uninit();
+    let mut kernel = std::mem::MaybeUninit::uninit();
+    let mut user = std::mem::MaybeUninit::uninit();
+    let cpu_ms = (unsafe {
+        GetProcessTimes(
+            process,
+            created.as_mut_ptr(),
+            exited.as_mut_ptr(),
+            kernel.as_mut_ptr(),
+            user.as_mut_ptr(),
+        )
+    } != 0)
+        .then(|| unsafe {
+            let ticks = |time: windows_sys::Win32::Foundation::FILETIME| {
+                (u64::from(time.dwHighDateTime) << 32) | u64::from(time.dwLowDateTime)
+            };
+            ticks(kernel.assume_init()).saturating_add(ticks(user.assume_init())) / 10_000
+        });
+    let mut counters: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
+    let counter_size = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+    counters.cb = counter_size;
+    let peak_rss = (unsafe { GetProcessMemoryInfo(process, &mut counters, counter_size) } != 0)
+        .then_some(counters.PeakWorkingSetSize as u64);
+    (cpu_ms, peak_rss)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn process_resource_metrics() -> (Option<u64>, Option<u64>) {
+    (None, None)
+}
+
+/// Wrap a raw briefing in the delimited context block injected at the
+/// harness boundary. Kept separate from the user's message: the doc write
+/// happens before this is appended to the run request's prompt.
+pub fn memory_context_block(briefing: &str) -> String {
+    format!("<komet-memory>\n{briefing}\n</komet-memory>")
+}
+
+/// Cosine similarity over two equal-length embedding vectors.
+#[cfg(feature = "memory-embeddings")]
+fn cosine(a: &[f32], b: &[f32]) -> f32 {
+    let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
+    for (x, y) in a.iter().zip(b.iter()) {
+        let (x, y) = (*x as f64, *y as f64);
+        dot += x * y;
+        na += x * x;
+        nb += y * y;
+    }
+    if na == 0.0 || nb == 0.0 {
+        0.0
+    } else {
+        (dot / (na.sqrt() * nb.sqrt())) as f32
+    }
+}
+
+/// Reciprocal-rank fusion (k=60) of two fact orderings: a fact present in
+/// both lists outranks one found by a single leg; ties break on the lower
+/// fact id for determinism.
+#[cfg(feature = "memory-embeddings")]
+fn rrf_merge_facts(
+    text: &[komet_memory::MemoryFact],
+    semantic: &[komet_memory::MemoryFact],
+    limit: usize,
+) -> Vec<komet_memory::MemoryFact> {
+    use std::collections::HashMap;
+    let mut scores: HashMap<i64, f64> = HashMap::new();
+    let mut facts: HashMap<i64, komet_memory::MemoryFact> = HashMap::new();
+    for (rank, fact) in text.iter().enumerate() {
+        *scores.entry(fact.id).or_default() += 1.0 / (61.0 + rank as f64);
+        facts.entry(fact.id).or_insert_with(|| fact.clone());
+    }
+    for (rank, fact) in semantic.iter().enumerate() {
+        *scores.entry(fact.id).or_default() += 1.0 / (61.0 + rank as f64);
+        facts.entry(fact.id).or_insert_with(|| fact.clone());
+    }
+    let mut ranked: Vec<(i64, f64)> = scores.into_iter().collect();
+    ranked.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.0.cmp(&b.0))
+    });
+    ranked
+        .into_iter()
+        .take(limit)
+        .filter_map(|(id, _)| facts.remove(&id))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use komet_proto::{DoneStatus, ToolCall as ProtoToolCall};
+
+    fn projector() -> MemoryProjector {
+        MemoryProjector {
+            chats: HashMap::new(),
+            cwd_projects: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn tool_call_projection_never_carries_payloads() {
+        let mut p = projector();
+        p.note_chat("c1", "/repo", HarnessId::ClaudeCode);
+        let event = AgentEvent::ToolCall {
+            id: "t1".into(),
+            call: ProtoToolCall::Exec {
+                command: "rm -rf / && echo sk-secret".into(),
+            },
+        };
+        let items = p.project("c1", 7, &event, 1000);
+        assert_eq!(items.len(), 1);
+        let MemoryItem::Record(rec) = &items[0] else {
+            panic!("expected record");
+        };
+        assert_eq!(rec.kind, "tool_call");
+        assert_eq!(rec.tool_name.as_deref(), Some("exec"));
+        assert!(rec.relative_path.is_none());
+        // The command string must not appear anywhere in the record.
+        let dbg = format!("{rec:?}");
+        assert!(!dbg.contains("rm -rf"));
+        assert!(!dbg.contains("sk-secret"));
+    }
+
+    #[test]
+    fn file_tool_paths_are_relativized_and_filtered() {
+        let mut p = projector();
+        p.note_chat("c1", "/repo", HarnessId::Codex);
+        let event = AgentEvent::ToolCall {
+            id: "t1".into(),
+            call: ProtoToolCall::WriteFile {
+                path: "/repo/src/main.rs".into(),
+                content: Some("secret body".into()),
+            },
+        };
+        let items = p.project("c1", 1, &event, 1000);
+        let MemoryItem::Record(rec) = &items[0] else {
+            panic!("expected record");
+        };
+        assert_eq!(rec.relative_path.as_deref(), Some("src/main.rs"));
+        assert!(!format!("{rec:?}").contains("secret body"));
+
+        // A path outside the project is dropped entirely.
+        let outside = AgentEvent::ToolCall {
+            id: "t2".into(),
+            call: ProtoToolCall::ReadFile {
+                path: "/etc/shadow".into(),
+            },
+        };
+        let items = p.project("c1", 2, &outside, 1001);
+        let MemoryItem::Record(rec) = &items[0] else {
+            panic!("expected record");
+        };
+        assert!(rec.relative_path.is_none());
+
+        // Secret-looking paths are dropped by policy.
+        let secret = AgentEvent::ToolCall {
+            id: "t3".into(),
+            call: ProtoToolCall::ReadFile {
+                path: "/repo/.env".into(),
+            },
+        };
+        let items = p.project("c1", 3, &secret, 1002);
+        let MemoryItem::Record(rec) = &items[0] else {
+            panic!("expected record");
+        };
+        assert!(rec.relative_path.is_none());
+    }
+
+    #[test]
+    fn tool_result_pairs_with_call_for_outcome() {
+        let mut p = projector();
+        p.note_chat("c1", "/repo", HarnessId::ClaudeCode);
+        p.project(
+            "c1",
+            1,
+            &AgentEvent::ToolCall {
+                id: "t1".into(),
+                call: ProtoToolCall::EditFile {
+                    path: "/repo/a.rs".into(),
+                    old_string: None,
+                    new_string: None,
+                },
+            },
+            1000,
+        );
+        let items = p.project(
+            "c1",
+            2,
+            &AgentEvent::ToolResult {
+                id: "t1".into(),
+                is_error: true,
+                output: Some("boom".into()),
+                diff: None,
+            },
+            1001,
+        );
+        let MemoryItem::Record(rec) = &items[0] else {
+            panic!("expected record");
+        };
+        assert_eq!(rec.kind, "tool_result");
+        assert_eq!(rec.outcome.as_deref(), Some("error"));
+        assert_eq!(rec.tool_name.as_deref(), Some("edit_file"));
+        assert_eq!(rec.relative_path.as_deref(), Some("a.rs"));
+        assert!(!format!("{rec:?}").contains("boom"));
+    }
+
+    #[test]
+    fn session_lifecycle_records_boundaries() {
+        let mut p = projector();
+        p.note_chat("c1", "/repo", HarnessId::ClaudeCode);
+        let start = AgentEvent::SessionStarted {
+            harness: HarnessId::ClaudeCode,
+            model: "opus".into(),
+            tools: vec![],
+            cwd: "/repo".into(),
+            session_id: "s1".into(),
+            assistant_message_id: "m1".into(),
+        };
+        let items = p.project("c1", 1, &start, 1000);
+        assert!(matches!(&items[0], MemoryItem::Record(r) if r.kind == "session_start"));
+
+        let done = AgentEvent::Done {
+            status: DoneStatus::Completed,
+            result: None,
+            error: None,
+            session_id: None,
+            reason: None,
+        };
+        let items = p.project("c1", 2, &done, 46000);
+        assert_eq!(items.len(), 2);
+        let MemoryItem::Record(rec) = &items[0] else {
+            panic!("expected record");
+        };
+        assert_eq!(rec.kind, "session_end");
+        assert_eq!(rec.outcome.as_deref(), Some("completed"));
+        assert_eq!(rec.duration_ms, Some(45000));
+        assert!(matches!(&items[1], MemoryItem::Checkpoint { seq: 2, .. }));
+    }
+
+    #[test]
+    fn credential_shaped_names_and_models_are_dropped() {
+        let mut p = projector();
+        p.note_chat("c1", "/repo", HarnessId::ClaudeCode);
+        let token = "ghp_aaaaaaaaaaaaaaaaaaaa";
+        // Model id carrying a token must not persist.
+        let start = AgentEvent::SessionStarted {
+            harness: HarnessId::ClaudeCode,
+            model: token.into(),
+            tools: vec![],
+            cwd: "/repo".into(),
+            session_id: "s1".into(),
+            assistant_message_id: "m1".into(),
+        };
+        let items = p.project("c1", 1, &start, 1000);
+        let MemoryItem::Record(rec) = &items[0] else {
+            panic!("expected record");
+        };
+        assert_eq!(rec.model, None);
+        assert!(!format!("{rec:?}").contains(token));
+
+        // MCP server/tool names are free-form: a token inside must not
+        // reach tool_name (and therefore search_text).
+        for (seq, call) in [
+            (
+                2u64,
+                ProtoToolCall::Mcp {
+                    server: "svc".into(),
+                    tool: token.into(),
+                    input: None,
+                },
+            ),
+            (
+                3,
+                ProtoToolCall::Unknown {
+                    name: format!("prefix_{token}"),
+                    input: None,
+                },
+            ),
+        ] {
+            let items = p.project(
+                "c1",
+                seq,
+                &AgentEvent::ToolCall {
+                    id: format!("t{seq}"),
+                    call,
+                },
+                1000,
+            );
+            let MemoryItem::Record(rec) = &items[0] else {
+                panic!("expected record");
+            };
+            assert_eq!(rec.tool_name, None, "seq {seq} leaked a credential");
+            assert!(!format!("{rec:?}").contains(token));
+        }
+
+        // Safe free-form names still record.
+        let items = p.project(
+            "c1",
+            4,
+            &AgentEvent::ToolCall {
+                id: "t4".into(),
+                call: ProtoToolCall::Mcp {
+                    server: "github".into(),
+                    tool: "create_issue".into(),
+                    input: None,
+                },
+            },
+            1001,
+        );
+        let MemoryItem::Record(rec) = &items[0] else {
+            panic!("expected record");
+        };
+        assert_eq!(rec.tool_name.as_deref(), Some("mcp:github/create_issue"));
+    }
+
+    /// The regression CodeRabbit flagged: a cursor ahead of `SessionStarted`
+    /// must not lose the tool pairing — catch-up rebuilds ctx from seq 0
+    /// through a dedicated replay projector.
+    #[test]
+    fn catch_up_rebuilds_context_from_full_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal =
+            Arc::new(RunJournal::open(dir.path().join("journals")).expect("journal open"));
+        let indexer = MemoryIndexer::open(dir.path(), journal.clone()).expect("indexer open");
+        let cwd = "/repo";
+        journal
+            .append(
+                "c1",
+                &AgentEvent::SessionStarted {
+                    harness: HarnessId::ClaudeCode,
+                    model: "opus".into(),
+                    tools: vec![],
+                    cwd: cwd.into(),
+                    session_id: "s1".into(),
+                    assistant_message_id: "m1".into(),
+                },
+            )
+            .unwrap();
+        journal
+            .append(
+                "c1",
+                &AgentEvent::ToolCall {
+                    id: "t1".into(),
+                    call: ProtoToolCall::EditFile {
+                        path: "/repo/a.rs".into(),
+                        old_string: None,
+                        new_string: None,
+                    },
+                },
+            )
+            .unwrap();
+        journal
+            .append(
+                "c1",
+                &AgentEvent::ToolResult {
+                    id: "t1".into(),
+                    is_error: false,
+                    output: None,
+                    diff: None,
+                },
+            )
+            .unwrap();
+        journal
+            .append(
+                "c1",
+                &AgentEvent::Done {
+                    status: DoneStatus::Completed,
+                    result: None,
+                    error: None,
+                    session_id: None,
+                    reason: None,
+                },
+            )
+            .unwrap();
+
+        // Pretend seqs 1-2 were already processed (cursor=2) — the live
+        // projector knows nothing about this chat, exactly like a restart.
+        indexer
+            .service()
+            .enqueue(MemoryItem::Checkpoint {
+                chat_id: "c1".into(),
+                seq: 2,
+            })
+            .unwrap();
+        wait_for(|| indexer.service().chat_cursor("c1").unwrap().last_seq == 2);
+
+        indexer.catch_up_inner();
+        let project_id = komet_memory::project_id_for(cwd);
+        wait_for(|| {
+            indexer
+                .service()
+                .recent(&project_id, 50, None)
+                .map(|e| e.iter().any(|ev| ev.kind == "session_end"))
+                .unwrap_or(false)
+        });
+        let events = indexer.service().recent(&project_id, 50, None).unwrap();
+        // seqs 3-4 only: the tool result must pair with the ToolCall seen
+        // during the context rebuild, and Done must emit session_end.
+        assert!(
+            events.iter().all(|e| e.kind != "session_start"),
+            "pre-cursor events must not be re-indexed: {events:?}"
+        );
+        let result = events
+            .iter()
+            .find(|e| e.kind == "tool_result")
+            .expect("tool_result missing");
+        assert_eq!(result.tool_name.as_deref(), Some("edit_file"));
+        assert_eq!(result.relative_path.as_deref(), Some("a.rs"));
+        assert!(events.iter().any(|e| e.kind == "session_end"));
+    }
+
+    #[test]
+    fn workspace_graph_scan_is_incremental_and_respects_secret_exclusions() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("project");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub struct Store;\n").unwrap();
+        std::fs::write(root.join(".env"), "SECRET=must_not_be_read").unwrap();
+        let journal = Arc::new(RunJournal::open(dir.path().join("journals")).unwrap());
+        let indexer = MemoryIndexer::open(&dir.path().join("data"), journal).unwrap();
+        let cwd = root.to_string_lossy().to_string();
+        let project_id = komet_memory::project_id_for(&cwd);
+
+        indexer.scan_workspace(&cwd, &project_id).unwrap();
+        let indexed = indexer.svc.file_indexes(&project_id).unwrap();
+        assert_eq!(indexed.len(), 1);
+        assert_eq!(indexed[0].0, "src/lib.rs");
+        let original_hash = indexed[0].1.clone();
+        let graph = indexer
+            .svc
+            .graph_neighbors(&project_id, "src/lib.rs", 10)
+            .unwrap();
+        assert!(
+            graph
+                .iter()
+                .any(|neighbor| neighbor.kind == "symbol" && neighbor.label == "Store")
+        );
+
+        std::fs::write(root.join("src/lib.rs"), "pub fn write_record() {}\n").unwrap();
+        indexer.scan_workspace(&cwd, &project_id).unwrap();
+        let updated = indexer.svc.file_indexes(&project_id).unwrap();
+        assert_ne!(updated[0].1, original_hash);
+        let graph = indexer
+            .svc
+            .graph_neighbors(&project_id, "src/lib.rs", 10)
+            .unwrap();
+        assert!(
+            graph
+                .iter()
+                .any(|neighbor| neighbor.label == "write_record"),
+            "updated file graph has no function symbol: {graph:?}"
+        );
+        assert!(!graph.iter().any(|neighbor| neighbor.label == "Store"));
+
+        std::fs::remove_file(root.join("src/lib.rs")).unwrap();
+        indexer.scan_workspace(&cwd, &project_id).unwrap();
+        assert!(
+            indexer
+                .svc
+                .graph_neighbors(&project_id, "src/lib.rs", 10)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn checkout_hints_read_branch_and_issue_from_git_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("project");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(
+            root.join(".git/HEAD"),
+            "ref: refs/heads/feature/issue-78-memory\n",
+        )
+        .unwrap();
+        let cwd = root.to_string_lossy();
+        let branch = current_branch(&cwd).unwrap();
+        assert_eq!(branch, "feature/issue-78-memory");
+        assert_eq!(issue_reference(&branch).as_deref(), Some("#78"));
+        assert_eq!(issue_reference("release/1.3.4"), None);
+    }
+
+    #[test]
+    fn memory_disk_usage_counts_store_and_model_cache_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("memory");
+        let model = dir.path().join("models/memory/model");
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::create_dir_all(model.parent().unwrap()).unwrap();
+        std::fs::write(store.join("memory.sqlite"), b"sqlite").unwrap();
+        std::fs::write(store.join("memory.sqlite-wal"), b"wal").unwrap();
+        std::fs::write(&model, b"model").unwrap();
+        assert_eq!(
+            memory_disk_bytes(&[store, dir.path().join("models/memory")]).unwrap(),
+            14
+        );
+    }
+
+    fn wait_for(mut cond: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            if cond() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("timed out waiting for memory writer");
+    }
+
+    #[test]
+    fn subagent_events_project_through_wrapper() {
+        let mut p = projector();
+        p.note_chat("c1", "/repo", HarnessId::ClaudeCode);
+        let inner = AgentEvent::ToolCall {
+            id: "sub1".into(),
+            call: ProtoToolCall::ReadFile {
+                path: "/repo/x.rs".into(),
+            },
+        };
+        let wrapped = AgentEvent::Subagent {
+            parent_tool_use_id: "parent".into(),
+            event: Box::new(inner),
+        };
+        let items = p.project("c1", 9, &wrapped, 1000);
+        assert_eq!(items.len(), 1);
+        assert!(projectable(&wrapped));
+        assert!(!projectable(&AgentEvent::TextDelta { text: "x".into() }));
+    }
+
+    /// Disabling memory is a STOP, not a pause: the replay cursors are
+    /// sealed at the journal tails and gap markers dropped, so events
+    /// journaled while OFF are never indexed — not by catch-up, not after
+    /// re-enable. Chats the index never tracked stay untracked.
+    #[test]
+    fn disabling_memory_is_a_stop_not_a_pause() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Arc::new(RunJournal::open(dir.path().join("journals")).unwrap());
+        let indexer = MemoryIndexer::open(dir.path(), journal.clone()).unwrap();
+        let cwd = "/repo";
+        let project_id = komet_memory::project_id_for(cwd);
+        indexer.note_chat("c1", cwd, HarnessId::ClaudeCode);
+
+        let start = AgentEvent::SessionStarted {
+            harness: HarnessId::ClaudeCode,
+            model: "opus".into(),
+            tools: vec![],
+            cwd: cwd.into(),
+            session_id: "s1".into(),
+            assistant_message_id: "m1".into(),
+        };
+        let seq1 = journal.append("c1", &start).unwrap();
+        indexer.index_event("c1", seq1, &start);
+        wait_for(|| indexer.service().stats(&project_id).unwrap().events == 1);
+
+        // A persisted gap must not survive the stop either.
+        indexer.service().note_gap("c1", seq1 + 1).unwrap();
+        indexer.set_global_enabled(false).unwrap();
+        assert!(indexer.service().chats_with_gaps().unwrap().is_empty());
+
+        // Events journaled while OFF: index_event is gated, the journal
+        // keeps them (it is authoritative), but nothing may be stored.
+        let call = AgentEvent::ToolCall {
+            id: "t1".into(),
+            call: ProtoToolCall::ReadFile {
+                path: "/repo/a.rs".into(),
+            },
+        };
+        let seq2 = journal.append("c1", &call).unwrap();
+        indexer.index_event("c1", seq2, &call);
+        let done = AgentEvent::Done {
+            status: DoneStatus::Completed,
+            result: None,
+            error: None,
+            session_id: None,
+            reason: None,
+        };
+        let seq3 = journal.append("c1", &done).unwrap();
+        indexer.index_event("c1", seq3, &done);
+        // A never-tracked chat keeps journaling too: it must stay untracked.
+        journal.append("c2", &start).unwrap();
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(indexer.service().stats(&project_id).unwrap().events, 1);
+
+        // Re-enable seals again at the new tail, then catch-up runs: the
+        // disabled window (seq2..=seq3) must not be replayed.
+        indexer.set_global_enabled(true).unwrap();
+        indexer.catch_up_inner();
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(
+            indexer.service().stats(&project_id).unwrap().events,
+            1,
+            "events journaled while memory was OFF were indexed"
+        );
+        assert!(
+            !indexer
+                .service()
+                .known_chats()
+                .unwrap()
+                .contains(&"c2".to_string()),
+            "an untracked chat became known without an explicit import"
+        );
+
+        // A live event after reactivation indexes normally.
+        let call2 = AgentEvent::ToolCall {
+            id: "t2".into(),
+            call: ProtoToolCall::ReadFile {
+                path: "/repo/b.rs".into(),
+            },
+        };
+        let seq4 = journal.append("c1", &call2).unwrap();
+        indexer.index_event("c1", seq4, &call2);
+        wait_for(|| indexer.service().stats(&project_id).unwrap().events == 2);
+    }
+
+    /// The download command is gated on the embeddings feature flag, not
+    /// just the UI button: `embeddings_enabled` defaults to false.
+    #[cfg(feature = "memory-embeddings")]
+    #[test]
+    fn model_download_requires_embeddings_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Arc::new(RunJournal::open(dir.path().join("journals")).unwrap());
+        let indexer = MemoryIndexer::open(dir.path(), journal.clone()).unwrap();
+        assert!(!indexer.embeddings_enabled());
+        assert!(indexer.download_embedding_model().is_err());
+    }
+
+    /// With the feature compiled in but the semantic leg off, hybrid fact
+    /// search must return exactly the palier-1 text ranking.
+    #[cfg(feature = "memory-embeddings")]
+    #[test]
+    fn hybrid_search_falls_back_to_text_without_embeddings() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Arc::new(RunJournal::open(dir.path().join("journals")).unwrap());
+        let indexer = MemoryIndexer::open(dir.path(), journal.clone()).unwrap();
+        let project_id = komet_memory::project_id_for("/repo");
+        indexer.note_chat("c1", "/repo", HarnessId::ClaudeCode);
+        let start = AgentEvent::SessionStarted {
+            harness: HarnessId::ClaudeCode,
+            model: "opus".into(),
+            tools: vec![],
+            cwd: "/repo".into(),
+            session_id: "s1".into(),
+            assistant_message_id: "m1".into(),
+        };
+        let seq = journal.append("c1", &start).unwrap();
+        indexer.index_event("c1", seq, &start);
+        wait_for(|| indexer.service().stats(&project_id).unwrap().events == 1);
+        let hybrid = indexer
+            .hybrid_search_facts(&project_id, "c1", "anything", 10)
+            .unwrap();
+        let text = indexer
+            .service()
+            .search_facts(&project_id, Some("c1"), "anything", 10)
+            .unwrap();
+        assert_eq!(hybrid.len(), text.len());
+    }
+}

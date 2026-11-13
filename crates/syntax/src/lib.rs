@@ -5,10 +5,12 @@
 
 use std::{collections::BTreeSet, ops::Range, path::Path, sync::atomic::AtomicUsize};
 
+use tree_sitter::{Language, Parser};
 use tree_sitter_highlight::{HighlightConfiguration, HighlightEvent, Highlighter};
 
 pub const DEFAULT_MAX_SOURCE_BYTES: usize = 1024 * 1024;
 pub const DEFAULT_MAX_SPANS: usize = 200_000;
+pub const DEFAULT_MAX_SYMBOLS: usize = 50_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HighlightLimits {
@@ -158,6 +160,118 @@ pub enum HighlightError {
     Parser(String),
     #[error("the {0:?} grammar is not bundled")]
     GrammarUnavailable(LanguageId),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodeSymbol {
+    pub name: String,
+    pub kind: String,
+    pub start_byte: usize,
+    pub end_byte: usize,
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum SymbolError {
+    #[error("source exceeds the configured symbol-indexing limit")]
+    SourceTooLarge,
+    #[error("tree-sitter parser failed: {0}")]
+    Parser(String),
+}
+
+/// Extract named declarations from one source file without retaining its text.
+/// Languages without a bundled grammar or files with no declarations return
+/// an empty result; malformed source still yields the parser's partial tree.
+pub fn extract_symbols(source: &str, path: &str) -> Result<Vec<CodeSymbol>, SymbolError> {
+    if source.len() > DEFAULT_MAX_SOURCE_BYTES {
+        return Err(SymbolError::SourceTooLarge);
+    }
+    let Some(language) = language_for_path(path) else {
+        return Ok(Vec::new());
+    };
+    let Some(grammar) = symbol_grammar(language) else {
+        return Ok(Vec::new());
+    };
+    let mut parser = Parser::new();
+    parser
+        .set_language(&grammar)
+        .map_err(|error| SymbolError::Parser(error.to_string()))?;
+    let Some(tree) = parser.parse(source, None) else {
+        return Err(SymbolError::Parser("parse cancelled".into()));
+    };
+    let mut symbols = Vec::new();
+    let mut pending = vec![tree.root_node()];
+    while let Some(node) = pending.pop() {
+        let kind = node.kind();
+        if is_declaration_node(kind)
+            && let Some(name) = node.child_by_field_name("name")
+            && let Some(text) = source.get(name.byte_range())
+        {
+            let clean = text.trim();
+            if !clean.is_empty() && symbols.len() < DEFAULT_MAX_SYMBOLS {
+                symbols.push(CodeSymbol {
+                    name: clean.to_string(),
+                    kind: kind.to_string(),
+                    start_byte: node.start_byte(),
+                    end_byte: node.end_byte(),
+                });
+            }
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            pending.push(child);
+        }
+    }
+    symbols.sort_by(|a, b| {
+        a.start_byte
+            .cmp(&b.start_byte)
+            .then_with(|| a.kind.cmp(&b.kind))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    symbols.dedup_by(|a, b| a.start_byte == b.start_byte && a.kind == b.kind && a.name == b.name);
+    Ok(symbols)
+}
+
+fn is_declaration_node(kind: &str) -> bool {
+    kind.ends_with("_definition")
+        || kind.ends_with("_declaration")
+        || matches!(
+            kind,
+            "function_item"
+                | "struct_item"
+                | "enum_item"
+                | "trait_item"
+                | "type_item"
+                | "mod_item"
+                | "const_item"
+                | "static_item"
+                | "type_spec"
+                | "method_definition"
+                | "function_declaration"
+        )
+}
+
+fn symbol_grammar(language: LanguageId) -> Option<Language> {
+    use LanguageId::*;
+    Some(match language {
+        Rust => tree_sitter_rust::LANGUAGE.into(),
+        JavaScript | Jsx => tree_sitter_javascript::LANGUAGE.into(),
+        TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+        Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
+        Python => tree_sitter_python::LANGUAGE.into(),
+        Go => tree_sitter_go::LANGUAGE.into(),
+        C => tree_sitter_c::LANGUAGE.into(),
+        Cpp => tree_sitter_cpp::LANGUAGE.into(),
+        CSharp => tree_sitter_c_sharp::LANGUAGE.into(),
+        Java => tree_sitter_java::LANGUAGE.into(),
+        Kotlin => tree_sitter_kotlin_ng::LANGUAGE.into(),
+        Swift => tree_sitter_swift::LANGUAGE.into(),
+        Ruby => tree_sitter_ruby::LANGUAGE.into(),
+        Php => tree_sitter_php::LANGUAGE_PHP.into(),
+        Lua => tree_sitter_lua::LANGUAGE.into(),
+        Bash => tree_sitter_bash::LANGUAGE.into(),
+        Nix => tree_sitter_nix::LANGUAGE.into(),
+        _ => return None,
+    })
 }
 
 impl HighlightedDocument {
@@ -824,6 +938,37 @@ mod tests {
             assert_eq!(language_for_alias(alias), Some(expected), "{alias}");
         }
         assert_eq!(language_for_alias("unknown-lang"), None);
+    }
+
+    #[test]
+    fn symbol_extraction_records_declarations_without_source_text() {
+        let symbols =
+            extract_symbols("pub struct Store;\nfn write_record() {}\n", "src/memory.rs").unwrap();
+        assert_eq!(
+            symbols
+                .iter()
+                .map(|symbol| (symbol.name.as_str(), symbol.kind.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("Store", "struct_item"), ("write_record", "function_item")]
+        );
+        assert!(
+            symbols
+                .iter()
+                .all(|symbol| symbol.end_byte > symbol.start_byte)
+        );
+    }
+
+    #[test]
+    fn symbol_extraction_is_bounded_and_ignores_unknown_files() {
+        assert!(
+            extract_symbols("not source", "asset.bin")
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            extract_symbols(&"x".repeat(DEFAULT_MAX_SOURCE_BYTES + 1), "src/main.rs"),
+            Err(SymbolError::SourceTooLarge)
+        );
     }
 
     #[test]

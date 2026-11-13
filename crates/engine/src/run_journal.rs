@@ -33,6 +33,10 @@ pub enum JournalError {
 struct JournalLine {
     seq: u64,
     event: AgentEvent,
+    /// Wall-clock append time (epoch ms). `0` on lines written before the
+    /// field existed — consumers fall back to the file mtime.
+    #[serde(default)]
+    ts_ms: i64,
 }
 
 /// Borrowing twin of [`JournalLine`] for writes; identical JSON shape.
@@ -40,6 +44,7 @@ struct JournalLine {
 struct JournalLineRef<'a> {
     seq: u64,
     event: &'a AgentEvent,
+    ts_ms: i64,
 }
 
 /// Open-descriptor cap; the oldest-used entry is evicted past it.
@@ -141,7 +146,11 @@ impl RunJournal {
         };
         journal.last_used = self.tick.fetch_add(1, Ordering::Relaxed);
         let seq = journal.next_seq;
-        let line = serde_json::to_string(&JournalLineRef { seq, event })?;
+        let line = serde_json::to_string(&JournalLineRef {
+            seq,
+            event,
+            ts_ms: crate::now_ms(),
+        })?;
         let mut buf = Vec::with_capacity(line.len() + 2);
         if journal.needs_newline {
             buf.push(b'\n');
@@ -155,6 +164,25 @@ impl RunJournal {
         Ok(seq)
     }
 
+    /// Events with `seq > after_seq`, in order, each with its journal
+    /// timestamp (`0` for lines written before timestamps existed). Same
+    /// era-fallback as [`Self::replay`]. Used by the memory indexer, which
+    /// needs real per-event times for replayed history.
+    pub fn replay_ts(
+        &self,
+        chat_id: &str,
+        after_seq: u64,
+    ) -> Result<Vec<(u64, i64, AgentEvent)>, JournalError> {
+        let path = self.path_for(chat_id);
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        let all = read_entries(&path)?;
+        let last_seq = all.last().map(|(seq, _, _)| *seq).unwrap_or(0);
+        let from = if after_seq > last_seq { 0 } else { after_seq };
+        Ok(all.into_iter().filter(|(seq, _, _)| *seq > from).collect())
+    }
+
     /// Events with `seq > after_seq`, in order. A cursor ahead of the last issued seq is
     /// from a previous era (file replaced) — falls back to a full replay, mirroring komet.
     pub fn replay(
@@ -162,14 +190,16 @@ impl RunJournal {
         chat_id: &str,
         after_seq: u64,
     ) -> Result<Vec<(u64, AgentEvent)>, JournalError> {
-        let path = self.path_for(chat_id);
-        if !path.exists() {
-            return Ok(Vec::new());
-        }
-        let all = read_lines(&path)?;
-        let last_seq = all.last().map(|(seq, _)| *seq).unwrap_or(0);
-        let from = if after_seq > last_seq { 0 } else { after_seq };
-        Ok(all.into_iter().filter(|(seq, _)| *seq > from).collect())
+        Ok(self
+            .replay_ts(chat_id, after_seq)?
+            .into_iter()
+            .map(|(seq, _, event)| (seq, event))
+            .collect())
+    }
+
+    /// Directory holding the journal files (for sibling bookkeeping files).
+    pub fn dir(&self) -> &Path {
+        &self.dir
     }
 
     /// The last event in a chat's journal, if any (ignores a torn tail line).
@@ -184,6 +214,21 @@ impl RunJournal {
     /// Last valid seq (tail read only), `None` for a missing/empty journal.
     pub fn last_seq(&self, chat_id: &str) -> Result<Option<u64>, JournalError> {
         Ok(read_tail(&self.path_for(chat_id))?.0.map(|(seq, _)| seq))
+    }
+
+    /// Wall-clock mtime of the chat's journal file (epoch ms), `None` when
+    /// the file is missing or its time can't be read. Journal lines carry
+    /// no timestamp, so the memory indexer uses this as the replay-time
+    /// approximation for catch-up events (issue #78).
+    pub fn journal_mtime_ms(&self, chat_id: &str) -> Option<i64> {
+        let modified = std::fs::metadata(self.path_for(chat_id))
+            .ok()?
+            .modified()
+            .ok()?;
+        modified
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|d| d.as_millis() as i64)
     }
 
     /// Targeted lookup (issue #10): the `ToolCall` + `ToolResult` events for
@@ -366,8 +411,9 @@ pub(crate) fn project_feed(
     }
 }
 
-/// Parse every valid line; malformed lines (torn tail writes) are skipped.
-fn read_lines(path: &Path) -> Result<Vec<(u64, AgentEvent)>, JournalError> {
+/// Parse every valid line with its timestamp; malformed lines (torn tail
+/// writes) are skipped.
+fn read_entries(path: &Path) -> Result<Vec<(u64, i64, AgentEvent)>, JournalError> {
     let file = match File::open(path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -380,13 +426,21 @@ fn read_lines(path: &Path) -> Result<Vec<(u64, AgentEvent)>, JournalError> {
             continue;
         }
         match serde_json::from_str::<JournalLine>(&line) {
-            Ok(parsed) => out.push((parsed.seq, parsed.event)),
+            Ok(parsed) => out.push((parsed.seq, parsed.ts_ms, parsed.event)),
             Err(err) => {
                 tracing::warn!(path = %path.display(), error = %err, "journal: skipping malformed line");
             }
         }
     }
     Ok(out)
+}
+
+/// Parse every valid line; malformed lines (torn tail writes) are skipped.
+fn read_lines(path: &Path) -> Result<Vec<(u64, AgentEvent)>, JournalError> {
+    Ok(read_entries(path)?
+        .into_iter()
+        .map(|(seq, _, event)| (seq, event))
+        .collect())
 }
 
 /// Remove the least recently used entry.
@@ -799,7 +853,8 @@ mod tests {
             "{}\n",
             serde_json::to_string(&JournalLineRef {
                 seq,
-                event: &text("x")
+                event: &text("x"),
+                ts_ms: 0,
             })
             .unwrap()
         )

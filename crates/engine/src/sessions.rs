@@ -502,6 +502,9 @@ struct Inner {
     /// Live per-subagent counters (see [`SubagentFeeds`]) — the host's only
     /// record of a child's tool count and elapsed time while it runs.
     subagent_feeds: SubagentFeeds,
+    /// Local project-memory indexer (issue #78 Ph.1): allow-listed event
+    /// projection → bounded queue → SQLite writer. Absent in bare tests.
+    memory: OnceLock<Arc<crate::memory::MemoryIndexer>>,
 }
 
 /// Turn-start hook: called with `(chat_id, cwd)`.
@@ -556,6 +559,7 @@ impl SessionsEngine {
                     "1" | "true" | "yes" | "on"
                 )),
                 subagent_feeds: SubagentFeeds::default(),
+                memory: OnceLock::new(),
             }),
         }
     }
@@ -585,6 +589,18 @@ impl SessionsEngine {
     /// The usage-history store, when the engine wired one.
     pub fn usage_store(&self) -> Option<Arc<crate::usage::UsageStore>> {
         self.inner.usage_store.get().cloned()
+    }
+
+    /// Wire the local project-memory indexer (once per engine graph).
+    pub fn set_memory(&self, indexer: Arc<crate::memory::MemoryIndexer>) {
+        if self.inner.memory.set(indexer).is_err() {
+            tracing::warn!("memory indexer was already wired to sessions");
+        }
+    }
+
+    /// The project-memory indexer, when the engine wired one.
+    pub fn memory(&self) -> Option<Arc<crate::memory::MemoryIndexer>> {
+        self.inner.memory.get().cloned()
     }
 
     /// Wire the device's terminals so the internal MCP catalog can answer
@@ -739,6 +755,8 @@ impl SessionsEngine {
         &self,
         chat_id: &str,
         run_id: &str,
+        cwd: &str,
+        agent: &str,
         ask: AskFn,
     ) -> Option<RunningEndpoint> {
         let Some(workspace) = self.inner.workspace() else {
@@ -747,6 +765,28 @@ impl SessionsEngine {
         };
         let mut catalog =
             McpCatalog::komet_default(Arc::new(EngineMcpHost::new(self.clone(), workspace)));
+        if let Some(indexer) = self.memory()
+            && indexer.global_enabled()
+        {
+            let project_id = komet_memory::project_id_for(cwd);
+            match indexer.is_enabled(&project_id) {
+                Ok(true) => {
+                    catalog = catalog.with_memory(crate::mcp::catalog::MemoryToolParams {
+                        service: indexer.service().clone(),
+                        indexer: Some(indexer.clone()),
+                        blackboard: indexer.blackboard().clone(),
+                        project_id,
+                        chat_id: chat_id.to_string(),
+                        agent: agent.to_string(),
+                        run_id: run_id.to_string(),
+                    });
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(chat = %chat_id, error = %error, "memory MCP tools unavailable");
+                }
+            }
+        }
         match self.inner.mcp_secrets.composio_platform_api_key() {
             Ok(Some(api_key)) => {
                 let api = ComposioApi::new(api_key, self.inner.device_id.clone());
@@ -1289,6 +1329,30 @@ impl SessionsEngine {
             request.prompt =
                 replay_prompt(handle.doc(), seen.as_deref(), &user_id, &request.prompt)?;
         }
+        // Project-memory handoff (issue #78 Ph.1): inject the deterministic
+        // briefing as a delimited context block — only for a fresh harness
+        // session (no resume) or an agent switch, never for slash commands,
+        // and only when memory has something useful to say. The block is
+        // appended to the RUN prompt inside drive_run, after the user
+        // message was already written to the doc — it is never persisted as
+        // part of the user's message or the transcript.
+        let memory_briefing = if request.prompt.trim_start().starts_with('/') {
+            None
+        } else {
+            let fresh_or_switched = request.resume.is_none() || switched_from.is_some();
+            if fresh_or_switched
+                && let Some(indexer) = self.inner.memory.get()
+                && let Ok(Some(text)) = indexer.briefing(
+                    &request.cwd,
+                    Some((chat_id, harness_id.as_str())),
+                    Some(request.prompt.as_str()),
+                )
+            {
+                Some(crate::memory::memory_context_block(&text))
+            } else {
+                None
+            }
+        };
         let run_id = new_id();
         let (steer_tx, steer_rx) = mpsc::channel::<SteerMessage>(32);
         let (cancel_tx, cancel_rx) = watch::channel(false);
@@ -1437,7 +1501,8 @@ impl SessionsEngine {
             })
         };
         let internal_mcp = if mcp_supported {
-            self.start_internal_mcp(chat_id, &run_id, mcp_ask).await
+            self.start_internal_mcp(chat_id, &run_id, &request.cwd, harness_id.as_str(), mcp_ask)
+                .await
         } else {
             None
         };
@@ -1494,6 +1559,16 @@ impl SessionsEngine {
         // lastMessageAt bump must never be observable ahead of the live run.
         self.inner.note_message(chat_id, &request.prompt);
 
+        // Project memory (issue #78): seed chat→project context once the run
+        // is definitely fresh — NOT for a routed steer, whose live run still
+        // owns the chat: overwriting its cwd/project here would re-attribute
+        // the run's remaining events (and its Done) to the steer's cwd.
+        if let Some(indexer) = self.inner.memory.get() {
+            indexer.set_agent_active(chat_id, true);
+            indexer.note_chat(chat_id, &request.cwd, harness_id);
+            indexer.index_workspace(&request.cwd);
+        }
+
         tokio::spawn(drive_run(
             self.inner.clone(),
             chat_id.to_string(),
@@ -1510,6 +1585,7 @@ impl SessionsEngine {
                 startup_retry,
             },
             internal_mcp,
+            memory_briefing,
         ));
         Ok(run_id)
     }
@@ -2138,6 +2214,14 @@ impl Inner {
                 event: event.clone(),
             });
         }
+        // Project-memory indexing (issue #78): offer the allow-listed
+        // projection to the bounded queue. seq 0 = journal append failed —
+        // nothing durable to index. Never blocks on SQLite.
+        if seq > 0
+            && let Some(indexer) = self.memory.get()
+        {
+            indexer.index_event(chat_id, seq, event);
+        }
         seq
     }
 
@@ -2426,12 +2510,22 @@ impl Inner {
     }
 
     fn remove_run(&self, chat_id: &str, run_id: &str) {
-        let mut runs = lock(&self.runs);
-        if runs.get(chat_id).is_some_and(|h| h.run_id == run_id) {
-            runs.remove(chat_id);
+        let removed = {
+            let mut runs = lock(&self.runs);
+            if runs.get(chat_id).is_some_and(|h| h.run_id == run_id) {
+                runs.remove(chat_id);
+                true
+            } else {
+                false
+            }
+        };
+        if removed {
             // The live counters describe a turn that is over: whatever the
             // chips kept at their terminal write is the doc's record now.
             self.subagent_feeds.clear(chat_id);
+            if let Some(indexer) = self.memory.get() {
+                indexer.set_agent_active(chat_id, false);
+            }
         }
     }
 }
@@ -2701,6 +2795,7 @@ async fn drive_run(
     mut cancel_rx: watch::Receiver<bool>,
     resume_state: RunResumeState,
     _internal_mcp: Option<RunningEndpoint>,
+    memory_briefing: Option<String>,
 ) {
     let device_id = inner.device_id.clone();
     // Captured for post-run auto-titling (the request moves into the harness).
@@ -2714,6 +2809,15 @@ async fn drive_run(
         resume: None,
         ..request.clone()
     });
+    // Project-memory handoff (issue #78): prepend the delimited Komet memory
+    // block to the prompt the HARNESS sees — after `retry_request` is cloned
+    // so a startup-crash retry re-derives its own block instead of stacking.
+    // `user_prompt` stays clean: the doc's user message was already written
+    // from the unmodified prompt upstream.
+    let mut request = request;
+    if let Some(block) = memory_briefing {
+        request.prompt = format!("{block}\n\n{}", request.prompt);
+    }
     // The run is dispatched and the CLI is being spawned: name that wait from
     // the first frame, before the harness has anything to say. Ephemeral, so a
     // viewer that connects mid-run simply reads the row's `Working` status.

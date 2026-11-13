@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[features]
+memory-embeddings = ["komet-memory/embeddings"]
+
 [dependencies]
 komet-proto.workspace = true
 komet-doc.workspace = true
@@ -14,6 +17,8 @@ komet-rpc.workspace = true
 komet-update.workspace = true
 # PTY output is folded into a gpui-free emulator mirror (terminals.rs).
 komet-term.workspace = true
+komet-memory.workspace = true
+komet-syntax.workspace = true
 loro.workspace = true
 tokio.workspace = true
 futures.workspace = true
@@ -49,4 +54,9 @@ komet-sync-server.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 # CredReadW / CredWriteW for the Windows Credential Manager fallback store.
-windows-sys = { version = "0.59", features = ["Win32_Security_Credentials", "Win32_Foundation"] }
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security_Credentials",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+] }

@@ -803,13 +803,15 @@ fn nav_settings_sections_are_distinct_entries() {
 
 #[test]
 fn settings_sections_include_security() {
-    assert_eq!(SettingsSection::ALL.len(), 11);
+    assert_eq!(SettingsSection::ALL.len(), 12);
     assert!(SettingsSection::ALL.contains(&SettingsSection::Providers));
     assert_eq!(SettingsSection::Providers.label(), "Providers");
     assert!(SettingsSection::ALL.contains(&SettingsSection::Security));
     assert_eq!(SettingsSection::Security.label(), "Security");
     assert!(SettingsSection::ALL.contains(&SettingsSection::Integrations));
     assert_eq!(SettingsSection::Integrations.label(), "Integrations");
+    assert!(SettingsSection::ALL.contains(&SettingsSection::Memory));
+    assert_eq!(SettingsSection::Memory.label(), "Memory");
 }
 
 #[test]

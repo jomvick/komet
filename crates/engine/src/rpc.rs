@@ -1322,6 +1322,25 @@ fn forwardable(method: &str) -> bool {
             | methods::TEST_MCP_SERVER
             | methods::LIST_MCP_TOOLS
             | methods::WATCH_MCP_STATUS
+            // Project memory is a device-local SQLite index: its settings,
+            // per-project controls and forget operations only make sense on
+            // the machine that owns the store.
+            | methods::GET_MEMORY_STATUS
+            | methods::SET_MEMORY_ENABLED
+            | methods::SET_MEMORY_EMBEDDINGS_ENABLED
+            | methods::RETRY_MEMORY_EMBEDDINGS
+            | methods::DOWNLOAD_MEMORY_MODEL
+            | methods::CANCEL_MEMORY_MODEL_DOWNLOAD
+            | methods::DELETE_MEMORY_MODEL
+            | methods::DELETE_MEMORY_PREVIOUS_COPY
+            | methods::SEARCH_MEMORY_SEMANTIC
+            | methods::SET_MEMORY_RETENTION_DAYS
+            | methods::SET_MEMORY_LOCATION
+            | methods::SET_MEMORY_PROJECT_ENABLED
+            | methods::SET_MEMORY_PROJECT_EXCLUSIONS
+            | methods::FORGET_MEMORY_PROJECT
+            | methods::FORGET_ALL_MEMORY
+            | methods::IMPORT_MEMORY_HISTORY
     )
 }
 
@@ -1796,6 +1815,25 @@ impl RpcService for EngineRpc {
             methods::GET_HARNESS_CLI_STATUS,
             methods::MANAGE_HARNESS_CLI,
             methods::SET_HARNESS_ENABLED,
+            // Project memory lives in a device-local SQLite store: inside an
+            // environment the caller must name the device that owns it,
+            // else the answer would describe the controller's own index.
+            methods::GET_MEMORY_STATUS,
+            methods::SET_MEMORY_ENABLED,
+            methods::SET_MEMORY_EMBEDDINGS_ENABLED,
+            methods::RETRY_MEMORY_EMBEDDINGS,
+            methods::DOWNLOAD_MEMORY_MODEL,
+            methods::CANCEL_MEMORY_MODEL_DOWNLOAD,
+            methods::DELETE_MEMORY_MODEL,
+            methods::DELETE_MEMORY_PREVIOUS_COPY,
+            methods::SEARCH_MEMORY_SEMANTIC,
+            methods::SET_MEMORY_RETENTION_DAYS,
+            methods::SET_MEMORY_LOCATION,
+            methods::SET_MEMORY_PROJECT_ENABLED,
+            methods::SET_MEMORY_PROJECT_EXCLUSIONS,
+            methods::FORGET_MEMORY_PROJECT,
+            methods::FORGET_ALL_MEMORY,
+            methods::IMPORT_MEMORY_HISTORY,
         ];
         if self.environment.is_some()
             && ENV_TARGETED.contains(&method)
@@ -2127,6 +2165,418 @@ impl RpcService for EngineRpc {
                     .pair_link(&ask.id)
                     .ok_or_else(|| RpcError::Failed("unknown_environment".to_string()))?;
                 RpcReply::value(&serde_json::json!({ "link": link }))
+            }
+            methods::GET_MEMORY_STATUS => {
+                let Some(indexer) = self.sessions.memory() else {
+                    return RpcReply::value(&serde_json::json!({
+                        "available": false,
+                        "enabled": false,
+                        "retentionDays": komet_memory::config::DEFAULT_RETENTION_DAYS,
+                        "dir": null,
+                        "pendingDir": null,
+                        "restartRequired": false,
+                        "previousDir": null,
+                        "previousBytes": 0,
+                        "events": 0,
+                        "chats": 0,
+                        "bytes": 0,
+                        "processCpuMs": null,
+                        "processPeakRssBytes": null,
+                        "fts": false,
+                        "untrackedChats": 0,
+                        "embeddingsEnabled": false,
+                        "embeddingsIndexed": 0,
+                        "embeddingsTotal": 0,
+                        "embeddingsWorking": false,
+                        "embeddingsError": null,
+                        "projects": [],
+                    }));
+                };
+                let (events, chats) = indexer
+                    .totals()
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                let (embeddings_indexed, embeddings_total, embeddings_working, embeddings_error) =
+                    indexer
+                        .embedding_status()
+                        .map_err(|error| RpcError::Failed(error.to_string()))?;
+                let (bytes, process_cpu_ms, process_peak_rss_bytes) = indexer
+                    .resource_stats()
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                // `pendingDir`/`restartRequired` resolve the EFFECTIVE
+                // configured directory — an explicit custom path and a
+                // reset back to the default are both pending targets;
+                // `None` means the open store already matches the config.
+                let pending_dir = indexer.pending_store_dir();
+                let restart_required = pending_dir.is_some();
+                let previous_dir = indexer.previous_copy_dir();
+                let previous_bytes = indexer.previous_copy_bytes();
+                let projects = indexer
+                    .list_projects()
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                RpcReply::value(&serde_json::json!({
+                    "available": true,
+                    "enabled": indexer.global_enabled(),
+                    "retentionDays": indexer.retention_days(),
+                    "dir": indexer.store_dir().display().to_string(),
+                    "pendingDir": pending_dir.map(|dir| dir.display().to_string()),
+                    "restartRequired": restart_required,
+                    "previousDir": previous_dir.map(|dir| dir.display().to_string()),
+                    "previousBytes": previous_bytes,
+                    "events": events,
+                    "chats": chats,
+                    "bytes": bytes,
+                    "processCpuMs": process_cpu_ms,
+                    "processPeakRssBytes": process_peak_rss_bytes,
+                    "fts": indexer.service().fts_enabled(),
+                    "untrackedChats": indexer.untracked_journal_chats(),
+                    "embeddingsEnabled": indexer.embeddings_enabled(),
+                    "embeddingsIndexed": embeddings_indexed,
+                    "embeddingsTotal": embeddings_total,
+                    "embeddingsWorking": embeddings_working,
+                    "embeddingsError": embeddings_error,
+                    "embeddingsModel": indexer.embedding_model_status(),
+                    "projects": projects,
+                }))
+            }
+            methods::SET_MEMORY_ENABLED => {
+                #[derive(serde::Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct P {
+                    enabled: bool,
+                }
+                let p: P = parse_params(params)?;
+                let indexer = self
+                    .sessions
+                    .memory()
+                    .ok_or_else(|| RpcError::Failed("memory unavailable".into()))?;
+                indexer
+                    .set_global_enabled(p.enabled)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "enabled": p.enabled }))
+            }
+            methods::SET_MEMORY_EMBEDDINGS_ENABLED => {
+                #[derive(serde::Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct P {
+                    enabled: bool,
+                }
+                let p: P = parse_params(params)?;
+                let indexer = self
+                    .sessions
+                    .memory()
+                    .ok_or_else(|| RpcError::Failed("memory unavailable".into()))?;
+                indexer
+                    .set_embeddings_enabled(p.enabled)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                RpcReply::value(&serde_json::json!({
+                    "embeddingsEnabled": indexer.embeddings_enabled()
+                }))
+            }
+            methods::RETRY_MEMORY_EMBEDDINGS => {
+                let indexer = self
+                    .sessions
+                    .memory()
+                    .ok_or_else(|| RpcError::Failed("memory unavailable".into()))?;
+                indexer
+                    .request_embedding_indexing()
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "started": true }))
+            }
+            methods::DOWNLOAD_MEMORY_MODEL => {
+                let indexer = self
+                    .sessions
+                    .memory()
+                    .ok_or_else(|| RpcError::Failed("memory unavailable".into()))?;
+                indexer
+                    .download_embedding_model()
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "started": true }))
+            }
+            methods::CANCEL_MEMORY_MODEL_DOWNLOAD => {
+                let indexer = self
+                    .sessions
+                    .memory()
+                    .ok_or_else(|| RpcError::Failed("memory unavailable".into()))?;
+                indexer.cancel_embedding_download();
+                RpcReply::value(&serde_json::json!({ "cancelled": true }))
+            }
+            methods::DELETE_MEMORY_MODEL => {
+                let indexer = self
+                    .sessions
+                    .memory()
+                    .ok_or_else(|| RpcError::Failed("memory unavailable".into()))?;
+                let freed = indexer
+                    .delete_embedding_model()
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "removedBytes": freed }))
+            }
+            methods::DELETE_MEMORY_PREVIOUS_COPY => {
+                let indexer = self
+                    .sessions
+                    .memory()
+                    .ok_or_else(|| RpcError::Failed("memory unavailable".into()))?;
+                let freed = indexer
+                    .delete_previous_copy()
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "removedBytes": freed }))
+            }
+            methods::SEARCH_MEMORY_SEMANTIC => {
+                #[derive(serde::Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct P {
+                    project_id: String,
+                    query: String,
+                }
+                let p: P = parse_params(params)?;
+                let indexer = self
+                    .sessions
+                    .memory()
+                    .ok_or_else(|| RpcError::Failed("memory unavailable".into()))?;
+                let results = tokio::task::spawn_blocking(move || {
+                    indexer.semantic_search(&p.project_id, &p.query)
+                })
+                .await
+                .map_err(|error| RpcError::Failed(format!("semantic search task failed: {error}")))?
+                .map_err(|error| RpcError::Failed(error.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "results": results }))
+            }
+            methods::SET_MEMORY_RETENTION_DAYS => {
+                #[derive(serde::Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct P {
+                    days: u32,
+                }
+                let p: P = parse_params(params)?;
+                let indexer = self
+                    .sessions
+                    .memory()
+                    .ok_or_else(|| RpcError::Failed("memory unavailable".into()))?;
+                indexer
+                    .set_retention_days(p.days)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "retentionDays": indexer.retention_days() }))
+            }
+            methods::SET_MEMORY_LOCATION => {
+                #[derive(serde::Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct P {
+                    /// `null`/empty resets to the default `<data_dir>/memory`.
+                    #[serde(default)]
+                    path: Option<String>,
+                }
+                let p: P = parse_params(params)?;
+                let location = p
+                    .path
+                    .map(|raw| raw.trim().to_string())
+                    .filter(|raw| !raw.is_empty());
+                let indexer = self
+                    .sessions
+                    .memory()
+                    .ok_or_else(|| RpcError::Failed("memory unavailable".into()))?;
+                indexer
+                    .set_location(location.clone())
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&serde_json::json!({
+                    "pendingDir": location,
+                    "restartRequired": true,
+                }))
+            }
+            methods::SET_MEMORY_PROJECT_ENABLED => {
+                #[derive(serde::Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct P {
+                    project_id: String,
+                    enabled: bool,
+                }
+                let p: P = parse_params(params)?;
+                let indexer = self
+                    .sessions
+                    .memory()
+                    .ok_or_else(|| RpcError::Failed("memory unavailable".into()))?;
+                indexer
+                    .set_enabled(&p.project_id, p.enabled)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
+            methods::SET_MEMORY_PROJECT_EXCLUSIONS => {
+                #[derive(serde::Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct P {
+                    project_id: String,
+                    // No serde default: clearing exclusions is an explicit
+                    // `[]`, never an accidentally omitted field.
+                    exclusions: Vec<String>,
+                }
+                let p: P = parse_params(params)?;
+                let indexer = self
+                    .sessions
+                    .memory()
+                    .ok_or_else(|| RpcError::Failed("memory unavailable".into()))?;
+                indexer
+                    .set_exclusions(&p.project_id, &p.exclusions)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
+            methods::FORGET_MEMORY_PROJECT => {
+                #[derive(serde::Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct P {
+                    project_id: String,
+                }
+                let p: P = parse_params(params)?;
+                let indexer = self
+                    .sessions
+                    .memory()
+                    .ok_or_else(|| RpcError::Failed("memory unavailable".into()))?;
+                let removed = indexer
+                    .forget_project(&p.project_id)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "removed": removed }))
+            }
+            methods::FORGET_ALL_MEMORY => {
+                let indexer = self
+                    .sessions
+                    .memory()
+                    .ok_or_else(|| RpcError::Failed("memory unavailable".into()))?;
+                let removed = indexer
+                    .forget_all()
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "removed": removed }))
+            }
+            methods::IMPORT_MEMORY_HISTORY => {
+                let indexer = self
+                    .sessions
+                    .memory()
+                    .ok_or_else(|| RpcError::Failed("memory unavailable".into()))?;
+                // The import flag is only consumed by an enabled catch-up;
+                // accepting it while disabled would silently arm a surprise
+                // backfill on the next re-enable instead of running now.
+                if !indexer.global_enabled() {
+                    return Err(RpcError::Failed("memory indexing is disabled".into()));
+                }
+                indexer.request_history_import();
+                RpcReply::value(&serde_json::json!({ "started": true }))
+            }
+            methods::GET_MEMORY_FACTS => {
+                #[derive(serde::Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct P {
+                    project_id: String,
+                    #[serde(default)]
+                    chat_id: Option<String>,
+                    #[serde(default)]
+                    include_stale: bool,
+                    #[serde(default)]
+                    limit: Option<usize>,
+                }
+                let p: P = parse_params(params)?;
+                let indexer = self
+                    .sessions
+                    .memory()
+                    .ok_or_else(|| RpcError::Failed("memory unavailable".into()))?;
+                let facts = indexer
+                    .facts(
+                        &p.project_id,
+                        p.chat_id.as_deref(),
+                        p.include_stale,
+                        p.limit.unwrap_or(20),
+                    )
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "facts": facts }))
+            }
+            methods::FORGET_MEMORY_FACT => {
+                #[derive(serde::Deserialize)]
+                struct P {
+                    id: i64,
+                }
+                let p: P = parse_params(params)?;
+                let indexer = self
+                    .sessions
+                    .memory()
+                    .ok_or_else(|| RpcError::Failed("memory unavailable".into()))?;
+                let removed = indexer
+                    .forget_fact(p.id)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "removed": removed }))
+            }
+            methods::PROMOTE_MEMORY_FACT => {
+                #[derive(serde::Deserialize)]
+                struct P {
+                    id: i64,
+                    confirmed: bool,
+                }
+                let p: P = parse_params(params)?;
+                let indexer = self
+                    .sessions
+                    .memory()
+                    .ok_or_else(|| RpcError::Failed("memory unavailable".into()))?;
+                let promoted = indexer
+                    .promote_fact_to_global(p.id, p.confirmed)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "promoted": promoted }))
+            }
+            methods::EXPORT_MEMORY_OBSIDIAN => {
+                #[derive(serde::Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct P {
+                    project_id: String,
+                    destination: String,
+                }
+                let p: P = parse_params(params)?;
+                let destination = std::path::PathBuf::from(p.destination.trim());
+                if !destination.is_absolute() {
+                    return Err(RpcError::BadParams(
+                        "Obsidian export destination must be an absolute path".into(),
+                    ));
+                }
+                let indexer = self
+                    .sessions
+                    .memory()
+                    .ok_or_else(|| RpcError::Failed("memory unavailable".into()))?;
+                let report = indexer
+                    .export_obsidian(&p.project_id, &destination)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                RpcReply::value(&serde_json::json!({
+                    "facts": report.facts,
+                    "sessions": report.sessions,
+                    "destination": destination,
+                }))
+            }
+            methods::GET_MEMORY_PROJECT_GRAPH => {
+                #[derive(serde::Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct P {
+                    project_id: String,
+                    #[serde(default)]
+                    limit: Option<usize>,
+                }
+                let p: P = parse_params(params)?;
+                let indexer = self
+                    .sessions
+                    .memory()
+                    .ok_or_else(|| RpcError::Failed("memory unavailable".into()))?;
+                let files = indexer
+                    .project_graph(&p.project_id, p.limit.unwrap_or(20))
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                RpcReply::value(&serde_json::json!({"files": files}))
+            }
+            methods::GET_MEMORY_ACTIVITY => {
+                #[derive(serde::Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct P {
+                    project_id: String,
+                    #[serde(default)]
+                    limit: Option<usize>,
+                }
+                let p: P = parse_params(params)?;
+                let indexer = self
+                    .sessions
+                    .memory()
+                    .ok_or_else(|| RpcError::Failed("memory unavailable".into()))?;
+                let events = indexer
+                    .recent_activity(&p.project_id, p.limit.unwrap_or(50))
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                RpcReply::value(&serde_json::json!({"events": events}))
             }
             methods::LOCAL_DEVICE => {
                 RpcReply::value(&serde_json::json!({ "deviceId": self.doc_host.device_id() }))

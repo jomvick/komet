@@ -10,7 +10,7 @@ name = "komet"
 path = "src/main.rs"
 
 [dependencies]
-komet-engine.workspace = true
+komet-engine = { workspace = true, features = ["memory-embeddings"] }
 komet-proto.workspace = true
 komet-rpc.workspace = true
 komet-ui.workspace = true
