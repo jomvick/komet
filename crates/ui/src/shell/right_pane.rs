@@ -209,15 +209,15 @@ impl Shell {
         }
     }
 
-    /// Open one Servo browser per panel key; repeated opens focus the existing
-    /// view instead of starting another engine process.
+    /// Open one CDP browser per panel key; repeated opens focus the existing
+    /// view instead of starting another engine process. Starts empty (no
+    /// default page): the address bar is the entry point.
     pub(super) fn add_browser_surface(&mut self, cx: &mut Context<Self>) {
         let key = self.panel_key(cx);
         if !self.browsers.contains_key(&key) {
             let profile_key = key.clone();
-            let browser = cx.new(|cx| {
-                crate::browser::BrowserSurface::new("https://example.com".into(), profile_key, cx)
-            });
+            let browser =
+                cx.new(|cx| crate::browser::BrowserSurface::new(String::new(), profile_key, cx));
             self.browsers.insert(key.clone(), browser);
         }
         push_unique_right_surface(

@@ -220,6 +220,7 @@ fn launch_browser(profile_key: &str, no_sandbox: bool) -> Result<(Child, String)
         .arg("--no-first-run")
         .arg("--no-default-browser-check")
         .arg("--allow-insecure-localhost")
+        .arg(format!("--user-agent={}", browser_user_agent(&executable)))
         .arg(format!("--user-data-dir={}", profile_dir.display()));
 
     if no_sandbox {
@@ -264,6 +265,46 @@ fn launch_browser(profile_key: &str, no_sandbox: bool) -> Result<(Child, String)
             Err(e)
         }
     }
+}
+
+/// UA « normale » : le jeton `HeadlessChrome` déclenche les pages anti-bot
+/// (DuckDuckGo sert « les bots utilisent aussi DuckDuckGo »), ce qui bloquait
+/// les recherches. On garde la version réelle du binaire installé.
+fn browser_user_agent(executable: &Path) -> String {
+    let version = browser_version(executable).unwrap_or_else(|| "142.0.0.0".to_owned());
+    let platform = if cfg!(target_os = "macos") {
+        "Macintosh; Intel Mac OS X 10_15_7"
+    } else if cfg!(target_os = "windows") {
+        "Windows NT 10.0; Win64; x64"
+    } else {
+        "X11; Linux x86_64"
+    };
+    format!(
+        "Mozilla/5.0 ({platform}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{version} Safari/537.36"
+    )
+}
+
+#[cfg(unix)]
+fn browser_version(executable: &Path) -> Option<String> {
+    let output = ProcessCommand::new(executable)
+        .arg("--version")
+        .output()
+        .ok()?;
+    parse_version(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// `chrome --version` → « Chromium 155.0.8059.84 … ».
+#[cfg(unix)]
+fn parse_version(output: &str) -> Option<String> {
+    output
+        .split_whitespace()
+        .find(|token| token.starts_with(|c: char| c.is_ascii_digit()))
+        .map(str::to_owned)
+}
+
+#[cfg(not(unix))]
+fn browser_version(_executable: &Path) -> Option<String> {
+    None
 }
 
 pub fn find_browser_executable() -> Option<PathBuf> {
@@ -595,6 +636,7 @@ fn needs_sandbox_fallback(err: &str) -> bool {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::path::Path;
 
     #[test]
     fn pool_refcount_kills_only_on_last_release() {
@@ -622,5 +664,23 @@ mod tests {
         ));
         assert!(!needs_sandbox_fallback("net::ERR_CONNECTION_REFUSED"));
         assert!(!needs_sandbox_fallback(""));
+    }
+
+    #[test]
+    fn user_agent_never_advertises_headless() {
+        let ua = browser_user_agent(Path::new("/nonexistent-browser-binary"));
+        assert!(ua.starts_with("Mozilla/5.0 ("), "{ua}");
+        assert!(!ua.to_ascii_lowercase().contains("headless"), "{ua}");
+        assert!(ua.contains("Chrome/"), "{ua}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parses_browser_version_line() {
+        assert_eq!(
+            parse_version("Chromium 155.0.8059.84 Built from source for Fedora release 44\n"),
+            Some("155.0.8059.84".to_owned())
+        );
+        assert_eq!(parse_version(""), None);
     }
 }

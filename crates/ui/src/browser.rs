@@ -1387,8 +1387,13 @@ fn run_client(
                 push_event(&events, wake, BrowserEvent::Failed(error));
                 loop {
                     match commands.recv_timeout(Duration::from_secs(30)) {
+                        // une URL tapée pendant l'échec relance le moteur
+                        // comme Réessayer (sinon la surface reste morte)
+                        Ok(BrowserCommand::Navigate(url)) => {
+                            current_url = url;
+                            break;
+                        }
                         Ok(BrowserCommand::Retry) => break,
-                        Ok(BrowserCommand::Navigate(url)) => current_url = url,
                         Ok(BrowserCommand::Shutdown)
                         | Err(mpsc::RecvTimeoutError::Disconnected) => return,
                         Ok(_) | Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -1456,12 +1461,15 @@ fn run_session(
     // La navigation part APRÈS le startScreencast : le screencast capture
     // ainsi la page dès son premier paint. (Naviguer avant = la page finit
     // de peindre avant l'attachement et Chrome n'émet plus aucun frame.)
-    socket
-        .send(Message::Text(cdp::page_navigate(next_id, current_url)))
-        .map_err(|e| e.to_string())?;
+    // Sans URL (surface ouverte à vide) on reste sur about:blank.
     let mut navigate_request_ids = std::collections::HashSet::new();
-    navigate_request_ids.insert(next_id);
-    next_id += 1;
+    if !current_url.trim().is_empty() {
+        socket
+            .send(Message::Text(cdp::page_navigate(next_id, current_url)))
+            .map_err(|e| e.to_string())?;
+        navigate_request_ids.insert(next_id);
+        next_id += 1;
+    }
 
     let mut page_title = String::new();
     let mut screenshot_request_id: Option<u64> = None;
