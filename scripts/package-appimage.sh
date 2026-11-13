@@ -21,6 +21,10 @@ rm -rf "$APPDIR" "$APPIMAGE"
 mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/share/applications" "$APPDIR/usr/share/icons"
 
 install -m 755 "$BIN" "$APPDIR/usr/bin/komet"
+# ONNX Runtime for the opt-in semantic memory (loaded dynamically — see
+# crates/memory/src/embeddings.rs). usr/lib is already on LD_LIBRARY_PATH
+# in AppRun, and also matches komet's bundled-library search path.
+scripts/fetch-onnxruntime.sh "$APPDIR/usr/lib"
 install -m 644 "$ROOT/dist/komet.desktop" "$APPDIR/usr/share/applications/komet.desktop"
 install -m 644 "$ROOT/dist/komet.desktop" "$APPDIR/komet.desktop"
 cp -r "$ROOT/dist/icons/hicolor" "$APPDIR/usr/share/icons/"

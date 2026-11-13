@@ -198,6 +198,7 @@ jobs:
           path: |
             target/package/*.zip
             target/package/*.exe
+            target/package/*.dll
           if-no-files-found: error
 
   publish:

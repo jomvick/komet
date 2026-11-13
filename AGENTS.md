@@ -35,6 +35,10 @@ the crate table in `ARCHITECTURE.md` §3 is authoritative.
 ## Runtime / env
 
 - `KOMET_DATA_DIR`, `KOMET_IPC_PORT`, `KOMET_HARNESS=mock` control local runs (used by the scripts).
+- Semantic memory (embeddings) loads ONNX Runtime dynamically: packaged builds bundle
+  `libonnxruntime` next to the binary (fetched by `scripts/fetch-onnxruntime.sh`, official
+  Microsoft binaries — the ort-sys prebuilts need glibc ≥ 2.38 / macOS ≥ 13.4). For local
+  runs, point `ORT_DYLIB_PATH` at a libonnxruntime ≥ 1.24 or drop one next to the binary.
 - Sync is off by default. Enable with `KOMET_EDGE_URL` + `KOMET_SYNC_TOKEN`; the canonical token var
   is `KOMET_SYNC_TOKEN` — `KOMET_EDGE_TOKEN` is only the dev-bearer shortcut in `crates/engine`.
 - Store roots differ by profile: local → `{data_dir}/profiles/local/`, synced/development →

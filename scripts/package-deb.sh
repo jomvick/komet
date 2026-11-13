@@ -43,6 +43,13 @@ mkdir -p "$STAGE_DIR/usr/bin" \
 # Install files
 install -m 755 "$BIN" "$STAGE_DIR/usr/bin/komet"
 strip --strip-unneeded "$STAGE_DIR/usr/bin/komet" 2>/dev/null || true
+# ONNX Runtime for the opt-in semantic memory (loaded dynamically — see
+# crates/memory/src/embeddings.rs). Lives in /usr/lib/komet so it cannot
+# collide with a distro onnxruntime package.
+ORT_TMP="$(mktemp -d)"
+scripts/fetch-onnxruntime.sh "$ORT_TMP"
+install -Dm755 "$ORT_TMP/libonnxruntime.so" "$STAGE_DIR/usr/lib/komet/libonnxruntime.so"
+rm -rf "$ORT_TMP"
 install -m 644 "$ROOT/dist/komet.desktop" "$STAGE_DIR/usr/share/applications/komet.desktop"
 cp -r "$ROOT/dist/icons/hicolor"/* "$STAGE_DIR/usr/share/icons/hicolor/"
 install -m 644 "$ROOT/dist/komet.png" "$STAGE_DIR/usr/share/pixmaps/komet.png"

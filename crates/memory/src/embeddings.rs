@@ -4,6 +4,57 @@ use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
 
 use crate::MemoryError;
 
+/// Name of the ONNX Runtime library the release packagers place next to the
+/// `komet` binary (see scripts/fetch-onnxruntime.sh). `ort` is built with
+/// `load-dynamic`, so nothing is linked at compile time: the first `ort` API
+/// call would otherwise panic on a missing dylib. We resolve it up front —
+/// `ORT_DYLIB_PATH` first, then the bundled copy — and only then let fastembed
+/// run. With no library anywhere, `ort` still falls back to a bare
+/// `dlopen("libonnxruntime…")`, so a system-installed runtime keeps working.
+#[cfg(target_os = "windows")]
+const ORT_DYLIB_NAME: &str = "onnxruntime.dll";
+#[cfg(target_os = "macos")]
+const ORT_DYLIB_NAME: &str = "libonnxruntime.dylib";
+#[cfg(all(unix, not(target_os = "macos")))]
+const ORT_DYLIB_NAME: &str = "libonnxruntime.so";
+
+fn ensure_ort_runtime() -> Result<(), MemoryError> {
+    if let Some(path) = std::env::var_os("ORT_DYLIB_PATH").filter(|value| !value.is_empty()) {
+        let _env = ort::init_from(path).map_err(|error| {
+            MemoryError::Other(format!("load ONNX Runtime from ORT_DYLIB_PATH: {error}"))
+        })?;
+        return Ok(());
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        return Ok(());
+    };
+    let Some(dir) = exe.parent() else {
+        return Ok(());
+    };
+    // Where the packagers put the library: next to the binary (tarball,
+    // Windows zip, portable exe), in a `lib/` subdir or the sibling `lib`,
+    // `lib64` and `Frameworks` dirs of FHS layouts and the macOS bundle.
+    let mut dirs = vec![dir.to_path_buf(), dir.join("lib")];
+    if let Some(parent) = dir.parent() {
+        dirs.push(parent.join("lib"));
+        dirs.push(parent.join("lib").join("komet"));
+        dirs.push(parent.join("lib64").join("komet"));
+        dirs.push(parent.join("Frameworks"));
+    }
+    for candidate in dirs.into_iter().map(|d| d.join(ORT_DYLIB_NAME)) {
+        if candidate.is_file() {
+            let _env = ort::init_from(&candidate).map_err(|error| {
+                MemoryError::Other(format!(
+                    "load bundled ONNX Runtime {}: {error}",
+                    candidate.display()
+                ))
+            })?;
+            return Ok(());
+        }
+    }
+    Ok(())
+}
+
 pub const EMBEDDING_DIMENSIONS: usize = 384;
 const MODEL: EmbeddingModel = EmbeddingModel::AllMiniLML6V2Q;
 /// Bumped when the bundled model changes: a READY marker from another
@@ -131,6 +182,7 @@ pub fn download_model(
     cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<u64, MemoryError> {
     use std::sync::atomic::Ordering;
+    ensure_ort_runtime()?;
     let staging = staging_dir(dir);
     if cancel.load(Ordering::Relaxed) {
         return Err(MemoryError::Other("model download cancelled".into()));
@@ -206,6 +258,7 @@ impl LocalEmbedder {
                 )));
             }
         }
+        ensure_ort_runtime()?;
         let options = TextInitOptions::new(MODEL)
             .with_cache_dir(dir.to_path_buf())
             .with_show_download_progress(false)

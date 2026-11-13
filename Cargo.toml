@@ -98,8 +98,17 @@ uuid = { version = "1", features = ["v4", "serde"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 fastembed = { version = "7.7.0", default-features = false, features = [
     "hf-hub-rustls-tls",
-    "ort-download-binaries-rustls-tls",
+    # ONNX Runtime is loaded dynamically at runtime (see komet-memory's
+    # embeddings module): the prebuilt ort-sys binaries require glibc >= 2.38
+    # and macOS >= 13.4, which would break the linux/macos release artifacts.
+    # Packagers bundle the official ONNX Runtime library next to the binary.
+    "ort-load-dynamic",
 ] }
+# Pinned to the exact version fastembed 7.7.0 requires. default-features off:
+# the needed features (ndarray, std, api-24, load-dynamic) come from
+# fastembed's own ort dependency — ort's defaults would re-enable
+# download-binaries and static linking.
+ort = { version = "=2.0.0-rc.15", default-features = false }
 sqlite-vec = "=0.1.9"
 
 # misc

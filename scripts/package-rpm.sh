@@ -37,6 +37,12 @@ mkdir -p "$RPM_BUILD_DIR"/{BUILD,RPMS,SOURCES,SPECS,SRPMS,tmp,buildroot}
 cp "$BIN" "$RPM_BUILD_DIR/SOURCES/komet"
 # Strip unneeded symbols if not already stripped
 strip --strip-unneeded "$RPM_BUILD_DIR/SOURCES/komet" 2>/dev/null || true
+# ONNX Runtime for the opt-in semantic memory (loaded dynamically — see
+# crates/memory/src/embeddings.rs).
+ORT_TMP="$(mktemp -d)"
+scripts/fetch-onnxruntime.sh "$ORT_TMP"
+cp "$ORT_TMP/libonnxruntime.so" "$RPM_BUILD_DIR/SOURCES/libonnxruntime.so"
+rm -rf "$ORT_TMP"
 cp "$ROOT/dist/komet.desktop" "$RPM_BUILD_DIR/SOURCES/komet.desktop"
 cp "$ROOT/dist/komet.png" "$RPM_BUILD_DIR/SOURCES/komet.png"
 cp -r "$ROOT/dist/icons/hicolor" "$RPM_BUILD_DIR/SOURCES/hicolor"
@@ -64,11 +70,13 @@ terminal sandboxing, and multi-device sync.
 %install
 rm -rf %{buildroot}
 mkdir -p %{buildroot}%{_bindir}
+mkdir -p %{buildroot}%{_libdir}/komet
 mkdir -p %{buildroot}%{_datadir}/applications
 mkdir -p %{buildroot}%{_datadir}/icons/hicolor
 mkdir -p %{buildroot}%{_datadir}/pixmaps
 
 install -m 755 %{_sourcedir}/komet %{buildroot}%{_bindir}/komet
+install -m 755 %{_sourcedir}/libonnxruntime.so %{buildroot}%{_libdir}/komet/libonnxruntime.so
 install -m 644 %{_sourcedir}/komet.desktop %{buildroot}%{_datadir}/applications/komet.desktop
 cp -r %{_sourcedir}/hicolor/* %{buildroot}%{_datadir}/icons/hicolor/
 install -m 644 %{_sourcedir}/komet.png %{buildroot}%{_datadir}/pixmaps/komet.png
@@ -89,6 +97,7 @@ fi
 
 %files
 %{_bindir}/komet
+%{_libdir}/komet/libonnxruntime.so
 %{_datadir}/applications/komet.desktop
 %{_datadir}/icons/hicolor/*/apps/komet.png
 %{_datadir}/pixmaps/komet.png

@@ -31,6 +31,9 @@ rm -rf "$STAGE" "$TARBALL"
 mkdir -p "$STAGE"
 install -m 755 "$BIN" "$STAGE/komet"
 strip --strip-unneeded "$STAGE/komet" 2>/dev/null || true
+# ONNX Runtime for the opt-in semantic memory (loaded dynamically — see
+# crates/memory/src/embeddings.rs). Sits next to the binary in the tarball.
+scripts/fetch-onnxruntime.sh "$STAGE"
 install -m 644 "$ROOT/dist/komet.desktop" "$STAGE/komet.desktop"
 install -m 644 "$ROOT/dist/komet.png" "$STAGE/komet.png"
 cp -r "$ROOT/dist/icons" "$STAGE/icons"
@@ -41,6 +44,9 @@ cat >"$STAGE/install.sh" <<'INSTALL'
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 install -Dm755 "$HERE/komet" "$HOME/.local/bin/komet"
+if [[ -f "$HERE/libonnxruntime.so" ]]; then
+  install -Dm755 "$HERE/libonnxruntime.so" "$HOME/.local/lib/komet/libonnxruntime.so"
+fi
 install -Dm644 "$HERE/komet.desktop" "$HOME/.local/share/applications/komet.desktop"
 mkdir -p "$HOME/.local/share/icons"
 if [[ -d "$HERE/icons/hicolor" ]]; then

@@ -32,6 +32,11 @@ mkdir -p "$STAGE" "$OUT_DIR"
 
 cp "$BIN" "$STAGE/komet.exe"
 cp "$BIN" "$PORTABLE_EXE"
+# ONNX Runtime for the opt-in semantic memory (loaded dynamically — see
+# crates/memory/src/embeddings.rs). Sits next to komet.exe in both the zip
+# and the portable exe layout.
+scripts/fetch-onnxruntime.sh "$STAGE"
+scripts/fetch-onnxruntime.sh "$OUT_DIR"
 [[ -f "$ROOT/README.md" ]] && cp "$ROOT/README.md" "$STAGE/"
 [[ -f "$ROOT/LICENSE" ]] && cp "$ROOT/LICENSE" "$STAGE/"
 
