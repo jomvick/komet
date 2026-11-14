@@ -32,6 +32,121 @@ impl WallpaperScope {
 /// so text stays readable. Lower = more visible image.
 pub const CARD_SCRIM_ALPHA: f32 = 0.82;
 
+// ---------------------------------------------------------------------------
+// Background effect
+// ---------------------------------------------------------------------------
+
+pub const DEFAULT_COLUMNS: u16 = 120;
+pub const MIN_COLUMNS: u16 = 40;
+pub const MAX_COLUMNS: u16 = 240;
+pub const DEFAULT_OPACITY: f32 = 0.35;
+pub const MIN_OPACITY: f32 = 0.05;
+
+/// Glyph ramp used by the ASCII effect. Ordered darkest → brightest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AsciiCharset {
+    #[default]
+    Classic,
+    Blocks,
+    Binary,
+}
+
+impl AsciiCharset {
+    pub const ALL: [AsciiCharset; 3] = [Self::Classic, Self::Blocks, Self::Binary];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Classic => "Classic",
+            Self::Blocks => "Blocks",
+            Self::Binary => "Binary",
+        }
+    }
+}
+
+/// Where the glyph colour comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AsciiColor {
+    /// The average colour of the source cell.
+    #[default]
+    Source,
+    /// Greyscale, the glyph's own luminance.
+    Mono,
+    /// The theme accent, scaled by the cell's luminance.
+    Accent,
+}
+
+impl AsciiColor {
+    pub const ALL: [AsciiColor; 3] = [Self::Source, Self::Mono, Self::Accent];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Source => "Image colours",
+            Self::Mono => "Mono",
+            Self::Accent => "Accent",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct AsciiParams {
+    /// Glyph columns across the target width; density follows from it.
+    pub columns: u16,
+    pub charset: AsciiCharset,
+    pub color: AsciiColor,
+    pub invert: bool,
+    /// Overall strength of the texture (it is painted over black).
+    pub opacity: f32,
+}
+
+impl Default for AsciiParams {
+    fn default() -> Self {
+        Self {
+            columns: DEFAULT_COLUMNS,
+            charset: AsciiCharset::default(),
+            color: AsciiColor::default(),
+            invert: false,
+            opacity: DEFAULT_OPACITY,
+        }
+    }
+}
+
+impl AsciiParams {
+    pub fn clamped(mut self) -> Self {
+        self.columns = self.columns.clamp(MIN_COLUMNS, MAX_COLUMNS);
+        self.opacity = if self.opacity.is_finite() {
+            self.opacity.clamp(MIN_OPACITY, 1.0)
+        } else {
+            DEFAULT_OPACITY
+        };
+        self
+    }
+}
+
+/// What is painted over the wallpaper image. `None` keeps the image itself.
+#[derive(Debug, Clone, Copy, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum BackgroundEffect {
+    #[default]
+    None,
+    Ascii(AsciiParams),
+}
+
+impl BackgroundEffect {
+    pub fn clamped(self) -> Self {
+        match self {
+            Self::Ascii(params) => Self::Ascii(params.clamped()),
+            Self::None => Self::None,
+        }
+    }
+
+    pub fn is_ascii(self) -> bool {
+        matches!(self, Self::Ascii(_))
+    }
+}
+
 /// The image under a card-tone veil. gpui clips children to a *rectangle* even
 /// when the parent is rounded, so the corner radius is applied to the image and
 /// the veil themselves.

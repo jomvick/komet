@@ -170,6 +170,9 @@ pub struct UiSettings {
     pub wallpaper_path: Option<String>,
     /// Where the wallpaper is painted: whole window or main panel.
     pub wallpaper_scope: wallpaper::WallpaperScope,
+    /// What is painted over the wallpaper: the image itself or an ASCII pass.
+    #[serde(default)]
+    pub background_effect: wallpaper::BackgroundEffect,
     /// Idle time before an edited workspace file is saved automatically.
     pub files_autosave_delay_ms: u64,
     /// Wrap long lines in workspace file editors and previews.
@@ -216,6 +219,7 @@ impl Default for UiSettings {
             appearance: crate::appearance::AppearanceMode::default(),
             wallpaper_path: None,
             wallpaper_scope: wallpaper::WallpaperScope::default(),
+            background_effect: wallpaper::BackgroundEffect::default(),
             files_autosave_delay_ms: FILES_AUTOSAVE_DELAY_DEFAULT_MS,
             files_word_wrap: false,
             files_editor_font_size: FILES_EDITOR_FONT_SIZE_DEFAULT,
@@ -445,6 +449,7 @@ impl UiSettings {
         self.terminal_scrollback_lines = self
             .terminal_scrollback_lines
             .clamp(TERMINAL_SCROLLBACK_MIN, TERMINAL_SCROLLBACK_MAX);
+        self.background_effect = self.background_effect.clamped();
         self.files_autosave_delay_ms = self
             .files_autosave_delay_ms
             .clamp(FILES_AUTOSAVE_DELAY_MIN_MS, FILES_AUTOSAVE_DELAY_MAX_MS);
@@ -547,6 +552,7 @@ mod tests {
             appearance: crate::appearance::AppearanceMode::Light,
             wallpaper_path: Some("/wallpapers/aurora.webp".into()),
             wallpaper_scope: wallpaper::WallpaperScope::Panel,
+            background_effect: wallpaper::BackgroundEffect::Ascii(wallpaper::AsciiParams::default()),
             files_autosave_delay_ms: 1000,
             files_word_wrap: true,
             files_editor_font_size: 13.0,
@@ -576,6 +582,39 @@ mod tests {
         let loaded = UiSettings::load(dir.path());
         assert_eq!(loaded.wallpaper_path, None);
         assert_eq!(loaded.sidebar_width, 300.0);
+    }
+
+    #[test]
+    fn background_effect_defaults_to_none_for_old_files() {
+        let loaded: UiSettings = serde_json::from_str(r#"{"soundEnabled": false}"#).unwrap();
+        assert_eq!(loaded.background_effect, wallpaper::BackgroundEffect::None);
+    }
+
+    #[test]
+    fn ascii_effect_round_trips_and_clamps() {
+        let params = wallpaper::AsciiParams {
+            columns: 10_000,
+            opacity: 5.0,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&wallpaper::BackgroundEffect::Ascii(params)).unwrap();
+        assert!(json.contains(r#""ascii""#), "got {json}");
+        let decoded: wallpaper::BackgroundEffect = serde_json::from_str(&json).unwrap();
+        let wallpaper::BackgroundEffect::Ascii(params) = decoded.clamped() else {
+            panic!("expected ascii");
+        };
+        assert_eq!(params.columns, 240);
+        assert_eq!(params.opacity, 1.0);
+    }
+
+    #[test]
+    fn nan_ascii_opacity_heals_to_default() {
+        let healed = wallpaper::AsciiParams {
+            opacity: f32::NAN,
+            ..Default::default()
+        }
+        .clamped();
+        assert_eq!(healed.opacity, wallpaper::DEFAULT_OPACITY);
     }
 
     #[test]
