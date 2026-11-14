@@ -20,9 +20,7 @@ use gpui::{
 };
 
 use komet_engine::registry::HarnessDescriptor;
-use komet_proto::{
-    ChatConfig, FolderListing, HarnessId, Model, ReasoningLevel, RepoRef, SandboxLevel, Space,
-};
+use komet_proto::{ChatConfig, HarnessId, Model, ReasoningLevel, RepoRef, SandboxLevel, Space};
 use komet_rpc::methods;
 
 /// Display cap for the ref list (t3code shows pages of 100 with a status
@@ -289,88 +287,6 @@ pub fn traits_customized(
                 })
         })
     })
-}
-
-// ---------------------------------------------------------------------------
-// Pure: folder-browser navigation (used by the shell's add-space flow)
-// ---------------------------------------------------------------------------
-
-/// Parent of an absolute path; `None` at the filesystem root.
-pub fn parent_path(path: &str) -> Option<String> {
-    let trimmed = path.trim_end_matches('/');
-    if trimmed.is_empty() {
-        return None; // was "/" (or empty)
-    }
-    match trimmed.rfind('/') {
-        Some(0) => Some("/".to_string()),
-        Some(at) => Some(trimmed[..at].to_string()),
-        None => None,
-    }
-}
-
-/// Join a listing path and an entry name.
-pub fn child_path(base: &str, name: &str) -> String {
-    if base.ends_with('/') {
-        format!("{base}{name}")
-    } else {
-        format!("{base}/{name}")
-    }
-}
-
-/// Byte length of `name`'s prefix matching `query`, compared char-for-char
-/// case-insensitively; `None` when `query` isn't a prefix of `name`. The
-/// length indexes into `name` (not `query`) so the completion suffix keeps
-/// the folder's real casing: `("Documents", "doc") → Some(3)` → `"uments"`.
-pub fn completion_prefix_len(name: &str, query: &str) -> Option<usize> {
-    let mut len = 0;
-    let mut name_chars = name.chars();
-    for qc in query.chars() {
-        let nc = name_chars.next()?;
-        if !nc.to_lowercase().eq(qc.to_lowercase()) {
-            return None;
-        }
-        len += nc.len_utf8();
-    }
-    Some(len)
-}
-
-/// Resolve a typed path segment against folder `names` (slash-descend):
-/// exact match first — case-SENSITIVE before case-insensitive, so `GitHub/`
-/// picks a `GitHub` sibling over `github` — then a unique case-insensitive
-/// prefix. Ambiguity resolves to `None`: the slash stays in the query.
-pub fn segment_target(names: &[&str], query: &str) -> Option<usize> {
-    if let Some(ix) = names.iter().position(|n| *n == query) {
-        return Some(ix);
-    }
-    if let Some(ix) = names
-        .iter()
-        .position(|n| completion_prefix_len(n, query) == Some(n.len()))
-    {
-        return Some(ix);
-    }
-    let mut hits = names
-        .iter()
-        .enumerate()
-        .filter(|(_, n)| completion_prefix_len(n, query).is_some());
-    let (ix, _) = hits.next()?;
-    hits.next().is_none().then_some(ix)
-}
-
-/// Breadcrumb segments for a path: `(label, full path)`, root first.
-pub fn breadcrumbs(path: &str) -> Vec<(String, String)> {
-    let mut out: Vec<(String, String)> = vec![("/".to_string(), "/".to_string())];
-    let mut acc = String::new();
-    for segment in path.split('/').filter(|s| !s.is_empty()) {
-        acc.push('/');
-        acc.push_str(segment);
-        out.push((segment.to_string(), acc.clone()));
-    }
-    out
-}
-
-/// Directory rows of a listing (files never render in the browser).
-pub fn browser_rows(listing: &FolderListing) -> Vec<&komet_proto::FolderEntry> {
-    listing.entries.iter().filter(|e| e.is_dir).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -2206,7 +2122,7 @@ impl Pickers {
         .id("project-new")
         .on_click(cx.listener(|this, _, window, cx| {
             this.close(cx);
-            window.dispatch_action(Box::new(crate::shell::AddSpacePalette), cx);
+            window.dispatch_action(Box::new(crate::shell::PickProjectFolder), cx);
         }))
         .child(
             crate::icons::icon(crate::icons::PLUS)
@@ -4265,7 +4181,7 @@ impl Render for Pickers {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use komet_proto::{FolderEntry, Model, ModelOption, ModelOptionChoice};
+    use komet_proto::{Model, ModelOption, ModelOptionChoice};
 
     fn bare_model(id: &str, label: &str) -> Model {
         Model {
@@ -4546,79 +4462,6 @@ mod tests {
             None
         );
         assert_eq!(resolve_send_model(Some(empty), None), None);
-    }
-
-    #[test]
-    fn folder_paths_and_breadcrumbs() {
-        assert_eq!(parent_path("/home/w/dev"), Some("/home/w".to_string()));
-        assert_eq!(parent_path("/home"), Some("/".to_string()));
-        assert_eq!(parent_path("/home/"), Some("/".to_string()));
-        assert_eq!(parent_path("/"), None);
-        assert_eq!(parent_path(""), None);
-        assert_eq!(child_path("/home", "w"), "/home/w");
-        assert_eq!(child_path("/", "home"), "/home");
-        let crumbs = breadcrumbs("/home/w/dev");
-        let labels: Vec<&str> = crumbs.iter().map(|(l, _)| l.as_str()).collect();
-        assert_eq!(labels, ["/", "home", "w", "dev"]);
-        assert_eq!(crumbs[2].1, "/home/w");
-        assert_eq!(breadcrumbs("/").len(), 1);
-    }
-
-    #[test]
-    fn completion_prefix_lengths() {
-        // Case-insensitive; the length indexes into the NAME's bytes.
-        assert_eq!(completion_prefix_len("Documents", "doc"), Some(3));
-        assert_eq!(&"Documents"[3..], "uments");
-        assert_eq!(completion_prefix_len("komet", "komet"), Some(5));
-        assert_eq!(completion_prefix_len("komet", ""), Some(0));
-        assert_eq!(completion_prefix_len("komet", "dev"), None);
-        // Longer than the name → not a prefix.
-        assert_eq!(completion_prefix_len("dev", "devel"), None);
-        // Multibyte names slice on a char boundary.
-        assert_eq!(completion_prefix_len("héllo", "hé"), Some(3));
-        assert_eq!(&"héllo"[3..], "llo");
-    }
-
-    #[test]
-    fn segment_target_resolution() {
-        let names = ["github", "GitHub", "worktree"];
-        // Exact casing beats the earlier case-insensitive sibling…
-        assert_eq!(segment_target(&names, "GitHub"), Some(1));
-        assert_eq!(segment_target(&names, "github"), Some(0));
-        // …but with no exact-cased hit, case-insensitive exact still lands.
-        assert_eq!(segment_target(&names, "WORKTREE"), Some(2));
-        // Unique prefix descends; an ambiguous one keeps the slash honest.
-        assert_eq!(segment_target(&names, "work"), Some(2));
-        assert_eq!(segment_target(&names, "g"), None);
-        assert_eq!(segment_target(&names, "x"), None);
-    }
-
-    #[test]
-    fn browser_navigation_reducer() {
-        let listing = FolderListing {
-            path: "/home/w".into(),
-            entries: vec![
-                FolderEntry {
-                    name: "notes.txt".into(),
-                    is_dir: false,
-                    is_repo: false,
-                },
-                FolderEntry {
-                    name: "dev".into(),
-                    is_dir: true,
-                    is_repo: false,
-                },
-                FolderEntry {
-                    name: "komet".into(),
-                    is_dir: true,
-                    is_repo: true,
-                },
-            ],
-            truncated: false,
-        };
-        // Files never show as rows.
-        assert_eq!(browser_rows(&listing).len(), 2);
-        assert_eq!(browser_rows(&listing)[1].name, "komet");
     }
 
     #[test]

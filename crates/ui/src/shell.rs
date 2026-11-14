@@ -33,7 +33,7 @@ use crate::composer::{Composer, ComposerEvent, ComposerInput, ComposerInputEvent
 use crate::files::{FilesCloseDisposition, FilesEvent, FilesSurface, WorkspacePathDrag};
 use crate::icons::{self, icon};
 use crate::motion::{self, AnimationExt as _, MotionSpec, RESIZE, TAB_SLIDE};
-use crate::popover::{self, Loadable};
+use crate::popover;
 use crate::rail;
 use crate::settings::appearance::AppearancePage;
 use crate::settings::archived::ArchivedPage;
@@ -77,11 +77,11 @@ mod github;
 mod spaces;
 mod tabs;
 
-use spaces::{AddSpaceFlow, RenameSpaceDialog};
+use spaces::RenameSpaceDialog;
 
 actions!(
     shell,
-    [ToggleSidebar, ToggleChanges, AddSpacePalette, NewSession]
+    [ToggleSidebar, ToggleChanges, PickProjectFolder, NewSession]
 );
 
 mod keymap;
@@ -363,9 +363,8 @@ pub struct Shell {
     /// Same keyboard treatment as the chat delete card (see `delete_focus`).
     space_delete_focus: gpui::FocusHandle,
     space_delete_focus_pending: bool,
-    /// The add-space palette (⌘K-style; device tabs + folder search), `Some`
-    /// while open.
-    add_space: Option<AddSpaceFlow>,
+    /// The native folder picker's in-flight prompt (the "+" add-project path).
+    project_picker_task: Option<Task<()>>,
     /// The sidebar's space-filter dropdown.
     spaces_menu: popover::Popup<spaces::SpacesMenu>,
     /// The sidebar's workspace (device) switcher dropdown.
@@ -721,7 +720,7 @@ impl Shell {
             delete_space_confirm: None,
             space_delete_focus: cx.focus_handle(),
             space_delete_focus_pending: false,
-            add_space: None,
+            project_picker_task: None,
             spaces_menu: popover::Popup::default(),
             devices_menu: popover::Popup::default(),
             chat_status_hover: None,
@@ -842,11 +841,6 @@ impl Shell {
         // and all of them independently reattach to the new local runtime.
         if signed_out_synced && self.runtime_change_task.is_none() {
             self.start_local_runtime_transition(false, cx);
-        }
-        // Capture knob: the add-space palette needs only the device registry.
-        if self.debug_dialog.as_deref() == Some("add-space") && !state.read(cx).devices.is_empty() {
-            self.debug_dialog = None;
-            self.open_add_space(cx);
         }
         // Capture knob: pop the requested dialog once chats have landed.
         if let Some(which) = self.debug_dialog.clone()
@@ -1446,13 +1440,9 @@ impl Shell {
                     this.toggle_right_pane(cx)
                 }
             }))
-            .on_action(cx.listener(|this, _: &AddSpacePalette, _, cx| {
-                if this.add_space.is_some() {
-                    this.add_space = None;
-                    cx.notify();
-                } else {
-                    this.open_add_space(cx);
-                }
+            // The "+" buttons: OS folder picker, whole folders as projects.
+            .on_action(cx.listener(|this, _: &PickProjectFolder, _, cx| {
+                this.open_project_folder_picker(cx);
             }))
             // Error-chip actions (transcript rows): Auth opens the Providers
             // settings section, Billing/ModelUnavailable opens the model

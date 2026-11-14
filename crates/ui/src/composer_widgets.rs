@@ -13,7 +13,8 @@ use std::time::{Duration, Instant};
 /// so a command or a diff that flickers does not make the pill strobe.
 ///
 /// Changes uses 600 ms; the processes chip 6 s (a command that just finished
-/// stays listed) and `pin` (a failed command) keeps it up regardless.
+/// stays listed through the linger, then drops — only `Running` entries
+/// count). `pin` still exists for callers that must hold a chip up.
 #[derive(Debug, Clone, Copy)]
 pub struct LingerGate {
     shown: bool,
@@ -85,24 +86,53 @@ pub struct StripInput {
     pub processes_allowed: bool,
 }
 
+/// Colour intent for one chip-label segment — resolved against the theme at
+/// paint time (the pure helpers never see a `Theme`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChipTone {
+    Muted,
+    /// `theme.diff_add` — the Changes chip's `+N`.
+    Add,
+    /// `theme.diff_del` — the Changes chip's `−N`.
+    Del,
+}
+
+/// One painted run of a chip label; `label` stays the plain-text form.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChipLabelPart {
+    pub text: SharedString,
+    pub tone: ChipTone,
+}
+
 /// One chip's rendered content, decided by pure code so the layout stays dumb.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChipContent {
     pub visible: bool,
     pub icon: &'static str,
     pub label: SharedString,
+    /// Coloured segments of `label` (Changes splits `+N`/`−N` out); empty
+    /// means "paint `label` in the chip's muted colour".
+    pub parts: Vec<ChipLabelPart>,
+}
+
+fn chip_part(text: String, tone: ChipTone) -> ChipLabelPart {
+    ChipLabelPart {
+        text: SharedString::from(text),
+        tone,
+    }
 }
 
 /// A chip's label and visibility, from the current data and the harness
 /// capabilities. Hidden chips render nothing at all.
 pub fn chip_content(kind: WidgetKind, input: &StripInput) -> ChipContent {
-    let (visible, icon, label) = match kind {
+    let (visible, icon, label, parts) = match kind {
         WidgetKind::Changes => {
             let Some((files, additions, deletions)) = input.widget_changes else {
                 return ChipContent {
                     visible: false,
                     icon: crate::icons::FILE_DIFF,
                     label: SharedString::default(),
+                    parts: Vec::new(),
                 };
             };
             let file_word = if files == 1 { "file" } else { "files" };
@@ -110,6 +140,12 @@ pub fn chip_content(kind: WidgetKind, input: &StripInput) -> ChipContent {
                 true,
                 crate::icons::FILE_DIFF,
                 format!("{files} {file_word} +{additions} −{deletions}"),
+                vec![
+                    chip_part(format!("{files} {file_word} "), ChipTone::Muted),
+                    chip_part(format!("+{additions}"), ChipTone::Add),
+                    chip_part(" ".to_string(), ChipTone::Muted),
+                    chip_part(format!("−{deletions}"), ChipTone::Del),
+                ],
             )
         }
         WidgetKind::Subagents => {
@@ -119,15 +155,19 @@ pub fn chip_content(kind: WidgetKind, input: &StripInput) -> ChipContent {
                 input.subagents_allowed && count > 0,
                 crate::icons::WIDGET,
                 format!("{count} {word}"),
+                Vec::new(),
             )
         }
         WidgetKind::Processes => {
-            let count = input.process_entries.len();
+            // Only commands still running count: a finished (or failed) one
+            // is history, not a live process — the transcript keeps it.
+            let count = running_process_count(&input.process_entries);
             let word = if count == 1 { "process" } else { "processes" };
             (
                 input.processes_allowed && count > 0,
                 crate::icons::TERMINAL,
                 format!("{count} {word}"),
+                Vec::new(),
             )
         }
     };
@@ -135,7 +175,22 @@ pub fn chip_content(kind: WidgetKind, input: &StripInput) -> ChipContent {
         visible,
         icon,
         label: SharedString::from(label),
+        parts,
     }
+}
+
+/// Entries whose command is still running — the only ones the processes
+/// chip counts or lists.
+pub fn running_process_entries(
+    entries: &[crate::transcript::AgentShellEntry],
+) -> impl Iterator<Item = &crate::transcript::AgentShellEntry> {
+    entries
+        .iter()
+        .filter(|entry| entry.status == crate::transcript::AgentShellStatus::Running)
+}
+
+fn running_process_count(entries: &[crate::transcript::AgentShellEntry]) -> usize {
+    running_process_entries(entries).count()
 }
 
 /// Cut in the middle so both the command name and its tail survive:
@@ -255,10 +310,6 @@ impl WidgetStrip {
     /// Advance the three gates; returns visibility in render order
     /// (Changes, Subagents, Processes).
     pub fn step(&mut self, input: &StripInput, now: Instant) -> [bool; 3] {
-        let failed = input
-            .process_entries
-            .iter()
-            .any(|entry| entry.status == crate::transcript::AgentShellStatus::Failed);
         // An open popup holds its own chip up, so a command that finishes
         // while the user reads its row does not yank the menu away.
         let open = self.open.get().copied();
@@ -275,9 +326,9 @@ impl WidgetStrip {
                 now,
             ),
             self.processes_gate.step(
-                input.processes_allowed && !input.process_entries.is_empty()
+                input.processes_allowed && running_process_count(&input.process_entries) > 0
                     || open == Some(WidgetKind::Processes),
-                failed,
+                false,
                 now,
             ),
         ]
@@ -525,6 +576,27 @@ mod tests {
     }
 
     #[test]
+    fn changes_chip_splits_coloured_add_del_parts() {
+        let mut input = strip_input();
+        input.widget_changes = Some((2, 5, 3));
+        let chip = chip_content(WidgetKind::Changes, &input);
+        let tones: Vec<ChipTone> = chip.parts.iter().map(|part| part.tone).collect();
+        assert_eq!(
+            tones,
+            vec![
+                ChipTone::Muted,
+                ChipTone::Add,
+                ChipTone::Muted,
+                ChipTone::Del
+            ]
+        );
+        assert_eq!(chip.parts[1].text.as_ref(), "+5");
+        assert_eq!(chip.parts[3].text.as_ref(), "−3");
+        // Plain-text form stays intact for anything reading `label`.
+        assert_eq!(chip.label.as_ref(), "2 files +5 −3");
+    }
+
+    #[test]
     fn subagent_and_process_chips_count_rows() {
         let mut input = strip_input();
         input.subagent_rows = vec![subagent_row("a")];
@@ -549,7 +621,22 @@ mod tests {
             "1 process"
         );
         input.process_entries.push(process_entry(
+            crate::transcript::AgentShellStatus::Running,
+            &[],
+        ));
+        assert_eq!(
+            chip_content(WidgetKind::Processes, &input).label.as_ref(),
+            "2 processes"
+        );
+
+        // Finished and failed commands are history, not live processes:
+        // they never count toward the chip.
+        input.process_entries.push(process_entry(
             crate::transcript::AgentShellStatus::Done,
+            &[],
+        ));
+        input.process_entries.push(process_entry(
+            crate::transcript::AgentShellStatus::Failed,
             &[],
         ));
         assert_eq!(
@@ -615,16 +702,28 @@ mod tests {
     }
 
     #[test]
-    fn failed_commands_pin_the_processes_chip() {
+    fn only_running_processes_keep_the_chip_up() {
         let now = Instant::now();
         let mut strip = WidgetStrip::new();
         let mut input = strip_input();
-        input.process_entries = vec![process_entry(
-            crate::transcript::AgentShellStatus::Failed,
+        // A lone finished (even failed) command never shows the chip.
+        input.process_entries = vec![
+            process_entry(crate::transcript::AgentShellStatus::Done, &[]),
+            process_entry(crate::transcript::AgentShellStatus::Failed, &[]),
+        ];
+        assert!(!strip.step(&input, now)[2]);
+        // A running command shows it; once it settles the linger carries the
+        // chip for 6 s, then it drops — nothing finished counts anymore.
+        input.process_entries.push(process_entry(
+            crate::transcript::AgentShellStatus::Running,
             &[],
-        )];
+        ));
         assert!(strip.step(&input, now)[2]);
-        input.process_entries.clear();
-        assert!(strip.step(&input, now)[2], "a failure holds the pill up");
+        input
+            .process_entries
+            .iter_mut()
+            .for_each(|e| e.status = crate::transcript::AgentShellStatus::Done);
+        assert!(strip.step(&input, now)[2], "just-finished lingers");
+        assert!(!strip.step(&input, now + Duration::from_secs(6))[2]);
     }
 }

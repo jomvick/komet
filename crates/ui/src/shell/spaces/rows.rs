@@ -783,6 +783,9 @@ impl Shell {
         let plus_key = format!("{hover_key}-plus");
         let plus_hover = plus_key.clone();
         let plus_space = folder_id.clone();
+        // Right-click on a real project opens its context menu (rename /
+        // remove) — the `~` project-less group has no space to manage.
+        let menu_space = folder_id.clone();
         div()
             .id(SharedString::from(format!("folder-header-{key}")))
             .flex()
@@ -811,6 +814,17 @@ impl Shell {
                 this.schedule_save(cx);
                 cx.notify();
             }))
+            .when(menu_space.is_some(), |el| {
+                el.on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                        if let Some(space) = &menu_space {
+                            this.space_menu.open((space.clone(), event.position));
+                            cx.notify();
+                        }
+                    }),
+                )
+            })
             // Folder icon
             .child(
                 crate::icons::icon(crate::icons::FOLDER)

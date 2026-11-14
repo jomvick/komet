@@ -146,7 +146,7 @@ impl Shell {
                     .size(px(14.0))
                     .text_color(theme.text_muted),
             )
-            .child(div().min_w_0().truncate().child(content.label.clone()))
+            .child(self.widget_chip_label(content, theme))
             .when(has_menu, |el| {
                 el.child(
                     icon(icons::ALT_ARROW_DOWN)
@@ -168,6 +168,40 @@ impl Shell {
                 WidgetKind::Changes => this.open_changes_widget(cx),
                 _ => this.toggle_widgets(kind, window, cx),
             }))
+    }
+
+    /// Chip label: the plain muted `label`, or — for the Changes chip — its
+    /// coloured `+N`/`−N` segments (`ChipContent::parts`).
+    fn widget_chip_label(
+        &self,
+        content: &crate::composer_widgets::ChipContent,
+        theme: &Theme,
+    ) -> gpui::Div {
+        use crate::composer_widgets::ChipTone;
+        if content.parts.is_empty() {
+            return div().min_w_0().truncate().child(content.label.clone());
+        }
+        let tone_color = |tone: ChipTone| match tone {
+            ChipTone::Muted => theme.text_muted,
+            ChipTone::Add => theme.diff_add,
+            ChipTone::Del => theme.diff_del,
+        };
+        let mut row = div()
+            .min_w_0()
+            .flex()
+            .flex_row()
+            .items_center()
+            .overflow_hidden()
+            .whitespace_nowrap();
+        for part in &content.parts {
+            row = row.child(
+                div()
+                    .flex_none()
+                    .text_color(tone_color(part.tone))
+                    .child(part.text.clone()),
+            );
+        }
+        row
     }
 
     fn widget_popup(
@@ -201,13 +235,13 @@ impl Shell {
             WidgetKind::Subagents => input.subagent_rows.iter().cloned().fold(card, |card, row| {
                 card.child(self.subagent_popup_row(row, theme, cx))
             }),
-            WidgetKind::Processes => input
-                .process_entries
-                .iter()
-                .cloned()
-                .fold(card, |card, entry| {
-                    card.child(self.process_popup_row(entry, progress, theme))
-                }),
+            WidgetKind::Processes => {
+                crate::composer_widgets::running_process_entries(&input.process_entries)
+                    .cloned()
+                    .fold(card, |card, entry| {
+                        card.child(self.process_popup_row(entry, progress, theme))
+                    })
+            }
             WidgetKind::Changes => card,
         };
         card.into_any_element()
@@ -442,7 +476,9 @@ impl Shell {
                             popover::btn_primary(&theme_owned, "Add a project")
                                 .id("onboarding-add-space")
                                 .mt(px(20.0))
-                                .on_click(cx.listener(|this, _, _, cx| this.open_add_space(cx))),
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.open_project_folder_picker(cx)
+                                })),
                         ),
                 ))
                 .into_any_element()

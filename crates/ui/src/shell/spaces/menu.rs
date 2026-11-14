@@ -31,20 +31,6 @@ impl Shell {
         }
     }
 
-    /// Land in a just-added space: filter the sidebar to it and open the
-    /// new-session canvas there.
-    pub(crate) fn land_in_space(&mut self, space_id: String, cx: &mut Context<Self>) {
-        self.route = Route::Chat;
-        self.settings.space_filter = Some(space_id.clone());
-        self.settings.last_space_id = Some(space_id.clone());
-        self.state.update(cx, |s, cx| {
-            s.select_space(Some(space_id), cx);
-            s.select_chat(None, cx);
-        });
-        self.schedule_save(cx);
-        cx.notify();
-    }
-
     // ---- sidebar sections ----
 
     /// The filter's display rows: "All projects", then spaces matching the
@@ -151,7 +137,7 @@ impl Shell {
             SpacesMenuRow::Space(id) => self.set_space_filter(Some(id), cx),
             SpacesMenuRow::AddSpace => {
                 self.close_spaces_menu(cx);
-                self.open_add_space(cx);
+                self.open_project_folder_picker(cx);
             }
         }
     }

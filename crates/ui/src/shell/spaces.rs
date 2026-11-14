@@ -1,17 +1,16 @@
 //! Spaces sidebar: the space-filter dropdown (searchable, with "All projects"),
-//! the filtered Sessions list, and the add-space palette (⌘K-style: device
-//! tabs + filtered folder browser).
+//! the filtered Sessions list, and the native add-project picker.
 //!
 //! A space = a synced (device, folder) pair. Spaces stopped being a
 //! navigation spine when tabs went device-local: the dropdown only FILTERS
 //! the sidebar's session list (never the tab strip) and hosts space
-//! management (add via the palette; rename/delete via row context menus).
-//! Child module of `shell` so it renders straight off `Shell`'s private state.
+//! management (add via the OS folder picker; rename/delete via row context
+//! menus). Child module of `shell` so it renders straight off `Shell`'s
+//! private state.
 
 use super::*;
-use crate::pickers::{breadcrumbs, browser_rows, completion_prefix_len, parent_path};
 use gpui::FocusHandle;
-use komet_proto::{ChatIndicator, Device, FolderListing, RepoRef, Space};
+use komet_proto::{ChatIndicator, Device, RepoRef, Space};
 
 /// The space-filter dropdown, `Some` while open. The same searchable-menu
 /// recipe as the composer's ref picker: filter input on top
@@ -44,44 +43,6 @@ pub(crate) enum SpacesMenuRow {
     All,
     Space(String),
     AddSpace,
-}
-
-/// The add-space palette (a command-K surface, summoned by ⌘K): search bar
-/// across the top, folder browser on the left, a Devices rail on the right,
-/// kbd-hint footer. One surface — picking a device in the rail rebrowses in
-/// place, no step wizard.
-pub(super) struct AddSpaceFlow {
-    /// The device currently browsed (the highlighted rail row).
-    device: Option<Device>,
-    /// Filter input; Enter descends into the highlighted folder. Carries the
-    /// tab-completion ghost (the faint suffix ⇥ accepts), and a trailing `/`
-    /// on a folder-naming query descends immediately.
-    search: Entity<ComposerInput>,
-    browser: Loadable<FolderListing>,
-    /// Requested browser path (`None` = the device's default, i.e. home).
-    browser_path: Option<String>,
-    /// The device's home (the path a `None` browse resolved to) — breadcrumbs
-    /// fold everything up to here into the device-name crumb.
-    home: Option<String>,
-    /// Best-effort git seed for the CURRENT browser path (known when we
-    /// descended through an entry whose `is_repo` we saw; the owning device's
-    /// SpacesSync re-verifies either way).
-    browser_repo: bool,
-    /// Keyboard highlight within the FILTERED folder rows.
-    active: usize,
-    submit_busy: bool,
-    error: Option<SharedString>,
-    /// Tracked on the card (`track_focus`) — puts the card on the keyboard
-    /// dispatch path so ↑↓/⌫/esc reach `add_space_key` while the search input
-    /// holds focus (the structure every working picker uses).
-    focus: FocusHandle,
-    /// Folder-list scroll — keyboard navigation keeps the highlighted row in
-    /// view (`scroll_to_item`).
-    list_scroll: gpui::ScrollHandle,
-    focus_pending: bool,
-    load_task: Option<Task<()>>,
-    submit_task: Option<Task<()>>,
-    _search_events: Subscription,
 }
 
 /// The space-row Rename dialog (same shape as [`RenameChatDialog`]).
