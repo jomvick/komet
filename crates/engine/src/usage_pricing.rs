@@ -140,13 +140,87 @@ const TABLE: &[(&str, Price)] = &[
             output: 4.4,
         },
     ),
-    // Google — ai.google.dev pricing, reviewed 2026-11.
+    // Google — ai.google.dev pricing, reviewed 2026-11. The Antigravity CLI
+    // (`agy`) reports gemini-3.x ids, often with a baked -low/-medium/-high
+    // effort suffix; the family prefix covers every tier.
+    (
+        "gemini-3.1-pro",
+        Price {
+            input: 2.0,
+            cached_input: 0.2,
+            output: 12.0,
+        },
+    ),
+    (
+        "gemini-3.8-flash",
+        Price {
+            input: 0.75,
+            cached_input: 0.075,
+            output: 3.75,
+        },
+    ),
+    (
+        "gemini-3.7-flash",
+        Price {
+            input: 0.75,
+            cached_input: 0.075,
+            output: 3.75,
+        },
+    ),
+    (
+        "gemini-3.6-flash",
+        Price {
+            input: 0.75,
+            cached_input: 0.075,
+            output: 3.75,
+        },
+    ),
+    (
+        "gemini-3.5-flash-lite",
+        Price {
+            input: 0.3,
+            cached_input: 0.03,
+            output: 2.5,
+        },
+    ),
+    (
+        "gemini-3.5-flash",
+        Price {
+            input: 1.5,
+            cached_input: 0.15,
+            output: 9.0,
+        },
+    ),
+    (
+        "gemini-3.1-flash-lite",
+        Price {
+            input: 0.25,
+            cached_input: 0.025,
+            output: 1.5,
+        },
+    ),
+    (
+        "gemini-3-flash",
+        Price {
+            input: 0.5,
+            cached_input: 0.05,
+            output: 3.0,
+        },
+    ),
     (
         "gemini-2.5-pro",
         Price {
             input: 1.25,
             cached_input: 0.125,
             output: 10.0,
+        },
+    ),
+    (
+        "gemini-2.5-flash-lite",
+        Price {
+            input: 0.1,
+            cached_input: 0.01,
+            output: 0.4,
         },
     ),
     (
@@ -172,6 +246,16 @@ const TABLE: &[(&str, Price)] = &[
             input: 0.2,
             cached_input: 0.02,
             output: 1.5,
+        },
+    ),
+    // OpenAI open weights — served by many providers at different rates;
+    // the common hosted rate (Bedrock/Azure/Together/Groq) is the estimate.
+    (
+        "gpt-oss-120b",
+        Price {
+            input: 0.15,
+            cached_input: 0.015,
+            output: 0.6,
         },
     ),
 ];
@@ -246,7 +330,15 @@ mod tests {
         assert!(price_for("claude-sonnet-4-5-20250929").is_some());
         assert!(price_for("anthropic/claude-opus-4-1").is_some());
         assert!(price_for("gpt-5.2-codex").is_some());
+        // agy/Antigravity gemini-3.x ids, effort suffix included.
+        assert!(price_for("gemini-3.8-flash-high").is_some());
+        assert!(price_for("gemini-3.1-pro-low").is_some());
+        assert!(price_for("gpt-oss-120b-medium").is_some());
         assert!(price_for("definitely-not-a-model").is_none());
+        // Lite variants must not be priced as their full-flash family.
+        let lite = price_for("gemini-2.5-flash-lite").unwrap();
+        let flash = price_for("gemini-2.5-flash").unwrap();
+        assert!(lite.input < flash.input);
         // sonnet-4-5 must not be priced as sonnet-4's cheaper… actually both
         // exist; the point is the 4-5 row wins over the 4 prefix.
         let p45 = price_for("claude-sonnet-4-5").unwrap();

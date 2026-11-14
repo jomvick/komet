@@ -3313,6 +3313,29 @@ impl RpcService for EngineRpc {
                         {
                             account.usage_windows = windows.clone();
                         }
+                        // Local logs: attribute each turn to the account that
+                        // was active when it ran, drop what Komet already
+                        // measured, and report coverage — never a silent zero.
+                        let local_usage = self.agent_accounts.local_reader(harness).map(|reader| {
+                            let timeline = self.agent_accounts.usage_timeline(harness);
+                            let measured = store
+                                .as_ref()
+                                .map(|store| {
+                                    store.measured_keys(
+                                        now - chrono::Duration::days(30),
+                                        harness,
+                                        active_accounts.get(&harness).map(String::as_str),
+                                    )
+                                })
+                                .unwrap_or_default();
+                            crate::usage_local::aggregate_local(
+                                reader.as_ref(),
+                                timeline.as_ref(),
+                                active_accounts.get(&harness).map(String::as_str),
+                                &measured,
+                                now,
+                            )
+                        });
                         komet_proto::AgentUsageReport {
                             harness,
                             account,
@@ -3359,6 +3382,7 @@ impl RpcService for EngineRpc {
                                 .details
                                 .get(&harness)
                                 .and_then(crate::usage_pricing::estimate),
+                            local_usage,
                         }
                     })
                     .collect();

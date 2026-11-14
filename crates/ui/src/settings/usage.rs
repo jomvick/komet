@@ -20,8 +20,9 @@ use gpui::{
 };
 
 use komet_proto::{
-    AgentUsageReport, AgentUsageWindow, HarnessId, UsageBreakdown, UsageCostEstimate, UsageDetail,
-    UsagePoint, UsageQuotaPoint, UsageReport, UsageTotals,
+    AgentLocalUsage, AgentUsageReport, AgentUsageWindow, HarnessId, UsageBreakdown,
+    UsageCostEstimate, UsageCoverage, UsageDetail, UsagePoint, UsageQuotaPoint, UsageReport,
+    UsageTotals,
 };
 use komet_rpc::methods;
 
@@ -39,6 +40,14 @@ const QUOTA_CAPABLE: [HarnessId; 5] = [
     HarnessId::Cursor,
     HarnessId::Antigravity,
     HarnessId::Copilot,
+];
+
+/// Agents whose CLIs keep local token logs the engine can read (issue #53).
+const LOCAL_LOG_AGENTS: [HarnessId; 4] = [
+    HarnessId::Grok,
+    HarnessId::Pi,
+    HarnessId::Opencode,
+    HarnessId::Muse,
 ];
 
 /// A stale visible page may refresh itself, but not more often than this.
@@ -114,6 +123,23 @@ impl Period {
             Self::Day => report.day_cost.as_ref(),
             Self::Week => report.week_cost.as_ref(),
             Self::Month => report.month_cost.as_ref(),
+        }
+    }
+
+    /// Same window inside the local-logs totals.
+    fn local_totals(self, local: &AgentLocalUsage) -> &UsageTotals {
+        match self {
+            Self::Day => &local.day,
+            Self::Week => &local.last_7_days,
+            Self::Month => &local.last_30_days,
+        }
+    }
+
+    fn local_cost(self, local: &AgentLocalUsage) -> Option<&UsageCostEstimate> {
+        match self {
+            Self::Day => local.day_cost.as_ref(),
+            Self::Week => local.week_cost.as_ref(),
+            Self::Month => local.month_cost.as_ref(),
         }
     }
 
@@ -359,11 +385,10 @@ impl UsagePage {
                 div()
                     .text_size(px(12.5))
                     .text_color(theme.text_muted)
-                    .child(SharedString::from(if account.is_some() {
-                        "Provider quota not reported."
-                    } else {
-                        "Provider quota not reported — no account signed in on this device."
-                    })),
+                    .child(SharedString::from(quota_reason_phrase(
+                        report,
+                        account.is_some(),
+                    ))),
             );
         }
         for window in windows {
@@ -371,6 +396,9 @@ impl UsagePage {
         }
 
         if let Some(report) = report {
+            if let Some(local) = report.local_usage.as_ref() {
+                body = body.child(self.local_block(local, theme));
+            }
             body = body.child(self.measured_block(report, theme, now));
         }
 
@@ -546,6 +574,84 @@ impl UsagePage {
             .when_some(track, |el, track| el.child(track))
             .child(widgets::meta_line(theme, meta))
             .into_any_element()
+    }
+
+    /// Tokens reconstructed from the agent's own logs, attributed to the
+    /// active account. Same visual weight as the measured block but a
+    /// different source label — the two are never merged.
+    fn local_block(&self, local: &AgentLocalUsage, theme: &Theme) -> AnyElement {
+        let totals = self.period.local_totals(local);
+        let mut block = div()
+            .flex()
+            .flex_col()
+            .gap(px(4.0))
+            .pt(px(10.0))
+            .border_t_1()
+            .border_color(theme.border)
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_baseline()
+                    .gap(px(8.0))
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(theme.text_muted)
+                            .child(SharedString::from("Local logs")),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(theme.text_muted.opacity(0.7))
+                            .child(SharedString::from(self.period.range_label())),
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(px(11.5))
+                    .text_color(theme.text_muted.opacity(0.75))
+                    .child(SharedString::from(format!(
+                        "Source : {} · couverture : {}",
+                        local.source_label,
+                        coverage_phrase(local),
+                    ))),
+            );
+        if local.coverage != UsageCoverage::Unavailable {
+            block = block.child(measured_line(theme, "Tokens", totals));
+            if let Some(rates) = rates_phrase(totals) {
+                block = block.child(
+                    div()
+                        .text_size(px(11.5))
+                        .text_color(theme.text_muted.opacity(0.75))
+                        .child(SharedString::from(rates)),
+                );
+            }
+            let cost_line = match self.period.local_cost(local) {
+                Some(cost) => {
+                    let mut text =
+                        format!("≈ ${:.2} API-equivalent (rates {})", cost.usd, cost.as_of);
+                    if !cost.unpriced_models.is_empty() {
+                        text.push_str(&format!(" · {} unpriced", cost.unpriced_models.len()));
+                    }
+                    Some(text)
+                }
+                None if totals.input_tokens + totals.output_tokens > 0 => {
+                    Some("API-equivalent cost: tarif inconnu".to_string())
+                }
+                None => None,
+            };
+            if let Some(text) = cost_line {
+                block = block.child(
+                    div()
+                        .text_size(px(11.5))
+                        .text_color(theme.text_muted.opacity(0.75))
+                        .child(SharedString::from(text)),
+                );
+            }
+        }
+        block.into_any_element()
     }
 
     fn measured_block(
@@ -851,8 +957,88 @@ pub fn time_to_exhaustion(
 fn capability(harness: HarnessId) -> &'static str {
     if QUOTA_CAPABLE.contains(&harness) {
         "Provider quotas + measured usage"
+    } else if LOCAL_LOG_AGENTS.contains(&harness) {
+        "Local logs + measured usage"
     } else {
         "Measured usage only"
+    }
+}
+
+/// The sentence that replaces a bare "Provider quota not reported.": it
+/// always says *why* — no account, no local source, or a local source that
+/// could not deliver (issue #53).
+fn quota_reason_phrase(report: Option<&AgentUsageReport>, account_present: bool) -> String {
+    if !account_present {
+        return "Provider quota not reported — no account signed in on this device.".to_string();
+    }
+    let Some(report) = report else {
+        return "Provider quota not reported.".to_string();
+    };
+    match report.local_usage.as_ref() {
+        Some(local) => match local.coverage {
+            UsageCoverage::Complete => {
+                "Provider quota not reported — local logs cover the active account.".to_string()
+            }
+            UsageCoverage::Partial => format!(
+                "Provider quota not reported — couverture : {}.",
+                coverage_phrase(local)
+            ),
+            UsageCoverage::Unavailable => format!(
+                "Provider quota not reported — {}.",
+                local_reason_phrase(local)
+            ),
+        },
+        None if QUOTA_CAPABLE.contains(&report.harness) => {
+            "Provider quota not reported — the provider did not return a quota sample."
+                .to_string()
+        }
+        None => {
+            "Provider quota not reported — this agent exposes no quota API and keeps no local token logs."
+                .to_string()
+        }
+    }
+}
+
+/// "couverture : partielle (3 tours non attribués)" — the phrase shown under
+/// the local-logs source label.
+fn coverage_phrase(local: &AgentLocalUsage) -> String {
+    match local.coverage {
+        UsageCoverage::Complete => "complète".to_string(),
+        UsageCoverage::Partial => {
+            if local.unattributed_turns > 0 {
+                format!(
+                    "partielle ({} tour{} non attribué{})",
+                    local.unattributed_turns,
+                    if local.unattributed_turns == 1 {
+                        ""
+                    } else {
+                        "s"
+                    },
+                    if local.unattributed_turns == 1 {
+                        ""
+                    } else {
+                        "s"
+                    },
+                )
+            } else {
+                "partielle".to_string()
+            }
+        }
+        UsageCoverage::Unavailable => format!("indisponible — {}", local_reason_phrase(local)),
+    }
+}
+
+/// Human phrasing for the engine's machine-ish reasons.
+fn local_reason_phrase(local: &AgentLocalUsage) -> String {
+    match local.reason.as_deref() {
+        Some("no session directory")
+        | Some("no local session logs found")
+        | Some("no opencode database") => "aucun log local trouvé".to_string(),
+        Some("muse session logs carry no token counters") => {
+            "les logs locaux ne contiennent pas de compteurs de tokens".to_string()
+        }
+        Some(other) => other.to_string(),
+        None => "source locale indisponible".to_string(),
     }
 }
 
@@ -1252,6 +1438,7 @@ mod tests {
             day_cost: None,
             week_cost: None,
             month_cost: None,
+            local_usage: None,
         }
     }
 
@@ -1296,6 +1483,74 @@ mod tests {
         let rates = rates_phrase(&tokens).unwrap();
         assert!(rates.contains("Cache hit 25%"), "{rates}");
         assert!(rates.contains("Reasoning 25% of output"), "{rates}");
+    }
+
+    fn local_usage(
+        coverage: UsageCoverage,
+        unattributed: u64,
+        reason: Option<&str>,
+    ) -> AgentLocalUsage {
+        AgentLocalUsage {
+            source_label: "local logs".into(),
+            coverage,
+            unattributed_turns: unattributed,
+            reason: reason.map(str::to_string),
+            ..AgentLocalUsage::default()
+        }
+    }
+
+    #[test]
+    fn coverage_phrase_names_the_gap() {
+        let complete = local_usage(UsageCoverage::Complete, 0, None);
+        assert_eq!(coverage_phrase(&complete), "complète");
+
+        let partial = local_usage(UsageCoverage::Partial, 3, None);
+        assert_eq!(
+            coverage_phrase(&partial),
+            "partielle (3 tours non attribués)"
+        );
+        let one = local_usage(UsageCoverage::Partial, 1, None);
+        assert_eq!(coverage_phrase(&one), "partielle (1 tour non attribué)");
+
+        let gone = local_usage(UsageCoverage::Unavailable, 0, Some("no session directory"));
+        assert_eq!(
+            coverage_phrase(&gone),
+            "indisponible — aucun log local trouvé"
+        );
+    }
+
+    #[test]
+    fn quota_reason_is_never_a_bare_not_reported() {
+        // No account signed in.
+        let no_account = report(UsageTotals::default(), None);
+        assert!(quota_reason_phrase(Some(&no_account), false).contains("no account signed in"));
+
+        // Local source present but unavailable → the reason surfaces.
+        let mut with_local = report(UsageTotals::default(), Some("a@b.c"));
+        with_local.local_usage = Some(local_usage(
+            UsageCoverage::Unavailable,
+            0,
+            Some("no session directory"),
+        ));
+        let phrase = quota_reason_phrase(Some(&with_local), true);
+        assert!(phrase.contains("aucun log local trouvé"), "{phrase}");
+
+        // Partial coverage names the unattributed turns.
+        with_local.local_usage = Some(local_usage(UsageCoverage::Partial, 2, None));
+        let phrase = quota_reason_phrase(Some(&with_local), true);
+        assert!(phrase.contains("2 tours non attribués"), "{phrase}");
+
+        // Agent with neither quota API nor local logs (Cline, Hermes…).
+        let mut bare = report(UsageTotals::default(), Some("a@b.c"));
+        bare.harness = HarnessId::Cline;
+        let phrase = quota_reason_phrase(Some(&bare), true);
+        assert!(phrase.contains("no local token logs"), "{phrase}");
+
+        // Quota-capable provider that simply did not answer.
+        let mut silent = report(UsageTotals::default(), Some("a@b.c"));
+        silent.harness = HarnessId::Codex;
+        let phrase = quota_reason_phrase(Some(&silent), true);
+        assert!(phrase.contains("did not return a quota sample"), "{phrase}");
     }
 
     #[test]

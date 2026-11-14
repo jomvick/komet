@@ -2287,7 +2287,7 @@ impl ContextUsageStats {
 /// Conservative context-window defaults for providers that do not report one.
 pub fn default_context_limit_for_model(model_name: &str) -> u64 {
     let model = model_name.to_ascii_lowercase();
-    if ["gemini-1.5", "gemini-2.0", "gemini-2.5"]
+    if ["gemini-1.5", "gemini-2.0", "gemini-2.5", "gemini-3"]
         .iter()
         .any(|name| model.contains(name))
     {

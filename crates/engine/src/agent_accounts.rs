@@ -125,8 +125,8 @@ const FLOW_TTL: Duration = Duration::from_secs(15 * 60);
 const CLI_LOGIN_STALL: Duration = Duration::from_secs(5 * 60);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(8);
 
-/// Credential stores owned by the CLI-managed providers that have an in-app
-/// sign-in (`devin`, `grok`, `muse`, `cline`, `qoder`). They keep a single live
+/// Credential stores owned by the CLI-managed providers (`devin`, `grok`,
+/// `muse`, `cline`, `qoder`, `hermes`). They keep a single live
 /// login in their own home; komet only reads the store after the flow lands.
 #[derive(Debug, Clone)]
 pub struct CliProviderFiles {
@@ -135,6 +135,11 @@ pub struct CliProviderFiles {
     pub cline_providers: PathBuf,
     pub qoder_auth: PathBuf,
     pub devin_credentials: PathBuf,
+    pub hermes_auth: PathBuf,
+    /// Muse session logs (`$XDG_DATA_HOME/muse/sessions`) — the local usage
+    /// reader's root (issue #53). Separate from `muse_auth`, which lives in
+    /// the config dir.
+    pub muse_sessions: PathBuf,
 }
 
 impl CliProviderFiles {
@@ -154,6 +159,14 @@ impl CliProviderFiles {
             cline_providers: home.join(".cline/data/settings/providers.json"),
             qoder_auth: home.join(".qoder/.auth/user"),
             devin_credentials: data_dir.join("devin/credentials.toml"),
+            // `$HERMES_HOME` relocates the whole Hermes home (default
+            // `~/.hermes`); its credential store is `auth.json` inside.
+            hermes_auth: std::env::var_os("HERMES_HOME")
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home.join(".hermes"))
+                .join("auth.json"),
+            muse_sessions: data_dir.join("muse/sessions"),
         }
     }
 
@@ -165,6 +178,8 @@ impl CliProviderFiles {
             cline_providers: root.join("cline/providers.json"),
             qoder_auth: root.join("qoder/user"),
             devin_credentials: root.join("devin/credentials.toml"),
+            hermes_auth: root.join("hermes/auth.json"),
+            muse_sessions: root.join("muse/sessions"),
         }
     }
 }
@@ -258,6 +273,7 @@ impl AgentAccountsConfig {
             HarnessId::Muse => Some(&self.cli_files.muse_auth),
             HarnessId::Cline => Some(&self.cli_files.cline_providers),
             HarnessId::Qoder => Some(&self.cli_files.qoder_auth),
+            HarnessId::Hermes => Some(&self.cli_files.hermes_auth),
             _ => None,
         }
     }
@@ -989,6 +1005,22 @@ struct Inner {
     fresh_probes: Mutex<HashMap<String, Instant>>,
     /// Local usage-history sink + this device's id (wired at engine assembly).
     usage_sink: Mutex<Option<(Arc<crate::usage::UsageStore>, String)>>,
+    /// Per-agent active-account history behind Settings › Usage attribution
+    /// (issue #53): which `account_key` was live when, persisted as
+    /// `account_timeline.jsonl` next to the usage store. `store: None` means
+    /// usage tracking was never wired (tests, headless) — recording is a no-op.
+    account_timeline: Mutex<AccountTimeline>,
+    /// Local-log readers for the agents that keep token usage on disk
+    /// (issue #53). Built once from the config paths; each reader caches its
+    /// scan state, so the same instances must serve every report.
+    local_readers: Vec<Arc<dyn crate::usage_sources::LocalUsageReader>>,
+}
+
+/// In-memory mirror of `account_timeline.jsonl`, keyed by `harness_slug`.
+#[derive(Default)]
+struct AccountTimeline {
+    store: Option<crate::usage_sources::TimelineStore>,
+    by_harness: HashMap<String, crate::usage_sources::ActivationTimeline>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -1300,6 +1332,7 @@ impl AgentAccounts {
                 .ok()
                 .and_then(|raw| serde_json::from_str(&raw).ok())
                 .unwrap_or_default();
+        let local_readers = crate::usage_readers::readers_for(&config);
         Self {
             inner: Arc::new(Inner {
                 config,
@@ -1310,6 +1343,8 @@ impl AgentAccounts {
                 antigravity_profile_cache: Mutex::new(antigravity_profile_cache),
                 fresh_probes: Mutex::new(HashMap::new()),
                 usage_sink: Mutex::new(None),
+                account_timeline: Mutex::new(AccountTimeline::default()),
+                local_readers,
             }),
         }
     }
@@ -1318,7 +1353,110 @@ impl AgentAccounts {
 
     /// Wire the local usage-history store (once per engine graph).
     pub fn set_usage_store(&self, store: Arc<crate::usage::UsageStore>, device_id: String) {
-        *lock(&self.inner.usage_sink) = Some((store, device_id));
+        *lock(&self.inner.usage_sink) = Some((store.clone(), device_id));
+        // The activation timeline lives inside the usage dir so a profile
+        // wipe takes both; like the rest of the store it is per-device.
+        let timeline_store = crate::usage_sources::TimelineStore::open(store.path())
+            .map_err(|err| {
+                tracing::warn!(error = %err, "agent-accounts: usage timeline unavailable");
+                err
+            })
+            .ok();
+        let mut state = lock(&self.inner.account_timeline);
+        state.by_harness = timeline_store
+            .as_ref()
+            .map(|store| store.load())
+            .unwrap_or_default();
+        state.store = timeline_store;
+    }
+
+    /// Local-log reader for `harness` (issue #53): `None` when the agent
+    /// keeps no usable token source — the Usage page then gives the precise
+    /// reason instead of an invented zero.
+    pub fn local_reader(
+        &self,
+        harness: HarnessId,
+    ) -> Option<Arc<dyn crate::usage_sources::LocalUsageReader>> {
+        let slug = harness_slug(harness);
+        self.inner
+            .local_readers
+            .iter()
+            .find(|reader| reader.agent() == slug)
+            .cloned()
+    }
+
+    /// Activation history for `harness` — attributes local-log turns to the
+    /// account that was active when each ran. `None` before the usage store
+    /// is wired or for an agent never observed.
+    pub fn usage_timeline(
+        &self,
+        harness: HarnessId,
+    ) -> Option<crate::usage_sources::ActivationTimeline> {
+        lock(&self.inner.account_timeline)
+            .by_harness
+            .get(harness_slug(harness))
+            .cloned()
+    }
+
+    /// Record an activation Komet performed itself (switch, completed sign-in).
+    /// `account = None` means the agent has no Komet-managed account.
+    fn note_activation(&self, harness: HarnessId, account: Option<String>) {
+        let mut state = lock(&self.inner.account_timeline);
+        let Some(store) = state.store.clone() else {
+            return;
+        };
+        let slug = harness_slug(harness);
+        let timeline = state.by_harness.entry(slug.to_string()).or_default();
+        let Some(entry) = timeline.record(now_ms(), account) else {
+            return;
+        };
+        if let Err(err) = store.append(slug, &entry) {
+            tracing::warn!(
+                harness = %slug,
+                error = %err,
+                "agent-accounts: could not persist account activation"
+            );
+        }
+    }
+
+    /// Compare each agent's live account with the last recorded activation.
+    /// A difference means the switch happened outside Komet (a login done in
+    /// a terminal while Komet was closed): the stretch since the last known
+    /// entry is marked as a gap instead of being guessed (issue #53).
+    fn reconcile_account_timelines(&self, active_keys: &HashMap<HarnessId, String>) {
+        let mut state = lock(&self.inner.account_timeline);
+        let Some(store) = state.store.clone() else {
+            return;
+        };
+        let now = now_ms();
+        for harness in [
+            HarnessId::ClaudeCode,
+            HarnessId::Codex,
+            HarnessId::Antigravity,
+            HarnessId::Cursor,
+            HarnessId::Copilot,
+            HarnessId::Devin,
+            HarnessId::Grok,
+            HarnessId::Muse,
+            HarnessId::Cline,
+            HarnessId::Hermes,
+            HarnessId::Qoder,
+            HarnessId::Opencode,
+            HarnessId::Pi,
+        ] {
+            let slug = harness_slug(harness);
+            let live = active_keys.get(&harness).cloned();
+            let timeline = state.by_harness.entry(slug.to_string()).or_default();
+            if let Some(entry) = timeline.reconcile(now, live)
+                && let Err(err) = store.append(slug, &entry)
+            {
+                tracing::warn!(
+                    harness = %slug,
+                    error = %err,
+                    "agent-accounts: could not persist account reconciliation"
+                );
+            }
+        }
     }
 
     /// Detect both CLIs, auto-snapshot the live logins, and assemble the view.
@@ -1391,6 +1529,7 @@ impl AgentAccounts {
             HarnessId::Grok,
             HarnessId::Muse,
             HarnessId::Cline,
+            HarnessId::Hermes,
         ] {
             if let Some(key) = self.sync_cli_file_accounts(harness)? {
                 active_keys.insert(harness, key);
@@ -1415,6 +1554,11 @@ impl AgentAccounts {
         {
             active_keys.insert(HarnessId::Copilot, slot.account_key);
         }
+
+        // Usage attribution (issue #53): the live keys are all known now —
+        // reconcile each agent's activation timeline. A login performed in a
+        // terminal while Komet was closed surfaces here as a gap, not a guess.
+        self.reconcile_account_timelines(&active_keys);
 
         // Dedupe: a re-login mints a NEW refresh token, so `account_key`
         // (hash of the refresh token) changes and `snapshot_detected` writes a
@@ -1483,6 +1627,7 @@ impl AgentAccounts {
             HarnessId::Grok,
             HarnessId::Muse,
             HarnessId::Cline,
+            HarnessId::Hermes,
             HarnessId::Qoder,
             HarnessId::Opencode,
             HarnessId::Pi,
@@ -1795,15 +1940,21 @@ impl AgentAccounts {
                 ));
             }
             HarnessId::Qoder => self.activate_qoder(&slot)?,
-            HarnessId::Devin | HarnessId::Grok | HarnessId::Muse | HarnessId::Cline => {
-                self.activate_cli_file(harness, &slot)?
-            }
+            HarnessId::Devin
+            | HarnessId::Grok
+            | HarnessId::Muse
+            | HarnessId::Cline
+            | HarnessId::Hermes => self.activate_cli_file(harness, &slot)?,
             other => {
                 return Err(EngineError::Other(format!(
                     "agent accounts are not supported for {other:?}"
                 )));
             }
         }
+        // Komet performed the switch itself: record it BEFORE the closing
+        // list() reconciles, or the change would look external and the whole
+        // stretch since the previous account would be marked unattributable.
+        self.note_activation(harness, Some(slot.account_key.clone()));
         self.list(UsageMode::Offline).await
     }
 
@@ -1816,9 +1967,11 @@ impl AgentAccounts {
         let active_id = match harness {
             HarnessId::Copilot => self.read_copilot_active_id()?,
             HarnessId::Qoder => self.read_qoder_active_id()?,
-            HarnessId::Devin | HarnessId::Grok | HarnessId::Muse | HarnessId::Cline => {
-                self.read_cli_active_id(harness)?
-            }
+            HarnessId::Devin
+            | HarnessId::Grok
+            | HarnessId::Muse
+            | HarnessId::Cline
+            | HarnessId::Hermes => self.read_cli_active_id(harness)?,
             _ => return None,
         };
         self.read_slots(harness)
@@ -2485,6 +2638,7 @@ impl AgentAccounts {
             | HarnessId::Grok
             | HarnessId::Muse
             | HarnessId::Cline
+            | HarnessId::Hermes
             | HarnessId::Qoder => self.start_cli_login(harness).await,
             other => Err(EngineError::Other(format!(
                 "agent logins are not supported for {other:?}"
@@ -3015,9 +3169,11 @@ impl AgentAccounts {
         // refuse `login` outright until it is cleared.
         let live_account = match harness {
             HarnessId::Qoder => self.sync_qoder_accounts()?,
-            HarnessId::Devin | HarnessId::Grok | HarnessId::Muse | HarnessId::Cline => {
-                self.sync_cli_file_accounts(harness)?
-            }
+            HarnessId::Devin
+            | HarnessId::Grok
+            | HarnessId::Muse
+            | HarnessId::Cline
+            | HarnessId::Hermes => self.sync_cli_file_accounts(harness)?,
             _ => None,
         };
         // Logout when a session MAY be live: a parseable store (live_account)
@@ -3644,11 +3800,15 @@ impl AgentAccounts {
     ) -> Result<(), EngineError> {
         match harness {
             HarnessId::Qoder => self.adopt_qoder_login()?,
-            HarnessId::Devin | HarnessId::Grok | HarnessId::Muse | HarnessId::Cline => {
-                self.adopt_cli_file_login(harness)?;
-            }
+            HarnessId::Devin
+            | HarnessId::Grok
+            | HarnessId::Muse
+            | HarnessId::Cline
+            | HarnessId::Hermes => self.adopt_cli_file_login(harness)?,
             _ => self.snapshot_detected(harness, detected)?,
         }
+        // The CLI wrote its own store: the new login IS the live account.
+        self.note_activation(harness, Some(detected.account_key.clone()));
         // Tear down WITHOUT cancel_login's restore: the store on disk IS the
         // new account — restoring the pre-flow slot would undo the sign-in.
         if let Some(LoginFlow::Cli { killer, .. }) = lock(&self.inner.flows).remove(login_id)
@@ -3688,6 +3848,8 @@ impl AgentAccounts {
         };
         self.enrich_antigravity_profile(&mut detected, &value).await;
         self.snapshot_detected(HarnessId::Antigravity, &detected)?;
+        // `agy` already rewrote the keyring — the new login is live.
+        self.note_activation(HarnessId::Antigravity, Some(detected.account_key.clone()));
         self.finish_antigravity_login(login_id);
         Ok(true)
     }
@@ -4042,6 +4204,7 @@ impl AgentAccounts {
         });
         if !active_exists {
             self.activate_copilot(slot)?;
+            self.note_activation(HarnessId::Copilot, Some(slot.account_key.clone()));
         }
         Ok(())
     }
@@ -4389,6 +4552,7 @@ impl AgentAccounts {
             .find(|s| s.account_key == detected.account_key)
         {
             self.activate_cursor(&slot)?;
+            self.note_activation(HarnessId::Cursor, Some(slot.account_key.clone()));
         }
         self.cancel_login(login_id);
         Ok(())
@@ -4611,6 +4775,7 @@ impl AgentAccounts {
                 .ok()
                 .filter(|raw| !raw.trim().is_empty())
                 .and_then(|raw| parse_devin_credentials(&raw)),
+            HarnessId::Hermes => read_json(path).and_then(|v| parse_hermes_auth(&v)),
             HarnessId::Qoder => parse_qoder_auth(path),
             _ => None,
         }
@@ -6204,6 +6369,7 @@ fn supports_switching(harness: HarnessId) -> bool {
             | HarnessId::Grok
             | HarnessId::Muse
             | HarnessId::Cline
+            | HarnessId::Hermes
     )
 }
 
@@ -6740,6 +6906,253 @@ fn toml_string(raw: &str, keys: &[&str]) -> Option<String> {
         }
         let value = value.trim().trim_matches(['"', '\'']).trim();
         (!value.is_empty()).then(|| value.to_string())
+    })
+}
+
+/// One credential row inside Hermes' `auth.json` — a `credential_pool`
+/// entry or a `providers.<name>` singleton state. Pool rows are credential
+/// ROTATION (several rows can back one login), not user-facing accounts, so
+/// komet reports the active provider's best row only.
+struct HermesCredential {
+    provider: String,
+    /// Stable per-row id (`credential_pool` `id`; the provider name for
+    /// singleton state) — the last-resort account key.
+    row_id: String,
+    label: Option<String>,
+    auth_type: Option<String>,
+    /// Token-shaped strings worth JWT-decoding, most-trusted first.
+    tokens: Vec<String>,
+}
+
+/// Token-shaped string fields Hermes persists on a credential row or a
+/// provider singleton (`tokens` is the Codex/xAI nested shape).
+fn hermes_token_strings(value: &serde_json::Value) -> Vec<String> {
+    const KEYS: &[&str] = &[
+        "access_token",
+        "agent_key",
+        "id_token",
+        "refresh_token",
+        "api_key",
+        "token",
+    ];
+    let mut tokens = Vec::new();
+    let mut push = |v: &serde_json::Value| {
+        if let Some(s) = v.as_str().filter(|s| !s.is_empty()) {
+            tokens.push(s.to_string());
+        }
+    };
+    for key in KEYS {
+        if let Some(v) = value.get(*key) {
+            push(v);
+        }
+    }
+    if let Some(nested) = value.get("tokens") {
+        for key in KEYS {
+            if let Some(v) = nested.get(*key) {
+                push(v);
+            }
+        }
+    }
+    tokens
+}
+
+/// `(email, display name, subject)` mined from a token's unverified JWT
+/// claims — same trust level as `jwt_claims` everywhere else here: the
+/// user's own CLI already trusts these tokens.
+fn hermes_jwt_identity(token: &str) -> (Option<String>, Option<String>, Option<String>) {
+    let claims = jwt_claims(token).unwrap_or_else(|| serde_json::json!({}));
+    let email = ["email", "preferred_username", "upn"]
+        .into_iter()
+        .find_map(|key| str_field(&claims, key));
+    let name = str_field(&claims, "name");
+    let sub = str_field(&claims, "sub");
+    (email, name, sub)
+}
+
+/// A pool `label`/`source` is a credential fingerprint ("device_code",
+/// "gh_cli", an env var name…), not a person — only `@`-shaped values count
+/// as an email, and machine-looking labels never become a display name.
+fn hermes_label_is_email(label: &str) -> bool {
+    label.contains('@')
+}
+
+fn hermes_label_is_identity(label: &str) -> bool {
+    if hermes_label_is_email(label) || label.contains("://") || label.ends_with(".json") {
+        return false;
+    }
+    let lower = label.to_ascii_lowercase();
+    !matches!(
+        lower.as_str(),
+        "device_code"
+            | "manual"
+            | "oauth"
+            | "api_key"
+            | "gh_cli"
+            | "gh auth token"
+            | "claude_code"
+            | "hermes_pkce"
+            | "qwen-cli"
+            | "model_config"
+            | "manual:device_code"
+    ) && !lower.starts_with("env:")
+        && !lower.starts_with("manual:")
+        && !lower.starts_with("config:")
+        && !lower.starts_with("op://")
+}
+
+/// Display name for a Hermes provider id (`openai-codex` → "OpenAI Codex").
+fn hermes_provider_label(provider: &str) -> String {
+    match provider {
+        "nous" => "Nous".to_string(),
+        "copilot" => "GitHub Copilot".to_string(),
+        "openai-codex" | "codex" => "OpenAI Codex".to_string(),
+        "xai-oauth" | "xai" => "xAI".to_string(),
+        "anthropic" => "Anthropic".to_string(),
+        "minimax-oauth" | "minimax" => "MiniMax".to_string(),
+        other => {
+            let mut label = other.replace(['-', '_'], " ");
+            if let Some(first) = label.get_mut(0..1) {
+                first.make_ascii_uppercase();
+            }
+            label
+        }
+    }
+}
+
+/// Hermes' `~/.hermes/auth.json` (`$HERMES_HOME` relocates the home):
+/// `credential_pool.<provider>[]` rows carry the live credentials — secrets
+/// stripped to a `secret_fingerprint` for borrowed sources (e.g. a Copilot
+/// row fed by `gh`) — and `providers.<name>` holds singleton state with a
+/// nested `tokens` object for Codex/xAI. Identity comes from JWT claims,
+/// then the row `label`; a row with neither still proves a login exists, so
+/// it surfaces under a provider-scoped placeholder like Qoder's.
+fn parse_hermes_auth(auth: &serde_json::Value) -> Option<Detected> {
+    let active_provider = auth.get("active_provider").and_then(|v| v.as_str());
+    let mut credentials: Vec<HermesCredential> = Vec::new();
+
+    if let Some(pool) = auth.get("credential_pool").and_then(|v| v.as_object()) {
+        let mut providers: Vec<(&String, &serde_json::Value)> = pool.iter().collect();
+        providers.sort_by(|a, b| a.0.cmp(b.0));
+        for (provider, entries) in providers {
+            let Some(entries) = entries.as_array() else {
+                continue;
+            };
+            let mut rows: Vec<&serde_json::Value> = entries.iter().collect();
+            rows.sort_by(|a, b| {
+                let key = |v: &serde_json::Value| {
+                    (
+                        v.get("priority").and_then(|p| p.as_i64()).unwrap_or(0),
+                        str_field(v, "id").unwrap_or_default(),
+                    )
+                };
+                key(a).cmp(&key(b))
+            });
+            for entry in rows {
+                credentials.push(HermesCredential {
+                    provider: provider.clone(),
+                    row_id: str_field(entry, "id").unwrap_or_else(|| provider.clone()),
+                    label: str_field(entry, "label"),
+                    auth_type: str_field(entry, "auth_type"),
+                    tokens: hermes_token_strings(entry),
+                });
+            }
+        }
+    }
+    // Singleton state counts only when it carries credential material — a
+    // `providers.<name>` block reduced to `last_auth_error` is a dead login,
+    // not an account.
+    if let Some(providers) = auth.get("providers").and_then(|v| v.as_object()) {
+        let mut names: Vec<&String> = providers.keys().collect();
+        names.sort();
+        for name in names {
+            let state = &providers[name];
+            let tokens = hermes_token_strings(state);
+            if tokens.is_empty() {
+                continue;
+            }
+            credentials.push(HermesCredential {
+                provider: name.clone(),
+                row_id: name.clone(),
+                label: str_field(state, "label"),
+                auth_type: None,
+                tokens,
+            });
+        }
+    }
+    if credentials.is_empty() {
+        return None;
+    }
+
+    // Identity per row: JWT claims first (email-ish claim > name > sub),
+    // then an `@`-shaped label. `sub` alone still keys the account.
+    let identities: Vec<(Option<String>, Option<String>, Option<String>)> = credentials
+        .iter()
+        .map(|c| {
+            let mut email = None;
+            let mut name = None;
+            let mut sub = None;
+            for token in &c.tokens {
+                let (e, n, s) = hermes_jwt_identity(token);
+                email = email.or(e);
+                name = name.or(n);
+                sub = sub.or(s);
+            }
+            if email.is_none()
+                && let Some(label) = &c.label
+                && hermes_label_is_email(label)
+            {
+                email = Some(label.clone());
+            }
+            (email, name, sub)
+        })
+        .collect();
+
+    // The active provider's rows first; inside each group a row exposing an
+    // email beats one with only a subject, which beats a bare credential
+    // fingerprint. `sort_by` is stable, so the deterministic collection order
+    // (provider name, then priority/id) breaks remaining ties.
+    let mut order: Vec<usize> = (0..credentials.len()).collect();
+    order.sort_by(|&a, &b| {
+        let rank = |i: usize| {
+            (
+                credentials[i].provider != active_provider.unwrap_or(""),
+                identities[i].0.is_none(),
+                identities[i].2.is_none(),
+            )
+        };
+        rank(a).cmp(&rank(b))
+    });
+    let best = order[0];
+    let cred = &credentials[best];
+    let (email, jwt_name, sub) = &identities[best];
+
+    let account_key = email
+        .as_ref()
+        .map(|e| e.to_lowercase())
+        .or_else(|| sub.clone())
+        .unwrap_or_else(|| format!("{}:{}", cred.provider, cred.row_id));
+    let display_name = jwt_name.clone().or_else(|| {
+        cred.label
+            .as_ref()
+            .filter(|l| hermes_label_is_identity(l))
+            .cloned()
+    });
+    Some(Detected {
+        account_key,
+        profile: SlotProfile {
+            email: email
+                .clone()
+                .unwrap_or_else(|| format!("Hermes · {}", hermes_provider_label(&cred.provider))),
+            display_name,
+            organization: None,
+            plan: None,
+            auth_kind: match cred.auth_type.as_deref() {
+                Some("api_key") => AgentAuthKind::ApiKey,
+                _ => AgentAuthKind::Oauth,
+            },
+        },
+        credentials: Some(serde_json::json!({ "managedBy": "hermes" })),
+        claude_config: None,
     })
 }
 
@@ -7465,6 +7878,67 @@ mod tests {
         assert_eq!(devin.account_key, "dev-1");
         assert_eq!(devin.profile.email, "d@e.f");
         assert_eq!(devin.profile.display_name.as_deref(), Some("Devin User"));
+
+        // Hermes: `credential_pool` rows + `providers` singleton state. The
+        // active provider's row wins; identity comes from JWT claims, then
+        // an `@`-shaped label — machine labels ("device_code", "gh auth
+        // token") never become an email.
+        let jwt = |claims: &str| format!("h.{}.s", BASE64_URL.encode(claims));
+        let hermes = parse_hermes_auth(&serde_json::json!({
+            "active_provider": "nous",
+            "credential_pool": {
+                "copilot": [{
+                    "id": "c1", "label": "gh auth token", "auth_type": "api_key",
+                    "priority": 0, "source": "gh_cli",
+                }],
+                "nous": [{
+                    "id": "n1", "label": "device_code", "auth_type": "oauth",
+                    "priority": 0,
+                    "access_token": jwt(r#"{"email":"H@I.J","name":"Hermes User","sub":"u-1"}"#),
+                }],
+            },
+            "providers": {"nous": {"client_id": "hermes-cli"}},
+        }))
+        .expect("hermes auth");
+        assert_eq!(hermes.account_key, "h@i.j");
+        assert_eq!(hermes.profile.email, "H@I.J");
+        assert_eq!(hermes.profile.display_name.as_deref(), Some("Hermes User"));
+
+        // A borrowed row whose secret was stripped to a fingerprint still
+        // proves a login: provider-scoped placeholder, stable row key.
+        let hermes_borrowed = parse_hermes_auth(&serde_json::json!({
+            "active_provider": "copilot",
+            "credential_pool": {
+                "copilot": [{
+                    "id": "d6324d", "label": "gh auth token", "auth_type": "api_key",
+                    "priority": 0, "source": "gh_cli", "secret_fingerprint": "sha256:abc",
+                }],
+            },
+        }))
+        .expect("hermes borrowed credential");
+        assert_eq!(hermes_borrowed.account_key, "copilot:d6324d");
+        assert_eq!(hermes_borrowed.profile.email, "Hermes · GitHub Copilot");
+
+        // Singleton `providers.<name>` tokens (Codex/xAI nested `tokens`)
+        // count as credential material; metadata-only state does not.
+        let hermes_codex = parse_hermes_auth(&serde_json::json!({
+            "providers": {
+                "openai-codex": {
+                    "tokens": {
+                        "access_token": jwt(r#"{"email":"cx@d.e","sub":"codex-sub"}"#),
+                    },
+                },
+            },
+        }))
+        .expect("hermes codex singleton");
+        assert_eq!(hermes_codex.account_key, "cx@d.e");
+        assert!(
+            parse_hermes_auth(&serde_json::json!({
+                "active_provider": "nous",
+                "providers": {"nous": {"last_auth_error": {"code": "invalid_grant"}}},
+            }))
+            .is_none()
+        );
     }
 
     #[test]
@@ -7627,6 +8101,124 @@ mod tests {
                 .iter()
                 .any(|a| a.harness == HarnessId::Grok && a.id == slot_b)
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Issue #53: the account timeline records Komet's own switches verbatim,
+    /// marks a login done outside Komet as an unattributable gap, survives a
+    /// restart (the store is reloaded, nothing is re-guessed), and turns
+    /// untagged when the live store disappears.
+    #[tokio::test]
+    async fn account_timeline_tracks_switches_external_logins_and_restarts() {
+        use crate::usage_sources::{Attribution, TimelineStore};
+
+        let root = std::env::temp_dir().join(format!(
+            "komet-account-timeline-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let config = AgentAccountsConfig {
+            data_dir: root.join("data"),
+            gh_cli: None,
+            claude_config_dir: root.join("claude"),
+            claude_config_file: root.join("claude.json"),
+            codex_home: root.join("codex"),
+            antigravity_home: root.join("antigravity"),
+            cursor_auth_file: root.join("sdk").join("auth.json"),
+            opencode_db: root.join("opencode/opencode.db"),
+            pi_auth: root.join("pi/auth.json"),
+            pi_settings: root.join("pi/settings.json"),
+            cli_files: CliProviderFiles::under(&root),
+        };
+        let usage_root = root.join("usage-root");
+        let store = Arc::new(crate::usage::UsageStore::open(&usage_root).unwrap());
+        let timeline = || TimelineStore::open(store.path()).unwrap().load();
+        let grok_timeline = |loaded: &HashMap<String, crate::usage_sources::ActivationTimeline>| {
+            loaded.get("grok").expect("grok timeline").clone()
+        };
+
+        let accounts = AgentAccounts::new(config.clone());
+        accounts.set_usage_store(store.clone(), "device-test".into());
+        let grok = config.cli_files.grok_auth.clone();
+        std::fs::create_dir_all(grok.parent().unwrap()).unwrap();
+        let store_a =
+            br#"{"https://auth.x.ai::a":{"email":"a@x.dev","user_id":"grok-a","token":"t1"}}"#;
+        std::fs::write(&grok, store_a).unwrap();
+
+        // First observation: account A live, no gap (Komet saw it from the start).
+        let snapshot = accounts.list(UsageMode::Offline).await.expect("list");
+        let slot_a = snapshot
+            .accounts
+            .iter()
+            .find(|a| a.harness == HarnessId::Grok && a.active)
+            .expect("active grok")
+            .id
+            .clone();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let tl = grok_timeline(&timeline());
+        assert_eq!(tl.entries().len(), 1);
+        let first = &tl.entries()[0];
+        assert_eq!(
+            tl.account_at(now_ms()),
+            Attribution::Account(first.account.clone().expect("account a"))
+        );
+
+        // External login: store B lands while Komet is not looking → the
+        // stretch since A's activation is a gap, not a guess.
+        let store_b =
+            br#"{"https://auth.x.ai::b":{"email":"b@x.dev","user_id":"grok-b","token":"t2"}}"#;
+        std::fs::write(&grok, store_b).unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        accounts.list(UsageMode::Offline).await.expect("list");
+        let tl = grok_timeline(&timeline());
+        assert_eq!(tl.entries().len(), 2);
+        let second = &tl.entries()[1];
+        assert_eq!(second.gap_from, Some(first.ts));
+        assert_ne!(second.account, first.account);
+        assert_eq!(tl.account_at(second.ts - 1), Attribution::Unknown);
+        assert_eq!(
+            tl.account_at(now_ms()),
+            Attribution::Account(second.account.clone().expect("account"))
+        );
+
+        // Komet's own switch back to A: recorded verbatim, no gap — turns
+        // before it still belong to B.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        accounts
+            .activate(HarnessId::Grok, &slot_a)
+            .await
+            .expect("activate A");
+        let tl = grok_timeline(&timeline());
+        assert_eq!(tl.entries().len(), 3);
+        let third = &tl.entries()[2];
+        assert_eq!(third.account, first.account);
+        assert_eq!(third.gap_from, None);
+        assert_eq!(
+            tl.account_at(third.ts - 1),
+            Attribution::Account(second.account.clone().expect("account b"))
+        );
+
+        // Restart: a fresh AgentAccounts reloads the same file and its
+        // reconcile finds nothing new to record.
+        let accounts2 = AgentAccounts::new(config.clone());
+        accounts2.set_usage_store(store.clone(), "device-test".into());
+        accounts2.list(UsageMode::Offline).await.expect("list");
+        let tl = grok_timeline(&timeline());
+        assert_eq!(tl.entries().len(), 3, "restart must not duplicate entries");
+        assert_eq!(
+            tl.account_at(now_ms()),
+            Attribution::Account(first.account.clone().expect("a"))
+        );
+
+        // The live store disappears (logout outside Komet): the account
+        // becomes untagged rather than staying pinned to A.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        std::fs::remove_file(&grok).unwrap();
+        accounts2.list(UsageMode::Offline).await.expect("list");
+        let tl = grok_timeline(&timeline());
+        assert_eq!(tl.entries().len(), 4);
+        assert_eq!(tl.entries()[3].account, None);
+        assert_eq!(tl.account_at(now_ms()), Attribution::Untagged);
         let _ = std::fs::remove_dir_all(&root);
     }
 

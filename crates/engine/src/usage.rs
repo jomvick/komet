@@ -413,6 +413,32 @@ impl UsageStore {
         series
     }
 
+    /// Measured turns at or after `since` as dedup keys for the local-log
+    /// readers (issue #53). Same visibility rule as `summarize`: rows tagged
+    /// with another account are excluded, untagged legacy rows always count.
+    pub fn measured_keys(
+        &self,
+        since: DateTime<Utc>,
+        harness: HarnessId,
+        active_account: Option<&str>,
+    ) -> Vec<crate::usage_sources::MeasuredKey> {
+        let cutoff = since.timestamp_millis();
+        let mut keys = Vec::new();
+        self.for_each::<TurnUsage>(TURNS_FILE, |turn| {
+            if turn.harness == harness
+                && turn.ts >= cutoff
+                && account_visible(turn.account.as_deref(), active_account)
+            {
+                keys.push(crate::usage_sources::MeasuredKey {
+                    ts: turn.ts,
+                    input_tokens: turn.input_tokens,
+                    output_tokens: turn.output_tokens,
+                });
+            }
+        });
+        keys
+    }
+
     /// Newest quota sample timestamp per `(agent, account)` bucket.
     pub fn last_quota_at(&self) -> HashMap<String, DateTime<Utc>> {
         let mut latest: HashMap<String, DateTime<Utc>> = HashMap::new();

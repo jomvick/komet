@@ -863,6 +863,53 @@ pub struct UsageQuotaPoint {
     pub windows: Vec<AgentUsageWindow>,
 }
 
+/// How complete a usage figure is — local logs, account attribution, …
+/// (`Unavailable` means "we cannot say", never "zero").
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum UsageCoverage {
+    Complete,
+    Partial,
+    #[default]
+    Unavailable,
+}
+
+/// Tokens reconstructed from the agent's own local logs, attributed to the
+/// account that was active when each turn ran (issue #53). Kept visually and
+/// structurally separate from provider quota (`usage_windows`) and from
+/// Komet-measured turns (`last_*`) — three different sources, three labels.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentLocalUsage {
+    #[serde(default)]
+    pub day: UsageTotals,
+    #[serde(default)]
+    pub last_7_days: UsageTotals,
+    #[serde(default)]
+    pub last_30_days: UsageTotals,
+    /// Turns inside `last_30_days` that no account could be attributed to
+    /// (the account changed while Komet was not running). Drives the
+    /// "couverture partielle" phrase in the UI.
+    #[serde(default)]
+    pub unattributed_turns: u64,
+    /// Reader's own label, e.g. "local logs".
+    #[serde(default)]
+    pub source_label: String,
+    #[serde(default)]
+    pub coverage: UsageCoverage,
+    /// Why coverage is not `Complete` ("no session directory", "N unreadable
+    /// lines", "muse session logs carry no token counters", …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// API-equivalent estimates per window; `None` = no priced model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub day_cost: Option<UsageCostEstimate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub week_cost: Option<UsageCostEstimate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub month_cost: Option<UsageCostEstimate>,
+}
+
 /// One agent's row on the Usage page: the active account's provider meters
 /// plus Komet-measured totals.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -909,6 +956,11 @@ pub struct AgentUsageReport {
     pub week_cost: Option<UsageCostEstimate>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub month_cost: Option<UsageCostEstimate>,
+    /// Tokens from the agent's own local logs for the active account.
+    /// `None` when the agent keeps no usable local source — the UI then
+    /// falls back to measured turns with a precise reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_usage: Option<AgentLocalUsage>,
 }
 
 /// Estimated spend for one measured window, labelled as an estimate (M5).
