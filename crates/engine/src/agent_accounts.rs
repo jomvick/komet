@@ -5499,6 +5499,49 @@ impl AgentAccounts {
         last
     }
 
+    /// Complete a summary that dropped a group with the flat per-model quota.
+    /// Consumer accounts answer `retrieveUserQuotaSummary` with the Claude/GPT
+    /// group only while `retrieveUserQuota` still carries the Gemini buckets,
+    /// which made the Gemini bar disappear (measured 2026-11-14).
+    async fn antigravity_fill_missing_groups(
+        &self,
+        endpoint: &str,
+        token: &str,
+        body: &serde_json::Value,
+        windows: &mut Vec<AgentUsageWindow>,
+    ) {
+        const GROUPS: [&str; 2] = ["Gemini", "Claude/GPT"];
+        if GROUPS
+            .iter()
+            .all(|label| windows.iter().any(|window| window.label == *label))
+        {
+            return;
+        }
+        let flat = endpoint.replace("retrieveUserQuotaSummary", "retrieveUserQuota");
+        let Ok(response) = self
+            .inner
+            .http
+            .post(&flat)
+            .bearer_auth(token)
+            .header("Content-Type", "application/json")
+            .header("User-Agent", "antigravity")
+            .header("x-goog-api-client", "gl-go/1.22 gdcl/0.0.0")
+            .json(body)
+            .send()
+            .await
+        else {
+            return;
+        };
+        let Ok(body) = response.json::<serde_json::Value>().await else {
+            return;
+        };
+        for window in parse_antigravity_flat_quota(&body) {
+            if !windows.iter().any(|known| known.label == window.label) {
+                windows.push(window);
+            }
+        }
+    }
+
     async fn query_antigravity_pa_once(
         &self,
         endpoint: &str,
@@ -5527,8 +5570,10 @@ impl AgentAccounts {
         let json = resp.json::<serde_json::Value>().await.unwrap_or_default();
         // Parse before classifying the status: an exhausted plan answers 403
         // with the quota still in the body. Skipping that hid the meters.
-        let windows = parse_antigravity_quota_response(&json);
+        let mut windows = parse_antigravity_quota_response(&json);
         if !windows.is_empty() {
+            self.antigravity_fill_missing_groups(endpoint, token, body, &mut windows)
+                .await;
             return PaProbe::Windows(windows);
         }
         if let Some(outcome) = classify_probe_status(status) {
@@ -7326,6 +7371,53 @@ fn parse_antigravity_quota_response(body: &serde_json::Value) -> Vec<AgentUsageW
     windows
 }
 
+/// Group the flat `retrieveUserQuota` buckets (one per model) into the family
+/// labels the summary endpoint uses. `chat_*` buckets carry no quota window.
+fn parse_antigravity_flat_quota(body: &serde_json::Value) -> Vec<AgentUsageWindow> {
+    let resp = body.get("response").unwrap_or(body);
+    let mut groups: Vec<AgentUsageWindow> = Vec::new();
+    for bucket in resp
+        .get("buckets")
+        .and_then(|b| b.as_array())
+        .into_iter()
+        .flatten()
+    {
+        let Some(used) = bucket_used_fraction(bucket) else {
+            continue;
+        };
+        let Some(model) = str_field(bucket, "modelId") else {
+            continue;
+        };
+        let model = model.to_ascii_lowercase();
+        let label = if model.contains("gemini") {
+            "Gemini"
+        } else if model.contains("claude") || model.contains("gpt") {
+            "Claude/GPT"
+        } else {
+            continue;
+        };
+        let resets_at =
+            parse_when(bucket.get("resetTime")).or_else(|| parse_when(bucket.get("reset_time")));
+        match groups.iter_mut().find(|window| window.label == label) {
+            // Every model shares the group limit; keep the tightest reading.
+            Some(window) => {
+                if used > window.used_fraction {
+                    window.used_fraction = used;
+                    window.resets_at = resets_at.or(window.resets_at);
+                }
+            }
+            None => groups.push(AgentUsageWindow {
+                label: label.to_string(),
+                used_fraction: used,
+                resets_at,
+                display_value: None,
+                window_seconds: bucket_window_seconds(bucket),
+            }),
+        }
+    }
+    groups
+}
+
 /// Number-or-string JSON float (protobuf JSON sometimes encodes doubles as
 /// strings; language_server may wrap them as `{ "value": … }`).
 fn json_f64(value: &serde_json::Value) -> Option<f64> {
@@ -8865,6 +8957,28 @@ mod tests {
         assert!(windows[0].resets_at.is_some());
         assert_eq!(windows[1].label, "Claude/GPT");
         assert!((windows[1].used_fraction - 0.4).abs() < 0.01);
+    }
+
+    #[test]
+    fn parse_antigravity_flat_quota_groups_by_model_family() {
+        // Real shape of `retrieveUserQuota` when the summary omits Gemini.
+        let json = serde_json::json!({
+            "buckets": [
+                { "tokenType": "WTUS", "modelId": "chat_20706", "remainingFraction": 1 },
+                { "resetTime": "2026-11-21T17:11:14Z", "tokenType": "WTUS", "modelId": "claude-opus-4-6-thinking", "remainingFraction": 0 },
+                { "resetTime": "2026-11-21T17:11:14Z", "tokenType": "WTUS", "modelId": "claude-sonnet-4-6", "remainingFraction": 0 },
+                { "resetTime": "2026-11-20T21:49:54Z", "tokenType": "WTUS", "modelId": "gemini-2.5-flash", "remainingFraction": 0.3 },
+                { "resetTime": "2026-11-20T21:49:54Z", "tokenType": "WTUS", "modelId": "gemini-3-flash", "remainingFraction": 0.3 }
+            ]
+        });
+        let windows = parse_antigravity_flat_quota(&json);
+        assert_eq!(windows.len(), 2);
+        assert_eq!(windows[0].label, "Claude/GPT");
+        assert!((windows[0].used_fraction - 1.0).abs() < 0.01);
+        assert!(windows[0].resets_at.is_some());
+        assert_eq!(windows[1].label, "Gemini");
+        assert!((windows[1].used_fraction - 0.7).abs() < 0.01);
+        assert!(windows[1].resets_at.is_some());
     }
 
     // ── antigravity language_server discovery (Linux /proc contract) ───────
