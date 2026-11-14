@@ -79,16 +79,11 @@ fn persistent_plan_card_shows_unfinished_work() {
     // One open task is enough: the card stays above the composer however
     // long the transcript gets, because it is derived from the doc, not
     // from what happens to be on screen.
-    assert_eq!(plan_card_layout(1, 0, true), Some((1, 0)));
-    assert_eq!(
-        plan_card_layout(1, 0, false),
-        Some((1, 0)),
-        "unfinished work keeps the card even after the run settles"
-    );
+    assert_eq!(plan_card_layout(1, 0), Some((1, 0)));
     // Past the display cap the extra tasks are announced, never silently cut.
-    assert_eq!(plan_card_layout(9, 2, true), Some((6, 3)));
+    assert_eq!(plan_card_layout(9, 2), Some((6, 3)));
     assert_eq!(
-        plan_card_layout(PLAN_CARD_MAX_ROWS, 0, true),
+        plan_card_layout(PLAN_CARD_MAX_ROWS, 0),
         Some((6, 0)),
         "exactly at the cap there is nothing to announce"
     );
@@ -97,20 +92,16 @@ fn persistent_plan_card_shows_unfinished_work() {
 #[test]
 fn persistent_plan_card_leaves_when_the_plan_is_done() {
     assert_eq!(
-        plan_card_layout(3, 3, false),
+        plan_card_layout(3, 3),
         None,
-        "everything done and the run settled: the chips carry the record"
+        "everything done: the chips carry the record"
     );
     assert_eq!(
-        plan_card_layout(3, 3, true),
-        Some((3, 0)),
-        "a live run keeps the last plan on screen — no flicker at the tail"
+        plan_card_layout(4, 3),
+        Some((4, 0)),
+        "one open task keeps the card"
     );
-    assert_eq!(
-        plan_card_layout(0, 0, true),
-        None,
-        "an empty plan never renders a card"
-    );
+    assert_eq!(plan_card_layout(0, 0), None, "an empty plan never renders");
 }
 
 #[test]

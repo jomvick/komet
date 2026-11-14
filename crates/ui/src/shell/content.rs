@@ -981,21 +981,15 @@ impl Shell {
     }
 
     /// The selected chat's current plan, above the composer. Visible while
-    /// work remains or the run is still live: once every task is done and the
-    /// run has settled, the transcript chips keep the record and the card
-    /// leaves the chrome. Width matches the composer column so the two read as
-    /// one stack; nothing here takes focus or blocks typing.
+    /// work remains: once every task is done the transcript chips keep the
+    /// record and the card leaves the chrome. Width matches the composer column
+    /// so the two read as one stack; nothing here takes focus or blocks typing.
     fn render_plan_card(&self, cx: &App) -> Option<AnyElement> {
         let state = self.state.read(cx);
-        let chat_id = state.selected_chat.as_deref()?;
         let plan = state.active_plan.as_deref()?;
         let total = plan.len();
         let done = plan.iter().filter(|item| item.done).count();
-        let run_live = matches!(
-            state.indicator_for(chat_id, Utc::now()),
-            Indicator::Working | Indicator::AwaitingInput
-        );
-        let (rows, hidden) = plan_card_layout(total, done, run_live)?;
+        let (rows, hidden) = plan_card_layout(total, done)?;
         let theme = Theme::of(cx).clone();
         Some(
             div()
@@ -1892,13 +1886,13 @@ impl Shell {
 pub const PLAN_CARD_MAX_ROWS: usize = 6;
 
 /// The plan card's two rules, decided apart from rendering. Visibility: open
-/// work always shows the card, and a fully-done plan leaves once the run
-/// settles (the transcript chips keep the record) — a run still going keeps the
-/// card up so the last tick is never a flicker. Cap: rows past
+/// work shows the card; a fully-done plan leaves immediately (the transcript
+/// chips keep the record) — otherwise the previous run's finished plan sits
+/// above the composer while the next run is live. Cap: rows past
 /// [`PLAN_CARD_MAX_ROWS`] are counted so the card can announce `+N` instead of
 /// silently cutting the list (transparency invariant I9).
-pub fn plan_card_layout(total: usize, done: usize, run_live: bool) -> Option<(usize, usize)> {
-    if total == 0 || (done == total && !run_live) {
+pub fn plan_card_layout(total: usize, done: usize) -> Option<(usize, usize)> {
+    if total == 0 || done >= total {
         return None;
     }
     let rows = total.min(PLAN_CARD_MAX_ROWS);
