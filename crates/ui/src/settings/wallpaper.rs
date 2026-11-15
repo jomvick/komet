@@ -1,10 +1,68 @@
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use gpui::{AnyElement, App, Global, Hsla, div, prelude::*, px};
+use sha2::{Digest, Sha256};
 
 use crate::settings::UiSettings;
 use crate::theme::Theme;
+
+/// Wallpapers are copied here on import so moving or deleting the source file
+/// later never blanks the app.
+fn wallpapers_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join("wallpapers")
+}
+
+/// Copy `src` under `{data_dir}/wallpapers/`, keyed by content hash so picking
+/// the same image twice reuses one file. No-op when `src` is already there.
+fn import_copy(data_dir: &Path, src: &Path) -> io::Result<PathBuf> {
+    let dir = wallpapers_dir(data_dir);
+    let canonical_dir = dir.canonicalize().unwrap_or_else(|_| dir.clone());
+    let canonical_src = src.canonicalize()?;
+    if canonical_src.starts_with(&canonical_dir) {
+        return Ok(canonical_src);
+    }
+
+    let bytes = std::fs::read(&canonical_src)?;
+    let digest = Sha256::digest(&bytes);
+    let stem: String = digest
+        .iter()
+        .take(8)
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let ext = canonical_src
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("img")
+        .to_ascii_lowercase();
+    std::fs::create_dir_all(&dir)?;
+    let stored = dir.join(format!("{stem}.{ext}"));
+    if !stored.exists() {
+        std::fs::write(&stored, &bytes)?;
+    }
+    Ok(stored)
+}
+
+/// Import `new`, persist it, and drop the previous copy. Returns the stored path.
+fn persist_path(data_dir: &Path, new: Option<&Path>) -> io::Result<Option<PathBuf>> {
+    let mut settings = UiSettings::load(data_dir);
+    let old = settings.wallpaper_path.clone().map(PathBuf::from);
+    let stored = match new {
+        Some(src) => Some(import_copy(data_dir, src)?),
+        None => None,
+    };
+    if let Some(old) = old.as_deref() {
+        if Some(old) != stored.as_deref() && old.starts_with(wallpapers_dir(data_dir)) {
+            // Best-effort: a missing copy is not an error.
+            let _ = std::fs::remove_file(old);
+        }
+    }
+    settings.wallpaper_path = stored
+        .as_ref()
+        .map(|path| path.to_string_lossy().into_owned());
+    settings.save(data_dir)?;
+    Ok(stored)
+}
 
 /// Where the wallpaper is painted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
@@ -237,19 +295,14 @@ pub fn set_path(path: Option<PathBuf>, cx: &mut App) -> io::Result<()> {
     }
     let data_dir = state.data_dir.clone();
 
-    let mut settings = UiSettings::load(&data_dir);
-    settings.wallpaper_path = path
-        .as_ref()
-        .map(|path| path.to_string_lossy().into_owned());
-    settings.save(&data_dir)?;
+    let stored = persist_path(&data_dir, path.as_deref())?;
 
-    cx.global_mut::<WallpaperState>().path = path;
+    cx.global_mut::<WallpaperState>().path = stored;
     let appearance = Theme::of(cx).appearance;
     Theme::install(appearance, cx);
     cx.refresh_windows();
     Ok(())
 }
-
 /// Change where the wallpaper is painted and persist it. The theme is
 /// re-installed because only the whole-window scope makes the shell surfaces
 /// translucent.
@@ -271,4 +324,56 @@ pub fn set_scope(scope: WallpaperScope, cx: &mut App) -> io::Result<()> {
     Theme::install(appearance, cx);
     cx.refresh_windows();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture(dir: &Path, name: &str, bytes: &[u8]) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    #[test]
+    fn import_copy_moves_the_image_under_the_data_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = fixture(dir.path(), "a.png", b"png-bytes");
+        let stored = import_copy(dir.path(), &src).unwrap();
+        assert!(stored.starts_with(dir.path().join("wallpapers")));
+        assert_eq!(std::fs::read(&stored).unwrap(), b"png-bytes");
+        assert_eq!(
+            import_copy(dir.path(), &stored).unwrap(),
+            stored,
+            "import is idempotent"
+        );
+    }
+
+    #[test]
+    fn persisting_a_new_wallpaper_drops_the_previous_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = fixture(dir.path(), "a.png", b"aaa");
+        let b = fixture(dir.path(), "b.png", b"bbb");
+
+        let first = persist_path(dir.path(), Some(&a)).unwrap().unwrap();
+        let second = persist_path(dir.path(), Some(&b)).unwrap().unwrap();
+
+        assert!(!first.exists(), "the replaced copy is deleted");
+        assert!(second.exists());
+        assert_eq!(
+            UiSettings::load(dir.path()).wallpaper_path.as_deref(),
+            Some(second.to_string_lossy().as_ref())
+        );
+    }
+
+    #[test]
+    fn removing_the_wallpaper_deletes_the_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = fixture(dir.path(), "a.png", b"aaa");
+        let stored = persist_path(dir.path(), Some(&a)).unwrap().unwrap();
+        assert_eq!(persist_path(dir.path(), None).unwrap(), None);
+        assert!(!stored.exists());
+        assert_eq!(UiSettings::load(dir.path()).wallpaper_path, None);
+    }
 }
