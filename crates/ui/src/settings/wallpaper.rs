@@ -47,6 +47,15 @@ fn import_copy(data_dir: &Path, src: &Path) -> io::Result<PathBuf> {
     Ok(stored)
 }
 
+/// True when both paths resolve to the same file (a data dir reached through a
+/// symlink gives two spellings of one copy).
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
+}
+
 /// Import `new`, persist it, and drop the previous copy. Returns the stored path.
 fn persist_path(data_dir: &Path, new: Option<&Path>) -> io::Result<Option<PathBuf>> {
     let mut settings = UiSettings::load(data_dir);
@@ -55,17 +64,20 @@ fn persist_path(data_dir: &Path, new: Option<&Path>) -> io::Result<Option<PathBu
         Some(src) => Some(import_copy(data_dir, src)?),
         None => None,
     };
+    settings.wallpaper_path = stored
+        .as_ref()
+        .map(|path| path.to_string_lossy().into_owned());
+    // Save first: a failed write must leave the copy the settings still point at.
+    settings.save(data_dir)?;
     if let Some(old) = old.as_deref()
-        && Some(old) != stored.as_deref()
+        && stored
+            .as_deref()
+            .is_none_or(|stored| !same_file(old, stored))
         && old.starts_with(wallpapers_dir(data_dir))
     {
         // Best-effort: a missing copy is not an error.
         let _ = std::fs::remove_file(old);
     }
-    settings.wallpaper_path = stored
-        .as_ref()
-        .map(|path| path.to_string_lossy().into_owned());
-    settings.save(data_dir)?;
     Ok(stored)
 }
 
@@ -253,6 +265,18 @@ fn veiled_image(source: AnyElement, tone: Hsla, scrim_alpha: f32, radius: f32) -
     )
 }
 
+/// The veil laid over the wallpaper inside the main card. The ASCII texture
+/// carries its own black backing, so the veil is only dropped once such a
+/// texture is actually painted — while the raw image is shown (or when it
+/// cannot be decoded), the veil keeps the panel text readable.
+pub fn scrim_alpha(effect: BackgroundEffect, has_texture: bool) -> f32 {
+    if effect.is_ascii() && has_texture {
+        0.0
+    } else {
+        CARD_SCRIM_ALPHA
+    }
+}
+
 /// The wallpaper layer for [`WallpaperScope::Panel`], to be the FIRST child of
 /// the main card (under its content, clipped by its rounded corners). `None` for
 /// `Window`, which paints behind the whole window.
@@ -268,11 +292,7 @@ pub fn card_layer(
         WallpaperScope::Panel => {
             // The ASCII texture carries its own black backing, so the veil
             // would only wash the glyphs out; the effect's opacity is the scrim.
-            let scrim = if effect.is_ascii() {
-                0.0
-            } else {
-                CARD_SCRIM_ALPHA
-            };
+            let scrim = scrim_alpha(effect, texture.is_some());
             Some(
                 div()
                     .absolute()
@@ -541,6 +561,63 @@ mod tests {
         assert_eq!(
             UiSettings::load(dir.path()).wallpaper_path.as_deref(),
             Some(second.to_string_lossy().as_ref())
+        );
+    }
+
+    #[test]
+    fn the_card_veil_stays_when_no_ascii_texture_is_painted() {
+        // The ASCII texture carries its own black backing, so the veil is only
+        // dropped once a texture exists. While the image is still the raw
+        // wallpaper — or when it cannot be decoded — the veil keeps the panel
+        // text readable.
+        assert_eq!(scrim_alpha(BackgroundEffect::None, true), CARD_SCRIM_ALPHA);
+        assert_eq!(scrim_alpha(BackgroundEffect::None, false), CARD_SCRIM_ALPHA);
+        assert_eq!(
+            scrim_alpha(BackgroundEffect::Ascii(Default::default()), true),
+            0.0
+        );
+        assert_eq!(
+            scrim_alpha(BackgroundEffect::Ascii(Default::default()), false),
+            CARD_SCRIM_ALPHA
+        );
+    }
+
+    #[test]
+    fn a_failed_save_keeps_the_previous_wallpaper_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = fixture(dir.path(), "a.png", b"aaa");
+        let b = fixture(dir.path(), "b.png", b"bbb");
+        let first = persist_path(dir.path(), Some(&a)).unwrap().unwrap();
+        assert!(first.exists());
+
+        // A directory where the atomic-write temp file goes makes the save fail.
+        std::fs::create_dir(dir.path().join("ui-settings.json.tmp")).unwrap();
+        assert!(persist_path(dir.path(), Some(&b)).is_err());
+        assert!(
+            first.exists(),
+            "a failed save must not delete the copy the settings still point at"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn picking_a_wallpaper_already_in_the_data_dir_keeps_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let src = fixture(dir.path(), "a.png", b"aaa");
+        let first = persist_path(&link, Some(&src)).unwrap().unwrap();
+        assert!(first.exists());
+
+        // The user picks the very file that is already stored: the stored path
+        // must survive, whichever spelling of the data dir the caller used.
+        let second = persist_path(&link, Some(&first)).unwrap().unwrap();
+        assert!(
+            second.exists(),
+            "re-picking the stored wallpaper deleted it"
         );
     }
 

@@ -90,6 +90,16 @@ pub const SAVE_DEBOUNCE_MS: u64 = 400;
 
 const FILE_NAME: &str = "ui-settings.json";
 
+/// A hand-edited or newer-build `backgroundEffect` must not reset every other
+/// preference (widths, keymap): an unreadable effect falls back to `None`.
+fn lenient_effect<'de, D>(deserializer: D) -> Result<wallpaper::BackgroundEffect, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).unwrap_or_default())
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct UiSettings {
@@ -171,6 +181,7 @@ pub struct UiSettings {
     /// Where the wallpaper is painted: whole window or main panel.
     pub wallpaper_scope: wallpaper::WallpaperScope,
     /// What is painted over the wallpaper: the image itself or an ASCII pass.
+    #[serde(default, deserialize_with = "lenient_effect")]
     pub background_effect: wallpaper::BackgroundEffect,
     /// Idle time before an edited workspace file is saved automatically.
     pub files_autosave_delay_ms: u64,
@@ -587,6 +598,33 @@ mod tests {
     fn background_effect_defaults_to_none_for_old_files() {
         let loaded: UiSettings = serde_json::from_str(r#"{"soundEnabled": false}"#).unwrap();
         assert_eq!(loaded.background_effect, wallpaper::BackgroundEffect::None);
+    }
+
+    #[test]
+    fn a_malformed_background_effect_does_not_wipe_the_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            UiSettings::path(dir.path()),
+            r#"{"sidebarWidth": 300, "backgroundEffect": "ascii"}"#,
+        )
+        .unwrap();
+
+        let loaded = UiSettings::load(dir.path());
+        assert_eq!(
+            loaded.background_effect,
+            wallpaper::BackgroundEffect::None,
+            "an unreadable effect falls back to none"
+        );
+        assert_eq!(
+            loaded.sidebar_width, 300.0,
+            "the rest of the settings must survive an unreadable effect"
+        );
+    }
+
+    #[test]
+    fn the_default_ascii_grid_is_120_columns() {
+        assert_eq!(wallpaper::AsciiParams::default().columns, 120);
+        assert_eq!(wallpaper::DEFAULT_COLUMNS, 120);
     }
 
     #[test]
