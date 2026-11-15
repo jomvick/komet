@@ -83,6 +83,14 @@ impl AppearancePage {
         });
         cx.notify();
     }
+
+    fn save_effect(&mut self, effect: wallpaper::BackgroundEffect, cx: &mut Context<Self>) {
+        self.wallpaper_error = wallpaper::set_effect(effect, cx).err().map(|err| {
+            tracing::warn!(error = %err, "could not apply background effect");
+            format!("Could not apply background effect: {err}")
+        });
+        cx.notify();
+    }
 }
 
 fn report_picker_error(
@@ -109,6 +117,63 @@ fn is_image_file(path: &Path) -> bool {
                     .iter()
                     .any(|supported| supported.eq_ignore_ascii_case(extension))
             })
+}
+
+/// Density presets, sparse → dense, in glyph columns.
+fn density_columns(preset: usize) -> u16 {
+    [80, 120, 160][preset.min(2)]
+}
+
+/// One segmented control button. The caller adds `.id`-less click handlers.
+fn segment(
+    theme: &Theme,
+    id: impl Into<SharedString>,
+    label: impl Into<SharedString>,
+    selected: bool,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id.into())
+        .px(px(12.0))
+        .py(px(8.0))
+        .rounded(px(10.0))
+        .border_1()
+        .border_color(if selected {
+            theme.border_strong
+        } else {
+            theme.border
+        })
+        .bg(if selected {
+            crate::theme::card_selected_bg()
+        } else {
+            theme.surface_raised.opacity(0.5)
+        })
+        .text_size(px(12.5))
+        .text_color(theme.text)
+        .cursor_pointer()
+        .child(label.into())
+}
+
+/// A caption over a row of [`segment`] buttons.
+fn labeled_row(theme: &Theme, label: &'static str, buttons: Vec<AnyElement>) -> gpui::Div {
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(6.0))
+        .child(
+            div()
+                .text_size(px(12.0))
+                .text_color(theme.text_muted)
+                .child(label),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .flex_wrap()
+                .items_center()
+                .gap(px(6.0))
+                .children(buttons),
+        )
 }
 
 /// One placeholder bar in the miniature, width given as a fraction of its
@@ -332,14 +397,185 @@ impl Render for AppearancePage {
                 )
         });
 
+        // Background effect. Shown once an image is chosen; ASCII reveals its
+        // own parameters only when selected.
+        let effect = wallpaper::effect(cx);
+        let ascii_params = match effect {
+            wallpaper::BackgroundEffect::Ascii(params) => params,
+            wallpaper::BackgroundEffect::None => wallpaper::AsciiParams::default(),
+        };
+        let ascii_supported = wallpaper_path
+            .as_deref()
+            .is_some_and(wallpaper::ascii::supports_ascii);
+        let effect_block = has_wallpaper.then(|| {
+            let current_is_ascii = effect.is_ascii();
+            let params = ascii_params;
+
+            let effect_buttons = div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(8.0))
+                .child(
+                    segment(&theme, "effect-none", "None", !current_is_ascii).on_click(
+                        cx.listener(|this, _, _, cx| {
+                            this.save_effect(wallpaper::BackgroundEffect::None, cx);
+                        }),
+                    ),
+                )
+                .child(
+                    segment(&theme, "effect-ascii", "ASCII", current_is_ascii)
+                        .when(!ascii_supported, |el| el.opacity(0.5))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.save_effect(wallpaper::BackgroundEffect::Ascii(params), cx);
+                        })),
+                );
+
+            let mut rows: Vec<AnyElement> = Vec::new();
+            if current_is_ascii {
+                let charset_buttons = wallpaper::AsciiCharset::ALL
+                    .into_iter()
+                    .map(|charset| {
+                        segment(
+                            &theme,
+                            format!("ascii-charset-{}", charset.label()),
+                            charset.label(),
+                            params.charset == charset,
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let next = wallpaper::AsciiParams { charset, ..params };
+                            this.save_effect(wallpaper::BackgroundEffect::Ascii(next), cx);
+                        }))
+                        .into_any_element()
+                    })
+                    .collect();
+                rows.push(labeled_row(&theme, "Character set", charset_buttons).into_any_element());
+
+                let color_buttons = wallpaper::AsciiColor::ALL
+                    .into_iter()
+                    .map(|color| {
+                        segment(
+                            &theme,
+                            format!("ascii-color-{}", color.label()),
+                            color.label(),
+                            params.color == color,
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let next = wallpaper::AsciiParams { color, ..params };
+                            this.save_effect(wallpaper::BackgroundEffect::Ascii(next), cx);
+                        }))
+                        .into_any_element()
+                    })
+                    .collect();
+                rows.push(labeled_row(&theme, "Colour", color_buttons).into_any_element());
+
+                let density_buttons = ["Sparse", "Medium", "Dense"]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(preset, label)| {
+                        let columns = density_columns(preset);
+                        segment(
+                            &theme,
+                            format!("ascii-density-{preset}"),
+                            label,
+                            params.columns == columns,
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let next = wallpaper::AsciiParams { columns, ..params };
+                            this.save_effect(wallpaper::BackgroundEffect::Ascii(next), cx);
+                        }))
+                        .into_any_element()
+                    })
+                    .collect();
+                rows.push(labeled_row(&theme, "Density", density_buttons).into_any_element());
+
+                let opacity_buttons = [0.15_f32, 0.25, 0.35, 0.5]
+                    .into_iter()
+                    .map(|opacity| {
+                        let label = format!("{}%", (opacity * 100.0) as u32);
+                        segment(
+                            &theme,
+                            format!("ascii-opacity-{label}"),
+                            label,
+                            (params.opacity - opacity).abs() < 0.001,
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let next = wallpaper::AsciiParams { opacity, ..params };
+                            this.save_effect(wallpaper::BackgroundEffect::Ascii(next), cx);
+                        }))
+                        .into_any_element()
+                    })
+                    .collect();
+                rows.push(labeled_row(&theme, "Opacity", opacity_buttons).into_any_element());
+
+                rows.push(
+                    div()
+                        .id("ascii-invert")
+                        .flex()
+                        .items_center()
+                        .gap(px(8.0))
+                        .cursor_pointer()
+                        .child(
+                            div()
+                                .text_size(px(12.0))
+                                .text_color(theme.text_muted)
+                                .child("Invert"),
+                        )
+                        .child(widgets::toggle_switch(&theme, params.invert))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let next = wallpaper::AsciiParams {
+                                invert: !params.invert,
+                                ..params
+                            };
+                            this.save_effect(wallpaper::BackgroundEffect::Ascii(next), cx);
+                        }))
+                        .into_any_element(),
+                );
+
+                rows.push(
+                    widgets::ghost_action(&theme)
+                        .id("ascii-reset")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.save_effect(
+                                wallpaper::BackgroundEffect::Ascii(
+                                    wallpaper::AsciiParams::default(),
+                                ),
+                                cx,
+                            );
+                        }))
+                        .child("Reset")
+                        .into_any_element(),
+                );
+            }
+
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(10.0))
+                .child(effect_buttons)
+                .when(!ascii_supported, |el| {
+                    el.child(
+                        div()
+                            .text_size(px(12.0))
+                            .text_color(theme.text_muted)
+                            .child("ASCII needs a PNG or JPEG."),
+                    )
+                })
+                .children(rows)
+        });
+
         let wallpaper_preview = wallpaper_path
             .as_ref()
             .filter(|path| path.is_file())
-            .map(|path| {
-                gpui::img(path.clone())
+            .map(|path| match wallpaper::ascii_texture(cx) {
+                Some(texture) => gpui::img(texture)
                     .size_full()
                     .object_fit(gpui::ObjectFit::Cover)
-                    .into_any_element()
+                    .into_any_element(),
+                None => gpui::img(path.clone())
+                    .size_full()
+                    .object_fit(gpui::ObjectFit::Cover)
+                    .into_any_element(),
             });
 
         div()
@@ -413,7 +649,11 @@ impl Render for AppearancePage {
                                                             }),
                                                     ),
                                             )
-                                            .child(div().child("No image")),
+                                            .child(div().child(if has_wallpaper {
+                                                "Custom image"
+                                            } else {
+                                                "No image"
+                                            })),
                                     )
                                     .child(
                                         div()
@@ -507,6 +747,7 @@ impl Render for AppearancePage {
                                 }
                             )
                             .children(scope_row)
+                            .children(effect_block)
                             .when_some(self.wallpaper_error.clone(), |el, error| {
                                 el.child(
                                     div()
@@ -570,5 +811,17 @@ mod tests {
         let (l, d) = (Theme::light(), Theme::dark());
         assert_ne!(l.surface.l, d.surface.l);
         assert_ne!(l.bg.l, d.bg.l);
+    }
+
+    #[test]
+    fn density_presets_are_sparse_medium_dense() {
+        assert_eq!(density_columns(0), 80);
+        assert_eq!(density_columns(1), 120);
+        assert_eq!(density_columns(2), 160);
+        assert_eq!(
+            density_columns(9),
+            160,
+            "out-of-range clamps to the densest"
+        );
     }
 }
