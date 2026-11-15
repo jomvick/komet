@@ -7,6 +7,8 @@ use sha2::{Digest, Sha256};
 use crate::settings::UiSettings;
 use crate::theme::Theme;
 
+pub mod ascii;
+
 /// Wallpapers are copied here on import so moving or deleting the source file
 /// later never blanks the app.
 fn wallpapers_dir(data_dir: &Path) -> PathBuf {

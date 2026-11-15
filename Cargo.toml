@@ -113,6 +113,8 @@ sqlite-vec = "=0.1.9"
 
 # misc
 base64 = "0.22"
+# 8x8 glyph bitmaps for the ASCII wallpaper effect (no other feature needed).
+font8x8 = "0.3"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 # Global allocator for the binaries: returns freed pages to the OS. System
 # malloc (macOS libmalloc especially) retains the churn high-water mark as

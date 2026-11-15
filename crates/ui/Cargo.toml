@@ -30,6 +30,7 @@ serde_json.workspace = true
 image.workspace = true
 pulldown-cmark.workspace = true
 base64 = "0.22"
+font8x8.workspace = true
 unicode-segmentation.workspace = true
 uuid.workspace = true
 chrono.workspace = true
