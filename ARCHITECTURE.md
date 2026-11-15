@@ -235,6 +235,10 @@ feature spec `docs/research/feature-inventory.md` §1.
   cubic-bezier(0.22,1,0.36,1)), reduced-motion switch.
 - **Theme**: always-dark monochrome, oklch-derived neutral scale precomputed to Hsla, hairline
   borders, Geist/Geist Mono bundled fonts.
+- **Wallpaper** (`komet-ui::settings::wallpaper`): image imported under `{data_dir}/wallpapers/`,
+  painted over the window or the main panel. Background effect `None` paints the image; `ASCII`
+  rasterises it once — off the UI thread — into a single RGBA glyph-grid texture, cached on disk
+  per (image, params, 256 px size bucket), so the paint path stays one image per frame.
 
 ## 5. Engine plan
 
