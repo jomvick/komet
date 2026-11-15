@@ -210,52 +210,85 @@ impl BackgroundEffect {
     }
 }
 
+/// The image, or its ASCII texture, as a full-bleed cover layer. `radius` is
+/// applied to the image itself because gpui clips to a rectangle, not a curve.
+pub fn image_layer(
+    path: PathBuf,
+    effect: BackgroundEffect,
+    texture: Option<Arc<RenderImage>>,
+    radius: f32,
+) -> AnyElement {
+    match (effect, texture) {
+        (BackgroundEffect::Ascii(params), Some(texture)) => div()
+            .size_full()
+            .child(
+                gpui::img(texture)
+                    .size_full()
+                    .object_fit(gpui::ObjectFit::Cover)
+                    .rounded(px(radius)),
+            )
+            .opacity(params.opacity)
+            .into_any_element(),
+        _ => gpui::img(path)
+            .size_full()
+            .object_fit(gpui::ObjectFit::Cover)
+            .rounded(px(radius))
+            .into_any_element(),
+    }
+}
+
 /// The image under a card-tone veil. gpui clips children to a *rectangle* even
 /// when the parent is rounded, so the corner radius is applied to the image and
 /// the veil themselves.
-fn veiled_image(path: PathBuf, tone: Hsla, scrim_alpha: f32, radius: f32) -> gpui::Div {
-    div()
-        .size_full()
-        .relative()
-        .child(
-            gpui::img(path)
-                .size_full()
-                .object_fit(gpui::ObjectFit::Cover)
-                .rounded(px(radius)),
-        )
-        .child(
-            div()
-                .absolute()
-                .top_0()
-                .bottom_0()
-                .left_0()
-                .right_0()
-                .rounded(px(radius))
-                .bg(tone.opacity(scrim_alpha)),
-        )
+fn veiled_image(source: AnyElement, tone: Hsla, scrim_alpha: f32, radius: f32) -> gpui::Div {
+    div().size_full().relative().child(source).child(
+        div()
+            .absolute()
+            .top_0()
+            .bottom_0()
+            .left_0()
+            .right_0()
+            .rounded(px(radius))
+            .bg(tone.opacity(scrim_alpha)),
+    )
 }
 
 /// The wallpaper layer for [`WallpaperScope::Panel`], to be the FIRST child of
 /// the main card (under its content, clipped by its rounded corners). `None` for
 /// `Window`, which paints behind the whole window.
-pub fn card_layer(path: PathBuf, scope: WallpaperScope, tone: Hsla) -> Option<AnyElement> {
+pub fn card_layer(
+    path: PathBuf,
+    scope: WallpaperScope,
+    tone: Hsla,
+    effect: BackgroundEffect,
+    texture: Option<Arc<RenderImage>>,
+) -> Option<AnyElement> {
     match scope {
         WallpaperScope::Window => None,
-        WallpaperScope::Panel => Some(
-            div()
-                .absolute()
-                .top_0()
-                .bottom_0()
-                .left_0()
-                .right_0()
-                .child(veiled_image(
-                    path,
-                    tone,
-                    CARD_SCRIM_ALPHA,
-                    Theme::PANEL_RADIUS,
-                ))
-                .into_any_element(),
-        ),
+        WallpaperScope::Panel => {
+            // The ASCII texture carries its own black backing, so the veil
+            // would only wash the glyphs out; the effect's opacity is the scrim.
+            let scrim = if effect.is_ascii() {
+                0.0
+            } else {
+                CARD_SCRIM_ALPHA
+            };
+            Some(
+                div()
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .left_0()
+                    .right_0()
+                    .child(veiled_image(
+                        image_layer(path, effect, texture, Theme::PANEL_RADIUS),
+                        tone,
+                        scrim,
+                        Theme::PANEL_RADIUS,
+                    ))
+                    .into_any_element(),
+            )
+        }
     }
 }
 

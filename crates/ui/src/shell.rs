@@ -19,9 +19,9 @@ use std::time::Duration;
 use chrono::Utc;
 use gpui::{
     AnyElement, App, Bounds, Context, Decorations, Empty, Entity, Focusable as _, IntoElement,
-    MouseButton, MouseDownEvent, MouseUpEvent, ObjectFit, Pixels, Point, Render, ResizeEdge,
-    SharedString, Size, StyleRefinement, StyledImage, Subscription, Task, Tiling, Window,
-    WindowButton, WindowButtonLayout, WindowControlArea, actions, div, img, prelude::*, px,
+    MouseButton, MouseDownEvent, MouseUpEvent, Pixels, Point, Render, ResizeEdge, SharedString,
+    Size, StyleRefinement, Subscription, Task, Tiling, Window, WindowButton, WindowButtonLayout,
+    WindowControlArea, actions, div, prelude::*, px,
 };
 
 use komet_engine::harness_cli::HarnessCliStatus;
@@ -1490,7 +1490,12 @@ impl Shell {
                     .bottom_0()
                     .left_0()
                     .right_0()
-                    .child(img(path).size_full().object_fit(ObjectFit::Cover)),
+                    .child(wallpaper::image_layer(
+                        path,
+                        wallpaper::effect(cx),
+                        wallpaper::ascii_texture(cx),
+                        0.0,
+                    )),
             )
         } else {
             root
@@ -1641,9 +1646,33 @@ impl Shell {
         let border_color = Theme::of(cx).border;
         // The workspace is one inset surface: the transcript and any
         // open side panel share its rounded boundary.
+        // The ASCII texture is generated from the render size, so it follows
+        // window resizes (one regeneration per 256 px bucket).
+        let accent = Theme::of(cx).accent.to_rgb();
+        let viewport_px = window.viewport_size();
+        wallpaper::ensure_ascii(
+            (
+                f32::from(viewport_px.width) as u32,
+                f32::from(viewport_px.height) as u32,
+            ),
+            [
+                (accent.r * 255.0) as u8,
+                (accent.g * 255.0) as u8,
+                (accent.b * 255.0) as u8,
+            ],
+            cx,
+        );
         let panel_wallpaper = wallpaper::path(cx)
             .filter(|path| path.is_file())
-            .and_then(|path| wallpaper::card_layer(path, wallpaper_scope, workspace_bg));
+            .and_then(|path| {
+                wallpaper::card_layer(
+                    path,
+                    wallpaper_scope,
+                    workspace_bg,
+                    wallpaper::effect(cx),
+                    wallpaper::ascii_texture(cx),
+                )
+            });
         let workspace: AnyElement = div()
             .flex_1()
             .min_w_0()
