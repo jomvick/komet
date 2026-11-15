@@ -171,7 +171,6 @@ pub struct UiSettings {
     /// Where the wallpaper is painted: whole window or main panel.
     pub wallpaper_scope: wallpaper::WallpaperScope,
     /// What is painted over the wallpaper: the image itself or an ASCII pass.
-    #[serde(default)]
     pub background_effect: wallpaper::BackgroundEffect,
     /// Idle time before an edited workspace file is saved automatically.
     pub files_autosave_delay_ms: u64,

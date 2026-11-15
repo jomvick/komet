@@ -372,10 +372,13 @@ pub fn set_effect(effect: BackgroundEffect, cx: &mut App) -> io::Result<()> {
 
     let state = cx.global_mut::<WallpaperState>();
     state.effect = effect;
-    // Drop any texture and cancel an in-flight job: they belong to the old effect.
-    state.ascii = None;
+    // Cancel the in-flight job and force a key check. The old texture stays on
+    // screen while the new one is built (no flash), except when leaving ASCII.
     state.ascii_key = None;
     state.pending = None;
+    if !effect.is_ascii() {
+        state.ascii = None;
+    }
     cx.refresh_windows();
     Ok(())
 }

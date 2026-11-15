@@ -141,21 +141,22 @@ pub fn load_source(path: &Path) -> Result<RgbaImage, String> {
         .map_err(|error| format!("could not decode {}: {error}", path.display()))
 }
 
-/// Stable cache key: source path + every parameter + the 256 px size bucket.
+/// Stable cache key: source path + every parameter that changes the pixels +
+/// the 256 px size bucket. `opacity` is applied when the texture is painted, so
+/// it is deliberately absent — moving the slider must not re-rasterise.
 pub fn cache_key(source: &Path, params: &AsciiParams, target: (u32, u32)) -> String {
     let bucket = |value: u32| (value / 256 * 256).max(256);
     let mut hasher = Sha256::new();
     hasher.update(source.to_string_lossy().as_bytes());
     hasher.update(
         format!(
-            "|{}x{}|{}|{:?}|{:?}|{}|{:.3}",
+            "|{}x{}|{}|{:?}|{:?}|{}",
             bucket(target.0),
             bucket(target.1),
             params.columns,
             params.charset,
             params.color,
             params.invert,
-            params.opacity
         )
         .as_bytes(),
     );
@@ -271,6 +272,18 @@ mod tests {
                 },
                 (1600, 1000)
             )
+        );
+        assert_eq!(
+            a,
+            cache_key(
+                Path::new("/w/a.png"),
+                &AsciiParams {
+                    opacity: 0.9,
+                    ..params
+                },
+                (1600, 1000)
+            ),
+            "opacity is a paint-time value, not a texture input"
         );
     }
 
