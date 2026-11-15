@@ -5,67 +5,13 @@
 //!
 //! Everything here is pure: no globals, no gpui `App`, no IO beyond `load_source`.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use font8x8::{BASIC_FONTS, BLOCK_FONTS, UnicodeFonts};
 use image::{Rgba, RgbaImage};
+use sha2::{Digest, Sha256};
 
 use super::{AsciiCharset, AsciiColor, AsciiParams};
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn luma_to_char_is_monotonic_and_inverted() {
-        let r = ramp(AsciiCharset::Classic);
-        assert_eq!(cell_char(0.0, false, r), ' ');
-        assert_eq!(cell_char(1.0, false, r), '@');
-        assert_eq!(cell_char(0.0, true, r), '@');
-        assert_eq!(cell_char(1.0, true, r), ' ');
-    }
-
-    #[test]
-    fn grid_never_divides_by_zero() {
-        assert_eq!(grid_size((0, 0), 120).2, 1);
-        let (cw, ch, rows) = grid_size((1600, 1000), 120);
-        assert_eq!(cw, 13);
-        assert_eq!(ch, 26);
-        assert_eq!(rows, 38);
-    }
-
-    #[test]
-    fn render_is_black_behind_a_space_cell() {
-        let src = RgbaImage::from_pixel(1, 1, Rgba([0, 0, 0, 255]));
-        let params = AsciiParams::default();
-        let out = render(&src, &params, (120, 60), [255, 255, 255]);
-        assert_eq!((out.width(), out.height()), (120, 60));
-        assert!(out.pixels().all(|p| p.0[..3] == [0, 0, 0]));
-    }
-
-    #[test]
-    fn render_paints_light_cells_with_the_accent() {
-        let src = RgbaImage::from_pixel(1, 1, Rgba([255, 255, 255, 255]));
-        let params = AsciiParams {
-            columns: 4,
-            color: AsciiColor::Accent,
-            ..Default::default()
-        };
-        let out = render(&src, &params, (64, 64), [200, 10, 10]);
-        assert!(
-            out.pixels().any(|p| p.0[0] > 100 && p.0[1] < 60),
-            "accent tint missing"
-        );
-    }
-
-    #[test]
-    fn ascii_support_is_png_jpeg_only() {
-        assert!(supports_ascii(Path::new("a.PNG")));
-        assert!(supports_ascii(Path::new("a.jpeg")));
-        assert!(supports_ascii(Path::new("a.jpg")));
-        assert!(!supports_ascii(Path::new("a.webp")));
-    }
-}
 
 /// Glyph ramp for a charset, darkest → brightest.
 pub fn ramp(charset: AsciiCharset) -> &'static str {
@@ -185,4 +131,158 @@ pub fn render(
         }
     }
     out
+}
+
+/// Decode the source image, with a readable error for the UI/log.
+pub fn load_source(path: &Path) -> Result<RgbaImage, String> {
+    image::open(path)
+        .map(|image| image.to_rgba8())
+        .map_err(|error| format!("could not decode {}: {error}", path.display()))
+}
+
+/// Stable cache key: source path + every parameter + the 256 px size bucket.
+pub fn cache_key(source: &Path, params: &AsciiParams, target: (u32, u32)) -> String {
+    let bucket = |value: u32| (value / 256 * 256).max(256);
+    let mut hasher = Sha256::new();
+    hasher.update(source.to_string_lossy().as_bytes());
+    hasher.update(
+        format!(
+            "|{}x{}|{}|{:?}|{:?}|{}|{:.3}",
+            bucket(target.0),
+            bucket(target.1),
+            params.columns,
+            params.charset,
+            params.color,
+            params.invert,
+            params.opacity
+        )
+        .as_bytes(),
+    );
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// At most one render per (image, params, size bucket); never queue a second.
+pub fn should_render(ready_key: Option<&str>, pending: bool, wanted: &str) -> bool {
+    ready_key != Some(wanted) && !pending
+}
+
+pub fn cache_path(data_dir: &Path, key: &str) -> PathBuf {
+    data_dir.join("wallpaper-cache").join(format!("{key}.png"))
+}
+
+pub fn load_cached(cache: &Path) -> Option<RgbaImage> {
+    image::open(cache).ok().map(|image| image.to_rgba8())
+}
+
+/// Write via a temp file + rename so a crash never leaves a half PNG.
+pub fn store_cached(cache: &Path, image: &RgbaImage) {
+    let Some(parent) = cache.parent() else { return };
+    if std::fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    let tmp = cache.with_extension("png.tmp");
+    if image
+        .save_with_format(&tmp, image::ImageFormat::Png)
+        .is_ok()
+    {
+        let _ = std::fs::rename(&tmp, cache);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn luma_to_char_is_monotonic_and_inverted() {
+        let r = ramp(AsciiCharset::Classic);
+        assert_eq!(cell_char(0.0, false, r), ' ');
+        assert_eq!(cell_char(1.0, false, r), '@');
+        assert_eq!(cell_char(0.0, true, r), '@');
+        assert_eq!(cell_char(1.0, true, r), ' ');
+    }
+
+    #[test]
+    fn grid_never_divides_by_zero() {
+        assert_eq!(grid_size((0, 0), 120).2, 1);
+        let (cw, ch, rows) = grid_size((1600, 1000), 120);
+        assert_eq!(cw, 13);
+        assert_eq!(ch, 26);
+        assert_eq!(rows, 38);
+    }
+
+    #[test]
+    fn render_is_black_behind_a_space_cell() {
+        let src = RgbaImage::from_pixel(1, 1, Rgba([0, 0, 0, 255]));
+        let params = AsciiParams::default();
+        let out = render(&src, &params, (120, 60), [255, 255, 255]);
+        assert_eq!((out.width(), out.height()), (120, 60));
+        assert!(out.pixels().all(|p| p.0[..3] == [0, 0, 0]));
+    }
+
+    #[test]
+    fn render_paints_light_cells_with_the_accent() {
+        let src = RgbaImage::from_pixel(1, 1, Rgba([255, 255, 255, 255]));
+        let params = AsciiParams {
+            columns: 4,
+            color: AsciiColor::Accent,
+            ..Default::default()
+        };
+        let out = render(&src, &params, (64, 64), [200, 10, 10]);
+        assert!(
+            out.pixels().any(|p| p.0[0] > 100 && p.0[1] < 60),
+            "accent tint missing"
+        );
+    }
+
+    #[test]
+    fn ascii_support_is_png_jpeg_only() {
+        assert!(supports_ascii(Path::new("a.PNG")));
+        assert!(supports_ascii(Path::new("a.jpeg")));
+        assert!(supports_ascii(Path::new("a.jpg")));
+        assert!(!supports_ascii(Path::new("a.webp")));
+    }
+
+    #[test]
+    fn cache_key_buckets_the_target_size() {
+        let params = AsciiParams::default();
+        let a = cache_key(Path::new("/w/a.png"), &params, (1600, 1000));
+        assert_eq!(
+            a,
+            cache_key(Path::new("/w/a.png"), &params, (1700, 1010)),
+            "same 256 px bucket"
+        );
+        assert_ne!(a, cache_key(Path::new("/w/a.png"), &params, (2000, 1000)));
+        assert_ne!(
+            a,
+            cache_key(
+                Path::new("/w/a.png"),
+                &AsciiParams {
+                    invert: true,
+                    ..params
+                },
+                (1600, 1000)
+            )
+        );
+    }
+
+    #[test]
+    fn a_corrupt_source_is_an_error_not_a_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("broken.png");
+        std::fs::write(&path, b"not a png").unwrap();
+        assert!(load_source(&path).is_err());
+    }
+
+    #[test]
+    fn a_render_is_skipped_while_one_holds_the_right_key() {
+        assert!(should_render(None, false, "k"));
+        assert!(!should_render(Some("k"), false, "k"));
+        assert!(should_render(Some("old"), false, "k"));
+        assert!(!should_render(None, true, "k"));
+    }
 }

@@ -1,7 +1,9 @@
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use gpui::{AnyElement, App, Global, Hsla, div, prelude::*, px};
+use gpui::{AnyElement, App, Global, Hsla, RenderImage, Task, div, prelude::*, px};
+use image::Frame;
 use sha2::{Digest, Sha256};
 
 use crate::settings::UiSettings;
@@ -53,11 +55,12 @@ fn persist_path(data_dir: &Path, new: Option<&Path>) -> io::Result<Option<PathBu
         Some(src) => Some(import_copy(data_dir, src)?),
         None => None,
     };
-    if let Some(old) = old.as_deref() {
-        if Some(old) != stored.as_deref() && old.starts_with(wallpapers_dir(data_dir)) {
-            // Best-effort: a missing copy is not an error.
-            let _ = std::fs::remove_file(old);
-        }
+    if let Some(old) = old.as_deref()
+        && Some(old) != stored.as_deref()
+        && old.starts_with(wallpapers_dir(data_dir))
+    {
+        // Best-effort: a missing copy is not an error.
+        let _ = std::fs::remove_file(old);
     }
     settings.wallpaper_path = stored
         .as_ref()
@@ -259,16 +262,27 @@ pub fn card_layer(path: PathBuf, scope: WallpaperScope, tone: Hsla) -> Option<An
 pub struct WallpaperState {
     pub path: Option<PathBuf>,
     pub scope: WallpaperScope,
+    pub effect: BackgroundEffect,
+    /// The rasterised ASCII texture, once a job has completed.
+    ascii: Option<Arc<RenderImage>>,
+    /// Cache key of `ascii` — one texture per (image, params, size bucket).
+    ascii_key: Option<String>,
+    /// Debounces regeneration: at most one job in flight.
+    pending: Option<Task<()>>,
     data_dir: PathBuf,
 }
 
 impl Global for WallpaperState {}
 
-pub fn init(path: Option<String>, data_dir: PathBuf, cx: &mut App) {
+pub fn init(path: Option<String>, effect: BackgroundEffect, data_dir: PathBuf, cx: &mut App) {
     let scope = UiSettings::load(&data_dir).wallpaper_scope;
     cx.set_global(WallpaperState {
         path: path.map(PathBuf::from),
         scope,
+        effect,
+        ascii: None,
+        ascii_key: None,
+        pending: None,
         data_dir,
     });
 }
@@ -288,6 +302,120 @@ pub fn is_enabled(cx: &App) -> bool {
     path(cx).is_some()
 }
 
+pub fn effect(cx: &App) -> BackgroundEffect {
+    cx.try_global::<WallpaperState>()
+        .map(|state| state.effect)
+        .unwrap_or_default()
+}
+
+pub fn ascii_texture(cx: &App) -> Option<Arc<RenderImage>> {
+    cx.try_global::<WallpaperState>()
+        .and_then(|state| state.ascii.clone())
+}
+
+/// Switch the effect and persist it. Rejects ASCII for formats the decoder
+/// cannot read, leaving the stored effect untouched.
+pub fn set_effect(effect: BackgroundEffect, cx: &mut App) -> io::Result<()> {
+    let Some(state) = cx.try_global::<WallpaperState>() else {
+        return Err(io::Error::other("wallpaper settings are not initialized"));
+    };
+    if state.effect == effect {
+        return Ok(());
+    }
+    if effect.is_ascii() {
+        match state.path.as_deref() {
+            Some(path) if ascii::supports_ascii(path) => {}
+            Some(_) => {
+                return Err(io::Error::other("ASCII needs a PNG or JPEG wallpaper"));
+            }
+            None => return Err(io::Error::other("Choose a wallpaper first")),
+        }
+    }
+    let data_dir = state.data_dir.clone();
+
+    let mut settings = UiSettings::load(&data_dir);
+    settings.background_effect = effect;
+    settings.save(&data_dir)?;
+
+    let state = cx.global_mut::<WallpaperState>();
+    state.effect = effect;
+    // Drop any texture and cancel an in-flight job: they belong to the old effect.
+    state.ascii = None;
+    state.ascii_key = None;
+    state.pending = None;
+    cx.refresh_windows();
+    Ok(())
+}
+
+/// Ask for the ASCII texture at `target` if the current one is stale. Called
+/// from the shell render; idempotent, and never queues a second job.
+pub fn ensure_ascii(target: (u32, u32), accent: [u8; 3], cx: &mut App) {
+    let Some(state) = cx.try_global::<WallpaperState>() else {
+        return;
+    };
+    let BackgroundEffect::Ascii(params) = state.effect else {
+        return;
+    };
+    let Some(path) = state.path.clone().filter(|path| path.is_file()) else {
+        return;
+    };
+    if !ascii::supports_ascii(&path) {
+        return;
+    }
+    let key = ascii::cache_key(&path, &params, target);
+    if !ascii::should_render(state.ascii_key.as_deref(), state.pending.is_some(), &key) {
+        return;
+    }
+    let data_dir = state.data_dir.clone();
+    let cache = ascii::cache_path(&data_dir, &key);
+
+    let task = cx.spawn(async move |cx| {
+        let built = cx
+            .background_executor()
+            .spawn(async move { build_texture(&path, &cache, &params, target, accent) })
+            .await;
+        cx.update(|cx| {
+            let Some(state) = cx.try_global::<WallpaperState>() else {
+                return;
+            };
+            // The effect may have changed while this ran; a stale texture is
+            // dropped rather than painted.
+            if !matches!(state.effect, BackgroundEffect::Ascii(_)) {
+                cx.global_mut::<WallpaperState>().pending = None;
+                return;
+            }
+            let state = cx.global_mut::<WallpaperState>();
+            state.pending = None;
+            match built {
+                Ok(image) => {
+                    state.ascii = Some(Arc::new(RenderImage::new(vec![Frame::new(image)])));
+                    state.ascii_key = Some(key);
+                }
+                Err(error) => tracing::warn!(%error, "could not render the ASCII wallpaper"),
+            }
+            cx.refresh_windows();
+        });
+    });
+    cx.global_mut::<WallpaperState>().pending = Some(task);
+}
+
+/// Disk cache first, then decode + rasterise + store. Runs off the UI thread.
+fn build_texture(
+    path: &Path,
+    cache: &Path,
+    params: &AsciiParams,
+    target: (u32, u32),
+    accent: [u8; 3],
+) -> Result<image::RgbaImage, String> {
+    if let Some(cached) = ascii::load_cached(cache) {
+        return Ok(cached);
+    }
+    let source = ascii::load_source(path)?;
+    let out = ascii::render(&source, params, target, accent);
+    ascii::store_cached(cache, &out);
+    Ok(out)
+}
+
 pub fn set_path(path: Option<PathBuf>, cx: &mut App) -> io::Result<()> {
     let Some(state) = cx.try_global::<WallpaperState>() else {
         return Err(io::Error::other("wallpaper settings are not initialized"));
@@ -300,6 +428,11 @@ pub fn set_path(path: Option<PathBuf>, cx: &mut App) -> io::Result<()> {
     let stored = persist_path(&data_dir, path.as_deref())?;
 
     cx.global_mut::<WallpaperState>().path = stored;
+    // A new image invalidates the texture; the next render regenerates it.
+    let state = cx.global_mut::<WallpaperState>();
+    state.ascii = None;
+    state.ascii_key = None;
+    state.pending = None;
     let appearance = Theme::of(cx).appearance;
     Theme::install(appearance, cx);
     cx.refresh_windows();
