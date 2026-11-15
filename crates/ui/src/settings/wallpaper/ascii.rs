@@ -42,12 +42,13 @@ pub fn supports_ascii(path: &Path) -> bool {
 }
 
 /// `(cell_w, cell_h, rows)` for a target pixel size. Cells are 1:2 (a character
-/// is taller than it is wide).
+/// is taller than it is wide) and rounded up so the grid covers the whole
+/// texture — a floor here would leave a black band on the right and bottom.
 pub fn grid_size(target: (u32, u32), columns: u16) -> (u32, u32, u32) {
     let columns = u32::from(columns.max(1));
-    let cell_w = (target.0 / columns).max(1);
+    let cell_w = target.0.div_ceil(columns).max(1);
     let cell_h = cell_w * 2;
-    let rows = (target.1 / cell_h).max(1);
+    let rows = target.1.div_ceil(cell_h).max(1);
     (cell_w, cell_h, rows)
 }
 
@@ -210,9 +211,12 @@ mod tests {
     fn grid_never_divides_by_zero() {
         assert_eq!(grid_size((0, 0), 120).2, 1);
         let (cw, ch, rows) = grid_size((1600, 1000), 120);
-        assert_eq!(cw, 13);
-        assert_eq!(ch, 26);
-        assert_eq!(rows, 38);
+        assert_eq!(cw, 14);
+        assert_eq!(ch, 28);
+        assert_eq!(rows, 36);
+        // The grid must cover the whole texture, not leave a black band.
+        assert!(cw * 120 >= 1600);
+        assert!(ch * rows >= 1000);
     }
 
     #[test]

@@ -424,7 +424,13 @@ pub fn ensure_ascii(target: (u32, u32), accent: [u8; 3], cx: &mut App) {
                     state.ascii = Some(Arc::new(RenderImage::new(vec![Frame::new(image)])));
                     state.ascii_key = Some(key);
                 }
-                Err(error) => tracing::warn!(%error, "could not render the ASCII wallpaper"),
+                Err(error) => {
+                    // Remember the key and drop any stale texture: a corrupt
+                    // source would otherwise retry (and repaint) on every frame.
+                    state.ascii = None;
+                    state.ascii_key = Some(key);
+                    tracing::warn!(%error, "could not render the ASCII wallpaper");
+                }
             }
             cx.refresh_windows();
         });
