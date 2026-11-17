@@ -1,6 +1,6 @@
 //! Settings → Providers: one card per agent, folding what used to be two
-//! pages. The header carries the enable toggle, the CLI install/update state
-//! and a quick "Connect"; the body carries that provider's accounts — email,
+//! pages. The header carries the enable toggle and the CLI install/update
+//! state; the body carries that provider's accounts — email,
 //! plan badge, Active, Switch / Forget — plus the add-account dialogs
 //! (paste-code and browser-poll flows). Agents whose sign-in lives in their
 //! own CLI show the hand-off command instead.
@@ -210,39 +210,6 @@ fn placeholder_descriptors() -> Vec<HarnessDescriptor> {
         .collect()
 }
 
-/// Connected/unknown harnesses, derived from the accounts snapshot.
-#[derive(Default)]
-struct AgentConnectionStatus {
-    connected: HashSet<HarnessId>,
-    unknown: HashSet<HarnessId>,
-}
-
-impl From<AgentAccountsSnapshot> for AgentConnectionStatus {
-    fn from(snapshot: AgentAccountsSnapshot) -> Self {
-        Self {
-            connected: snapshot
-                .accounts
-                .into_iter()
-                .map(|account| account.harness)
-                .collect(),
-            unknown: snapshot
-                .warnings
-                .into_iter()
-                .map(|warning| warning.harness)
-                .collect(),
-        }
-    }
-}
-
-/// A quick "Connect" is offered only where a login we can start exists and the
-/// provider is neither connected nor in an unknown state.
-fn show_connect_button(harness: HarnessId, status: Option<&AgentConnectionStatus>) -> bool {
-    supports_in_app_login(harness)
-        && status.is_some_and(|status| {
-            !status.connected.contains(&harness) && !status.unknown.contains(&harness)
-        })
-}
-
 fn newly_available_cli_update(
     statuses: &[HarnessCliStatus],
     announced: &HashSet<(HarnessId, String)>,
@@ -431,6 +398,11 @@ fn codex_on_path() -> bool {
 
 pub struct ProvidersPage {
     state: Entity<AppState>,
+    /// Embedded mode (first-run onboarding): the page renders only the error
+    /// strips, cards and dialogs — the toolbar, title, subtitle, footer note
+    /// and the centered scroll column belong to the host page (toolbar omitted
+    /// in onboarding).
+    embedded: bool,
     /// Which device's harnesses and logins are shown; `None` = this device (no
     /// passthrough). Retargeted by the page-header device switcher; every RPC
     /// resolves it again through [`Self::with_target`].
@@ -508,6 +480,7 @@ impl ProvidersPage {
         let engine_connected = state.read(cx).engine().is_some();
         let mut page = Self {
             state,
+            embedded: false,
             target_device,
             target_generation: 0,
             device_menu: popover::Popup::default(),
@@ -544,6 +517,31 @@ impl ProvidersPage {
         page.load_harnesses(cx);
         page.load_accounts(cx);
         page
+    }
+
+    /// Embedded inside the first-run onboarding's Agents step: same loads,
+    /// same dialogs, but the page chrome (title, subtitle, footer, centered
+    /// scroll column) is the onboarding's job. The entity is held for the
+    /// whole onboarding — never recreated while a login dialog is up, or the
+    /// browser-wait poll would die with it.
+    pub fn new_embedded(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
+        let mut page = Self::new(state, cx);
+        page.embedded = true;
+        page
+    }
+
+    /// The harness catalog as last loaded. The onboarding step summary reads
+    /// the REAL loadable — never [`placeholder_descriptors`], whose rows all
+    /// claim `installed: true` — so a still-loading catalog reads "Looking
+    /// for agents…", not a false "everything is installed".
+    pub fn harnesses(&self) -> &Loadable<Vec<HarnessDescriptor>> {
+        &self.harnesses
+    }
+
+    /// Re-probe the harness catalog and the saved accounts (Refresh).
+    pub fn reload(&mut self, cx: &mut Context<Self>) {
+        self.load_harnesses(cx);
+        self.load_accounts(cx);
     }
 
     fn copy_login_command(&mut self, harness: HarnessId, cx: &mut Context<Self>) {
@@ -1157,11 +1155,6 @@ impl ProvidersPage {
             .iter()
             .filter(|descriptor| descriptor_enabled(descriptor))
             .count();
-        let connection = self
-            .accounts
-            .ready()
-            .cloned()
-            .map(AgentConnectionStatus::from);
         descriptors
             .iter()
             .enumerate()
@@ -1305,23 +1298,6 @@ impl ProvidersPage {
                     );
 
                 let mut actions = div().flex().flex_row().items_center().gap(px(8.0));
-                if show_connect_button(harness, connection.as_ref()) {
-                    actions = actions.child(
-                        widgets::ghost_action(theme)
-                            .id(("provider-connect", ix))
-                            .hover(|s| widgets::ghost_hover(theme, s))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                cx.stop_propagation();
-                                this.request_login(harness, cx);
-                            }))
-                            .child(
-                                crate::icons::icon(crate::icons::KEY_MINIMALISTIC)
-                                    .size(px(14.0))
-                                    .text_color(theme.text_muted),
-                            )
-                            .child(SharedString::from("Connect")),
-                    );
-                }
                 if show_manage_button {
                     let label = if managing {
                         "Working…"
@@ -2550,6 +2526,53 @@ impl ProvidersPage {
             .into_any_element();
         Some(popover::modal("replace-account-dialog", viewport, card))
     }
+
+    /// The page-header controls (Check updates / Refresh / device switcher).
+    /// Onboarding embeds the page without them.
+    fn render_toolbar(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        use crate::settings::widgets;
+        // Driven by the load flags, not the `Loadable` states: a reload keeps
+        // the previous cards on screen, so `Loading` no longer means in flight.
+        let refreshing = self.harnesses_loading || self.accounts_loading;
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(10.0))
+            .child(
+                widgets::ghost_action(theme)
+                    .id("providers-check-updates")
+                    .flex_none()
+                    .text_size(px(12.5))
+                    .hover(|s| widgets::ghost_hover(theme, s))
+                    .when(!self.checking_updates, |el| {
+                        el.on_click(cx.listener(|this, _, _, cx| this.check_updates(cx)))
+                    })
+                    .child(crate::icons::icon(crate::icons::REFRESH).size(px(14.0)))
+                    .child(SharedString::from(if self.checking_updates {
+                        "Checking for updates…"
+                    } else {
+                        "Check for updates"
+                    })),
+            )
+            .child(
+                widgets::ghost_action(theme)
+                    .id("providers-refresh")
+                    .flex_none()
+                    .text_size(px(12.5))
+                    .hover(|s| widgets::ghost_hover(theme, s))
+                    .when(refreshing, |el| el.opacity(0.5))
+                    .on_click(cx.listener(|this, _, _, cx| this.reload(cx)))
+                    .child(
+                        crate::icons::icon(crate::icons::REFRESH)
+                            .size(px(16.0))
+                            .text_color(theme.text_muted),
+                    )
+                    .child(SharedString::from("Refresh")),
+            )
+            .child(self.render_device_switcher(theme, cx))
+            .into_any_element()
+    }
 }
 
 impl Render for ProvidersPage {
@@ -2559,9 +2582,7 @@ impl Render for ProvidersPage {
         let dialog = self.render_login_dialog(window.viewport_size(), window, cx);
         let update_dialog = self.render_cli_update_dialog(window.viewport_size(), cx);
         let replace_dialog = self.render_replace_dialog(window.viewport_size(), cx);
-        // Driven by the load flags, not the `Loadable` states: a reload keeps
-        // the previous cards on screen, so `Loading` no longer means in flight.
-        let refreshing = self.harnesses_loading || self.accounts_loading;
+        let toolbar = self.render_toolbar(&theme, cx);
 
         // Cards paint from the static agent table first and reconcile with the
         // engine's catalog when it lands, so Providers is usable — names,
@@ -2586,16 +2607,48 @@ impl Render for ProvidersPage {
                             .id("providers-retry")
                             .mt(px(8.0))
                             .hover(|s| widgets::ghost_hover(&theme, s))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.load_harnesses(cx);
-                                this.load_accounts(cx);
-                            }))
+                            .on_click(cx.listener(|this, _, _, cx| this.reload(cx)))
                             .child(SharedString::from("Retry")),
                     ),
                 )
             })
             .children(cards)
             .into_any_element();
+
+        if self.embedded {
+            return div()
+                .id("providers-page-embedded")
+                .w_full()
+                .flex()
+                .flex_col()
+                .gap(px(12.0))
+                .when_some(self.error.clone(), |el, message| {
+                    el.child(
+                        widgets::error_strip(&theme, message)
+                            .id("providers-error")
+                            .cursor_pointer()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.error = None;
+                                cx.notify();
+                            })),
+                    )
+                })
+                .when_some(self.accounts_error.clone(), |el, message| {
+                    el.child(
+                        widgets::error_strip(&theme, message)
+                            .id("providers-accounts-error")
+                            .cursor_pointer()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.accounts_error = None;
+                                cx.notify();
+                            })),
+                    )
+                })
+                .child(body)
+                .when_some(dialog, |el, dialog| el.child(dialog))
+                .when_some(update_dialog, |el, dialog| el.child(dialog))
+                .when_some(replace_dialog, |el, dialog| el.child(dialog));
+        }
 
         div()
             .id("providers-page")
@@ -2617,41 +2670,7 @@ impl Render for ProvidersPage {
                     .gap(px(10.0))
                     .child(widgets::page_header(&theme, "Providers", None))
                     .child(div().flex_1())
-                    .child(
-                        widgets::ghost_action(&theme)
-                            .id("providers-check-updates")
-                            .flex_none()
-                            .text_size(px(12.5))
-                            .hover(|s| widgets::ghost_hover(&theme, s))
-                            .when(!self.checking_updates, |el| {
-                                el.on_click(cx.listener(|this, _, _, cx| this.check_updates(cx)))
-                            })
-                            .child(crate::icons::icon(crate::icons::REFRESH).size(px(14.0)))
-                            .child(SharedString::from(if self.checking_updates {
-                                "Checking for updates…"
-                            } else {
-                                "Check for updates"
-                            })),
-                    )
-                    .child(
-                        widgets::ghost_action(&theme)
-                            .id("providers-refresh")
-                            .flex_none()
-                            .text_size(px(12.5))
-                            .hover(|s| widgets::ghost_hover(&theme, s))
-                            .when(refreshing, |el| el.opacity(0.5))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.load_harnesses(cx);
-                                this.load_accounts(cx);
-                            }))
-                            .child(
-                                crate::icons::icon(crate::icons::REFRESH)
-                                    .size(px(16.0))
-                                    .text_color(theme.text_muted),
-                            )
-                            .child(SharedString::from("Refresh")),
-                    )
-                    .child(self.render_device_switcher(&theme, cx)),
+                    .child(toolbar),
             )
             .child(widgets::page_subtitle(
                 &theme,
@@ -2996,23 +3015,6 @@ mod tests {
         // An enabled agent whose CLI disappeared can still be turned off.
         assert!(toggle_interactive(false, true, 2));
         assert!(!toggle_interactive(false, true, 1));
-    }
-
-    #[test]
-    fn connect_is_only_offered_for_unconnected_app_managed_accounts() {
-        let status = AgentConnectionStatus {
-            connected: HashSet::from([HarnessId::ClaudeCode]),
-            unknown: HashSet::from([HarnessId::Antigravity]),
-        };
-
-        assert!(!show_connect_button(HarnessId::ClaudeCode, Some(&status)));
-        assert!(show_connect_button(HarnessId::Codex, Some(&status)));
-        // Grok has an in-app browser login, so an unconnected Grok offers it.
-        assert!(show_connect_button(HarnessId::Grok, Some(&status)));
-        assert!(!show_connect_button(HarnessId::Antigravity, Some(&status)));
-        // Hermes signs in through its own CLI: never a Connect button.
-        assert!(!show_connect_button(HarnessId::Hermes, Some(&status)));
-        assert!(!show_connect_button(HarnessId::Codex, None));
     }
 
     #[test]

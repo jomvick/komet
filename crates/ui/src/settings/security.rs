@@ -93,13 +93,27 @@ pub enum SecurityEvent {
 
 pub struct SecurityPage {
     level: SandboxLevel,
+    /// Embedded mode (first-run onboarding): rows only — the page header and
+    /// subtitle belong to the host step.
+    embedded: bool,
 }
 
 impl EventEmitter<SecurityEvent> for SecurityPage {}
 
 impl SecurityPage {
     pub fn new(level: SandboxLevel, _cx: &mut Context<Self>) -> Self {
-        Self { level }
+        Self {
+            level,
+            embedded: false,
+        }
+    }
+
+    /// Embedded inside the onboarding's Permissions step: the picker card and
+    /// the full-access warning, without the settings-page chrome.
+    pub fn new_embedded(level: SandboxLevel, cx: &mut Context<Self>) -> Self {
+        let mut page = Self::new(level, cx);
+        page.embedded = true;
+        page
     }
 
     fn pick(&mut self, level: SandboxLevel, cx: &mut Context<Self>) {
@@ -181,12 +195,18 @@ impl SecurityPage {
 impl Render for SecurityPage {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx).clone();
-        widgets::page_column()
-            .child(widgets::page_header(&theme, "Security", None))
-            .child(widgets::page_subtitle(
-                &theme,
-                "Default agent access for new chats. The composer can still override it per chat.",
-            ))
+        let column = widgets::page_column();
+        let column = if self.embedded {
+            column
+        } else {
+            column
+                .child(widgets::page_header(&theme, "Security", None))
+                .child(widgets::page_subtitle(
+                    &theme,
+                    "Default agent access for new chats. The composer can still override it per chat.",
+                ))
+        };
+        column
             .child(widgets::field_label(&theme, "Default access"))
             .child(
                 widgets::section_card(&theme)

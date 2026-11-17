@@ -24,6 +24,9 @@ use crate::theme::{Appearance, Theme};
 pub struct AppearancePage {
     picker_task: Option<Task<()>>,
     wallpaper_error: Option<String>,
+    /// Embedded mode (first-run onboarding): the controls only — the page
+    /// header and subtitle belong to the host step.
+    embedded: bool,
 }
 
 impl AppearancePage {
@@ -31,7 +34,15 @@ impl AppearancePage {
         Self {
             picker_task: None,
             wallpaper_error: None,
+            embedded: false,
         }
+    }
+
+    /// Embedded inside the onboarding's Appearance step.
+    pub fn new_embedded(cx: &mut Context<Self>) -> Self {
+        let mut page = Self::new(cx);
+        page.embedded = true;
+        page
     }
 
     fn open_wallpaper_picker(&mut self, cx: &mut Context<Self>) {
@@ -119,11 +130,6 @@ fn is_image_file(path: &Path) -> bool {
             })
 }
 
-/// Density presets, sparse → dense, in glyph columns.
-fn density_columns(preset: usize) -> u16 {
-    [80, 120, 160][preset.min(2)]
-}
-
 /// One segmented control button. The caller adds `.id`-less click handlers.
 fn segment(
     theme: &Theme,
@@ -151,29 +157,6 @@ fn segment(
         .text_color(theme.text)
         .cursor_pointer()
         .child(label.into())
-}
-
-/// A caption over a row of [`segment`] buttons.
-fn labeled_row(theme: &Theme, label: &'static str, buttons: Vec<AnyElement>) -> gpui::Div {
-    div()
-        .flex()
-        .flex_col()
-        .gap(px(6.0))
-        .child(
-            div()
-                .text_size(px(12.0))
-                .text_color(theme.text_muted)
-                .child(label),
-        )
-        .child(
-            div()
-                .flex()
-                .flex_row()
-                .flex_wrap()
-                .items_center()
-                .gap(px(6.0))
-                .children(buttons),
-        )
 }
 
 /// One placeholder bar in the miniature, width given as a fraction of its
@@ -333,8 +316,9 @@ impl Render for AppearancePage {
                 }))
         });
 
-        // Where the image is painted. Only offered once an image is chosen.
-        let scope_row = has_wallpaper.then(|| {
+        // Where the image is painted. Only offered once an image is chosen;
+        // onboarding keeps the wallpaper step to the image itself.
+        let scope_row = (has_wallpaper && !self.embedded).then(|| {
             let current_scope = wallpaper::scope(cx);
             let buttons: Vec<_> = wallpaper::WallpaperScope::ALL
                 .into_iter()
@@ -397,8 +381,8 @@ impl Render for AppearancePage {
                 )
         });
 
-        // Background effect. Shown once an image is chosen; ASCII reveals its
-        // own parameters only when selected.
+        // Background effect: a single choice, no knobs — picking ASCII runs the
+        // fixed recipe over the image (zeron parity).
         let effect = wallpaper::effect(cx);
         let ascii_params = match effect {
             wallpaper::BackgroundEffect::Ascii(params) => params,
@@ -407,9 +391,8 @@ impl Render for AppearancePage {
         let ascii_supported = wallpaper_path
             .as_deref()
             .is_some_and(wallpaper::ascii::supports_ascii);
-        let effect_block = has_wallpaper.then(|| {
+        let effect_block = (has_wallpaper && !self.embedded).then(|| {
             let current_is_ascii = effect.is_ascii();
-            let params = ascii_params;
 
             let effect_buttons = div()
                 .flex()
@@ -427,126 +410,9 @@ impl Render for AppearancePage {
                     segment(&theme, "effect-ascii", "ASCII", current_is_ascii)
                         .when(!ascii_supported, |el| el.opacity(0.5))
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.save_effect(wallpaper::BackgroundEffect::Ascii(params), cx);
+                            this.save_effect(wallpaper::BackgroundEffect::Ascii(ascii_params), cx);
                         })),
                 );
-
-            let mut rows: Vec<AnyElement> = Vec::new();
-            if current_is_ascii {
-                let charset_buttons = wallpaper::AsciiCharset::ALL
-                    .into_iter()
-                    .map(|charset| {
-                        segment(
-                            &theme,
-                            format!("ascii-charset-{}", charset.label()),
-                            charset.label(),
-                            params.charset == charset,
-                        )
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            let next = wallpaper::AsciiParams { charset, ..params };
-                            this.save_effect(wallpaper::BackgroundEffect::Ascii(next), cx);
-                        }))
-                        .into_any_element()
-                    })
-                    .collect();
-                rows.push(labeled_row(&theme, "Character set", charset_buttons).into_any_element());
-
-                let color_buttons = wallpaper::AsciiColor::ALL
-                    .into_iter()
-                    .map(|color| {
-                        segment(
-                            &theme,
-                            format!("ascii-color-{}", color.label()),
-                            color.label(),
-                            params.color == color,
-                        )
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            let next = wallpaper::AsciiParams { color, ..params };
-                            this.save_effect(wallpaper::BackgroundEffect::Ascii(next), cx);
-                        }))
-                        .into_any_element()
-                    })
-                    .collect();
-                rows.push(labeled_row(&theme, "Colour", color_buttons).into_any_element());
-
-                let density_buttons = ["Sparse", "Medium", "Dense"]
-                    .into_iter()
-                    .enumerate()
-                    .map(|(preset, label)| {
-                        let columns = density_columns(preset);
-                        segment(
-                            &theme,
-                            format!("ascii-density-{preset}"),
-                            label,
-                            params.columns == columns,
-                        )
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            let next = wallpaper::AsciiParams { columns, ..params };
-                            this.save_effect(wallpaper::BackgroundEffect::Ascii(next), cx);
-                        }))
-                        .into_any_element()
-                    })
-                    .collect();
-                rows.push(labeled_row(&theme, "Density", density_buttons).into_any_element());
-
-                let opacity_buttons = [0.15_f32, 0.25, 0.35, 0.5]
-                    .into_iter()
-                    .map(|opacity| {
-                        let label = format!("{}%", (opacity * 100.0) as u32);
-                        segment(
-                            &theme,
-                            format!("ascii-opacity-{label}"),
-                            label,
-                            (params.opacity - opacity).abs() < 0.001,
-                        )
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            let next = wallpaper::AsciiParams { opacity, ..params };
-                            this.save_effect(wallpaper::BackgroundEffect::Ascii(next), cx);
-                        }))
-                        .into_any_element()
-                    })
-                    .collect();
-                rows.push(labeled_row(&theme, "Opacity", opacity_buttons).into_any_element());
-
-                rows.push(
-                    div()
-                        .id("ascii-invert")
-                        .flex()
-                        .items_center()
-                        .gap(px(8.0))
-                        .cursor_pointer()
-                        .child(
-                            div()
-                                .text_size(px(12.0))
-                                .text_color(theme.text_muted)
-                                .child("Invert"),
-                        )
-                        .child(widgets::toggle_switch(&theme, params.invert))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            let next = wallpaper::AsciiParams {
-                                invert: !params.invert,
-                                ..params
-                            };
-                            this.save_effect(wallpaper::BackgroundEffect::Ascii(next), cx);
-                        }))
-                        .into_any_element(),
-                );
-
-                rows.push(
-                    widgets::ghost_action(&theme)
-                        .id("ascii-reset")
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.save_effect(
-                                wallpaper::BackgroundEffect::Ascii(
-                                    wallpaper::AsciiParams::default(),
-                                ),
-                                cx,
-                            );
-                        }))
-                        .child("Reset")
-                        .into_any_element(),
-                );
-            }
 
             div()
                 .flex()
@@ -561,7 +427,6 @@ impl Render for AppearancePage {
                             .child("ASCII needs a PNG or JPEG."),
                     )
                 })
-                .children(rows)
         });
 
         let wallpaper_preview = wallpaper_path
@@ -578,21 +443,28 @@ impl Render for AppearancePage {
                     .into_any_element(),
             });
 
-        div()
-            .id("appearance-page")
-            .size_full()
-            .overflow_y_scroll()
-            .child(
-                widgets::page_column()
-                    .child(widgets::page_header(&theme, "Appearance", None))
-                    .child(
-                        widgets::page_subtitle(
-                            &theme,
-                            "Choose a theme for this device.",
+        let page = div().id("appearance-page");
+        let page = if self.embedded {
+            // Inside the onboarding the host owns the scroll container and
+            // sizing; the page contributes its controls only.
+            page.w_full()
+        } else {
+            page.size_full().overflow_y_scroll()
+        };
+        page.child({
+                let column = widgets::page_column();
+                let column = if self.embedded {
+                    column
+                } else {
+                    column
+                        .child(widgets::page_header(&theme, "Appearance", None))
+                        .child(
+                            widgets::page_subtitle(&theme, "Choose a theme for this device.")
+                                .max_w(px(512.0))
+                                .line_height(px(20.0)),
                         )
-                        .max_w(px(512.0))
-                        .line_height(px(20.0)),
-                    )
+                };
+                column
                     .child(
                         div()
                             .mt(px(32.0))
@@ -765,8 +637,8 @@ impl Render for AppearancePage {
                             .text_color(theme.text_muted)
                             .line_height(px(18.0))
                             .child(helper(current, system)),
-                    ),
-            )
+                    )
+        })
     }
 }
 
@@ -811,17 +683,5 @@ mod tests {
         let (l, d) = (Theme::light(), Theme::dark());
         assert_ne!(l.surface.l, d.surface.l);
         assert_ne!(l.bg.l, d.bg.l);
-    }
-
-    #[test]
-    fn density_presets_are_sparse_medium_dense() {
-        assert_eq!(density_columns(0), 80);
-        assert_eq!(density_columns(1), 120);
-        assert_eq!(density_columns(2), 160);
-        assert_eq!(
-            density_columns(9),
-            160,
-            "out-of-range clamps to the densest"
-        );
     }
 }

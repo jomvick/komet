@@ -195,6 +195,21 @@ pub struct UiSettings {
     /// providers whose quotas Komet reads first.
     #[serde(default = "default_usage_agents")]
     pub usage_agents: Vec<String>,
+    /// Whether the first-run onboarding finished. `None` = the key is absent,
+    /// which is ambiguous: an existing file that predates the flag belongs to
+    /// a user who has been driving Komet already (migrated to done at load,
+    /// see [`UiSettings::load`]), while a missing file is a true first
+    /// install and stays unfinished. `Some(false)` is only ever written by
+    /// the explicit "Show onboarding" replay.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub onboarding_completed: Option<bool>,
+    /// Set by [`UiSettings::load`] when the file parsed but carried no
+    /// `onboardingCompleted` key. Never persisted, never serialized: only the
+    /// debug-build replay reads it so `cargo run` shows the tour on a
+    /// developer machine without re-onboarding release users, whose migrated
+    /// `Some(true)` is the end of it.
+    #[serde(skip)]
+    pub onboarding_key_absent: bool,
 }
 
 fn default_usage_agents() -> Vec<String> {
@@ -235,6 +250,8 @@ impl Default for UiSettings {
             files_editor_font_size: FILES_EDITOR_FONT_SIZE_DEFAULT,
             files_show_all: false,
             usage_agents: default_usage_agents(),
+            onboarding_completed: None,
+            onboarding_key_absent: false,
         }
     }
 }
@@ -473,17 +490,38 @@ impl UiSettings {
     }
 
     /// Load from `{data_dir}/ui-settings.json`; defaults on any failure.
+    ///
+    /// A file that exists but lacks `onboardingCompleted` was written by an
+    /// earlier build: that user has been driving Komet and must not be thrown
+    /// into the first-run tour. The key stays absent in memory (so saving does
+    /// not invent it) and [`Self::onboarding_completed`] reads the observation
+    /// — which also lets a debug build replay the tour until it is finished
+    /// for real (and `Some(true)` gets written). A MISSING file is a true
+    /// first install: nothing is absent, and the tour shows.
     pub fn load(data_dir: &Path) -> Self {
         match std::fs::read_to_string(Self::path(data_dir)) {
             Ok(text) => match serde_json::from_str::<UiSettings>(&text) {
-                Ok(settings) => settings.clamped(),
+                Ok(mut settings) => {
+                    settings.onboarding_key_absent = settings.onboarding_completed.is_none();
+                    settings.clamped()
+                }
                 Err(err) => {
                     tracing::warn!(error = %err, "ui-settings corrupt; using defaults");
-                    Self::default()
+                    // A corrupt file still proves the app ran before.
+                    Self {
+                        onboarding_completed: Some(true),
+                        ..Self::default()
+                    }
                 }
             },
             Err(_) => Self::default(),
         }
+    }
+
+    /// The onboarding gate: explicitly done, or a pre-flag file (whose owner
+    /// has already been using Komet).
+    pub fn onboarding_completed(&self) -> bool {
+        self.onboarding_completed == Some(true) || self.onboarding_key_absent
     }
 
     /// Write atomically (temp file + rename) so a crash mid-write never corrupts.
@@ -568,6 +606,8 @@ mod tests {
             files_editor_font_size: 13.0,
             files_show_all: false,
             usage_agents: vec!["claude-code".into(), "cursor".into()],
+            onboarding_completed: Some(true),
+            onboarding_key_absent: false,
         };
         settings.save(dir.path()).unwrap();
         let json = std::fs::read_to_string(UiSettings::path(dir.path())).unwrap();
@@ -705,7 +745,110 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(UiSettings::load(dir.path()), UiSettings::default());
         std::fs::write(UiSettings::path(dir.path()), "{not json").unwrap();
-        assert_eq!(UiSettings::load(dir.path()), UiSettings::default());
+        // A corrupt file still proves the app ran before: onboarding is done,
+        // every other preference resets to defaults.
+        let loaded = UiSettings::load(dir.path());
+        assert_eq!(
+            loaded,
+            UiSettings {
+                onboarding_completed: Some(true),
+                ..UiSettings::default()
+            }
+        );
+    }
+
+    /// An existing file written before the flag existed reads as "completed" —
+    /// users of earlier builds must never see the first-run tour — while the
+    /// key stays absent so saving does not invent it, and the rest of their
+    /// preferences survive untouched.
+    #[test]
+    fn onboarding_flag_migrates_existing_files_to_completed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            UiSettings::path(dir.path()),
+            r#"{"sidebarWidth": 300, "soundEnabled": false}"#,
+        )
+        .unwrap();
+        let loaded = UiSettings::load(dir.path());
+        assert_eq!(loaded.onboarding_completed, None);
+        assert!(loaded.onboarding_key_absent);
+        assert!(loaded.onboarding_completed());
+        assert_eq!(loaded.sidebar_width, 300.0, "other keys still parse");
+        assert!(!loaded.sound_enabled);
+    }
+
+    /// A missing file is a true first install: onboarding stays unfinished.
+    #[test]
+    fn a_missing_file_leaves_onboarding_unfinished() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(UiSettings::load(dir.path()).onboarding_completed, None);
+    }
+
+    /// `onboarding_key_absent` records "the file predates the flag" so a debug
+    /// build replays the tour until it is finished for real; it is never
+    /// serialized and a file that carries the key (even `false`) is never
+    /// "absent".
+    #[test]
+    fn a_legacy_file_reports_the_absent_key() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(UiSettings::path(dir.path()), r#"{"sidebarWidth": 300}"#).unwrap();
+        let legacy = UiSettings::load(dir.path());
+        assert!(legacy.onboarding_key_absent);
+        assert!(legacy.onboarding_completed());
+        // Saving a legacy load does not add the key, so the observation
+        // survives the write.
+        legacy.save(dir.path()).unwrap();
+        let json = std::fs::read_to_string(UiSettings::path(dir.path())).unwrap();
+        assert!(!json.contains("onboardingKeyAbsent"));
+        assert!(!json.contains("onboardingCompleted"));
+        assert!(UiSettings::load(dir.path()).onboarding_key_absent);
+
+        std::fs::write(
+            UiSettings::path(dir.path()),
+            r#"{"onboardingCompleted": false}"#,
+        )
+        .unwrap();
+        assert!(!UiSettings::load(dir.path()).onboarding_key_absent);
+
+        let settings = UiSettings {
+            onboarding_completed: Some(true),
+            ..UiSettings::default()
+        };
+        settings.save(dir.path()).unwrap();
+        assert!(!UiSettings::load(dir.path()).onboarding_key_absent);
+    }
+
+    /// Only the explicit replay writes `false` — and it must survive a load
+    /// (the migration above only fires for `None`).
+    #[test]
+    fn an_explicit_false_survives_the_migration() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            UiSettings::path(dir.path()),
+            r#"{"onboardingCompleted": false}"#,
+        )
+        .unwrap();
+        let loaded = UiSettings::load(dir.path());
+        assert_eq!(loaded.onboarding_completed, Some(false));
+        assert!(!loaded.onboarding_completed());
+    }
+
+    /// The round trip writes the flag under the camelCase key once it is set.
+    #[test]
+    fn onboarding_flag_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = UiSettings {
+            onboarding_completed: Some(true),
+            ..UiSettings::default()
+        };
+        settings.save(dir.path()).unwrap();
+        let json = std::fs::read_to_string(UiSettings::path(dir.path())).unwrap();
+        let saved: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(saved["onboardingCompleted"], true);
+        assert_eq!(
+            UiSettings::load(dir.path()).onboarding_completed,
+            Some(true)
+        );
     }
 
     #[test]
