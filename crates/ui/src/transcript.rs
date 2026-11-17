@@ -519,6 +519,17 @@ pub enum QuestionStatus {
     Awaiting,
 }
 
+/// The agent switch a user turn carried (`MessagePart::Switch`), rendered as
+/// brand marks above the bubble (zcode's "agent → agent" line, icons only).
+/// The labels are the fallback for markers written before harness slugs.
+#[derive(Clone)]
+pub struct SwitchTransition {
+    pub from: Option<komet_proto::HarnessId>,
+    pub to: Option<komet_proto::HarnessId>,
+    pub from_label: SharedString,
+    pub to_label: SharedString,
+}
+
 #[derive(Clone)]
 pub enum RowKind {
     User {
@@ -539,6 +550,8 @@ pub enum RowKind {
         attachments: Arc<Vec<crate::attachments::UserAttachment>>,
         /// Optimistic echo not yet confirmed by a doc frame.
         pending: bool,
+        /// The agent switch this turn carried — brand marks above the bubble.
+        switch: Option<SwitchTransition>,
     },
     /// One top-level markdown block of a completed message.
     Markdown {
@@ -581,6 +594,21 @@ pub enum RowKind {
         detail: Option<String>,
         retryable: bool,
     },
+    /// A mid-chat model switch, recorded by the engine as a `System` entry
+    /// the moment `setChatConfig` lands (zcode's permanent "Model switched
+    /// A → B" divider — visible from the switch, not deferred to the next
+    /// user message like agent switches). Model fields are catalog ids;
+    /// labels resolve at render time, harness slugs pick the catalog.
+    ModelSwitch {
+        from_model: Option<String>,
+        to_model: Option<String>,
+        from_harness: Option<SharedString>,
+        to_harness: Option<SharedString>,
+    },
+    /// An agent (harness) switch recorded as a `System` entry at config-write
+    /// time — the same permanent divider the user-message marker renders
+    /// (brand icons), but visible from the moment of the switch.
+    AgentSwitch { switch: SwitchTransition },
     /// One context-compaction boundary. Its own row kind, outside the tool
     /// grouping, because it is a fact about the *history* rather than an
     /// action the agent took — and its recap is fetched per cycle, not per
@@ -816,6 +844,8 @@ fn row_kind_tag(kind: &RowKind) -> &'static str {
         RowKind::QuestionRow { .. } => "question",
         RowKind::PermissionRow { .. } => "permission",
         RowKind::ErrorChip { .. } => "error",
+        RowKind::AgentSwitch { .. } => "agent_switch",
+        RowKind::ModelSwitch { .. } => "model_switch",
         RowKind::Compaction { .. } => "compaction",
     }
 }
@@ -1053,13 +1083,32 @@ pub fn rows_for_entry(
     let entry_id: SharedString = entry.id.clone().into();
 
     if entry.role == MessageRole::User {
+        // Switch markers are not message text: they render as a brand-mark
+        // line above the bubble (see [`switch_line`]).
+        let mut switch: Option<SwitchTransition> = None;
         let raw: String = entry
             .parts
             .iter()
             .filter_map(|p| match p {
                 MessagePart::Text { text, .. } => Some(text.clone()),
-                MessagePart::Switch { from, to, .. } => {
-                    Some(format!("Switched from {from} to {to}"))
+                MessagePart::Switch {
+                    from,
+                    to,
+                    from_harness,
+                    to_harness,
+                    ..
+                } => {
+                    switch = Some(SwitchTransition {
+                        from: from_harness
+                            .as_deref()
+                            .and_then(komet_proto::HarnessId::from_slug),
+                        to: to_harness
+                            .as_deref()
+                            .and_then(komet_proto::HarnessId::from_slug),
+                        from_label: from.as_str().into(),
+                        to_label: to.as_str().into(),
+                    });
+                    None
                 }
                 _ => None,
             })
@@ -1076,9 +1125,14 @@ pub fn rows_for_entry(
             Some((display, spans)) => (display, spans),
             None => (parsed.text, Vec::new()),
         };
+        let version = if switch.is_some() {
+            (raw.len() as u64) << 2 | (pending as u64) << 1 | 1
+        } else {
+            (raw.len() as u64) << 1 | pending as u64
+        };
         return vec![Row {
             id: entry.id.clone().into(),
-            version: (raw.len() as u64) << 1 | pending as u64,
+            version,
             turn_start: true,
             kind: RowKind::User {
                 text: text.into(),
@@ -1086,6 +1140,7 @@ pub fn rows_for_entry(
                 mentions: Arc::new(mentions),
                 attachments: Arc::new(parsed.attachments),
                 pending,
+                switch,
             },
             entry_id,
             // User rows always carry the strip (chat-view.tsx: whenever
@@ -1361,8 +1416,70 @@ pub fn rows_for_entry(
                             timestamp: None,
                         });
                     }
-                    // Tools are grouped by the outer arm; switch markers are
-                    // metadata-only and do not render as transcript rows.
+                    // A switch marker on a SYSTEM entry is the permanent
+                    // config-switch divider written at `setChatConfig` time
+                    // (zcode): agent switches draw the brand-icon line, model
+                    // switches the "Model switched A → B" line — a combined
+                    // change emits both, agent first.
+                    MessagePart::Switch {
+                        id: part_id,
+                        from,
+                        to,
+                        from_model,
+                        to_model,
+                        from_harness,
+                        to_harness,
+                    } if entry.role == MessageRole::System => {
+                        let from_harness_id = from_harness
+                            .as_deref()
+                            .and_then(komet_proto::HarnessId::from_slug);
+                        let to_harness_id = to_harness
+                            .as_deref()
+                            .and_then(komet_proto::HarnessId::from_slug);
+                        let agent_changed = from_harness_id.is_some()
+                            && to_harness_id.is_some()
+                            && from_harness_id != to_harness_id;
+                        let mut fingerprint = format!(
+                            "{from:?}\0{to:?}\0{from_harness:?}\0{to_harness:?}\0{from_model:?}\0{to_model:?}"
+                        );
+                        fingerprint.push_str(&entry.id);
+                        let version = fnv1a(fingerprint.as_bytes());
+                        if agent_changed {
+                            rows.push(Row {
+                                id: format!("{}#{}", entry.id, part_id).into(),
+                                version,
+                                turn_start: false,
+                                kind: RowKind::AgentSwitch {
+                                    switch: SwitchTransition {
+                                        from: from_harness_id,
+                                        to: to_harness_id,
+                                        from_label: from.as_str().into(),
+                                        to_label: to.as_str().into(),
+                                    },
+                                },
+                                entry_id: entry_id.clone(),
+                                timestamp: None,
+                            });
+                        }
+                        if from_model.is_some() || to_model.is_some() {
+                            rows.push(Row {
+                                id: format!("{}#{}m", entry.id, part_id).into(),
+                                version,
+                                turn_start: false,
+                                kind: RowKind::ModelSwitch {
+                                    from_model: from_model.clone(),
+                                    to_model: to_model.clone(),
+                                    from_harness: from_harness.as_deref().map(SharedString::from),
+                                    to_harness: to_harness.as_deref().map(SharedString::from),
+                                },
+                                entry_id: entry_id.clone(),
+                                timestamp: None,
+                            });
+                        }
+                    }
+                    // Tools are grouped by the outer arm; agent-switch markers
+                    // on assistant/system entries are metadata-only and do
+                    // not render as transcript rows.
                     MessagePart::Tool { .. } | MessagePart::Switch { .. } => {}
                 }
             }
@@ -4370,6 +4487,119 @@ impl Transcript {
         )
     }
 
+    /// The agent-switch line above a user bubble: brand marks only (zcode's
+    /// "agent → agent" divider), with the stored labels as the fallback for
+    /// markers written before harness slugs existed.
+    fn switch_line(switch: &SwitchTransition, theme: &Theme) -> AnyElement {
+        let content: AnyElement = match (switch.from, switch.to) {
+            (Some(from), Some(to)) => {
+                let (from_icon, from_tint) = crate::pickers::harness_brand_icon(from);
+                let (to_icon, to_tint) = crate::pickers::harness_brand_icon(to);
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(
+                        crate::icons::icon(from_icon)
+                            .size(px(16.0))
+                            .text_color(from_tint.unwrap_or(theme.text_muted)),
+                    )
+                    .child(
+                        crate::icons::icon(crate::icons::ARROW_RIGHT)
+                            .size(px(12.0))
+                            .text_color(theme.text_faint),
+                    )
+                    .child(
+                        crate::icons::icon(to_icon)
+                            .size(px(16.0))
+                            .text_color(to_tint.unwrap_or(theme.text)),
+                    )
+                    .into_any_element()
+            }
+            _ => div()
+                .text_size(px(11.0))
+                .text_color(theme.text_muted)
+                .child(SharedString::from(format!(
+                    "{} → {}",
+                    switch.from_label, switch.to_label
+                )))
+                .into_any_element(),
+        };
+        div()
+            .w_full()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(10.0))
+            .py(px(4.0))
+            .child(div().flex_1().h(px(1.0)).bg(crate::theme::hairline(0.10)))
+            .child(content)
+            .child(div().flex_1().h(px(1.0)).bg(crate::theme::hairline(0.10)))
+            .into_any_element()
+    }
+
+    /// The permanent "⇄ Model switched A → B" divider (zcode): hairlines
+    /// around the switch glyph and the resolved catalog labels — the raw id
+    /// stands in when the catalog isn't loaded here, "Default" for the
+    /// harness default (`None` model in the marker).
+    fn model_switch_line(
+        &self,
+        from_model: Option<&str>,
+        to_model: Option<&str>,
+        from_harness: Option<&str>,
+        to_harness: Option<&str>,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let pickers = self
+            .composer
+            .as_ref()
+            .and_then(|weak| weak.upgrade())
+            .map(|composer| composer.read(cx).pickers().clone());
+        let app: &gpui::App = cx;
+        let label = |harness: Option<&str>, model: Option<&str>| -> String {
+            let Some(model) = model else {
+                return "Default".to_string();
+            };
+            harness
+                .and_then(komet_proto::HarnessId::from_slug)
+                .and_then(|harness| {
+                    pickers
+                        .as_ref()
+                        .and_then(|pickers| pickers.read(app).model_label(harness, model))
+                })
+                .unwrap_or_else(|| model.to_string())
+        };
+        let line = div()
+            .flex()
+            .items_center()
+            .gap(px(7.0))
+            .text_size(px(11.0))
+            .text_color(theme.text_muted)
+            .child(
+                crate::icons::icon(crate::icons::SWITCH)
+                    .size(px(13.0))
+                    .text_color(theme.text_muted),
+            )
+            .child(SharedString::from(format!(
+                "Model switched {} → {}",
+                label(from_harness, from_model),
+                label(to_harness, to_model)
+            )));
+        div()
+            .w_full()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(10.0))
+            .py(px(4.0))
+            .child(div().flex_1().h(px(1.0)).bg(crate::theme::hairline(0.10)))
+            .child(line)
+            .child(div().flex_1().h(px(1.0)).bg(crate::theme::hairline(0.10)))
+            .into_any_element()
+    }
+
     fn render_row(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let Some(row) = self.rows.get(ix).cloned() else {
             return gpui::Empty.into_any_element();
@@ -4419,16 +4649,21 @@ impl Transcript {
                 mentions,
                 attachments,
                 pending,
+                switch,
                 ..
             } => {
                 let attachments = attachments.clone();
                 let text = text.clone();
                 let mentions = mentions.clone();
                 let pending = *pending;
+                let switch = switch.clone();
                 // Attachment thumbnails ride ABOVE the bubble, right-aligned
                 // (chat-view.tsx RowView: UserAttachmentStrip then the text
                 // HStack); image-only sends show no bubble at all.
                 let mut column = div().w_full().flex().flex_col();
+                if let Some(switch) = switch.as_ref() {
+                    column = column.child(Self::switch_line(switch, &theme));
+                }
                 if !attachments.is_empty() {
                     column = column.child(self.render_user_attachments(
                         &row.id,
@@ -4605,6 +4840,20 @@ impl Transcript {
                 detail,
                 retryable,
             } => self.render_error_chip(&row.id, message, kind, detail, *retryable, &theme, cx),
+            RowKind::AgentSwitch { switch } => Self::switch_line(switch, &theme),
+            RowKind::ModelSwitch {
+                from_model,
+                to_model,
+                from_harness,
+                to_harness,
+            } => self.model_switch_line(
+                from_model.as_deref(),
+                to_model.as_deref(),
+                from_harness.as_deref(),
+                to_harness.as_deref(),
+                &theme,
+                cx,
+            ),
             RowKind::Compaction {
                 compaction_id,
                 status,
@@ -6893,7 +7142,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_switch_is_visible_in_the_user_message() {
+    fn agent_switch_renders_as_icons_not_text() {
         let entry = SessionMessageEntry {
             id: "user-switch".into(),
             role: MessageRole::User,
@@ -6905,6 +7154,8 @@ mod tests {
                     to: "Muse Code".into(),
                     from_harness: Some("claude-code".into()),
                     to_harness: Some("muse".into()),
+                    from_model: None,
+                    to_model: None,
                 },
             ],
             created_at: 0,
@@ -6915,16 +7166,125 @@ mod tests {
 
         let rows = rows_for_entry(&entry, false, &mut parse);
         let Some(Row {
-            kind: RowKind::User { text, .. },
+            kind: RowKind::User { text, switch, .. },
             ..
         }) = rows.first()
         else {
             panic!("expected user transcript row");
         };
-        assert_eq!(
-            text.as_ref(),
-            "Continue with this provider\n\nSwitched from Claude Code to Muse Code"
-        );
+        // The prompt stays the message; the switch is its own icon line (it
+        // must not leak "Switched from …" into the bubble text).
+        assert_eq!(text.as_ref(), "Continue with this provider");
+        let switch = switch.as_ref().expect("switch carried by the row");
+        assert_eq!(switch.from, Some(komet_proto::HarnessId::ClaudeCode));
+        assert_eq!(switch.to, Some(komet_proto::HarnessId::Muse));
+        assert_eq!(switch.from_label.as_ref(), "Claude Code");
+        assert_eq!(switch.to_label.as_ref(), "Muse Code");
+
+        // A marker without harness slugs (older doc) keeps the labels.
+        let mut legacy = entry.clone();
+        legacy.parts = vec![MessagePart::Switch {
+            id: "switch-2".into(),
+            from: "Claude Code".into(),
+            to: "Muse Code".into(),
+            from_harness: None,
+            to_harness: None,
+            from_model: None,
+            to_model: None,
+        }];
+        let rows = rows_for_entry(&legacy, false, &mut parse);
+        let RowKind::User { switch, .. } = &rows[0].kind else {
+            panic!("expected user transcript row");
+        };
+        let switch = switch.as_ref().expect("switch carried by the row");
+        assert!(switch.from.is_none() && switch.to.is_none());
+        assert_eq!(switch.to_label.as_ref(), "Muse Code");
+    }
+
+    #[test]
+    fn model_switch_system_entry_renders_as_its_own_row() {
+        let entry = SessionMessageEntry {
+            id: "sys-switch-1".into(),
+            role: MessageRole::System,
+            parts: vec![MessagePart::Switch {
+                id: "switch-model-1".into(),
+                from: "claude-opus".into(),
+                to: "glm-5.3-flash".into(),
+                from_harness: Some("claude-code".into()),
+                to_harness: Some("claude-code".into()),
+                from_model: Some("claude-opus".into()),
+                to_model: Some("glm-5.3-flash".into()),
+            }],
+            created_at: 0,
+            device_id: "dev".into(),
+            status: Some(MessageStatus::Complete),
+            continuation_of: None,
+        };
+
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        assert_eq!(rows.len(), 1);
+        let RowKind::ModelSwitch {
+            from_model,
+            to_model,
+            to_harness,
+            ..
+        } = &rows[0].kind
+        else {
+            panic!("expected model-switch row");
+        };
+        assert_eq!(from_model.as_deref(), Some("claude-opus"));
+        assert_eq!(to_model.as_deref(), Some("glm-5.3-flash"));
+        assert_eq!(to_harness.as_deref(), Some("claude-code"));
+
+        // An agent-only switch on a system entry is the permanent agent
+        // divider written at setChatConfig time — its own icon row.
+        let mut agent_only = entry.clone();
+        agent_only.parts = vec![MessagePart::Switch {
+            id: "switch-agent-1".into(),
+            from: "Claude Code".into(),
+            to: "Muse Code".into(),
+            from_harness: Some("claude-code".into()),
+            to_harness: Some("muse".into()),
+            from_model: None,
+            to_model: None,
+        }];
+        let rows = rows_for_entry(&agent_only, false, &mut parse);
+        assert_eq!(rows.len(), 1);
+        let RowKind::AgentSwitch { switch } = &rows[0].kind else {
+            panic!("expected agent-switch row");
+        };
+        assert_eq!(switch.from, Some(komet_proto::HarnessId::ClaudeCode));
+        assert_eq!(switch.to, Some(komet_proto::HarnessId::Muse));
+
+        // A combined agent+model change emits both dividers, agent first.
+        let mut combined = agent_only.clone();
+        combined.parts = vec![MessagePart::Switch {
+            id: "switch-both-1".into(),
+            from: "claude-opus".into(),
+            to: "glm-5.3-flash".into(),
+            from_harness: Some("claude-code".into()),
+            to_harness: Some("muse".into()),
+            from_model: Some("claude-opus".into()),
+            to_model: Some("glm-5.3-flash".into()),
+        }];
+        let rows = rows_for_entry(&combined, false, &mut parse);
+        assert_eq!(rows.len(), 2);
+        assert!(matches!(rows[0].kind, RowKind::AgentSwitch { .. }));
+        assert!(matches!(rows[1].kind, RowKind::ModelSwitch { .. }));
+
+        // A marker with no harness change and no model fields renders
+        // nothing (nothing actually switched).
+        let mut noop = agent_only.clone();
+        noop.parts = vec![MessagePart::Switch {
+            id: "switch-noop-1".into(),
+            from: "Claude Code".into(),
+            to: "Claude Code".into(),
+            from_harness: Some("claude-code".into()),
+            to_harness: Some("claude-code".into()),
+            from_model: None,
+            to_model: None,
+        }];
+        assert!(rows_for_entry(&noop, false, &mut parse).is_empty());
     }
 
     fn tool_part(id: &str, command: &str) -> MessagePart {

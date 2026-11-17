@@ -73,18 +73,24 @@ impl Render for FilesSettingsPage {
                 .px(px(10.0))
                 .rounded(px(7.0))
                 .border_1()
-                .border_color(if active {
-                    theme.accent.opacity(0.7)
-                } else {
-                    theme.border
-                })
+                .border_color(theme.border)
                 .bg(if active {
-                    theme.accent.opacity(0.11)
+                    theme.mark_bg()
                 } else {
                     crate::theme::wash(0.025)
                 })
+                .when(active, |el| el.shadow(theme.mark_ring()))
                 .text_size(px(11.5))
-                .text_color(if active { theme.text } else { theme.text_muted })
+                .font_weight(if active {
+                    gpui::FontWeight::MEDIUM
+                } else {
+                    gpui::FontWeight::NORMAL
+                })
+                .text_color(if active {
+                    theme.accent
+                } else {
+                    theme.text_muted
+                })
                 .flex()
                 .items_center()
                 .cursor_pointer()
@@ -110,18 +116,24 @@ impl Render for FilesSettingsPage {
                 .px(px(10.0))
                 .rounded(px(7.0))
                 .border_1()
-                .border_color(if active {
-                    theme.accent.opacity(0.7)
-                } else {
-                    theme.border
-                })
+                .border_color(theme.border)
                 .bg(if active {
-                    theme.accent.opacity(0.11)
+                    theme.mark_bg()
                 } else {
                     crate::theme::wash(0.025)
                 })
+                .when(active, |el| el.shadow(theme.mark_ring()))
                 .text_size(px(11.5))
-                .text_color(if active { theme.text } else { theme.text_muted })
+                .font_weight(if active {
+                    gpui::FontWeight::MEDIUM
+                } else {
+                    gpui::FontWeight::NORMAL
+                })
+                .text_color(if active {
+                    theme.accent
+                } else {
+                    theme.text_muted
+                })
                 .flex()
                 .items_center()
                 .cursor_pointer()

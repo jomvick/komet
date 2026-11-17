@@ -14,10 +14,10 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use futures::StreamExt;
 use gpui::{
-    AnyElement, App, Bounds, Context, Element, Entity, FocusHandle, GlobalElementId,
-    InspectorElementId, InteractiveElement, IntoElement, LayoutId, MouseButton, ObjectFit, Pixels,
-    Render, RenderImage, ScrollDelta, ScrollWheelEvent, SharedString, Window, div, img, prelude::*,
-    px,
+    AnyElement, App, Bounds, ClipboardItem, Context, Element, Entity, FocusHandle, Focusable,
+    GlobalElementId, InspectorElementId, InteractiveElement, IntoElement, LayoutId, MouseButton,
+    ObjectFit, Pixels, Render, RenderImage, ScrollDelta, ScrollWheelEvent, SharedString, Window,
+    div, img, prelude::*, px,
 };
 use image::{Frame, RgbaImage};
 use serde_json::Value;
@@ -29,6 +29,7 @@ use process::acquire_browser;
 
 use crate::composer::{ComposerInput, ComposerInputEvent};
 use crate::icons;
+use crate::popover;
 
 const DEFAULT_VIEWPORT: (u32, u32) = (1280, 800);
 type WsStream = WebSocket<MaybeTlsStream<std::net::TcpStream>>;
@@ -194,6 +195,8 @@ pub struct BrowserSurface {
     show_console: bool,
     console_logs: VecDeque<ConsoleLog>,
     status_toast: Option<String>,
+    /// The "…" overflow menu's open flag (Screenshot / Console entries).
+    dots_open: bool,
     last_viewport: Cell<(u32, u32)>,
     visible: bool,
     /// resize débouncé : la plus récente taille + scale à envoyer
@@ -205,7 +208,7 @@ pub struct BrowserSurface {
 
 impl BrowserSurface {
     pub fn new(url: String, profile_key: String, cx: &mut Context<Self>) -> Self {
-        let address = cx.new(|cx| ComposerInput::new("Search or enter an address", cx));
+        let address = cx.new(|cx| ComposerInput::new("Search or enter URL", cx));
         address.update(cx, |input, cx| input.set_text(url.clone(), cx));
 
         let console_input = cx.new(|cx| ComposerInput::new("Evaluate JavaScript...", cx));
@@ -300,7 +303,9 @@ impl BrowserSurface {
             page_focus: cx.focus_handle(),
             image: None,
             retired_images: Vec::new(),
-            title: "Browser".into(),
+            // Empty until the page reports a title — `tab_title` falls back
+            // to the URL's host, then "Browser".
+            title: String::new(),
             url,
             is_loading: false,
             can_back: false,
@@ -311,6 +316,7 @@ impl BrowserSurface {
             show_console: false,
             console_logs: VecDeque::new(),
             status_toast: None,
+            dots_open: false,
             last_viewport: Cell::new((0, 0)),
             visible: true,
             pending_resize: Rc::new(Cell::new(None)),
@@ -394,12 +400,34 @@ impl BrowserSurface {
         cx.notify();
     }
 
+    /// Status line under the toolbar — auto-clears so a stale "Saved:" never
+    /// sits there forever.
+    fn flash_status(&mut self, message: impl Into<String>, cx: &mut Context<Self>) {
+        self.status_toast = Some(message.into());
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_secs(3)).await;
+            let _ = this.update(cx, |this, cx| {
+                this.status_toast = None;
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Ctrl+L: focus the address field and select its whole content.
+    pub fn focus_address(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.address.update(cx, |input, cx| {
+            input.focus_select_all(window, cx);
+        });
+    }
+
     pub fn tab_title(&self) -> SharedString {
-        if self.title.trim().is_empty() {
-            SharedString::from("Browser")
-        } else {
-            self.title.clone().into()
+        if !self.title.trim().is_empty() {
+            return self.title.clone().into();
         }
+        host_of(&self.url)
+            .map(SharedString::from)
+            .unwrap_or_else(|| SharedString::from("Browser"))
     }
 
     fn receive_events(&mut self, cx: &mut Context<Self>) {
@@ -472,10 +500,12 @@ impl BrowserSurface {
                         .unwrap_or_else(|| PathBuf::from("."))
                         .join(&file_name);
                     if let Ok(()) = std::fs::write(&path, &bytes) {
-                        self.status_toast = Some(format!("Saved: {}", path.display()));
+                        self.flash_status(format!("Saved: {}", path.display()), cx);
                     } else {
-                        self.status_toast =
-                            Some(format!("Screenshot captured ({} bytes)", bytes.len()));
+                        self.flash_status(
+                            format!("Screenshot captured ({} bytes)", bytes.len()),
+                            cx,
+                        );
                     }
                     changed = true;
                 }
@@ -484,7 +514,7 @@ impl BrowserSurface {
                     changed = true;
                 }
                 Ok(BrowserEvent::Warning(warning)) => {
-                    self.status_toast = Some(warning);
+                    self.flash_status(warning, cx);
                     changed = true;
                 }
                 Err(TryRecvError::Empty) => break,
@@ -612,6 +642,11 @@ impl Render for BrowserSurface {
         }
 
         let theme = crate::theme::Theme::of(cx).clone();
+        let address_focused = {
+            let input = self.address.read(cx);
+            input.focus_handle(cx).is_focused(window)
+        };
+        let entity_empty = cx.entity().clone();
         // Position de la souris vue par le panneau ; press et release sont des
         // commandes séparées (drag + sélection de texte), moves = hover/menus.
         let press_commands = self.commands.clone();
@@ -633,18 +668,81 @@ impl Render for BrowserSurface {
                     .into_any_element()
             })
             .unwrap_or_else(|| {
+                if self.is_loading {
+                    return div()
+                        .size_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_color(theme.text_muted)
+                        .text_size(px(13.0))
+                        .child("Loading…")
+                        .into_any_element();
+                }
+                // Empty state: a single fake-field row — clicking it lands the
+                // caret in the real address bar with everything selected.
+                let caps: [SharedString; 3] = if cfg!(target_os = "macos") {
+                    ["⌘".into(), "+".into(), "L".into()]
+                } else {
+                    ["Ctrl".into(), "+".into(), "L".into()]
+                };
                 div()
                     .size_full()
                     .flex()
                     .items_center()
                     .justify_center()
-                    .text_color(theme.text_muted)
-                    .text_size(px(13.0))
-                    .child(if self.is_loading {
-                        "Chargement…"
-                    } else {
-                        "Entrez une adresse pour commencer"
-                    })
+                    .child(
+                        div()
+                            .id("browser-empty-address")
+                            .h(px(28.0))
+                            .w_full()
+                            .max_w(px(320.0))
+                            .px(px(8.0))
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(8.0))
+                            .rounded(px(8.0))
+                            .cursor_pointer()
+                            .when(address_focused, |el| el.shadow(theme.mark_ring()))
+                            .hover(|s| s.bg(crate::theme::ink(0.04)))
+                            .on_click(move |_event, window, cx| {
+                                entity_empty.update(cx, |this, cx| {
+                                    this.focus_address(window, cx);
+                                });
+                            })
+                            .child(
+                                crate::icons::icon(icons::GLOBAL)
+                                    .size(px(14.0))
+                                    .text_color(theme.text_muted),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .text_size(px(12.5))
+                                    .text_color(theme.text)
+                                    .child("Open Address…"),
+                            )
+                            .children(caps.iter().enumerate().map(|(ix, cap)| {
+                                div()
+                                    .h(px(18.0))
+                                    .min_w(px(18.0))
+                                    .px(px(5.0))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded(px(4.0))
+                                    .bg(crate::theme::ink(0.06))
+                                    .text_size(px(11.0))
+                                    .text_color(if ix == 1 {
+                                        theme.text_faint
+                                    } else {
+                                        theme.text_muted
+                                    })
+                                    .child(cap.clone())
+                            })),
+                    )
                     .into_any_element()
             });
 
@@ -663,8 +761,8 @@ impl Render for BrowserSurface {
                         .px(px(4.0))
                         .py(px(1.0))
                         .rounded(px(3.0))
-                        .bg(gpui::hsla(215.0 / 360.0, 0.9, 0.5, 0.85))
-                        .text_color(gpui::white())
+                        .bg(theme.solid)
+                        .text_color(theme.on_solid)
                         .text_size(px(10.0))
                         .cursor_pointer()
                         .child(label)
@@ -790,7 +888,6 @@ impl Render for BrowserSurface {
         let back = self.commands.clone();
         let forward = self.commands.clone();
         let reload = self.commands.clone();
-        let capture = self.commands.clone();
         let retry = self.error.is_some();
         let can_back = self.can_back && !retry;
         let can_forward = self.can_forward && !retry;
@@ -799,9 +896,9 @@ impl Render for BrowserSurface {
         let console_active = self.show_console;
 
         let entity_overlay = cx.entity().clone();
-        let entity_console = cx.entity().clone();
         let entity_clear = cx.entity().clone();
-        let entity_submit = cx.entity().clone();
+        let entity_copy = cx.entity().clone();
+        let entity_dots = cx.entity().clone();
 
         div()
             .size_full()
@@ -811,11 +908,11 @@ impl Render for BrowserSurface {
             .text_color(theme.text)
             .child(
                 div()
-                    .h(px(42.0))
+                    .h(px(36.0))
                     .flex_none()
                     .flex()
                     .items_center()
-                    .gap(px(6.0))
+                    .gap(px(4.0))
                     .px(px(8.0))
                     .border_b_1()
                     .border_color(theme.border)
@@ -854,15 +951,21 @@ impl Render for BrowserSurface {
                             .flex_1()
                             .flex()
                             .items_center()
-                            .rounded(px(6.0))
+                            .rounded(px(8.0))
                             .border_1()
-                            .border_color(theme.border)
-                            .bg(theme.surface)
+                            .border_color(if address_focused {
+                                theme.border_strong
+                            } else {
+                                theme.border
+                            })
+                            .when(address_focused, |el| el.shadow(theme.mark_ring()))
+                            .bg(crate::theme::ink(0.04))
                             .px(px(6.0))
                             .child(div().flex_1().min_w_0().child(self.address.clone()))
+                            // Copy the shown address — Enter already submits.
                             .child(
                                 div()
-                                    .id("navigate-go")
+                                    .id("browser-copy-url")
                                     .size(px(20.0))
                                     .flex_none()
                                     .flex()
@@ -872,26 +975,24 @@ impl Render for BrowserSurface {
                                     .cursor_pointer()
                                     .hover(|s| s.bg(crate::theme::ink(0.08)))
                                     .on_click(move |_event, _window, cx| {
-                                        entity_submit.update(cx, |this, cx| {
-                                            this.submit_address(cx);
+                                        entity_copy.update(cx, |this, cx| {
+                                            let url =
+                                                this.address.read(cx).text().trim().to_owned();
+                                            if !url.is_empty() {
+                                                cx.write_to_clipboard(ClipboardItem::new_string(
+                                                    url.clone(),
+                                                ));
+                                                this.flash_status("URL copied", cx);
+                                            }
                                         });
                                     })
                                     .child(
-                                        crate::icons::icon(crate::icons::ARROW_RIGHT)
+                                        crate::icons::icon(crate::icons::COPY)
                                             .size(px(12.0))
                                             .text_color(theme.text_muted),
                                     ),
                             ),
                     )
-                    // Button: Capture / Screenshot
-                    .child(browser_button(
-                        icons::IMAGE,
-                        theme.text_muted,
-                        true,
-                        move || {
-                            capture.send(BrowserCommand::CaptureScreenshot);
-                        },
-                    ))
                     // Button: Toggle Obscura Interactive Elements Overlay
                     .child(browser_button_toggle(
                         icons::EYE,
@@ -907,24 +1008,110 @@ impl Render for BrowserSurface {
                             });
                         },
                     ))
-                    // Button: Toggle DevTools Console
-                    .child(browser_button_toggle(
-                        icons::TERMINAL,
-                        console_active,
-                        theme.text_muted,
-                        move |_event, _window, cx| {
-                            entity_console.update(cx, |this, cx| {
-                                this.show_console = !this.show_console;
-                                cx.notify();
-                            });
-                        },
-                    )),
+                    // "…" overflow menu: Screenshot + Console & DevTools —
+                    // same recipe as the header's `+` menu.
+                    .child({
+                        let mut dots = div()
+                            .id("browser-dots")
+                            .size(px(28.0))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(6.0))
+                            .cursor_pointer()
+                            .hover(|s| s.bg(crate::theme::ink(0.06)))
+                            .on_click(move |_event, _window, cx| {
+                                entity_dots.update(cx, |this, cx| {
+                                    this.dots_open = !this.dots_open;
+                                    cx.notify();
+                                });
+                            })
+                            .child(
+                                crate::icons::icon(crate::icons::MORE)
+                                    .size(px(14.0))
+                                    .text_color(theme.text_muted),
+                            );
+                        if self.dots_open {
+                            let menu =
+                                popover::popover_card(&theme)
+                                    .w(px(190.0))
+                                    .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                                        this.dots_open = false;
+                                        cx.notify();
+                                    }))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_col()
+                                            .gap(px(2.0))
+                                            .child(
+                                                popover::menu_row(
+                                                    &theme,
+                                                    false,
+                                                    "browser-menu-screenshot",
+                                                    cx.entity_id(),
+                                                )
+                                                .id("browser-menu-screenshot-row")
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.dots_open = false;
+                                                    this.commands
+                                                        .send(BrowserCommand::CaptureScreenshot);
+                                                    cx.notify();
+                                                }))
+                                                .child(
+                                                    crate::icons::icon(icons::IMAGE)
+                                                        .size(px(13.0))
+                                                        .text_color(theme.text_muted),
+                                                )
+                                                .child(SharedString::from("Screenshot")),
+                                            )
+                                            .child(
+                                                popover::menu_row(
+                                                    &theme,
+                                                    console_active,
+                                                    "browser-menu-console",
+                                                    cx.entity_id(),
+                                                )
+                                                .id("browser-menu-console-row")
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.dots_open = false;
+                                                    this.show_console = !this.show_console;
+                                                    cx.notify();
+                                                }))
+                                                .child(
+                                                    crate::icons::icon(icons::TERMINAL)
+                                                        .size(px(13.0))
+                                                        .text_color(theme.text_muted),
+                                                )
+                                                .child(SharedString::from("Console & DevTools"))
+                                                .when(console_active, |el| {
+                                                    el.child(
+                                                        div().ml_auto().child(
+                                                            crate::icons::icon(icons::CHECK)
+                                                                .size(px(12.0))
+                                                                .text_color(theme.accent),
+                                                        ),
+                                                    )
+                                                }),
+                                            ),
+                                    )
+                                    .into_any_element();
+                            dots = dots.relative().child(popover::anchored_menu_below_gap(
+                                "browser-dots-menu",
+                                menu,
+                                None,
+                                6.0,
+                            ));
+                        }
+                        dots
+                    }),
             )
             // Visual loading bar when navigation is in flight
             .when(self.is_loading, |el| {
                 el.child(
                     div()
-                        .h(px(3.0))
+                        .h(px(2.0))
                         .flex_none()
                         .w_full()
                         .relative()
@@ -952,7 +1139,7 @@ impl Render for BrowserSurface {
                         .px(px(10.0))
                         .py(px(4.0))
                         .text_size(px(11.0))
-                        .text_color(theme.accent)
+                        .text_color(theme.text_muted)
                         .child(status),
                 )
             })
@@ -1004,9 +1191,9 @@ impl Render for BrowserSurface {
                                 .text_size(px(11.0))
                                 .children(self.console_logs.iter().map(|log| {
                                     let color: gpui::Hsla = match log.level.as_str() {
-                                        "error" => gpui::rgb(0xff6b6b).into(),
-                                        "warning" | "warn" => gpui::rgb(0xffd93d).into(),
-                                        "input" => theme.accent,
+                                        "error" => theme.danger,
+                                        "warning" | "warn" => theme.warning,
+                                        "input" => theme.text_muted,
                                         _ => theme.text,
                                     };
                                     div()
@@ -1157,11 +1344,6 @@ fn browser_button_toggle(
     color: gpui::Hsla,
     action: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
-    let bg = if active {
-        crate::theme::ink(0.12)
-    } else {
-        gpui::transparent_black()
-    };
     div()
         .id(icon_path)
         .size(px(28.0))
@@ -1170,7 +1352,10 @@ fn browser_button_toggle(
         .items_center()
         .justify_center()
         .rounded(px(6.0))
-        .bg(bg)
+        .when(active, |el| {
+            el.bg(crate::theme::glass_selected_bg())
+                .shadow(crate::theme::glass_selected_shadows())
+        })
         .cursor_pointer()
         .hover(|style| style.bg(crate::theme::ink(0.08)))
         .on_click(action)
@@ -1215,6 +1400,24 @@ pub fn normalize_url(value: &str) -> Result<String, String> {
         return Ok(format!("https://{value}"));
     }
     Ok(search_url(value))
+}
+
+/// Hostname of a URL for tab titles — scheme and port stripped, path/query
+/// dropped. `None` for empty or unparseable input.
+pub fn host_of(url: &str) -> Option<String> {
+    let rest = url.trim();
+    let rest = rest
+        .strip_prefix("http://")
+        .or_else(|| rest.strip_prefix("https://"))
+        .unwrap_or(rest);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host = if let Some(rest) = authority.strip_prefix('[') {
+        // [::1]:8080 → ::1
+        rest.split(']').next().unwrap_or("")
+    } else {
+        authority.split(':').next().unwrap_or("")
+    };
+    (!host.is_empty()).then(|| host.to_string())
 }
 
 fn percent_encode_query(query: &str) -> String {
@@ -2174,6 +2377,22 @@ mod tests {
             "https://duckduckgo.com/?q=komet%20browser"
         );
         assert_eq!(normalize_url("about:blank").unwrap(), "about:blank");
+    }
+
+    #[test]
+    fn host_of_extracts_the_hostname() {
+        assert_eq!(
+            host_of("https://example.com/path?q=1").as_deref(),
+            Some("example.com")
+        );
+        assert_eq!(
+            host_of("http://localhost:3000/app").as_deref(),
+            Some("localhost")
+        );
+        assert_eq!(host_of("example.com/docs").as_deref(), Some("example.com"));
+        assert_eq!(host_of("https://[::1]:8080/").as_deref(), Some("::1"));
+        assert_eq!(host_of("  "), None);
+        assert_eq!(host_of(""), None);
     }
 
     #[test]

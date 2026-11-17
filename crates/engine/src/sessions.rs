@@ -1263,14 +1263,42 @@ impl SessionsEngine {
         let switched_from = active_provider.filter(|active| *active != harness_id);
         if let Some(from) = switched_from {
             handle.doc().mark_provider_switched()?;
-            let marker = MessagePart::Switch {
-                id: format!("switch-{}", new_id()),
-                from: from.display_name().into(),
-                to: harness_id.display_name().into(),
-                from_harness: Some(from.as_str().into()),
-                to_harness: Some(harness_id.as_str().into()),
-            };
-            handle.doc().append_switch_part(&user_id, &marker)?;
+            // The setChatConfig path already wrote a `System` switch marker
+            // the moment the harness changed (rpc.rs `note_config_switch`) —
+            // attaching another one to this message would draw the divider
+            // twice. The part stays as the fallback for switches that never
+            // went through a config write (a failed mutate, an older client).
+            let marker_recorded =
+                handle
+                    .doc()
+                    .read_entries()
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|entry| {
+                        entry.role == komet_doc::MessageRole::System
+                            && entry.parts.iter().any(|part| {
+                                matches!(
+                                    part,
+                                    MessagePart::Switch {
+                                        from_harness: Some(f),
+                                        to_harness: Some(t),
+                                        ..
+                                    } if f == from.as_str() && t == harness_id.as_str()
+                                )
+                            })
+                    });
+            if !marker_recorded {
+                let marker = MessagePart::Switch {
+                    id: format!("switch-{}", new_id()),
+                    from: from.display_name().into(),
+                    to: harness_id.display_name().into(),
+                    from_harness: Some(from.as_str().into()),
+                    to_harness: Some(harness_id.as_str().into()),
+                    from_model: None,
+                    to_model: None,
+                };
+                handle.doc().append_switch_part(&user_id, &marker)?;
+            }
             // Preserve sessions created before provider marks were introduced:
             // the active provider's current session is still discoverable via
             // the single-provider cache and becomes its per-provider mark.

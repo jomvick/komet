@@ -216,7 +216,7 @@ impl SyntaxPalette {
         }
     }
 
-    fn dark(text: Hsla, comment: Hsla, danger: Hsla) -> Self {
+    fn dark(text: Hsla, comment: Hsla, danger: Hsla, accent: Hsla) -> Self {
         // Same sources and 72% saturation treatment as history::graph_color.
         let indigo = git_graph_tone(oklch(0.673, 0.182, 276.935));
         let pink = git_graph_tone(oklch(0.718, 0.202, 349.761));
@@ -247,17 +247,19 @@ impl SyntaxPalette {
             tag: pink,
             attribute: amber,
             label: amber,
-            markup_heading: indigo,
+            // Markup tones stay achromatic: headings take the body ink (size
+            // and weight already mark them), strong takes the accent marker.
+            markup_heading: text,
             markup_raw: emerald,
             markup_link: pink,
             markup_reference: amber,
             markup_emphasis: pink,
-            markup_strong: indigo,
+            markup_strong: accent,
             invalid: red,
         }
     }
 
-    fn light(text: Hsla, comment: Hsla, danger: Hsla) -> Self {
+    fn light(text: Hsla, comment: Hsla, danger: Hsla, accent: Hsla) -> Self {
         // Match the light graph's hue families at text-safe lightness.
         let indigo = git_graph_tone(oklch(0.47, 0.20, 276.966));
         let pink = git_graph_tone(oklch(0.47, 0.17, 0.584));
@@ -288,12 +290,12 @@ impl SyntaxPalette {
             tag: pink,
             attribute: amber,
             label: amber,
-            markup_heading: indigo,
+            markup_heading: text,
             markup_raw: emerald,
             markup_link: pink,
             markup_reference: amber,
             markup_emphasis: pink,
-            markup_strong: indigo,
+            markup_strong: accent,
             invalid: red,
         }
     }
@@ -651,28 +653,35 @@ impl Theme {
             text_muted: neutral(0.75), // ~7.9:1 on #191919
             text_faint: neutral(0.60), // ~4.3:1 on #191919
             text_dim: grey(0x98),
-            solid: neutral(0.922),                       // near-white plate
-            on_solid: grey(0x0e),                        // near-black label
-            accent: oklch(0.673, 0.182, 276.935),        // indigo-400
-            accent_strong: oklch(0.585, 0.233, 277.117), // indigo-500
-            on_accent: neutral(0.985),
-            danger: oklch(0.704, 0.191, 22.216),       // red-400
+            solid: neutral(0.922), // near-white plate
+            on_solid: grey(0x0e),  // near-black label
+            // Ivory marker tone: near `text`, so marked elements pair it with
+            // [`Theme::mark_bg`]/[`Theme::mark_ring`] instead of relying on hue.
+            accent: rgb8(0xfa, 0xf9, 0xf5),              // #faf9f5
+            accent_strong: neutral(0.922), // the solid plate — accent fills read as buttons
+            on_accent: grey(0x0e),         // on_solid ink
+            danger: oklch(0.704, 0.191, 22.216), // red-400
             danger_muted: oklch(0.808, 0.114, 19.571), // red-300
-            warning: oklch(0.828, 0.189, 84.429),      // amber-400
+            warning: oklch(0.828, 0.189, 84.429), // amber-400
             warning_muted: oklch(0.924, 0.12, 95.746), // amber-200
-            success: oklch(0.765, 0.177, 163.223),     // emerald-400
-            busy: oklch(0.718, 0.202, 349.761),        // pink-400
+            success: oklch(0.765, 0.177, 163.223), // emerald-400
+            busy: oklch(0.718, 0.202, 349.761), // pink-400
             success_muted: oklch(0.845, 0.143, 164.978), // emerald-300
             surface_raised_hover: neutral(0.32),
             band: band_for(Appearance::Dark),
             input_bg: hsla(0.0, 0.0, 1.0, 0.03),
-            selection: hsla(0.66, 0.6, 0.55, 0.35),
+            selection: rgb8(0xfa, 0xf9, 0xf5).opacity(0.20),
             cursor: hsla(0.0, 0.0, 1.0, 0.35),
-            caret: hsla(0.66, 0.7, 0.7, 1.0),
+            caret: rgb8(0xfa, 0xf9, 0xf5),
             danger_strong: oklch(0.58, 0.16, 25.0),
             code_text: oklch(0.811, 0.111, 293.571), // violet-300
             code_wash: oklch(0.702, 0.183, 293.541).opacity(0.12), // violet-400/12
-            syntax: SyntaxPalette::dark(neutral(0.922), neutral(0.60), oklch(0.704, 0.191, 22.216)),
+            syntax: SyntaxPalette::dark(
+                neutral(0.922),
+                neutral(0.60),
+                oklch(0.704, 0.191, 22.216),
+                rgb8(0xfa, 0xf9, 0xf5),
+            ),
             diff_add: oklch(0.765, 0.177, 163.223), // emerald-400
             diff_del: oklch(0.704, 0.191, 22.216),  // red-400
             diff_hunk_bg: hsla(0.6, 0.35, 0.6, 0.05),
@@ -725,15 +734,17 @@ impl Theme {
             text_dim: neutral(0.50),
             solid: neutral(0.205),    // near-black plate, deeper than body text
             on_solid: neutral(0.985), // near-white label
-            accent: oklch(0.511, 0.262, 276.966), // indigo-600
-            accent_strong: oklch(0.511, 0.262, 276.966), // indigo-600 fill
-            on_accent: neutral(0.985),
-            danger: oklch(0.577, 0.245, 27.325),        // red-600
-            danger_muted: oklch(0.505, 0.213, 27.518),  // red-700
-            warning: oklch(0.555, 0.163, 48.998),       // amber-700 — carries 12px text
+            // Slate marker tone — darker than body text, so it still reads as
+            // the "important" ink on white without any hue at all.
+            accent: rgb8(0x14, 0x14, 0x13), // #141413
+            accent_strong: rgb8(0x14, 0x14, 0x13),
+            on_accent: rgb8(0xfa, 0xf9, 0xf5), // ivory label on the slate plate
+            danger: oklch(0.577, 0.245, 27.325), // red-600
+            danger_muted: oklch(0.505, 0.213, 27.518), // red-700
+            warning: oklch(0.555, 0.163, 48.998), // amber-700 — carries 12px text
             warning_muted: oklch(0.473, 0.137, 46.201), // amber-800
-            success: oklch(0.596, 0.145, 163.225),      // emerald-600
-            busy: oklch(0.592, 0.249, 0.584),           // pink-600
+            success: oklch(0.596, 0.145, 163.225), // emerald-600
+            busy: oklch(0.592, 0.249, 0.584),  // pink-600
             success_muted: oklch(0.508, 0.118, 165.612), // emerald-700
             // Opaque pills darken on hover here rather than brighten — same
             // "brighten the plate, don't wash it out" rule, read the other way.
@@ -742,13 +753,18 @@ impl Theme {
             // the dark 16% would read as a bruise.
             band: band_for(Appearance::Light),
             input_bg: grey(0xff),
-            selection: hsla(0.66, 0.75, 0.62, 0.28),
+            selection: rgb8(0x14, 0x14, 0x13).opacity(0.14),
             cursor: hsla(0.0, 0.0, 0.0, 0.55),
-            caret: hsla(0.66, 0.78, 0.42, 1.0),
+            caret: rgb8(0x14, 0x14, 0x13),
             danger_strong: oklch(0.51, 0.20, 25.0),
             code_text: oklch(0.491, 0.27, 292.581), // violet-700
             code_wash: oklch(0.541, 0.281, 293.009).opacity(0.10), // violet-600/10
-            syntax: SyntaxPalette::light(neutral(0.25), neutral(0.48), oklch(0.505, 0.213, 27.518)),
+            syntax: SyntaxPalette::light(
+                neutral(0.25),
+                neutral(0.48),
+                oklch(0.505, 0.213, 27.518),
+                rgb8(0x14, 0x14, 0x13),
+            ),
             diff_add: oklch(0.596, 0.145, 163.225), // emerald-600
             diff_del: oklch(0.577, 0.245, 27.325),  // red-600
             diff_hunk_bg: hsla(0.6, 0.35, 0.35, 0.07),
@@ -818,6 +834,31 @@ impl Theme {
     /// State wash at `alpha` — see [`wash`].
     pub fn wash(&self, alpha: f32) -> Hsla {
         wash_for(self.appearance, alpha)
+    }
+
+    /// The shared "marked / important" plate: a light [`Self::accent`] wash.
+    /// Ivory and slate sit almost on `text`, so colour alone no longer
+    /// separates a marked element from body copy — the faint plate does.
+    pub fn mark_bg(&self) -> Hsla {
+        self.accent.opacity(0.10)
+    }
+
+    /// The marker's edge: a thin INSET ring in the accent tone, the same
+    /// technique as [`card_selected_shadows`] — painted on top of the fill,
+    /// so it survives translucent surfaces and wallpaper. Pair with
+    /// [`Self::mark_bg`] and accent-coloured semi-bold text.
+    pub fn mark_ring(&self) -> Vec<gpui::BoxShadow> {
+        let color = match self.appearance {
+            Appearance::Dark => self.accent.opacity(0.5),
+            Appearance::Light => self.accent.opacity(0.4),
+        };
+        vec![gpui::BoxShadow {
+            color,
+            offset: gpui::point(gpui::px(0.0), gpui::px(0.0)),
+            blur_radius: gpui::px(0.0),
+            spread_radius: gpui::px(1.0),
+            inset: true,
+        }]
     }
 }
 
@@ -1043,6 +1084,13 @@ pub fn card_selected_shadows() -> Vec<gpui::BoxShadow> {
 /// — for surfaces matched against reference-screenshot samples.
 pub fn grey(value: u8) -> Hsla {
     hsla(0.0, 0.0, value as f32 / 255.0, 1.0)
+}
+
+/// An exact tone from 8-bit sRGB channels (`rgb8(0xfa, 0xf9, 0xf5)` ≡ `#faf9f5`)
+/// — for accents carrying a whisper of chroma that [`grey`] cannot express.
+pub fn rgb8(r: u8, g: u8, b: u8) -> Hsla {
+    let (h, s, l) = rgb_to_hsl(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0);
+    hsla(h, s, l, 1.0)
 }
 
 /// Convert an oklch color (CSS notation: L 0..1, C, H in degrees) to gpui Hsla.
@@ -1319,9 +1367,9 @@ mod tests {
     }
 
     /// Accents are the tokens a naive invert gets most wrong: the dark theme's
-    /// 400-step indigo/red land near 3:1 on white. The light palette drops to the
-    /// 600 step at the same hue, which must clear AA for non-text UI (3:1) and,
-    /// for the accent proper, body-text AA.
+    /// bright status colors land near 3:1 on white. The light palette reassigns
+    /// them at text-safe lightness, which must clear AA for non-text UI (3:1)
+    /// and, for the accent proper, body-text AA.
     #[test]
     fn accents_clear_contrast_on_their_background() {
         let l = Theme::light();
@@ -1451,18 +1499,33 @@ mod tests {
 
     /// Solid (primary button) plates must carry their label at AA in both modes.
     ///
-    /// The accent plate is held to 4.0 rather than 4.5: dark mode's indigo-500
-    /// fill — inherited unchanged from the original palette — measures 4.38:1
-    /// under white, which clears WCAG AA for the medium-weight 14px labels these
-    /// buttons use (large-text AA is 3:1) but not body copy. Light mode's
-    /// indigo-600 clears the stricter bar with room to spare.
+    /// The accent plate is held to the same 7:1 bar as `solid`: ivory/slate
+    /// fills are near-achromatic, so the label pair is the only thing keeping
+    /// an accent button readable — there is no hue left to rescue it.
     #[test]
     fn solid_button_is_legible_in_both_appearances() {
         for t in [Theme::dark(), Theme::light()] {
             let r = contrast_ratio(t.on_solid, t.solid);
             assert!(r >= 7.0, "{:?} solid button {r:.2}:1", t.appearance);
             let a = contrast_ratio(t.on_accent, t.accent_strong);
-            assert!(a >= 4.0, "{:?} accent button {a:.2}:1", t.appearance);
+            assert!(a >= 7.0, "{:?} accent button {a:.2}:1", t.appearance);
+        }
+    }
+
+    /// The accent is now a near-achromatic marker (ivory on dark, slate on
+    /// light), so it must clear the *body-text* bar against the page in both
+    /// appearances — and stay numerically distinct from `text`, or marked
+    /// elements would be indistinguishable from plain copy.
+    #[test]
+    fn accent_marker_clears_text_contrast() {
+        for t in [Theme::dark(), Theme::light()] {
+            let r = contrast_ratio(t.accent, t.bg);
+            assert!(r >= 7.0, "{:?} accent on bg is {r:.2}:1", t.appearance);
+            assert_ne!(
+                t.accent, t.text,
+                "{:?} accent collapsed onto text — the marker needs its own tone",
+                t.appearance
+            );
         }
     }
 
@@ -1587,6 +1650,16 @@ mod tests {
                 assert_eq!(c.s, 0.0, "{:?} neutral has chroma", t.appearance);
                 assert_eq!(c.a, 1.0, "{:?} neutral is translucent", t.appearance);
             }
+            // The accent is *nearly* achromatic by design (ivory #faf9f5 keeps
+            // a whisper of warmth, slate #141413 a trace of blue) — hold it to
+            // a tolerance rather than the strict zero the true neutrals get.
+            assert!(
+                t.accent.s <= 0.35,
+                "{:?} accent saturation {:.3} left the neutral family",
+                t.appearance,
+                t.accent.s
+            );
+            assert_eq!(t.accent.a, 1.0, "{:?} accent is translucent", t.appearance);
         }
     }
 

@@ -246,6 +246,14 @@ pub enum MessagePart {
         from_harness: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         to_harness: Option<String>,
+        /// Model ids when the marker records a MODEL switch (a `System`
+        /// entry written at `setChatConfig` time — zcode's permanent
+        /// "Model switched A → B" divider). `None` on agent-switch markers,
+        /// which keep riding the next user message.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from_model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        to_model: Option<String>,
     },
     Error {
         id: String,
@@ -379,12 +387,16 @@ impl MessagePart {
                 to,
                 from_harness,
                 to_harness,
+                from_model,
+                to_model,
                 ..
             } => {
                 from.len()
                     + to.len()
                     + from_harness.as_ref().map_or(0, String::len)
                     + to_harness.as_ref().map_or(0, String::len)
+                    + from_model.as_ref().map_or(0, String::len)
+                    + to_model.as_ref().map_or(0, String::len)
             }
             MessagePart::Error { message, .. } => message.len(),
             MessagePart::Permission { summary, .. } => summary.len(),

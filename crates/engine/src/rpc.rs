@@ -922,11 +922,17 @@ impl EngineRpc {
                 .set_chat_pinned(&chat_id, pinned)
                 .map_err(failed)
                 .map(drop),
-            MutateParams::SetChatConfig { chat_id, config } => self
-                .workspace
-                .set_chat_config(&chat_id, &config)
-                .map_err(failed)
-                .map(drop),
+            MutateParams::SetChatConfig { chat_id, config } => {
+                let previous = self.workspace.chat_config(&chat_id);
+                let changed = self
+                    .workspace
+                    .set_chat_config(&chat_id, &config)
+                    .map_err(failed)?;
+                if changed && let Some(previous) = previous {
+                    self.note_config_switch(&chat_id, &previous, &config);
+                }
+                Ok(())
+            }
             MutateParams::DeleteChat { chat_id } => {
                 self.workspace.delete_chat(&chat_id).map_err(failed)?;
                 self.doc_host.purge_chat(&chat_id);
@@ -946,6 +952,55 @@ impl EngineRpc {
                     .map_err(failed)
                     .map(drop)
             }
+        }
+    }
+
+    /// zcode-style switch dividers: a `System` entry at the chat doc's tail
+    /// the moment the stored harness OR model changes, so the switch is
+    /// permanent and visible immediately — not deferred to the next user
+    /// message. The send path keeps its own agent-switch marker as a
+    /// fallback (deduped against this one — sessions.rs).
+    /// Host-only per the writer discipline; a config flip on a viewer device
+    /// syncs the row but writes no marker here.
+    fn note_config_switch(&self, chat_id: &str, previous: &ChatConfig, config: &ChatConfig) {
+        let model_changed = previous.model != config.model;
+        if (!model_changed && previous.harness == config.harness) || !self.doc_host.is_host(chat_id)
+        {
+            return;
+        }
+        let part = MessagePart::Switch {
+            id: format!("switch-{}", crate::new_id()),
+            from: if model_changed {
+                previous.model.clone().unwrap_or_else(|| "default".into())
+            } else {
+                previous.harness.display_name().into()
+            },
+            to: if model_changed {
+                config.model.clone().unwrap_or_else(|| "default".into())
+            } else {
+                config.harness.display_name().into()
+            },
+            from_harness: Some(previous.harness.as_str().into()),
+            to_harness: Some(config.harness.as_str().into()),
+            from_model: if model_changed {
+                previous.model.clone()
+            } else {
+                None
+            },
+            to_model: if model_changed {
+                config.model.clone()
+            } else {
+                None
+            },
+        };
+        let result = self.doc_host.open(chat_id).and_then(|handle| {
+            handle
+                .doc()
+                .record_switch_part(&part, self.doc_host.device_id(), crate::now_ms())
+                .map_err(crate::EngineError::from)
+        });
+        if let Err(err) = result {
+            tracing::warn!(chat = %chat_id, error = %err, "model-switch marker write failed");
         }
     }
 }

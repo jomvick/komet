@@ -1,6 +1,6 @@
 use gpui::{App, KeyBinding, Keystroke};
 
-use super::{NewSession, ToggleChanges, ToggleSidebar};
+use super::{FocusBrowserAddress, NewSession, ToggleChanges, ToggleSidebar};
 use crate::settings::{KeymapConfig, platform_combo};
 use crate::terminal::panel::ToggleTerminal;
 
@@ -49,6 +49,8 @@ pub fn apply_keymap(cx: &mut App, keymap: &KeymapConfig) {
             NewSession,
             None,
         ),
+        // Fixed shortcut (not user-remappable): focus the browser address bar.
+        KeyBinding::new(&platform_combo("mod-l"), FocusBrowserAddress, None),
     ]);
     // Terminal tab/font chrome (Ctx+Shift+W/F2/=/-/0…). `init` bound these at
     // startup, but the clear above removed them, so re-bind the same set.

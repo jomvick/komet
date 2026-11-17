@@ -240,11 +240,10 @@ pub fn render_block(
             highlight,
         ),
         Block::BlockQuote { children } => div()
-            // Accent-tinted quote: indigo rail + a whisper of the same hue
-            // behind it (the inline-code treatment, dialed down).
+            // Quote marker: accent rail + the shared mark wash behind it.
             .border_l_2()
             .border_color(theme.accent.opacity(0.6))
-            .bg(theme.accent.opacity(0.05))
+            .bg(theme.mark_bg())
             .rounded_tr(px(6.0))
             .rounded_br(px(6.0))
             .pl(px(12.0))
@@ -569,14 +568,15 @@ fn flatten_runs_weighted(runs: &[InlineRun], theme: &Theme, base_weight: FontWei
         } else {
             FontStyle::Normal
         };
-        // Links stay monochrome — foreground with an underline (komet's md
-        // theme underlines in the text color; indigo is reserved for primary
-        // actions).
+        // Links take the accent marker tone with a thin underline — the hue
+        // is gone (ivory/slate), so the underline carries the affordance.
         let is_link = run.style.link.is_some();
-        // Inline code reads violet (see `inline_code_text`); everything else
-        // stays the monochrome foreground.
+        // Inline code reads violet (see `inline_code_text`); links take the
+        // accent; everything else stays the monochrome foreground.
         let color = if run.style.code {
             inline_code_text(theme)
+        } else if is_link {
+            theme.accent
         } else {
             theme.text
         };
@@ -610,7 +610,7 @@ fn flatten_runs_weighted(runs: &[InlineRun], theme: &Theme, base_weight: FontWei
             // only be a square box.
             background_color: None,
             underline: is_link.then_some(UnderlineStyle {
-                color: Some(theme.text_muted),
+                color: Some(theme.accent),
                 thickness: px(1.0),
                 wavy: false,
             }),
@@ -753,9 +753,9 @@ fn flat_text_element(
         .into_any_element()
 }
 
-/// Selection tint: the accent hue under the glyphs, dark-panel strength.
+/// Selection tint: the shared selection wash under the glyphs.
 fn selection_wash(theme: &Theme) -> Hsla {
-    theme.accent.opacity(0.35) // indigo-400
+    theme.selection
 }
 
 /// Selection support for a plain (non-markdown) text element — the user
@@ -1361,8 +1361,8 @@ mod tests {
         assert_eq!(flat.links, vec![(3..7, "https://x.dev".to_string())]);
         let total: usize = flat.runs.iter().map(|r| r.len).sum();
         assert_eq!(total, flat.text.len());
-        // Links stay monochrome (foreground + underline), never accent-tinted.
-        assert_eq!(flat.runs[1].color, theme.text);
+        // Links take the accent marker tone with a thin underline.
+        assert_eq!(flat.runs[1].color, theme.accent);
         assert!(flat.runs[1].underline.is_some());
         assert_eq!(flat.runs[2].font.weight, FontWeight::SEMIBOLD);
     }

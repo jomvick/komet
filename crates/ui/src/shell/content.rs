@@ -543,84 +543,10 @@ impl Shell {
         // stages them in the composer. `has_active_drag` gates the veil so a drag
         // that left the window (FileDrop Exited) can't strand it.
         let file_drag_active = self.file_drag_active && cx.has_active_drag();
-        let provider_switch_notice = self
-            .composer
-            .read(cx)
-            .pickers()
-            .read(cx)
-            .provider_switch_notice()
-            .map(|notice| {
-                let theme = Theme::of(cx).clone();
-                let (from_icon, from_tint) = crate::pickers::harness_brand_icon(notice.from);
-                let (to_icon, to_tint) = crate::pickers::harness_brand_icon(notice.to);
-                let transition = div()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .gap(px(10.0))
-                    .child(
-                        icon(from_icon)
-                            .size(px(18.0))
-                            .text_color(from_tint.unwrap_or(theme.text_muted)),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(12.0))
-                            .text_color(theme.text_muted)
-                            .child(notice.from.display_name()),
-                    )
-                    .child(
-                        icon(crate::icons::ARROW_RIGHT)
-                            .size(px(14.0))
-                            .text_color(theme.text_muted.opacity(0.75)),
-                    )
-                    .child(
-                        icon(to_icon)
-                            .size(px(18.0))
-                            .text_color(to_tint.unwrap_or(theme.text)),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(12.0))
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(theme.text)
-                            .child(notice.to.display_name()),
-                    );
-                let card = div()
-                    .px(px(16.0))
-                    .py(px(11.0))
-                    .rounded(px(14.0))
-                    .border_1()
-                    .border_color(crate::theme::hairline(0.12))
-                    .bg(theme.surface)
-                    .shadow(crate::theme::card_selected_shadows())
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .gap(px(5.0))
-                    .child(transition)
-                    .child(
-                        div()
-                            .text_size(px(10.0))
-                            .text_color(theme.text_muted.opacity(0.8))
-                            .child(format!(
-                                "{} is selected for this session",
-                                notice.to.display_name()
-                            )),
-                    );
-                div()
-                    .absolute()
-                    .top(px(24.0))
-                    .left_0()
-                    .right_0()
-                    .flex()
-                    .justify_center()
-                    .child(motion::fade_in(
-                        ("provider-switch-notice", notice.sequence),
-                        card,
-                    ))
-                    .into_any_element()
-            });
+        // Switch dividers, zcode-style, live in the transcript: the engine
+        // writes a permanent `System` marker into the chat doc the moment
+        // setChatConfig lands (agent or model change) — visible from the
+        // switch, never a transient toast.
         let drop_confirm = self.drop_confirm_pill(theme);
         div()
             .id("chat-dropzone")
@@ -697,7 +623,6 @@ impl Shell {
                     cx.notify();
                 },
             ))
-            .children(provider_switch_notice)
             .child(
                 // Full-height underlay: the transcript viewport spans the
                 // whole column, scrolling UNDER the titlebar above and the
@@ -1501,6 +1426,8 @@ impl Shell {
         let rows = self.right_surface_rows(cx);
         let count = rows.len();
         let active = self.resolved_right_active(cx);
+        // Index of the lit tab, for the between-tabs divider rule.
+        let active_ix = rows.iter().position(|(s, _, _, _)| *s == active);
         let drag = self
             .right_tab_drag
             .as_ref()
@@ -1575,7 +1502,8 @@ impl Shell {
             let chip = div()
                 .id(("right-surface-tab", ix))
                 .group(group.clone())
-                .h(px(34.0))
+                .relative()
+                .h(px(28.0))
                 .w(px(CHIP_W))
                 .flex_none()
                 .pl(px(8.0))
@@ -1584,13 +1512,8 @@ impl Shell {
                 .flex_row()
                 .items_center()
                 .gap(px(5.0))
+                .rounded(px(8.0))
                 .cursor_pointer()
-                .border_b_2()
-                .border_color(if is_active {
-                    theme.accent
-                } else {
-                    gpui::transparent_black()
-                })
                 // The old session-tab strip's solved carve-out: NOT
                 // `.occlude()` — a BlockMouse hitbox ends the hit test,
                 // so the scroll container behind the tabs never saw
@@ -1602,10 +1525,13 @@ impl Shell {
                 .on_mouse_down(gpui::MouseButton::Left, |_, window, _| {
                     window.prevent_default()
                 })
-                .when(is_active, |el| el.bg(crate::theme::wash(0.06)))
-                .when(!is_active, |el| {
-                    el.hover(|s| s.bg(crate::theme::wash(0.04)))
+                // Same selection recipe as the sidebar sessions: the glass
+                // wash plus its inset ring — no underline, one lit tab only.
+                .when(is_active, |el| {
+                    el.bg(crate::theme::glass_selected_bg())
+                        .shadow(crate::theme::glass_selected_shadows())
                 })
+                .when(!is_active, |el| el.hover(|s| s.bg(theme.glass_hover())))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     cx.stop_propagation();
                     this.set_right_active(surface, cx);
@@ -1641,6 +1567,11 @@ impl Shell {
                         .flex_1()
                         .truncate()
                         .text_size(px(12.0))
+                        .font_weight(if is_active {
+                            gpui::FontWeight::MEDIUM
+                        } else {
+                            gpui::FontWeight::NORMAL
+                        })
                         .text_color(if is_active {
                             theme.text
                         } else {
@@ -1652,12 +1583,14 @@ impl Shell {
                     div()
                         .id(("right-surface-close", ix))
                         .flex_none()
-                        .size(px(18.0))
-                        .rounded(px(3.0))
+                        .size(px(16.0))
+                        .rounded(px(4.0))
                         .flex()
                         .items_center()
                         .justify_center()
-                        .opacity(0.0)
+                        // The lit tab keeps a dim ✕ at rest; an inactive one
+                        // reveals it only while its chip is hovered.
+                        .opacity(if is_active { 0.7 } else { 0.0 })
                         .group_hover(group.clone(), |s| s.opacity(1.0))
                         .hover(|s| s.bg(crate::theme::wash(0.12)))
                         .on_click(cx.listener(move |this, _, window, cx| {
@@ -1669,7 +1602,20 @@ impl Shell {
                                 .size(px(10.0))
                                 .text_color(theme.text_muted),
                         ),
-                );
+                )
+                // Hairline divider in the chip's right gap — only BETWEEN two
+                // inactive neighbours, never after the last tab.
+                .when(divider_visible(ix, active_ix, count), |el| {
+                    el.child(
+                        div()
+                            .absolute()
+                            .right(px(2.0))
+                            .top(px(7.0))
+                            .w(px(1.0))
+                            .h(px(14.0))
+                            .bg(crate::theme::hairline(0.10)),
+                    )
+                });
             // Sliding transform while a sibling drags over (the terminal
             // drawer's exact recipe): animate 150ms between committed
             // offsets; the dragged tab leaves an invisible spacer — the
@@ -1690,7 +1636,7 @@ impl Shell {
                 }
                 Some((from, ..)) if ix == from => div()
                     .w(px(CHIP_W))
-                    .h(px(24.0))
+                    .h(px(28.0))
                     .flex_none()
                     .into_any_element(),
                 _ => chip.into_any_element(),
@@ -1703,12 +1649,12 @@ impl Shell {
         let plus_fade = "right-surface-add-fade";
         let mut plus = div()
             .id("right-surface-add")
-            .size(px(24.0))
+            .size(px(28.0))
             .flex_none()
             .flex()
             .items_center()
             .justify_center()
-            .rounded(px(6.0))
+            .rounded(px(8.0))
             .cursor_pointer()
             .bg(motion::hover_blend(
                 plus_fade,
@@ -1735,7 +1681,7 @@ impl Shell {
             }))
             .child(
                 icon(icons::PLUS)
-                    .size(px(13.0))
+                    .size(px(14.0))
                     .text_color(theme.text_muted),
             );
         if plus_open {
@@ -1879,6 +1825,13 @@ impl Shell {
         self.right_tween = Some(WidthTween::new(from, self.right_target(cx)));
         cx.notify();
     }
+}
+
+/// Whether chip `ix` draws the hairline divider on its right edge: only
+/// BETWEEN two inactive neighbours — never after the last tab, never next to
+/// the lit one. `active_ix` is `None` when the picker (no chip) is showing.
+pub(crate) fn divider_visible(ix: usize, active_ix: Option<usize>, count: usize) -> bool {
+    ix + 1 < count && Some(ix) != active_ix && Some(ix + 1) != active_ix
 }
 
 /// Row ceiling for the plan card above the composer: the card must stay a

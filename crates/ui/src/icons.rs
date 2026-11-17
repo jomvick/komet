@@ -103,6 +103,8 @@ icon_assets![
     (WINDOW_RESTORE, "window-restore"),
     (WINDOW_CLOSE, "window-close"),
     (THINKING, "thinking"),
+    // Swap arrows for the model-switch divider (zcode's "⇄ Model switched").
+    (SWITCH, "switch"),
     // Hand-drawn fold-all chevrons, drawn as a family with EXPAND_ARROWS
     // (same stroke, caps, 90° joints) — Solar has no unfold-less either.
     (FOLD_VERTICAL, "fold-vertical"),
@@ -151,6 +153,8 @@ icon_assets![
     (STOP, "stop"),
     (CHECK, "check"),
     (COPY, "copy"),
+    // Hand-drawn ellipsis in the Solar Linear style — the "…" overflow menu.
+    (MORE, "more"),
     // Hand-drawn star pair in the Solar Linear style (like the terminal/
     // plus/return ports) — outline for the favorite affordance, bold for the
     // favorited state and the picker's favorites rail tab.

@@ -999,3 +999,21 @@ fn file_drop_zone_routes_transcript_vs_composer() {
         FileDropZone::Composer
     );
 }
+
+#[test]
+fn tab_divider_only_sits_between_two_inactive_neighbours() {
+    // Three tabs, middle one lit: no divider touches it on either side.
+    assert!(!divider_visible(0, Some(1), 3));
+    assert!(!divider_visible(1, Some(1), 3));
+    // First and last never draw one.
+    assert!(!divider_visible(2, Some(1), 3));
+    // Two inactive neighbours, lit tab elsewhere: both inner edges draw.
+    assert!(divider_visible(0, Some(2), 3));
+    assert!(!divider_visible(1, Some(2), 3)); // ix=1's right neighbour is lit
+    // No lit chip at all (picker showing): every inner boundary draws.
+    assert!(divider_visible(0, None, 3));
+    assert!(divider_visible(1, None, 3));
+    assert!(!divider_visible(2, None, 3));
+    // Single tab: nothing to divide.
+    assert!(!divider_visible(0, None, 1));
+}

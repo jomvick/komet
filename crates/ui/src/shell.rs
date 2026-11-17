@@ -33,6 +33,7 @@ use crate::composer::{Composer, ComposerEvent, ComposerInput, ComposerInputEvent
 use crate::files::{FilesCloseDisposition, FilesEvent, FilesSurface, WorkspacePathDrag};
 use crate::icons::{self, icon};
 use crate::motion::{self, AnimationExt as _, MotionSpec, RESIZE, TAB_SLIDE};
+use crate::onboarding::{Onboarding, OnboardingEvent};
 use crate::popover;
 use crate::rail;
 use crate::settings::appearance::AppearancePage;
@@ -81,7 +82,13 @@ use spaces::RenameSpaceDialog;
 
 actions!(
     shell,
-    [ToggleSidebar, ToggleChanges, PickProjectFolder, NewSession]
+    [
+        ToggleSidebar,
+        ToggleChanges,
+        PickProjectFolder,
+        NewSession,
+        FocusBrowserAddress
+    ]
 );
 
 mod keymap;
@@ -99,7 +106,7 @@ pub use navigation::{
     push_unique_right_surface, resort_offsets, workspace_file_title,
 };
 
-mod gate;
+pub(crate) mod gate;
 use gate::{OrgGateUi, grid_backdrop};
 
 mod sync;
@@ -153,16 +160,16 @@ impl Render for SurfaceTabGhost {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx);
         div()
-            .h(px(24.0))
+            .h(px(28.0))
             .w(px(112.0))
             .px(px(8.0))
             .flex()
             .items_center()
-            .rounded(px(6.0))
+            .rounded(px(8.0))
             .bg(theme.surface_raised)
             .border_1()
             .border_color(theme.border_strong)
-            .text_size(px(11.5))
+            .text_size(px(12.0))
             .text_color(theme.text)
             .opacity(0.85)
             .child(div().truncate().child(self.title.clone()))
@@ -409,6 +416,9 @@ pub struct Shell {
     /// Cached: `detect_install` stats `current_exe` and this renders per frame.
     install: komet_update::InstallKind,
     org: Option<OrgGateUi>,
+    /// First-run tour; `Some` renders it instead of the ready page. Cleared on
+    /// its `Finish`, which persists `settings.onboarding_completed` first.
+    onboarding: Option<Entity<Onboarding>>,
     sync_flow: SyncFlow,
     mutate_task: Option<Task<()>>,
     auth_task: Option<Task<()>>,
@@ -643,6 +653,28 @@ impl Shell {
             Route::Chat => NavEntry::Chat(String::new()),
             Route::Settings(section) => NavEntry::Settings(section),
         });
+        // First-run tour: only a true first install (no `ui-settings.json`) is
+        // unfinished — `UiSettings::load` migrates existing files to done.
+        // `KOMET_ONBOARDING=<step>` replays it for demos and styling passes;
+        // debug builds also replay it once for a file that predates the flag,
+        // so `cargo run` shows the tour without touching release users.
+        let replay = std::env::var("KOMET_ONBOARDING").is_ok()
+            || (cfg!(debug_assertions) && settings.onboarding_key_absent);
+        let onboarding = (!settings.onboarding_completed() || replay).then(|| {
+            let state = state.clone();
+            let data_dir = data_dir.clone();
+            cx.new(|cx| Onboarding::new(state, data_dir, cx))
+        });
+        if let Some(onboarding) = onboarding.clone() {
+            cx.subscribe(
+                &onboarding,
+                |this: &mut Shell, _, event: &OnboardingEvent, cx| {
+                    let OnboardingEvent::Finish { add_project } = *event;
+                    this.finish_onboarding(add_project, cx);
+                },
+            )
+            .detach();
+        }
         Self {
             state,
             transcript,
@@ -741,6 +773,7 @@ impl Shell {
             cli_update_rows: HashMap::new(),
             install: komet_update::detect_install(),
             org: None,
+            onboarding,
             sync_flow: SyncFlow::Idle,
             mutate_task: None,
             auth_task: None,
@@ -1170,6 +1203,29 @@ impl Shell {
         cx.notify();
     }
 
+    /// Leave the first-run tour: persist the flag immediately (not through the
+    /// debounce — a crash right after finishing must not replay the tour), then
+    /// reveal the shell.
+    fn finish_onboarding(&mut self, add_project: bool, cx: &mut Context<Self>) {
+        self.settings.onboarding_completed = Some(true);
+        // `schedule_save` re-stamps this from the global before writing; a
+        // direct save has to do the same or it would write the boot-time theme
+        // back over a pick made during the tour.
+        self.settings.appearance = crate::appearance::mode(cx);
+        if let Err(err) = self.settings.save(&self.data_dir) {
+            tracing::warn!(error = %err, "failed to persist onboarding flag");
+        }
+        // The Finish event is emitted from a click listener INSIDE the tour's
+        // own update; dropping the entity here would pull the value out from
+        // under that update. Hand the last handle to the deferred queue.
+        let onboarding = self.onboarding.take();
+        cx.defer(move |_| drop(onboarding));
+        if add_project {
+            self.open_project_folder_picker(cx);
+        }
+        cx.notify();
+    }
+
     /// Debounced settings write: waits [`SAVE_DEBOUNCE_MS`], then persists the
     /// latest snapshot on the background executor. Re-scheduling drops (cancels)
     /// the previous timer.
@@ -1393,6 +1449,7 @@ impl Shell {
         }
         if !restart_required
             && matches!(gate, GatePhase::Ready)
+            && self.onboarding.is_none()
             && matches!(self.route, Route::Chat)
             && window.focused(cx).is_none()
         {
@@ -1438,6 +1495,21 @@ impl Shell {
             .on_action(cx.listener(|this, _: &ToggleChanges, _, cx| {
                 if matches!(this.route, Route::Chat) {
                     this.toggle_right_pane(cx)
+                }
+            }))
+            // Ctrl+L / ⌘L: focus the browser's address field — only when the
+            // Browser surface is the active right-pane tab.
+            .on_action(cx.listener(|this, _: &FocusBrowserAddress, window, cx| {
+                if !matches!(this.route, Route::Chat)
+                    || this.resolved_right_active(cx) != RightSurface::Browser
+                {
+                    return;
+                }
+                let key = this.panel_key(cx);
+                if let Some(browser) = this.browsers.get(&key) {
+                    browser.update(cx, |browser, cx| {
+                        browser.focus_address(window, cx);
+                    });
                 }
             }))
             // The "+" buttons: OS folder picker, whole folders as projects.
@@ -1512,7 +1584,11 @@ impl Shell {
             gate.clone()
         };
         let root = match &render_gate {
-            GatePhase::Ready => self.render_ready_page(root, window, cx),
+            // The first-run tour owns the window until it finishes.
+            GatePhase::Ready => match self.onboarding.clone() {
+                Some(onboarding) => root.child(onboarding),
+                None => self.render_ready_page(root, window, cx),
+            },
             // Only the sign-out restart lands here; a normal Connecting boot
             // renders the Ready page above.
             GatePhase::Loading => root,
@@ -1542,21 +1618,22 @@ impl Shell {
         // keep them above every auth/org/error gate as well as the full
         // application. Gate pages also need a native drag surface
         // because they do not render the unified tabs/settings titlebar.
-        let root = if (!restart_required && matches!(gate, GatePhase::Ready))
-            || !cfg!(target_os = "windows")
-        {
-            root
-        } else {
-            root.child(
-                div()
-                    .absolute()
-                    .top_0()
-                    .left_0()
-                    .right_0()
-                    .h(px(Theme::TITLEBAR_HEIGHT))
-                    .window_control_area(WindowControlArea::Drag),
-            )
-        };
+        let root =
+            if (!restart_required && matches!(gate, GatePhase::Ready) && self.onboarding.is_none())
+                || !cfg!(target_os = "windows")
+            {
+                root
+            } else {
+                root.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .right_0()
+                        .h(px(Theme::TITLEBAR_HEIGHT))
+                        .window_control_area(WindowControlArea::Drag),
+                )
+            };
         root.children(self.render_windows_caption_controls(window, cx))
             .children(self.render_linux_caption_controls(window, cx))
     }

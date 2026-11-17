@@ -2045,6 +2045,16 @@ impl ComposerInput {
         cx.notify();
     }
 
+    /// Focus the field and select the whole content — the "focus the address
+    /// bar" affordance (Ctrl+L / the browser empty-state row).
+    pub fn focus_select_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.selected_range = 0..self.content.len();
+        self.selection_reversed = false;
+        self.follow_cursor = true;
+        window.focus(&self.focus_handle, cx);
+        cx.notify();
+    }
+
     fn invalidate_mention_tooltip(&mut self) {
         self.mention_tooltip_generation = self.mention_tooltip_generation.wrapping_add(1);
         self.mention_tooltip = MentionTooltipPhase::Hidden;

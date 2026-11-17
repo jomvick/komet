@@ -354,13 +354,6 @@ enum ModelsLoad {
     Force,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct ProviderSwitchNotice {
-    pub from: HarnessId,
-    pub to: HarnessId,
-    pub sequence: u64,
-}
-
 pub struct Pickers {
     state: Entity<AppState>,
     config: DraftConfig,
@@ -413,9 +406,6 @@ pub struct Pickers {
     switch_task: Option<Task<()>>,
     /// Last mid-session switch failure (shown in the ref popover).
     switch_error: Option<String>,
-    provider_switch_notice: Option<ProviderSwitchNotice>,
-    provider_switch_sequence: u64,
-    provider_switch_task: Option<Task<()>>,
     mutate_task: Option<Task<()>>,
     _search_events: Subscription,
     _state_observe: Subscription,
@@ -571,9 +561,6 @@ impl Pickers {
             switching: None,
             switch_task: None,
             switch_error: None,
-            provider_switch_notice: None,
-            provider_switch_sequence: 0,
-            provider_switch_task: None,
             mutate_task: None,
             _search_events: search_events,
             _state_observe: state_observe,
@@ -594,8 +581,15 @@ impl Pickers {
         &self.config
     }
 
-    pub(crate) fn provider_switch_notice(&self) -> Option<ProviderSwitchNotice> {
-        self.provider_switch_notice
+    /// Catalog label for a model id on `harness` — `None` when the catalog
+    /// isn't loaded or doesn't list the id (callers fall back to the id).
+    pub(crate) fn model_label(&self, harness: HarnessId, model_id: &str) -> Option<String> {
+        self.models
+            .get(&harness)?
+            .ready()?
+            .iter()
+            .find(|model| model.id == model_id)
+            .map(|model| model.label.clone())
     }
 
     fn engine(&self, cx: &App) -> Option<EngineHandle> {
@@ -854,15 +848,14 @@ impl Pickers {
             }
         });
         // Prime the model picker's rail BEFORE anchoring the highlight (the
-        // visible rows depend on it): the favorites view when stars exist —
-        // t3 ModelPickerContent's initial selection — else the effective
-        // harness.
+        // visible rows depend on it): always the effective harness's list —
+        // opening on Favorites hid the current agent's models behind starred
+        // rows of OTHER harnesses (user report: "on opencode I see no models,
+        // I have to click the opencode logo"). Favorites stay one click away
+        // on the star tab, and starred rows still float to the top of the
+        // harness list itself.
         if kind == PickerKind::HarnessModel {
-            self.model_rail = if !self.defaults.favorites.is_empty() {
-                ModelRail::Favorites
-            } else {
-                ModelRail::Harness
-            };
+            self.model_rail = ModelRail::Harness;
         }
         // The keyboard-nav highlight starts ON the selected row — row 0
         // otherwise reads as a second active row (user report).
@@ -1336,7 +1329,6 @@ impl Pickers {
 
     fn pick_harness(&mut self, harness: HarnessId, cx: &mut Context<Self>) {
         let existing_chat = self.state.read(cx).selected_chat.is_some();
-        let previous_harness = self.effective_harness(cx);
         if self.config.harness != Some(harness) {
             // Model, effort, and options are provider-specific.
             self.config.model = None;
@@ -1349,38 +1341,19 @@ impl Pickers {
                 .defaults
                 .model_for(harness)
                 .map(|remembered| remembered.id.clone());
-            self.update_chat_config(cx, |config| {
-                config.harness = harness;
-                config.model = model;
-                config.reasoning = None;
-                config.model_options.clear();
-            });
-            if let Some(from) = previous_harness.filter(|from| *from != harness) {
-                self.provider_switch_sequence = self.provider_switch_sequence.wrapping_add(1);
-                let sequence = self.provider_switch_sequence;
-                self.provider_switch_notice = Some(ProviderSwitchNotice {
-                    from,
-                    to: harness,
-                    sequence,
-                });
-                self.provider_switch_task = Some(cx.spawn(async move |this, cx| {
-                    cx.background_executor()
-                        .timer(std::time::Duration::from_millis(1800))
-                        .await;
-                    this.update(cx, |pickers, cx| {
-                        if pickers
-                            .provider_switch_notice
-                            .is_some_and(|notice| notice.sequence == sequence)
-                        {
-                            pickers.provider_switch_notice = None;
-                            pickers.provider_switch_task = None;
-                            cx.notify();
-                        }
-                    })
-                    .ok();
-                }));
-                cx.notify();
-            }
+            self.update_chat_config(
+                cx,
+                |config| {
+                    config.harness = harness;
+                    config.model = model;
+                    config.reasoning = None;
+                    config.model_options.clear();
+                },
+                false,
+            );
+            // The engine writes a permanent `System` switch marker into the
+            // chat doc the moment setChatConfig lands — the transcript renders
+            // it as the agent icon divider (zcode); no transient toast.
             // The picker stays open: the rail click re-scopes the viewed list
             // (see the rail's doc comment) and the user picks a model right
             // here — pick_model owns the close (user report: the menu closed
@@ -1397,10 +1370,14 @@ impl Pickers {
 
     fn pick_model(&mut self, model_id: String, cx: &mut Context<Self>) {
         self.animate_close(cx);
-        if self.state.read(cx).selected_chat.is_some() {
+        let existing_chat = self.state.read(cx).selected_chat.is_some();
+        if existing_chat {
             // Existing chat: persist to the chat row (Mutate setChatConfig) —
-            // survives restarts and syncs; next runs in this chat use it.
-            self.update_chat_config(cx, move |config| config.model = Some(model_id));
+            // survives restarts and syncs; next runs in this chat use it. A
+            // real change also gets the permanent "Model switched" divider:
+            // the engine writes a `System` switch marker into the chat doc
+            // (zcode's line, visible from the switch — not a fading toast).
+            self.update_chat_config(cx, |config| config.model = Some(model_id.clone()), false);
         } else {
             // New chat: draft pick + sticky last-used memory for this harness.
             self.config.model = Some(model_id.clone());
@@ -1452,7 +1429,7 @@ impl Pickers {
     fn pick_reasoning(&mut self, level: ReasoningLevel, cx: &mut Context<Self>) {
         // Always a concrete selection (no toggle-back-to-default).
         if self.state.read(cx).selected_chat.is_some() {
-            self.update_chat_config(cx, move |config| config.reasoning = Some(level));
+            self.update_chat_config(cx, move |config| config.reasoning = Some(level), true);
         } else {
             self.config.reasoning = Some(level);
             self.defaults.reasoning = Some(level);
@@ -1469,15 +1446,19 @@ impl Pickers {
         cx: &mut Context<Self>,
     ) {
         if self.state.read(cx).selected_chat.is_some() {
-            self.update_chat_config(cx, move |config| {
-                if default {
-                    config.model_options.remove(&option_id);
-                } else {
-                    config
-                        .model_options
-                        .insert(option_id, serde_json::Value::String(choice_id));
-                }
-            });
+            self.update_chat_config(
+                cx,
+                move |config| {
+                    if default {
+                        config.model_options.remove(&option_id);
+                    } else {
+                        config
+                            .model_options
+                            .insert(option_id, serde_json::Value::String(choice_id));
+                    }
+                },
+                true,
+            );
         } else if default {
             self.config.model_options.remove(&option_id);
         } else {
@@ -1492,7 +1473,7 @@ impl Pickers {
     /// path as the model pickers, so the chat reopens at this level on every
     /// device.
     pub fn set_chat_sandbox(&mut self, level: SandboxLevel, cx: &mut Context<Self>) {
-        self.update_chat_config(cx, |config| config.sandbox = level);
+        self.update_chat_config(cx, |config| config.sandbox = level, true);
     }
 
     /// Apply `change` to the selected chat's effective config and persist it:
@@ -1500,7 +1481,16 @@ impl Pickers {
     /// (LWW workspace write — restarts and other devices see it). The written
     /// row always carries the CONCRETE resolved model/reasoning, with the
     /// reasoning re-clamped to the (possibly just-changed) model's ladder.
-    fn update_chat_config(&mut self, cx: &mut Context<Self>, change: impl FnOnce(&mut ChatConfig)) {
+    /// `preserve_model` keeps the row's stored model on changes that don't
+    /// pick one (reasoning/options/sandbox): the resolved concrete id would
+    /// otherwise rewrite `None` → `Some(default)` and fire a phantom
+    /// "Model switched" marker engine-side.
+    fn update_chat_config(
+        &mut self,
+        cx: &mut Context<Self>,
+        change: impl FnOnce(&mut ChatConfig),
+        preserve_model: bool,
+    ) {
         let Some(chat_id) = self.state.read(cx).selected_chat.clone() else {
             return;
         };
@@ -1511,6 +1501,7 @@ impl Pickers {
             return; // harness unknown (catalog + chat row both missing) — nothing safe to write
         };
         // Preserve fields the pickers don't own.
+        let mut stored_model = None;
         if let Some(existing) = self
             .state
             .read(cx)
@@ -1519,8 +1510,12 @@ impl Pickers {
         {
             config.sandbox = existing.sandbox;
             config.mcp_server_ids = existing.mcp_server_ids.clone();
+            stored_model = Some(existing.model.clone());
         }
         change(&mut config);
+        if preserve_model && let Some(model) = stored_model {
+            config.model = model;
+        }
         // Reasoning must stay concrete for whatever model the row now names.
         // A catalog model's ladder is authoritative even when empty (Haiku,
         // Antigravity Claude — those models reject `--effort`). The harness

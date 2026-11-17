@@ -169,6 +169,12 @@ struct DocPartJson {
     summary_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     summary_in_journal: Option<bool>,
+    /// Model ids on a switch part that records a MODEL change (additive;
+    /// absent on agent-switch markers and every older row).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    from_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    to_model: Option<String>,
 }
 
 /// App parts → doc part json (mirror of `toDocParts`).
@@ -243,12 +249,16 @@ fn to_doc_part(part: &MessagePart) -> Result<DocPartJson, DocError> {
             to,
             from_harness,
             to_harness,
+            from_model,
+            to_model,
         } => DocPartJson {
             id: id.clone(),
             kind: "switch".into(),
             message: Some(format!("{from} → {to}")),
             // store the switch metadata as the request tuple for round-tripping
             questions: Some(serde_json::to_value((from, to, from_harness, to_harness))?),
+            from_model: from_model.clone(),
+            to_model: to_model.clone(),
             ..Default::default()
         },
         MessagePart::Error {
@@ -379,6 +389,8 @@ fn from_doc_part(p: DocPartJson) -> MessagePart {
                     to,
                     from_harness,
                     to_harness,
+                    from_model: p.from_model,
+                    to_model: p.to_model,
                 },
                 None => MessagePart::Text {
                     id: p.id,
@@ -920,6 +932,50 @@ impl SessionDoc {
         })
     }
 
+    /// Persist a switch fact that arrived OUTSIDE a running turn (a mid-chat
+    /// model change via `setChatConfig`): its own `System` entry at the doc
+    /// tail, so the divider is visible from the moment of the switch — not
+    /// deferred to the next user message the way agent-switch markers are.
+    ///
+    /// One entry per marker (`sys-{part.id}`); the part id is minted per
+    /// switch, so a repeated call is a no-op rather than a duplicate row.
+    pub fn record_switch_part(
+        &self,
+        part: &MessagePart,
+        device_id: &str,
+        created_at: i64,
+    ) -> Result<(), DocError> {
+        let MessagePart::Switch { id, .. } = part else {
+            return Err(DocError::Schema(
+                "record_switch_part requires a switch part".into(),
+            ));
+        };
+        let entry_id = format!("sys-{id}");
+        let messages = self.doc.get_list("messages");
+        for i in 0..messages.len() {
+            let Some(loro::ValueOrContainer::Container(loro::Container::Map(entry))) =
+                messages.get(i)
+            else {
+                continue;
+            };
+            if matches!(
+                entry.get("id"),
+                Some(loro::ValueOrContainer::Value(LoroValue::String(s))) if s.as_str() == entry_id
+            ) {
+                return Ok(());
+            }
+        }
+        self.push_message(&SessionMessageEntry {
+            id: entry_id,
+            role: MessageRole::System,
+            parts: vec![part.clone()],
+            created_at,
+            device_id: device_id.to_string(),
+            status: Some(MessageStatus::Complete),
+            continuation_of: None,
+        })
+    }
+
     /// Stamp the post-compaction token count that the boundary frame itself did
     /// not carry onto an existing compaction part. First writer wins: a count
     /// the agent reported is never overwritten by an inferred one.
@@ -1369,6 +1425,7 @@ fn push_part(parts: &LoroList, part: &MessagePart) -> Result<(), DocError> {
             push_response(&list, response)?;
         }
     }
+    write_switch_fields(&map, &doc_part)?;
     Ok(())
 }
 
@@ -1875,12 +1932,25 @@ fn update_part_fields(map: &LoroMap, part: &MessagePart) -> Result<(), DocError>
     // `responses` is deliberately absent: the answer list grows through
     // [`SessionDoc::record_input_response`], which appends into the container.
     // Writing the fold's (always empty) copy here would erase real answers.
+    write_switch_fields(map, &doc_part)?;
     if let Some(text) = &doc_part.text {
         // Defensive path only — the fold never rewrites earlier text.
         if let Some(loro::ValueOrContainer::Container(loro::Container::Text(t))) = map.get("text") {
             t.update(text, Default::default())
                 .map_err(|e| DocError::Schema(e.to_string()))?;
         }
+    }
+    Ok(())
+}
+
+/// Write the model-id columns of a switch part. Shared by push and in-place
+/// update for the same reason as [`write_compaction_fields`].
+fn write_switch_fields(map: &LoroMap, doc_part: &DocPartJson) -> Result<(), DocError> {
+    if let Some(from_model) = &doc_part.from_model {
+        map.insert("fromModel", from_model.as_str())?;
+    }
+    if let Some(to_model) = &doc_part.to_model {
+        map.insert("toModel", to_model.as_str())?;
     }
     Ok(())
 }
@@ -2824,6 +2894,8 @@ mod tests {
             to: "Devin".into(),
             from_harness: Some("claude-code".into()),
             to_harness: Some("devin".into()),
+            from_model: None,
+            to_model: None,
         };
         assert!(doc.append_switch_part("m1", &marker).unwrap());
         assert!(doc.append_switch_part("m1", &marker).unwrap());
@@ -2847,6 +2919,43 @@ mod tests {
                 .filter(|part| matches!(part, MessagePart::Switch { .. }))
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn model_switch_marker_round_trips_as_system_entry() {
+        let doc = SessionDoc::init("chat-1").unwrap();
+        doc.push_message(&user_entry("m1", "hello")).unwrap();
+        let marker = MessagePart::Switch {
+            id: "switch-model-1".into(),
+            from: "claude-opus".into(),
+            to: "glm-5.3-flash".into(),
+            from_harness: Some("claude-code".into()),
+            to_harness: Some("claude-code".into()),
+            from_model: Some("claude-opus".into()),
+            to_model: Some("glm-5.3-flash".into()),
+        };
+        doc.record_switch_part(&marker, "dev-a", 42).unwrap();
+        // Idempotent: the same marker never stacks a second entry.
+        doc.record_switch_part(&marker, "dev-a", 42).unwrap();
+        let entries = doc.read_entries().unwrap();
+        assert_eq!(entries.len(), 2);
+        let entry = &entries[1];
+        assert_eq!(entry.role, MessageRole::System);
+        assert_eq!(entry.id, "sys-switch-model-1");
+        assert_eq!(entry.device_id, "dev-a");
+        assert_eq!(entry.created_at, 42);
+        assert!(entry.parts.contains(&marker));
+        assert!(
+            !doc.record_switch_part(
+                &MessagePart::Text {
+                    id: "t".into(),
+                    text: "x".into(),
+                },
+                "dev-a",
+                43
+            )
+            .is_ok()
         );
     }
 

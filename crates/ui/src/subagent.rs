@@ -801,6 +801,31 @@ impl SubagentPanel {
                 theme,
             ),
             RowKind::ErrorChip { message, .. } => error_chip(message.clone(), theme),
+            RowKind::AgentSwitch { switch } => div()
+                .w_full()
+                .py(px(4.0))
+                .text_size(px(11.0))
+                .text_color(theme.text_muted)
+                .child(SharedString::from(format!(
+                    "{} → {}",
+                    switch.from_label, switch.to_label
+                )))
+                .into_any_element(),
+            RowKind::ModelSwitch {
+                from_model,
+                to_model,
+                ..
+            } => div()
+                .w_full()
+                .py(px(4.0))
+                .text_size(px(11.0))
+                .text_color(theme.text_muted)
+                .child(SharedString::from(format!(
+                    "Model switched {} → {}",
+                    from_model.as_deref().unwrap_or("default"),
+                    to_model.as_deref().unwrap_or("default"),
+                )))
+                .into_any_element(),
             RowKind::Compaction {
                 status,
                 trigger,
