@@ -1046,7 +1046,7 @@ impl Shell {
                     popover::menu_row(theme, false, "user-menu-settings", cx.entity_id())
                         .id("user-menu-settings")
                         .on_click(cx.listener(|this, _, _, cx| {
-                            this.open_settings(SettingsSection::Devices, cx)
+                            this.open_settings(SettingsSection::General, cx)
                         }))
                         .child(
                             icon(icons::SETTINGS_MINIMALISTIC)

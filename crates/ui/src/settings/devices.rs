@@ -111,6 +111,9 @@ pub struct DevicesPage {
     /// Set once a FRESH stream frame answers the click, so "You're up to
     /// date" never reports a predated frame as the answer.
     just_checked: bool,
+    /// Embedded mode (Settings → General): cards only — the section header
+    /// and the scroll container belong to the host page.
+    embedded: bool,
     _observe: Subscription,
 }
 
@@ -129,8 +132,17 @@ impl DevicesPage {
             check_error: None,
             check_task: None,
             just_checked: false,
+            embedded: false,
             _observe: observe,
         }
+    }
+
+    /// Embedded inside Settings → General: the devices and updates cards
+    /// without the page header, subtitle or own scroll container.
+    pub fn new_embedded(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
+        let mut page = Self::new(state, cx);
+        page.embedded = true;
+        page
     }
 
     fn settle_if_fresh(&mut self, checked_at: Option<i64>, cx: &mut Context<Self>) {
@@ -659,36 +671,45 @@ impl Render for DevicesPage {
             None => updates_card.into_any_element(),
         };
 
-        div()
-            .id("devices-page")
-            .size_full()
-            .overflow_y_scroll()
-            .child(
-                widgets::page_column()
-                    .child(widgets::page_header(
-                        &theme,
-                        "Devices",
-                        (count > 0).then_some(count),
-                    ))
-                    .child(widgets::page_subtitle(
-                        &theme,
-                        devices_subtitle(workspace_scope),
-                    ))
-                    .when_some(self.error.clone(), |el, message| {
-                        el.child(
-                            widgets::error_strip(&theme, message)
-                                .id("devices-error")
-                                .cursor_pointer()
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.error = None;
-                                    cx.notify();
-                                })),
-                        )
-                    })
-                    .child(card)
-                    .child(updates_card),
-            )
+        let column = widgets::page_column();
+        let column = if self.embedded {
+            column
+        } else {
+            column
+                .child(widgets::page_header(
+                    &theme,
+                    "Devices",
+                    (count > 0).then_some(count),
+                ))
+                .child(widgets::page_subtitle(
+                    &theme,
+                    devices_subtitle(workspace_scope),
+                ))
+        };
+        let column = column
+            .when_some(self.error.clone(), |el, message| {
+                el.child(
+                    widgets::error_strip(&theme, message)
+                        .id("devices-error")
+                        .cursor_pointer()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.error = None;
+                            cx.notify();
+                        })),
+                )
+            })
+            .child(card)
+            .child(updates_card);
+
+        let page = div().id("devices-page");
+        let page = if self.embedded {
+            page.w_full()
+        } else {
+            page.size_full().overflow_y_scroll()
+        };
+        page.child(column)
             .when_some(dialog, |el, dialog| el.child(dialog))
+            .into_any_element()
     }
 }
 

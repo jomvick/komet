@@ -32,6 +32,7 @@ use komet_proto::{
 use komet_rpc::{RpcError, methods};
 
 use crate::attachments::{self, StagedAttachment};
+use crate::browser::ElementContext;
 use crate::icons::{self, icon};
 use crate::motion;
 use crate::pickers::Pickers;
@@ -197,6 +198,66 @@ pub const STRIP_THUMB: f32 = 56.0;
 pub const STRIP_GAP: f32 = 8.0;
 pub const STRIP_PAD_TOP: f32 = 12.0;
 pub const STRIP_PAD_X: f32 = 16.0;
+
+/// Pastilles « Add element » : plus petites que les vignettes de fichiers.
+const ELEMENT_CHIP_H: f32 = 26.0;
+const ELEMENT_CHIP_GAP: f32 = 6.0;
+const ELEMENT_CHIP_MAX_W: f32 = 280.0;
+
+/// Libellé de la pastille : `tag · sélecteur|texte|titre` (tronqué à 48 car.).
+fn element_chip_label(element: &ElementContext) -> String {
+    let tag = if element.tag.is_empty() {
+        "element"
+    } else {
+        element.tag.as_str()
+    };
+    let detail = if !element.selector.is_empty() {
+        element.selector.clone()
+    } else if !element.text.is_empty() {
+        element.text.clone()
+    } else {
+        element.title.clone()
+    };
+    let detail: String = detail.chars().take(48).collect();
+    if detail.is_empty() {
+        tag.to_string()
+    } else {
+        format!("{tag} · {detail}")
+    }
+}
+
+/// Largeur estimée d'une pastille (car. × ~7 px + icône/×/insets) — sert
+/// uniquement au calcul de hauteur du strip, jamais au layout réel.
+fn element_chip_width(element: &ElementContext) -> f32 {
+    (element_chip_label(element).chars().count() as f32 * 7.0 + 52.0)
+        .clamp(96.0, ELEMENT_CHIP_MAX_W)
+}
+
+/// Hauteur ajoutée par le strip de pastilles d'éléments (0 si vide) — même
+/// recette wrap que [`attachment_strip_height`] mais sur des pastilles de
+/// largeur variable estimée.
+pub fn element_strip_height(elements: &[ElementContext], inner_width: f32) -> f32 {
+    if elements.is_empty() {
+        return 0.0;
+    }
+    let usable = (inner_width - 2.0 * STRIP_PAD_X).max(ELEMENT_CHIP_MAX_W);
+    let mut rows = 1usize;
+    let mut row_width = 0.0f32;
+    for element in elements {
+        let width = element_chip_width(element);
+        if row_width > 0.0 && row_width + ELEMENT_CHIP_GAP + width > usable {
+            rows += 1;
+            row_width = width;
+        } else {
+            row_width += if row_width > 0.0 {
+                ELEMENT_CHIP_GAP
+            } else {
+                0.0
+            } + width;
+        }
+    }
+    STRIP_PAD_TOP + rows as f32 * ELEMENT_CHIP_H + (rows - 1) as f32 * ELEMENT_CHIP_GAP
+}
 
 /// Height the wrap strip adds to the pill for `count` staged thumbnails at an
 /// `inner_width` pill content width (0 when empty). Mirrors flex-wrap: as many
@@ -1630,6 +1691,9 @@ pub enum ComposerInputEvent {
     MentionNavigate(isize),
     MentionAccept,
     MentionDismiss,
+    /// ↑/↓ pendant qu'une popup « candidate » (suggestions de la barre
+    /// d'adresse, historique…) est ouverte — le wrapper gère la sélection.
+    PopupNavigate(isize),
     /// Escape with no mention popup — used by in-place prompt edit.
     Cancelled,
     /// Images pasted from the clipboard (screenshots / copied image data) —
@@ -1684,6 +1748,10 @@ pub struct ComposerInput {
     /// Escape with no mention popup emits [`ComposerInputEvent::Cancelled`]
     /// instead of propagating (in-place prompt edit).
     cancel_on_escape: bool,
+    /// ↑/↓ émettent [`ComposerInputEvent::PopupNavigate`] au lieu de déplacer
+    /// le curseur — pour les popups de suggestions hors mentions (barre
+    /// d'adresse du navigateur). Activé par `set_popup_nav`.
+    popup_nav: bool,
     /// Bumped once per `layout_text` pass — the flip logic uses it to apply at
     /// most one compact↔expanded flip per layout (a flip is only re-evaluated
     /// after the input has been measured in the new mode).
@@ -1775,6 +1843,7 @@ impl ComposerInput {
             ghost: None,
             mentions_enabled: false,
             cancel_on_escape: false,
+            popup_nav: false,
             layout_epoch: 0,
             display_is_placeholder: true,
             blink_anchor: Instant::now(),
@@ -1888,6 +1957,12 @@ impl ComposerInput {
 
     pub(crate) fn enable_escape_cancel(&mut self) {
         self.cancel_on_escape = true;
+    }
+
+    /// Redirige ↑/↓ vers [`ComposerInputEvent::PopupNavigate`] tant qu'une
+    /// popup de suggestions est ouverte (barre d'adresse du navigateur).
+    pub fn set_popup_nav(&mut self, enabled: bool) {
+        self.popup_nav = enabled;
     }
 
     fn refresh_projection(&mut self) {
@@ -2396,6 +2471,10 @@ impl ComposerInput {
     }
 
     fn up(&mut self, _: &Up, _: &mut Window, cx: &mut Context<Self>) {
+        if self.popup_nav {
+            cx.emit(ComposerInputEvent::PopupNavigate(-1));
+            return;
+        }
         if self.mention_has_selection {
             cx.emit(ComposerInputEvent::MentionNavigate(-1));
             return;
@@ -2406,6 +2485,10 @@ impl ComposerInput {
     }
 
     fn down(&mut self, _: &Down, _: &mut Window, cx: &mut Context<Self>) {
+        if self.popup_nav {
+            cx.emit(ComposerInputEvent::PopupNavigate(1));
+            return;
+        }
         if self.mention_has_selection {
             cx.emit(ComposerInputEvent::MentionNavigate(1));
             return;
@@ -3959,6 +4042,9 @@ struct QueuedPrompt {
     text: String,
     steer: bool,
     staged: Vec<StagedAttachment>,
+    /// Éléments « Add element » indexés pendant la capture (même cycle de
+    /// vie que les pièces jointes : vidés à l'envoi, rendus à la file).
+    elements: Vec<ElementContext>,
     use_mcp: bool,
 }
 
@@ -3979,6 +4065,9 @@ pub struct Composer {
     /// Staged-but-unsent attachments per chat key (use-attachments.ts `stash`):
     /// navigating away and back restores them; memory-only, like the original.
     attachments: HashMap<String, Vec<StagedAttachment>>,
+    /// Éléments de page indexés via « Add element » du navigateur, par chat :
+    /// pastilles `<browser-element>` sérialisées dans le prompt au send.
+    elements: HashMap<String, Vec<ElementContext>>,
     /// The staged attachment being viewed full-size (click a thumbnail).
     preview: Option<attachments::PreviewImage>,
     /// Focused while the lightbox is open so Escape reaches it; the input
@@ -4210,7 +4299,7 @@ impl Composer {
                 this.add_staged(staged, cx);
             }
             ComposerInputEvent::PastedPaths(paths) => this.add_paths(paths.clone(), true, cx),
-            ComposerInputEvent::Cancelled => {}
+            ComposerInputEvent::Cancelled | ComposerInputEvent::PopupNavigate(_) => {}
         });
         let current_key = state.read(cx).selected_chat.clone().unwrap_or_default();
         // The question dock's "Other" field. Escape here is the question's
@@ -4237,6 +4326,7 @@ impl Composer {
             drafts: HashMap::new(),
             last_sent: None,
             attachments: HashMap::new(),
+            elements: HashMap::new(),
             preview: None,
             preview_focus: cx.focus_handle(),
             preview_focus_pending: false,
@@ -4419,6 +4509,113 @@ impl Composer {
     /// raw image bytes, and a deleted chat's stage could never be sent again.
     pub fn purge_chat(&mut self, chat_id: &str) {
         self.attachments.remove(chat_id);
+        self.elements.remove(chat_id);
+    }
+
+    // ---- éléments de page indexés (« Add element » du navigateur) ----
+
+    /// Éléments capturés pour le chat courant.
+    fn staged_elements(&self) -> &[ElementContext] {
+        self.elements
+            .get(&self.current_key)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    /// Indexe un élément de page : pastille dans le strip, bloc
+    /// `<browser-element>` dans le prompt au send.
+    pub fn add_element(&mut self, context: ElementContext, cx: &mut Context<Self>) {
+        self.elements
+            .entry(self.current_key.clone())
+            .or_default()
+            .push(context);
+        cx.notify();
+    }
+
+    fn remove_element(&mut self, index: usize, cx: &mut Context<Self>) {
+        if let Some(list) = self.elements.get_mut(&self.current_key) {
+            if index < list.len() {
+                list.remove(index);
+            }
+            if list.is_empty() {
+                self.elements.remove(&self.current_key);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Pastilles d'éléments sous le strip de pièces jointes : pastille
+    /// `tag · détail` avec pastille TARGET, retirée par son ×.
+    fn render_element_strip(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<gpui::Div> {
+        let elements = self.staged_elements();
+        if elements.is_empty() {
+            return None;
+        }
+        let mut strip = div()
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .gap(px(ELEMENT_CHIP_GAP))
+            .px(px(STRIP_PAD_X))
+            .pt(px(STRIP_PAD_TOP));
+        for (ix, element) in elements.iter().enumerate() {
+            let group: SharedString = format!("composer-element-{ix}").into();
+            let label = element_chip_label(element);
+            strip = strip.child(
+                div()
+                    .group(group.clone())
+                    .h(px(ELEMENT_CHIP_H))
+                    .max_w(px(ELEMENT_CHIP_MAX_W))
+                    .pl(px(8.0))
+                    .pr(px(5.0))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(5.0))
+                    .rounded_full()
+                    .border_1()
+                    .border_color(crate::theme::hairline(0.10))
+                    .bg(crate::theme::ink(0.04))
+                    .child(
+                        crate::icons::icon(crate::icons::TARGET)
+                            .size(px(11.0))
+                            .text_color(theme.accent),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_size(px(11.0))
+                            .text_color(theme.text)
+                            .child(SharedString::from(label)),
+                    )
+                    .child(
+                        div()
+                            .id(("composer-element-remove", ix))
+                            .size(px(14.0))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_full()
+                            .cursor_pointer()
+                            .opacity(0.0)
+                            .group_hover(group, |s| s.opacity(1.0))
+                            .hover(|s| s.bg(crate::theme::ink(0.10)))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.remove_element(ix, cx);
+                            }))
+                            .child(
+                                crate::icons::icon(crate::icons::CLOSE)
+                                    .size(px(9.0))
+                                    .text_color(theme.text_muted),
+                            ),
+                    ),
+            );
+        }
+        Some(strip)
     }
 
     /// Staged files share the same strip; only image entries open a preview.
@@ -5494,7 +5691,9 @@ impl Composer {
     fn button_mode(&self, cx: &App) -> SendButtonMode {
         // A staged image counts as content: image-only sends are legal
         // (the prompt body becomes "See the attached image(s).").
-        let has_text = !self.input.read(cx).text().trim().is_empty() || !self.staged().is_empty();
+        let has_text = !self.input.read(cx).text().trim().is_empty()
+            || !self.staged().is_empty()
+            || !self.staged_elements().is_empty();
         // `can_steer` = agent supports mid-turn injection (StepBoundary). When
         // the agent only supports TurnBoundary steering (or no steering at all),
         // we use the Queue mode so the prompt waits locally for the turn to finish.
@@ -5514,7 +5713,9 @@ impl Composer {
         let use_mcp = self.use_mcp_next_prompt;
         match self.button_mode(cx) {
             SendButtonMode::Stop => self.interrupt(cx),
-            _ if text.is_empty() && self.staged().is_empty() => {}
+            _ if text.is_empty()
+                && self.staged().is_empty()
+                && self.staged_elements().is_empty() => {}
             _ if self.send_blocked(cx) => {}
             SendButtonMode::Queue => self.enqueue_prompt(text, false, use_mcp, cx),
             SendButtonMode::Send => {
@@ -5654,11 +5855,13 @@ impl Composer {
             .attachments
             .remove(&self.current_key)
             .unwrap_or_default();
+        let elements = self.elements.remove(&self.current_key).unwrap_or_default();
         self.preview = None;
         self.prompt_queue.push_back(QueuedPrompt {
             text,
             steer,
             staged,
+            elements,
             use_mcp,
         });
         self.use_mcp_next_prompt = false;
@@ -5680,6 +5883,12 @@ impl Composer {
                     .entry(self.current_key.clone())
                     .or_default()
                     .extend(item.staged);
+            }
+            if !item.elements.is_empty() {
+                self.elements
+                    .entry(self.current_key.clone())
+                    .or_default()
+                    .extend(item.elements);
             }
             self.send(item.text, item.steer, false, item.use_mcp, cx);
         }
@@ -5719,6 +5928,7 @@ impl Composer {
                     text: queued.text,
                     steer: false,
                     staged: Vec::new(),
+                    elements: Vec::new(),
                     use_mcp: queued.use_mcp,
                 });
             }
@@ -5761,14 +5971,14 @@ impl Composer {
         // text that was typed here is already there; a replayed text (prompt
         // queue, outbox drain) is put back into an empty input instead of
         // being lost.
-        if !self.staged().is_empty() {
+        if !self.staged().is_empty() || !self.staged_elements().is_empty() {
             if !from_input && self.input.read(cx).text().trim().is_empty() {
                 self.input
                     .update(cx, |input, cx| input.set_text(text.clone(), cx));
             }
             self.failure = Some(
                 format!(
-                    "{} — send blocked; your files stay in the composer",
+                    "{} — send blocked; your staged items stay in the composer",
                     capitalized(reason.as_str())
                 )
                 .into(),
@@ -5891,6 +6101,18 @@ impl Composer {
         } else {
             Vec::new()
         };
+        // Éléments « Add element » : même snapshot-and-clear que les fichiers ;
+        // sérialisés en blocs `<browser-element>` dans le prompt.
+        let staged_elements = if from_input {
+            self.elements.remove(&self.current_key).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let element_blocks = staged_elements
+            .iter()
+            .map(|element| element.prompt_block())
+            .collect::<Vec<_>>()
+            .join("\n\n");
         let message_id = uuid::Uuid::new_v4().to_string();
         let created_at = chrono::Utc::now().timestamp_millis();
 
@@ -5906,6 +6128,13 @@ impl Composer {
             .map(|att| format!("pending/{}/{}", att.id, att.name))
             .collect();
         let echo_text = attachments::with_attachments(&text, &echo_paths);
+        let echo_text = if element_blocks.is_empty() {
+            echo_text
+        } else if echo_text.trim().is_empty() {
+            element_blocks.clone()
+        } else {
+            format!("{}\n\n{}", echo_text.trim_end(), element_blocks)
+        };
         for (path, att) in echo_paths.iter().zip(&staged) {
             if let Some(image) = att.image.as_ref() {
                 attachments::seed_attachment(&device_id, path, &att.name, image.clone());
@@ -6002,6 +6231,13 @@ impl Composer {
                 // text (`with_attachments`, the persisted transport) and the
                 // paths onto the Run request (inline image blocks).
                 let mut content = text.clone();
+                if !element_blocks.is_empty() {
+                    content = if content.trim().is_empty() {
+                        element_blocks.clone()
+                    } else {
+                        format!("{}\n\n{}", content.trim_end(), element_blocks)
+                    };
+                }
                 let mut attachment_paths: Vec<String> = Vec::new();
                 if !staged.is_empty() {
                     for att in &staged {
@@ -6035,7 +6271,7 @@ impl Composer {
                             }
                         }
                     }
-                    content = attachments::with_attachments(&text, &attachment_paths);
+                    content = attachments::with_attachments(&content, &attachment_paths);
                     // Refresh the echo in place with the attachment refs
                     // (same id, same clock — the bubble grows its thumbnails
                     // without flickering).
@@ -6276,7 +6512,28 @@ impl Composer {
                                 merged.extend(fresh);
                             }
                         }
-                        composer.attachments.insert(restore_key, merged);
+                        composer.attachments.insert(restore_key.clone(), merged);
+                    }
+                    if !staged_elements.is_empty() {
+                        // Même main-d'œuvre que les fichiers : les éléments
+                        // capturés pendant le send reviennent dans la pastille.
+                        let mut merged = staged_elements.clone();
+                        for key in [err_chat_id.clone(), restore_key.clone()] {
+                            if let Some(slot) = composer.elements.get_mut(&key) {
+                                let fresh: Vec<_> = slot
+                                    .drain(..)
+                                    .filter(|e| {
+                                        !merged.iter().any(|f| {
+                                            f.url == e.url
+                                                && f.selector == e.selector
+                                                && f.text == e.text
+                                        })
+                                    })
+                                    .collect();
+                                merged.extend(fresh);
+                            }
+                        }
+                        composer.elements.insert(restore_key, merged);
                     }
                 }
                 cx.notify();
@@ -7926,7 +8183,8 @@ impl Render for Composer {
         // modes (attachment-ui.tsx AttachmentStrip sits above the input row).
         let staged_count = self.staged().len();
         let strip_width_hint = if last_width > 0.0 { last_width } else { 720.0 };
-        let strip_h = attachment_strip_height(staged_count, strip_width_hint);
+        let strip_h = attachment_strip_height(staged_count, strip_width_hint)
+            + element_strip_height(self.staged_elements(), strip_width_hint);
         let base_height = if expanded {
             composer_total_height(content_height)
         } else {
@@ -8019,8 +8277,10 @@ impl Render for Composer {
             ));
         }
         // Staged-thumbnail strip (attachment-ui.tsx AttachmentStrip), above
-        // the input inside the pill in both modes.
+        // the input inside the pill in both modes — followed by the element
+        // pills captured via the browser's « Add element » mode.
         let strip = self.render_attachment_strip(&theme, cx);
+        let element_strip = self.render_element_strip(&theme, cx);
 
         // The pill chrome (komet composer.tsx): `rounded-[26px] border
         // border-white/[0.08] bg-white/[0.03] shadow-xl` — a floating pill with
@@ -8059,6 +8319,7 @@ impl Render for Composer {
                 .flex()
                 .flex_col()
                 .children(strip)
+                .children(element_strip)
                 .child(
                     div()
                         .h(px(
@@ -8127,6 +8388,7 @@ impl Render for Composer {
                 .flex_col()
                 .justify_end()
                 .children(strip)
+                .children(element_strip)
                 .child(
                     div()
                         .h(px(COMPACT_TOTAL_HEIGHT - PILL_BORDER_V))
@@ -8240,6 +8502,44 @@ impl Render for Composer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn element_chip_label_prefers_selector_then_text() {
+        let el = ElementContext {
+            tag: "button".into(),
+            text: "Submit".into(),
+            ..ElementContext::default()
+        };
+        assert_eq!(element_chip_label(&el), "button · Submit");
+        let el = ElementContext {
+            selector: "#login".into(),
+            ..el
+        };
+        assert_eq!(element_chip_label(&el), "button · #login");
+        let el = ElementContext {
+            title: "Example".into(),
+            tag: String::new(),
+            selector: String::new(),
+            text: String::new(),
+            ..ElementContext::default()
+        };
+        assert_eq!(element_chip_label(&el), "element · Example");
+    }
+
+    #[test]
+    fn element_strip_height_wraps_and_is_empty_when_no_elements() {
+        assert_eq!(element_strip_height(&[], 400.0), 0.0);
+        let el = ElementContext {
+            tag: "div".into(),
+            ..ElementContext::default()
+        };
+        // Une pastille : pad-top + une ligne de 26 px.
+        let one = element_strip_height(std::slice::from_ref(&el), 400.0);
+        assert!(one > STRIP_PAD_TOP && one < STRIP_PAD_TOP + 40.0);
+        // Assez de pastilles pour dépasser la largeur : la hauteur grandit.
+        let many: Vec<ElementContext> = (0..12).map(|_| el.clone()).collect();
+        assert!(element_strip_height(&many, 300.0) > one);
+    }
 
     #[test]
     fn access_chip_cycles_through_every_level() {

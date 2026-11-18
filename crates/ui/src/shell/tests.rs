@@ -714,7 +714,7 @@ fn nav_history_starts_with_nothing_to_walk() {
 fn nav_push_then_back_and_forward() {
     let mut nav = NavHistory::new(chat("a"));
     nav.push(chat("b"));
-    nav.push(NavEntry::Settings(SettingsSection::Devices));
+    nav.push(NavEntry::Settings(SettingsSection::General));
     assert!(nav.can_back());
     assert!(!nav.can_forward());
 
@@ -733,7 +733,7 @@ fn nav_push_then_back_and_forward() {
     assert_eq!(nav.forward(), Some(chat("b")));
     assert_eq!(
         nav.forward(),
-        Some(NavEntry::Settings(SettingsSection::Devices))
+        Some(NavEntry::Settings(SettingsSection::General))
     );
     assert!(!nav.can_forward());
     assert_eq!(nav.forward(), None);
@@ -782,27 +782,27 @@ fn nav_replace_swaps_in_place() {
 #[test]
 fn nav_settings_sections_are_distinct_entries() {
     let mut nav = NavHistory::new(chat("a"));
-    nav.push(NavEntry::Settings(SettingsSection::Devices));
+    nav.push(NavEntry::Settings(SettingsSection::General));
     nav.push(NavEntry::Settings(SettingsSection::Shortcuts));
     assert_eq!(nav.len(), 3, "section changes are navigations");
     assert_eq!(
         nav.back(),
-        Some(NavEntry::Settings(SettingsSection::Devices))
+        Some(NavEntry::Settings(SettingsSection::General))
     );
     assert_eq!(nav.back(), Some(chat("a")));
 }
 
 #[test]
-fn settings_sections_include_security() {
-    assert_eq!(SettingsSection::ALL.len(), 12);
+fn settings_sections_general_first_ten_entries() {
+    assert_eq!(SettingsSection::ALL.len(), 10);
+    assert_eq!(SettingsSection::ALL[0], SettingsSection::General);
+    assert_eq!(SettingsSection::General.label(), "General");
     assert!(SettingsSection::ALL.contains(&SettingsSection::Providers));
     assert_eq!(SettingsSection::Providers.label(), "Providers");
-    assert!(SettingsSection::ALL.contains(&SettingsSection::Security));
-    assert_eq!(SettingsSection::Security.label(), "Security");
+    assert!(SettingsSection::ALL.contains(&SettingsSection::Archived));
+    assert_eq!(SettingsSection::Archived.label(), "Archived sessions");
     assert!(SettingsSection::ALL.contains(&SettingsSection::Integrations));
     assert_eq!(SettingsSection::Integrations.label(), "Integrations");
-    assert!(SettingsSection::ALL.contains(&SettingsSection::Memory));
-    assert_eq!(SettingsSection::Memory.label(), "Memory");
 }
 
 #[test]

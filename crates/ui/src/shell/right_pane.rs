@@ -216,8 +216,65 @@ impl Shell {
         let key = self.panel_key(cx);
         if !self.browsers.contains_key(&key) {
             let profile_key = key.clone();
-            let browser =
-                cx.new(|cx| crate::browser::BrowserSurface::new(String::new(), profile_key, cx));
+            let data_dir = self.state.read(cx).data_dir.clone();
+            let prefs = self.settings.browser.clone();
+            // Page d'accueil (Settings → Browser) : vide = état « Open
+            // Address… » ; sinon la première surface charge directement.
+            let initial_url = prefs.home_url.clone().unwrap_or_default();
+            let browser = cx.new(|cx| {
+                crate::browser::BrowserSurface::new(initial_url, profile_key, data_dir, prefs, cx)
+            });
+            // Événements surface → shell : new tab, settings, indexation
+            // d'élément dans le composer, panneau d'historique.
+            self.browser_subs.insert(
+                key.clone(),
+                cx.subscribe(
+                    &browser,
+                    |this, surface, event: &crate::browser::BrowserSurfaceEvent, cx| {
+                        use crate::browser::BrowserSurfaceEvent;
+                        match event {
+                            BrowserSurfaceEvent::NewTab => {
+                                this.add_browser_surface(cx);
+                                surface.update(cx, |surface, cx| surface.new_tab(cx));
+                            }
+                            BrowserSurfaceEvent::OpenSettings => {
+                                this.open_settings(SettingsSection::Browser, cx);
+                            }
+                            // « Add element » : la pastille rejoint le
+                            // composer du chat courant (comme une pièce jointe).
+                            BrowserSurfaceEvent::AddElement(context) => {
+                                this.composer.update(cx, |composer, cx| {
+                                    composer.add_element(context.as_ref().clone(), cx);
+                                });
+                            }
+                            // Preset d'émulation choisi dans la barre device :
+                            // persisté comme « preset par défaut » (nouvelles
+                            // surfaces) sans toucher aux surfaces ouvertes.
+                            BrowserSurfaceEvent::EmulationChanged(slug) => {
+                                this.settings.browser.emulation_preset = slug.clone();
+                                this.schedule_save(cx);
+                            }
+                            // « Clear Storage » avec History coché : le
+                            // journal est partagé entre surfaces — on purge
+                            // la mémoire de toutes (favoris conservés) et le
+                            // fichier, au cas où une surface n'a pas de store.
+                            BrowserSurfaceEvent::HistoryCleared => {
+                                if let Some(data_dir) = this.state.read(cx).data_dir.clone()
+                                    && let Err(err) = crate::browser::clear_history_file(&data_dir)
+                                {
+                                    tracing::warn!(error = %err, "failed to clear history file");
+                                }
+                                for surface in this.browsers.values() {
+                                    surface.update(cx, |surface, cx| {
+                                        surface.clear_all_history(cx);
+                                    });
+                                }
+                            }
+                            _ => {}
+                        }
+                    },
+                ),
+            );
             self.browsers.insert(key.clone(), browser);
         }
         push_unique_right_surface(
@@ -472,6 +529,26 @@ impl Shell {
         Some(WorkspacePathDrag::new(path, false))
     }
 
+    /// Persist + propagate an autosave-delay change made in Settings →
+    /// General → Files. Pending edits re-arm their flush timer under the new
+    /// delay (`set_autosave_delay_ms` returns the paths it rescheduled).
+    pub(super) fn set_files_autosave_delay_ms(&mut self, delay_ms: u64, cx: &mut Context<Self>) {
+        self.settings.files_autosave_delay_ms = delay_ms;
+        let surfaces = self
+            .files
+            .values()
+            .chain(self.file_surfaces.values())
+            .cloned()
+            .collect::<Vec<_>>();
+        for surface in surfaces {
+            surface.update(cx, |surface, cx| {
+                surface.set_autosave_delay_ms(delay_ms, cx)
+            });
+        }
+        self.schedule_save(cx);
+        cx.notify();
+    }
+
     pub(super) fn set_files_word_wrap(
         &mut self,
         word_wrap: bool,
@@ -620,6 +697,7 @@ impl Shell {
         match surface {
             RightSurface::Browser => {
                 self.browsers.remove(&key);
+                self.browser_subs.remove(&key);
             }
             RightSurface::Files | RightSurface::File(_) => {}
             RightSurface::Diff(id) => {

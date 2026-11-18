@@ -1,38 +1,36 @@
 use super::*;
 use crate::icons;
+use crate::settings::browser::BrowserSettingsEvent;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsSection {
-    Devices,
+    /// Devices, Security, Files and Memory consolidated on one scrolling page.
+    General,
     /// One card per agent: enablement, CLI install state and its logins.
     Providers,
     /// Provider quota windows + Komet-measured token usage (issue #53).
     Usage,
-    /// Local project-memory index controls (issue #78).
-    Memory,
     Appearance,
-    Files,
+    /// Built-in browser settings (search engine, history, zoom, captures…).
+    Browser,
     Notifications,
     Shortcuts,
     Archived,
     Sync,
-    Security,
     Integrations,
 }
 
 impl SettingsSection {
-    pub const ALL: [SettingsSection; 12] = [
-        SettingsSection::Devices,
+    pub const ALL: [SettingsSection; 10] = [
+        SettingsSection::General,
         SettingsSection::Providers,
         SettingsSection::Usage,
-        SettingsSection::Memory,
         SettingsSection::Appearance,
-        SettingsSection::Files,
+        SettingsSection::Browser,
         SettingsSection::Notifications,
         SettingsSection::Shortcuts,
         SettingsSection::Archived,
         SettingsSection::Sync,
-        SettingsSection::Security,
         SettingsSection::Integrations,
     ];
 
@@ -40,17 +38,15 @@ impl SettingsSection {
     /// `settingsTitle` — the same strings in both places).
     pub fn label(self) -> &'static str {
         match self {
-            SettingsSection::Devices => "Devices",
+            SettingsSection::General => "General",
             SettingsSection::Providers => "Providers",
             SettingsSection::Usage => "Usage",
-            SettingsSection::Memory => "Memory",
             SettingsSection::Appearance => "Appearance",
-            SettingsSection::Files => "Files",
+            SettingsSection::Browser => "Browser",
             SettingsSection::Notifications => "Notifications",
             SettingsSection::Shortcuts => "Shortcuts",
             SettingsSection::Archived => "Archived sessions",
             SettingsSection::Sync => "Sync",
-            SettingsSection::Security => "Security",
             SettingsSection::Integrations => "Integrations",
         }
     }
@@ -60,19 +56,69 @@ impl SettingsSection {
     /// reusing one generic settings icon for unrelated pages.
     pub const fn nav_icon(self) -> &'static str {
         match self {
-            SettingsSection::Devices => icons::MONITOR,
+            SettingsSection::General => icons::SETTINGS_MINIMALISTIC,
             SettingsSection::Providers => icons::WIDGET,
             SettingsSection::Usage => icons::SORT_VERTICAL,
-            SettingsSection::Memory => icons::HARD_DRIVE,
             SettingsSection::Appearance => icons::TUNING,
-            SettingsSection::Files => icons::FOLDER_WITH_FILES,
+            SettingsSection::Browser => icons::GLOBAL,
             SettingsSection::Notifications => icons::BELL,
             SettingsSection::Shortcuts => icons::KEYBOARD,
             SettingsSection::Archived => icons::ARCHIVE_MINIMALISTIC,
             SettingsSection::Sync => icons::CLOUD,
-            SettingsSection::Security => icons::SHIELD,
             SettingsSection::Integrations => icons::PLUG,
         }
+    }
+
+    /// Sidebar group caption — `None` for ungrouped entries. Groups must be
+    /// contiguous in `ALL` or the caption would repeat.
+    pub const fn group(self) -> Option<&'static str> {
+        match self {
+            SettingsSection::Providers | SettingsSection::Usage => Some("Agents"),
+            SettingsSection::Appearance
+            | SettingsSection::Browser
+            | SettingsSection::Notifications
+            | SettingsSection::Shortcuts => Some("App"),
+            SettingsSection::Archived | SettingsSection::Sync => Some("Data"),
+            _ => None,
+        }
+    }
+}
+
+/// A scroll anchor inside the General settings page — the sections the
+/// navigation chips jump to, in render order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GeneralAnchor {
+    Devices,
+    Security,
+    Files,
+    Memory,
+}
+
+impl GeneralAnchor {
+    pub const ALL: [GeneralAnchor; 4] = [
+        GeneralAnchor::Devices,
+        GeneralAnchor::Security,
+        GeneralAnchor::Files,
+        GeneralAnchor::Memory,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            GeneralAnchor::Devices => "Devices",
+            GeneralAnchor::Security => "Security",
+            GeneralAnchor::Files => "Files",
+            GeneralAnchor::Memory => "Memory",
+        }
+    }
+
+    /// Index of this anchor's section among the General page's direct scroll
+    /// children: child 0 is the header + chips block, the sections follow in
+    /// [`Self::ALL`] order — `scroll_to_item` addresses them by this index.
+    pub fn scroll_index(self) -> usize {
+        1 + Self::ALL
+            .iter()
+            .position(|anchor| *anchor == self)
+            .unwrap_or(0)
     }
 }
 
@@ -328,11 +374,22 @@ impl Shell {
         {
             self.providers_page = None;
         }
+        if section != SettingsSection::General {
+            self.pending_general_anchor = None;
+        }
         self.route = Route::Settings(section);
         self.nav.push(NavEntry::Settings(section));
         self.close_user_menu(cx);
         self.close_chat_menu(cx);
         cx.notify();
+    }
+
+    /// Open Settings → General, remembering the section the caller asked for
+    /// (Devices / Security / Files / Memory). The pending anchor is consumed
+    /// by [`Self::settings_outlet`] once the page exists.
+    pub fn open_general(&mut self, anchor: GeneralAnchor, cx: &mut Context<Self>) {
+        self.pending_general_anchor = Some(anchor);
+        self.open_settings(SettingsSection::General, cx);
     }
 
     pub(super) fn close_settings(&mut self, cx: &mut Context<Self>) {
@@ -380,15 +437,18 @@ impl Shell {
     pub(super) fn settings_outlet(
         &mut self,
         section: SettingsSection,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         match section {
-            SettingsSection::Devices => {
-                if self.devices_page.is_none() {
-                    let state = self.state.clone();
-                    self.devices_page = Some(cx.new(|cx| DevicesPage::new(state, cx)));
+            SettingsSection::General => {
+                self.ensure_general_pages(window, cx);
+                if let Some(anchor) = self.pending_general_anchor.take()
+                    && let Some(page) = &self.general_page
+                {
+                    page.update(cx, |page, cx| page.scroll_to(anchor, cx));
                 }
-                match &self.devices_page {
+                match &self.general_page {
                     Some(page) => page.clone().into_any_element(),
                     None => Empty.into_any_element(),
                 }
@@ -433,16 +493,6 @@ impl Shell {
                     None => Empty.into_any_element(),
                 }
             }
-            SettingsSection::Memory => {
-                if self.memory_page.is_none() {
-                    let state = self.state.clone();
-                    self.memory_page = Some(cx.new(|cx| MemoryPage::new(state, cx)));
-                }
-                match &self.memory_page {
-                    Some(page) => page.clone().into_any_element(),
-                    None => Empty.into_any_element(),
-                }
-            }
             SettingsSection::Appearance => {
                 if self.appearance_page.is_none() {
                     self.appearance_page = Some(cx.new(AppearancePage::new));
@@ -452,47 +502,69 @@ impl Shell {
                     None => Empty.into_any_element(),
                 }
             }
-            SettingsSection::Files => {
-                if self.files_settings_page.is_none() {
-                    let page = cx.new(|cx| {
-                        FilesSettingsPage::new(
-                            self.settings.files_autosave_delay_ms,
-                            self.settings.files_editor_font_size,
-                            self.settings.files_word_wrap,
-                            self.settings.files_show_all,
-                            cx,
-                        )
-                    });
-                    // Persist whenever the page flips a setting.
-                    let _sub = cx.subscribe(
+            SettingsSection::Browser => {
+                if self.browser_page.is_none() {
+                    let page = cx.new(|cx| BrowserPage::new(self.settings.browser.clone(), cx));
+                    // Persiste les préférences à chaque retouche et vide les
+                    // fichiers d'historique sur les actions « Clear… ».
+                    self.browser_page_sub = Some(cx.subscribe(
                         &page,
-                        |this: &mut Shell,
-                         _,
-                         event: &crate::settings::files::FilesSettingsEvent,
-                         cx| {
-                            use crate::settings::files::FilesSettingsEvent;
-                            match *event {
-                                FilesSettingsEvent::AutosaveDelayChanged(ms) => {
-                                    this.settings.files_autosave_delay_ms = ms;
+                        |this: &mut Shell, _, event: &crate::settings::browser::BrowserSettingsEvent, cx| {
+                            match event {
+                                BrowserSettingsEvent::Changed(prefs) => {
+                                    this.settings.browser = prefs.clone();
                                     this.schedule_save(cx);
+                                    // Répercute sur les surfaces ouvertes
+                                    // (rétention ; recherche/captures sont
+                                    // lus à l'usage).
+                                    for surface in this.browsers.values() {
+                                        surface.update(cx, |surface, cx| {
+                                            surface.update_prefs(prefs.clone(), cx);
+                                        });
+                                    }
                                 }
-                                FilesSettingsEvent::EditorFontSizeChanged(size) => {
-                                    this.set_files_editor_font_size(size, cx);
+                                BrowserSettingsEvent::ClearHistory => {
+                                    // Mémoire + disque sur toutes les surfaces
+                                    // (historique ET favoris, comme annoncé),
+                                    // puis les fichiers en ceinture+bretelles.
+                                    for surface in this.browsers.values() {
+                                        surface.update(cx, |surface, cx| {
+                                            surface.clear_history_and_favorites(cx);
+                                        });
+                                    }
+                                    if let Err(err) =
+                                        crate::browser::clear_storage_files(&this.data_dir)
+                                    {
+                                        tracing::warn!(error = %err, "failed to clear browser storage");
+                                    }
                                 }
-                                FilesSettingsEvent::WordWrapChanged(_) => {
-                                    // Propagated from FilesSurface events; handled via
-                                    // set_files_word_wrap when triggered from a surface.
-                                }
-                                FilesSettingsEvent::ShowAllFilesChanged(_) => {
-                                    // Propagated from FilesSurface events.
+                                // « Clear browsing data… » = le même dialogue
+                                // que le menu « … » : on l'ouvre sur la surface
+                                // du panneau courant (panneau droit affiché) ;
+                                // sans surface, repli sur les fichiers.
+                                BrowserSettingsEvent::ClearBrowsingData => {
+                                    let key = this.panel_key(cx);
+                                    if this.browsers.contains_key(&key) {
+                                        this.add_browser_surface(cx);
+                                        if let Some(surface) = this.browsers.get(&key) {
+                                            let surface = surface.clone();
+                                            surface.update(cx, |surface, cx| {
+                                                surface.open_clear_dialog(cx);
+                                            });
+                                        }
+                                    } else if let Err(err) =
+                                        crate::browser::clear_storage_files(&this.data_dir)
+                                    {
+                                        tracing::warn!(error = %err, "failed to clear browser storage");
+                                    }
                                 }
                             }
                             cx.notify();
                         },
-                    );
-                    self.files_settings_page = Some(page);
+                    ));
+                    self.browser_page = Some(page);
                 }
-                match &self.files_settings_page {
+                match &self.browser_page {
                     Some(page) => page.clone().into_any_element(),
                     None => Empty.into_any_element(),
                 }
@@ -583,44 +655,6 @@ impl Shell {
                     None => Empty.into_any_element(),
                 }
             }
-            SettingsSection::Security => {
-                if self.security_page.is_none() {
-                    let level = self
-                        .state
-                        .read(cx)
-                        .data_dir
-                        .as_deref()
-                        .map(SecurityDefaults::load)
-                        .unwrap_or_default()
-                        .default_sandbox;
-                    let page = cx.new(|cx| SecurityPage::new(level, cx));
-                    self.security_sub = Some(cx.subscribe(
-                        &page,
-                        |this: &mut Shell, _, event: &SecurityEvent, cx| {
-                            let SecurityEvent::DefaultSandboxChanged(level) = *event;
-                            if let Some(data_dir) = this.state.read(cx).data_dir.clone() {
-                                let defaults = SecurityDefaults {
-                                    default_sandbox: level,
-                                };
-                                if let Err(err) = defaults.save(&data_dir) {
-                                    tracing::warn!(error = %err, "security-defaults save failed");
-                                }
-                            }
-                            this.state.update(cx, |s, _| {
-                                // The default only seeds NEW chats; the level of
-                                // the chat currently open (if any) is its own.
-                                s.set_new_chat_access(level);
-                            });
-                            cx.notify();
-                        },
-                    ));
-                    self.security_page = Some(page);
-                }
-                match &self.security_page {
-                    Some(page) => page.clone().into_any_element(),
-                    None => Empty.into_any_element(),
-                }
-            }
             SettingsSection::Integrations => {
                 if self.integrations_page.is_none() {
                     let state = self.state.clone();
@@ -632,6 +666,101 @@ impl Shell {
                 }
             }
         }
+    }
+
+    /// Lazily create the four embedded pages of the General section plus the
+    /// `GeneralPage` hosting them. The child entities and their subscriptions
+    /// stay on the Shell (same lifetime rules as the standalone pages had):
+    /// settings edits persist via `schedule_save` and propagate to surfaces.
+    fn ensure_general_pages(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if self.general_page.is_some() {
+            return;
+        }
+        let state = self.state.clone();
+        if self.devices_page.is_none() {
+            self.devices_page = Some(cx.new(|cx| DevicesPage::new_embedded(state.clone(), cx)));
+        }
+        if self.security_page.is_none() {
+            let level = state
+                .read(cx)
+                .data_dir
+                .as_deref()
+                .map(SecurityDefaults::load)
+                .unwrap_or_default()
+                .default_sandbox;
+            let page = cx.new(|cx| SecurityPage::new_embedded(level, cx));
+            self.security_sub = Some(cx.subscribe(
+                &page,
+                |this: &mut Shell, _, event: &SecurityEvent, cx| {
+                    let SecurityEvent::DefaultSandboxChanged(level) = *event;
+                    if let Some(data_dir) = this.state.read(cx).data_dir.clone() {
+                        let defaults = SecurityDefaults {
+                            default_sandbox: level,
+                        };
+                        if let Err(err) = defaults.save(&data_dir) {
+                            tracing::warn!(error = %err, "security-defaults save failed");
+                        }
+                    }
+                    this.state.update(cx, |s, _| {
+                        // The default only seeds NEW chats; the level of
+                        // the chat currently open (if any) is its own.
+                        s.set_new_chat_access(level);
+                    });
+                    cx.notify();
+                },
+            ));
+            self.security_page = Some(page);
+        }
+        if self.files_settings_page.is_none() {
+            let page = cx.new(|cx| {
+                FilesSettingsPage::new_embedded(
+                    self.settings.files_autosave_delay_ms,
+                    self.settings.files_editor_font_size,
+                    self.settings.files_word_wrap,
+                    self.settings.files_show_all,
+                    cx,
+                )
+            });
+            // Persist + propagate whenever the page flips a setting. Kept in
+            // a Shell field: a `Subscription` dropped at end of scope
+            // unsubscribes, which is what silently broke Files persistence.
+            self.files_settings_sub = Some(cx.subscribe_in(
+                &page,
+                window,
+                |this: &mut Shell,
+                 _,
+                 event: &crate::settings::files::FilesSettingsEvent,
+                 window,
+                 cx| {
+                    use crate::settings::files::FilesSettingsEvent;
+                    match *event {
+                        FilesSettingsEvent::AutosaveDelayChanged(ms) => {
+                            this.set_files_autosave_delay_ms(ms, cx);
+                        }
+                        FilesSettingsEvent::EditorFontSizeChanged(size) => {
+                            this.set_files_editor_font_size(size, cx);
+                        }
+                        FilesSettingsEvent::WordWrapChanged(word_wrap) => {
+                            this.set_files_word_wrap(word_wrap, window, cx);
+                        }
+                        FilesSettingsEvent::ShowAllFilesChanged(show_all) => {
+                            this.set_files_show_all(show_all, cx);
+                        }
+                    }
+                    cx.notify();
+                },
+            ));
+            self.files_settings_page = Some(page);
+        }
+        if self.memory_page.is_none() {
+            self.memory_page = Some(cx.new(|cx| MemoryPage::new(state.clone(), cx)));
+        }
+        let devices = self.devices_page.clone().unwrap();
+        let security = self.security_page.clone().unwrap();
+        let files = self.files_settings_page.clone().unwrap();
+        let memory = self.memory_page.clone().unwrap();
+        self.general_page =
+            Some(cx.new(|cx| GeneralPage::new(devices, security, files, memory, cx)));
     }
 }
 

@@ -38,8 +38,10 @@ use crate::popover;
 use crate::rail;
 use crate::settings::appearance::AppearancePage;
 use crate::settings::archived::ArchivedPage;
+use crate::settings::browser::BrowserPage;
 use crate::settings::devices::DevicesPage;
 use crate::settings::files::FilesSettingsPage;
+use crate::settings::general::GeneralPage;
 use crate::settings::integrations::IntegrationsPage;
 use crate::settings::memory::MemoryPage;
 use crate::settings::notifications::{NotificationsEvent, NotificationsPage};
@@ -101,7 +103,7 @@ pub use titlebar::{
 
 mod navigation;
 pub use navigation::{
-    CHAT_ROW_HEIGHT, ChatPanels, NavEntry, NavHistory, RESORT, RightSurface, Route,
+    CHAT_ROW_HEIGHT, ChatPanels, GeneralAnchor, NavEntry, NavHistory, RESORT, RightSurface, Route,
     SIDEBAR_GLASS_FADE_BAND, SIDEBAR_LIST_GAP, SessionPanels, SettingsSection,
     push_unique_right_surface, resort_offsets, workspace_file_title,
 };
@@ -310,6 +312,9 @@ pub struct Shell {
     /// One Servo browser surface per chat/panel key. Dropping the entity stops
     /// its RPC client and terminates the child browser engine.
     browsers: std::collections::HashMap<String, Entity<crate::browser::BrowserSurface>>,
+    /// Surface → shell event hookups (NewTab, OpenSettings, …), one per
+    /// browser entity, cleaned up with it.
+    browser_subs: std::collections::HashMap<String, Subscription>,
     /// One workspace browser per chat/panel key. Dropping the entity closes
     /// its file watcher and every in-flight workspace request.
     files: std::collections::HashMap<String, Entity<FilesSurface>>,
@@ -335,10 +340,16 @@ pub struct Shell {
     route: Route,
     /// Route history behind the titlebar back/forward buttons (§ nav history).
     nav: NavHistory,
+    /// Consolidated Devices/Security/Files/Memory page (Settings → General).
+    general_page: Option<Entity<GeneralPage>>,
+    /// Section the next General render should scroll to (set by
+    /// [`Shell::open_general`], consumed by `settings_outlet`).
+    pending_general_anchor: Option<GeneralAnchor>,
     devices_page: Option<Entity<DevicesPage>>,
     archived_page: Option<Entity<ArchivedPage>>,
     appearance_page: Option<Entity<AppearancePage>>,
     files_settings_page: Option<Entity<FilesSettingsPage>>,
+    browser_page: Option<Entity<BrowserPage>>,
     notifications_page: Option<Entity<NotificationsPage>>,
     shortcuts_page: Option<Entity<ShortcutsPage>>,
     providers_page: Option<Entity<ProvidersPage>>,
@@ -349,6 +360,11 @@ pub struct Shell {
     integrations_page: Option<Entity<IntegrationsPage>>,
     shortcuts_sub: Option<Subscription>,
     notifications_sub: Option<Subscription>,
+    /// Settings → Browser page events (prefs persist + clear-data actions).
+    browser_page_sub: Option<Subscription>,
+    /// Files settings events → persist + propagate to open surfaces. Must be
+    /// a field: a `Subscription` dropped at end of scope unsubscribes.
+    files_settings_sub: Option<Subscription>,
     security_sub: Option<Subscription>,
     sync_sub: Option<Subscription>,
     usage_sub: Option<Subscription>,
@@ -609,30 +625,48 @@ impl Shell {
         apply_keymap(cx, &settings.keymap);
         // Dev/testing knob: `KOMET_OPEN_ROUTE=settings[/<section>]` boots
         // straight into a settings section — these pages have no deep link and
-        // synthetic input can't reach them on headless compositors.
-        let route = match std::env::var("KOMET_OPEN_ROUTE").ok().as_deref() {
-            Some("settings") | Some("settings/devices") => {
-                Route::Settings(SettingsSection::Devices)
-            }
+        // synthetic input can't reach them on headless compositors. The four
+        // sections consolidated into General keep their own anchors.
+        let open_route = std::env::var("KOMET_OPEN_ROUTE").ok();
+        let (route, pending_general_anchor) = match open_route.as_deref() {
+            Some("settings") => (Route::Settings(SettingsSection::General), None),
+            Some("settings/devices") => (
+                Route::Settings(SettingsSection::General),
+                Some(GeneralAnchor::Devices),
+            ),
+            Some("settings/security") => (
+                Route::Settings(SettingsSection::General),
+                Some(GeneralAnchor::Security),
+            ),
+            Some("settings/files") => (
+                Route::Settings(SettingsSection::General),
+                Some(GeneralAnchor::Files),
+            ),
+            Some("settings/memory") => (
+                Route::Settings(SettingsSection::General),
+                Some(GeneralAnchor::Memory),
+            ),
             Some("settings/providers") | Some("settings/agents") | Some("settings/harnesses") => {
-                Route::Settings(SettingsSection::Providers)
+                (Route::Settings(SettingsSection::Providers), None)
             }
-            Some("settings/appearance") => Route::Settings(SettingsSection::Appearance),
-            Some("settings/notifications") => Route::Settings(SettingsSection::Notifications),
-            Some("settings/shortcuts") => Route::Settings(SettingsSection::Shortcuts),
-            Some("settings/archived") => Route::Settings(SettingsSection::Archived),
-            Some("settings/security") => Route::Settings(SettingsSection::Security),
-            Some("settings/integrations") => Route::Settings(SettingsSection::Integrations),
+            Some("settings/appearance") => (Route::Settings(SettingsSection::Appearance), None),
+            Some("settings/notifications") => {
+                (Route::Settings(SettingsSection::Notifications), None)
+            }
+            Some("settings/browser") => (Route::Settings(SettingsSection::Browser), None),
+            Some("settings/shortcuts") => (Route::Settings(SettingsSection::Shortcuts), None),
+            Some("settings/archived") => (Route::Settings(SettingsSection::Archived), None),
+            Some("settings/integrations") => (Route::Settings(SettingsSection::Integrations), None),
             // `new` pins the new-chat canvas (suppresses boot auto-select).
             Some("new") => {
                 state.update(cx, |s, _| s.auto_selected = true);
-                Route::Chat
+                (Route::Chat, None)
             }
             // Default startup opens the new-session canvas. Existing sessions
             // remain available in the sidebar and are opened explicitly.
             _ => {
                 state.update(cx, |s, _| s.auto_selected = true);
-                Route::Chat
+                (Route::Chat, None)
             }
         };
         // More capture knobs of the same kind: `KOMET_OPEN_DIALOG=rename|delete`
@@ -708,6 +742,7 @@ impl Shell {
             subagent_subs: std::collections::HashMap::new(),
             subagent_seq: 0,
             browsers: std::collections::HashMap::new(),
+            browser_subs: std::collections::HashMap::new(),
             files: std::collections::HashMap::new(),
             files_subs: std::collections::HashMap::new(),
             file_surfaces: std::collections::HashMap::new(),
@@ -722,10 +757,13 @@ impl Shell {
             right_tab_scroll: gpui::ScrollHandle::new(),
             route,
             nav,
+            general_page: None,
+            pending_general_anchor,
             devices_page: None,
             archived_page: None,
             appearance_page: None,
             files_settings_page: None,
+            browser_page: None,
             notifications_page: None,
             shortcuts_page: None,
             providers_page: None,
@@ -736,6 +774,8 @@ impl Shell {
             integrations_page: None,
             shortcuts_sub: None,
             notifications_sub: None,
+            browser_page_sub: None,
+            files_settings_sub: None,
             security_sub: None,
             sync_sub: None,
             usage_sub: None,

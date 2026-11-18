@@ -73,6 +73,18 @@ icon_assets![
     // generic agent/widget mark used by harness configuration.
     (PLUG, "plug"),
     (TAG, "tag"),
+    // Crosshair/target glyph for the browser's "Add element" picker.
+    (TARGET, "target"),
+    // Loupe pour la ligne « Search … » des suggestions de la barre d'adresse.
+    (SEARCH, "search"),
+    // Réglages du navigateur : horloge (rétention), loupe + (zoom),
+    // appareil photo (dossier des captures) — style Solar Linear maison.
+    (CLOCK, "clock"),
+    (ZOOM_IN, "zoom-in"),
+    (CAMERA, "camera"),
+    // Barre d'émulation device : rotation du cadre (PR 7).
+    (ROTATE, "rotate"),
+    (HOME, "home"),
     (SIDEBAR_MINIMALISTIC, "sidebar-minimalistic"),
     // Mirrored variant (komet window-controls.tsx `-scale-x-100`): the LEFT
     // sidebar toggle shows the panel line on the left; gpui divs have no

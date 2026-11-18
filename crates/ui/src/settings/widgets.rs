@@ -152,6 +152,69 @@ pub fn option_card(
         )
 }
 
+/// Header of one section inside a single-scroll settings page (the General
+/// page): a ~15px semibold title over a 12.5px muted subtitle. The 32px top
+/// margin is the inter-section rhythm — callers render it as the first child
+/// of each section block.
+pub fn section_header(
+    theme: &Theme,
+    title: impl Into<SharedString>,
+    subtitle: impl Into<SharedString>,
+) -> gpui::Div {
+    div()
+        .mt(px(32.0))
+        .flex()
+        .flex_col()
+        .gap(px(4.0))
+        .child(
+            div()
+                .text_size(px(15.0))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(theme.text)
+                .child(title.into()),
+        )
+        .child(
+            div()
+                .text_size(px(12.5))
+                .text_color(theme.text_muted)
+                .child(subtitle.into()),
+        )
+}
+
+/// Jump chip of the General page's section navigator — the same recipe as
+/// the Files page's option chips (`mark_bg` fill + `mark_ring` halo when
+/// active). The caller adds `.id(..)` and `.on_click(..)`.
+pub fn nav_chip(theme: &Theme, label: impl Into<SharedString>, active: bool) -> gpui::Div {
+    div()
+        .h(px(28.0))
+        .px(px(12.0))
+        .rounded(px(7.0))
+        .border_1()
+        .border_color(theme.border)
+        .bg(if active {
+            theme.mark_bg()
+        } else {
+            crate::theme::wash(0.025)
+        })
+        .when(active, |el| el.shadow(theme.mark_ring()))
+        .text_size(px(12.0))
+        .font_weight(if active {
+            gpui::FontWeight::MEDIUM
+        } else {
+            gpui::FontWeight::NORMAL
+        })
+        .text_color(if active {
+            theme.accent
+        } else {
+            theme.text_muted
+        })
+        .flex()
+        .items_center()
+        .cursor_pointer()
+        .hover(|style| style.bg(crate::theme::wash(0.08)))
+        .child(label.into())
+}
+
 /// Section card: `mt-6 overflow-hidden rounded-xl border border-border bg-card`
 /// — the card tone, thinned to a translucent tint over glass so the card
 /// reads as frost instead of a solid slab ([`Theme::card_glass_bg`]).

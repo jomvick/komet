@@ -21,6 +21,9 @@ pub struct FilesSettingsPage {
     editor_font_size: f32,
     word_wrap: bool,
     show_all_files: bool,
+    /// Embedded mode (Settings → General): controls only — the section header
+    /// and the scroll container belong to the host page.
+    embedded: bool,
 }
 
 impl EventEmitter<FilesSettingsEvent> for FilesSettingsPage {}
@@ -38,7 +41,27 @@ impl FilesSettingsPage {
             editor_font_size,
             word_wrap,
             show_all_files,
+            embedded: false,
         }
+    }
+
+    /// Embedded inside Settings → General.
+    pub fn new_embedded(
+        autosave_delay_ms: u64,
+        editor_font_size: f32,
+        word_wrap: bool,
+        show_all_files: bool,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut page = Self::new(
+            autosave_delay_ms,
+            editor_font_size,
+            word_wrap,
+            show_all_files,
+            cx,
+        );
+        page.embedded = true;
+        page
     }
 
     pub fn set_word_wrap(&mut self, word_wrap: bool, cx: &mut Context<Self>) {
@@ -276,22 +299,29 @@ impl Render for FilesSettingsPage {
                     ),
             );
 
-        div()
-            .id("files-settings-page")
-            .size_full()
-            .overflow_y_scroll()
-            .child(
-                widgets::page_column()
-                    .child(widgets::page_header(&theme, "Files", None))
-                    .child(
-                        widgets::page_subtitle(
-                            &theme,
-                            "Control how workspace files are displayed and saved while you edit.",
-                        )
-                        .max_w(px(512.0))
-                        .line_height(px(20.0)),
+        let column = widgets::page_column();
+        let column = if self.embedded {
+            column
+        } else {
+            column
+                .child(widgets::page_header(&theme, "Files", None))
+                .child(
+                    widgets::page_subtitle(
+                        &theme,
+                        "Control how workspace files are displayed and saved while you edit.",
                     )
-                    .child(card),
-            )
+                    .max_w(px(512.0))
+                    .line_height(px(20.0)),
+                )
+        };
+        let column = column.child(card);
+
+        let page = div().id("files-settings-page");
+        let page = if self.embedded {
+            page.w_full()
+        } else {
+            page.size_full().overflow_y_scroll()
+        };
+        page.child(column).into_any_element()
     }
 }

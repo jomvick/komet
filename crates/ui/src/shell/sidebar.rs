@@ -78,56 +78,81 @@ impl Shell {
                             .text_color(theme.text_muted.opacity(0.6))
                             .child(SharedString::from("Settings")),
                     )
-                    .child(div().flex().flex_col().gap(px(2.0)).children(
-                        SettingsSection::ALL.into_iter().map(|item| {
+                    .child({
+                        let mut items: Vec<AnyElement> = Vec::new();
+                        let mut last_group: Option<&'static str> = None;
+                        for item in SettingsSection::ALL {
+                            if let Some(group) = item.group()
+                                && last_group != Some(group)
+                            {
+                                last_group = Some(group);
+                                items.push(
+                                    div()
+                                        .px(px(Theme::SPACE_SM))
+                                        .pt(px(10.0))
+                                        .pb(px(2.0))
+                                        .text_size(px(10.5))
+                                        .font_weight(gpui::FontWeight::MEDIUM)
+                                        .text_color(theme.text_muted.opacity(0.6))
+                                        .child(SharedString::from(group))
+                                        .into_any_element(),
+                                );
+                            }
                             let selected = item == section;
                             let icon_tint = if selected {
                                 theme.on_accent
                             } else {
                                 theme.text_muted
                             };
-                            div()
-                                .id(SharedString::from(format!("settings-nav-{}", item.label())))
-                                .flex()
-                                .flex_row()
-                                .items_center()
-                                .gap(px(8.0))
-                                .rounded(px(8.0))
-                                .px(px(Theme::SPACE_SM))
-                                .py(px(6.0))
-                                .text_size(px(13.0))
-                                .when(selected, |el| {
-                                    el.bg(crate::theme::glass_selected_bg())
-                                        .font_weight(gpui::FontWeight::MEDIUM)
-                                })
-                                .text_color(if selected {
-                                    theme.text
-                                } else {
-                                    theme.text_muted
-                                })
-                                .cursor_pointer()
-                                .hover(|s| s.bg(theme.glass_hover()).text_color(theme.text))
-                                .on_click(
-                                    cx.listener(move |this, _, _, cx| this.open_settings(item, cx)),
-                                )
-                                .child(
-                                    div()
-                                        .size(px(24.0))
-                                        .flex_none()
-                                        .rounded(px(7.0))
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .when(selected, |el| el.bg(theme.accent))
-                                        .child(
-                                            icon(item.nav_icon())
-                                                .size(px(15.0))
-                                                .text_color(icon_tint),
-                                        ),
-                                )
-                                .child(SharedString::from(item.label()))
-                        }),
-                    )),
+                            items.push(
+                                div()
+                                    .id(SharedString::from(format!(
+                                        "settings-nav-{}",
+                                        item.label()
+                                    )))
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(px(8.0))
+                                    .rounded(px(8.0))
+                                    .px(px(Theme::SPACE_SM))
+                                    .py(px(6.0))
+                                    .text_size(px(13.0))
+                                    .when(selected, |el| {
+                                        el.bg(crate::theme::glass_selected_bg())
+                                            .font_weight(gpui::FontWeight::MEDIUM)
+                                    })
+                                    .text_color(if selected {
+                                        theme.text
+                                    } else {
+                                        theme.text_muted
+                                    })
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(theme.glass_hover()).text_color(theme.text))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.open_settings(item, cx)
+                                    }))
+                                    .child(
+                                        div()
+                                            .size(px(24.0))
+                                            .flex_none()
+                                            .rounded(px(7.0))
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .when(selected, |el| el.bg(theme.accent))
+                                            .child(
+                                                icon(item.nav_icon())
+                                                    .size(px(15.0))
+                                                    .text_color(icon_tint),
+                                            ),
+                                    )
+                                    .child(SharedString::from(item.label()))
+                                    .into_any_element(),
+                            );
+                        }
+                        div().flex().flex_col().gap(px(2.0)).children(items)
+                    }),
             )
             // Back pinned to the bottom (komet settings-sidebar.tsx).
             .child(
@@ -781,7 +806,7 @@ impl Shell {
                 .py(px(Theme::SPACE_SM))
                 .rounded(px(8.0))
                 .on_click(cx.listener(|this, _, _, cx| {
-                    this.open_settings(SettingsSection::Devices, cx);
+                    this.open_settings(SettingsSection::General, cx);
                 }))
                 .child(
                     icon(icons::SETTINGS_MINIMALISTIC)

@@ -31,9 +31,11 @@ pub enum RememberedNavigation {
 
 pub mod appearance;
 pub mod archived;
+pub mod browser;
 pub mod composer;
 pub mod devices;
 pub mod files;
+pub mod general;
 pub mod integrations;
 pub mod memory;
 pub mod notifications;
@@ -195,6 +197,9 @@ pub struct UiSettings {
     /// providers whose quotas Komet reads first.
     #[serde(default = "default_usage_agents")]
     pub usage_agents: Vec<String>,
+    /// Réglages du navigateur intégré (Settings → Browser).
+    #[serde(default)]
+    pub browser: BrowserPrefs,
     /// Whether the first-run onboarding finished. `None` = the key is absent,
     /// which is ambiguous: an existing file that predates the flag belongs to
     /// a user who has been driving Komet already (migrated to done at load,
@@ -210,6 +215,46 @@ pub struct UiSettings {
     /// `Some(true)` is the end of it.
     #[serde(skip)]
     pub onboarding_key_absent: bool,
+}
+
+/// Réglages du navigateur intégré (Settings → Browser). `searchUrl` est un
+/// modèle avec `{q}` ; `KOMET_SEARCH_URL` reste prioritaire s'il est défini.
+/// `historyRetentionDays` : `None` = illimité. `zoomDefault`/`rememberZoom`
+/// et `emulationPreset` sont consommés par les PR zoom/émulation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct BrowserPrefs {
+    /// Page d'accueil : `None`/vide = onglet vierge (état « Open Address… »).
+    pub home_url: Option<String>,
+    /// Modèle de recherche (`{q}` remplacé par la requête encodée).
+    pub search_url: String,
+    /// Enregistrer les visites dans l'historique.
+    pub history_enabled: bool,
+    /// Jours de rétention de l'historique ; `None` = illimité.
+    pub history_retention_days: Option<u32>,
+    /// Zoom par défaut des nouvelles surfaces (1.0 = 100 %).
+    pub zoom_default: f32,
+    /// Mémoriser le zoom par hôte.
+    pub remember_zoom: bool,
+    /// Dossier des captures d'écran ; `None` = dossier Téléchargements.
+    pub capture_dir: Option<String>,
+    /// Preset d'émulation par défaut (`None` = responsive désactivé).
+    pub emulation_preset: Option<String>,
+}
+
+impl Default for BrowserPrefs {
+    fn default() -> Self {
+        Self {
+            home_url: None,
+            search_url: "https://duckduckgo.com/?q={q}".into(),
+            history_enabled: true,
+            history_retention_days: Some(90),
+            zoom_default: 1.0,
+            remember_zoom: false,
+            capture_dir: None,
+            emulation_preset: None,
+        }
+    }
 }
 
 fn default_usage_agents() -> Vec<String> {
@@ -250,6 +295,7 @@ impl Default for UiSettings {
             files_editor_font_size: FILES_EDITOR_FONT_SIZE_DEFAULT,
             files_show_all: false,
             usage_agents: default_usage_agents(),
+            browser: BrowserPrefs::default(),
             onboarding_completed: None,
             onboarding_key_absent: false,
         }
@@ -606,6 +652,16 @@ mod tests {
             files_editor_font_size: 13.0,
             files_show_all: false,
             usage_agents: vec!["claude-code".into(), "cursor".into()],
+            browser: BrowserPrefs {
+                home_url: Some("https://start.example".into()),
+                search_url: "https://searx.example/?q={q}".into(),
+                history_enabled: false,
+                history_retention_days: None,
+                zoom_default: 1.25,
+                remember_zoom: true,
+                capture_dir: Some("/tmp/shots".into()),
+                emulation_preset: Some("iphone-se".into()),
+            },
             onboarding_completed: Some(true),
             onboarding_key_absent: false,
         };

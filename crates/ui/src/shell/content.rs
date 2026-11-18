@@ -391,7 +391,7 @@ impl Shell {
         // the unified window titlebar now (render_title_bar). Settings never
         // underlaps: pad below the overlaid titlebar.
         if let Route::Settings(section) = self.route {
-            let outlet = self.settings_outlet(section, cx);
+            let outlet = self.settings_outlet(section, window, cx);
             return div()
                 .flex_1()
                 .min_w_0()
