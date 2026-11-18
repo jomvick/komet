@@ -993,6 +993,14 @@ impl ProvidersPage {
             cx.notify();
             return;
         };
+        // First-run onboarding: enabling an agent that needs a login reveals
+        // its account section right away — the user sees they CAN add an
+        // account, nothing is started for them.
+        if enabled && self.embedded && requires_login(harness) {
+            self.expanded.insert(harness);
+            self.load_card_cli_status(harness, cx);
+            cx.notify();
+        }
         let params = self.with_target(
             serde_json::json!({
                 "harness": harness,
