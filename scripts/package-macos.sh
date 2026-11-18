@@ -27,10 +27,6 @@ cargo build --release -p komet
 rm -rf "$APP" "$DMG" "$APP_TARBALL"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 install -m 755 "$ROOT/target/release/komet" "$APP/Contents/MacOS/komet"
-# ONNX Runtime for the opt-in semantic memory (loaded dynamically — see
-# crates/memory/src/embeddings.rs). Frameworks is one of komet's search dirs.
-mkdir -p "$APP/Contents/Frameworks"
-scripts/fetch-onnxruntime.sh "$APP/Contents/Frameworks"
 sed "s/__VERSION__/$VERSION/" "$ROOT/dist/macos/Info.plist" >"$APP/Contents/Info.plist"
 
 # Icon: iconset from the pre-masked macOS icon (squircle + margins + shadow

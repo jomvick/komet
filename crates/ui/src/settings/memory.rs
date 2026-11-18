@@ -1,71 +1,62 @@
-//! Settings → Memory: local project memory (issue #78, phases 1–7).
+//! Settings → General → Memory: local project memory controls and inspection.
 //!
 //! The index is device-local and allow-listed — it never leaves this machine
-//! and never stores prompts, commands, file contents or credentials. This page
-//! is the visibility/control surface that makes the default-on choice
+//! and never stores prompts, commands, file contents or credentials. This
+//! block is the visibility/control surface that makes the default-on choice
 //! acceptable: where the data lives, how much there is, per-project switches
-//! and exclusions, retention, typed facts, graph/timeline inspection,
-//! explicit forget actions, and one-way Obsidian export.
-//!
-//! Storage changes apply at next engine start (the live SQLite connections
-//! cannot be moved underneath themselves); the page says so instead of
-//! pretending the move is instant.
+//! and exclusions, typed facts, graph/timeline inspection, explicit forget
+//! actions, and one-way Obsidian export.
 
 use gpui::{AnyElement, App, Context, Entity, SharedString, Task, Window, div, prelude::*, px};
 use serde::Deserialize;
 
 use komet_rpc::methods;
 
-use crate::composer::{ComposerInput, ComposerInputEvent};
+use crate::composer::ComposerInput;
 use crate::popover::Loadable;
 use crate::settings::widgets;
 use crate::state::{AppState, EngineHandle};
 use crate::theme::Theme;
-
-/// Retention choices offered in the UI (days). The engine clamps to its own
-/// bounds; these are the values a user actually wants.
-const RETENTION_PRESETS: [u32; 5] = [7, 30, 90, 180, 365];
+use crate::transcript::format_timestamp;
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct MemoryStatus {
     pub available: bool,
     pub enabled: bool,
-    pub embeddings_enabled: bool,
-    pub embeddings_indexed: u64,
-    pub embeddings_total: u64,
-    pub embeddings_working: bool,
-    pub embeddings_error: Option<String>,
-    #[serde(default)]
-    pub embeddings_model: EmbeddingsModel,
-    pub process_cpu_ms: Option<u64>,
-    pub process_peak_rss_bytes: Option<u64>,
+    /// Fixed raw-event retention (days) — reported for display only.
     pub retention_days: u32,
     pub dir: Option<String>,
-    pub pending_dir: Option<String>,
-    /// Store copy left behind by the last relocation, and its size.
-    pub previous_dir: Option<String>,
-    pub previous_bytes: u64,
-    pub restart_required: bool,
     pub events: u64,
     pub chats: u64,
     pub bytes: u64,
     pub fts: bool,
+    pub process_cpu_ms: Option<u64>,
+    pub process_peak_rss_bytes: Option<u64>,
     pub untracked_chats: u64,
+    /// Trailing 7-day instrumentation: briefings injected, memory tool calls,
+    /// and the briefed/unbriefed `read_file` comparison.
+    pub usage_week: Option<UsageWeek>,
     pub projects: Vec<MemoryProject>,
 }
 
-/// Local embedding-model lifecycle reported by the engine: `state` is one
-/// of absent / downloading / ready / failed / unavailable (build without
-/// the feature). `bytes` is the live size when ready, staging bytes while
-/// downloading.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
-pub struct EmbeddingsModel {
-    pub state: String,
-    pub bytes: u64,
-    pub error: Option<String>,
-    pub download_error: Option<String>,
+pub struct UsageWeek {
+    pub briefings: u64,
+    pub briefing_chars: u64,
+    pub memory_calls: Vec<MemoryCallMetric>,
+    pub sessions_briefed: u64,
+    pub sessions_unbriefed: u64,
+    pub read_files_briefed: u64,
+    pub read_files_unbriefed: u64,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct MemoryCallMetric {
+    pub metric: String,
+    pub count: u64,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -98,13 +89,6 @@ pub struct MemoryFact {
     pub valid_from_ms: i64,
     pub stale_at_ms: Option<i64>,
     pub replaced_by: Option<i64>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct MemorySemanticResult {
-    pub fact: MemoryFact,
-    pub distance: f32,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -143,11 +127,6 @@ enum Confirm {
     ForgetAll,
     ForgetFact(i64),
     PromoteFact(i64),
-    DeleteModel,
-    /// The directory holding the copy a previous relocation left behind.
-    DeletePreviousCopy(String),
-    /// A location that looks like a synced/network drive, awaiting "use anyway".
-    UseRiskyLocation(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -165,6 +144,9 @@ pub struct MemoryPage {
     status: Loadable<MemoryStatus>,
     loading: bool,
     task: Option<Task<()>>,
+    /// Facts/graph/activity fetch for the expanded project — kept separate
+    /// from `task` so a detail reload never cancels an in-flight status load.
+    detail_task: Option<Task<()>>,
     error: Option<SharedString>,
     notice: Option<SharedString>,
     /// The engine the displayed status belongs to — memory is device-local,
@@ -174,48 +156,25 @@ pub struct MemoryPage {
     /// an older generation are dropped, so a slow reply from the previous
     /// engine can't overwrite the new one's status.
     generation: u64,
-    /// Draft for a custom storage folder (empty = the default location).
-    location_input: Entity<ComposerInput>,
+    /// Obsidian export destination draft (absolute folder path).
     export_input: Entity<ComposerInput>,
-    semantic_query_input: Entity<ComposerInput>,
     /// Project whose detail row is expanded, plus its exclusions draft.
     expanded: Option<String>,
     exclusions_input: Option<Entity<ComposerInput>>,
     facts: Vec<MemoryFact>,
-    semantic_results: Vec<MemorySemanticResult>,
-    semantic_loading: bool,
-    semantic_generation: u64,
     graph_files: Vec<MemoryGraphFile>,
     activity: Vec<MemoryActivity>,
     facts_loading: bool,
     facts_generation: u64,
     fact_filter: FactFilter,
+    /// Whether the per-project list is unfolded.
+    projects_open: bool,
     confirm: Option<Confirm>,
-    /// A status poll is already running while the model downloads —
-    /// prevents one poller per status reload.
-    polling_model: bool,
-    /// Cancel was clicked; the engine stops on its next chunk, so the card
-    /// says "Cancelling…" until the state actually leaves `downloading`.
-    cancelling_model: bool,
 }
 
 impl MemoryPage {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
-        let location_input = cx.new(|cx| ComposerInput::new("Custom folder…", cx));
-        let export_input = cx.new(|cx| ComposerInput::new("New or Komet-owned export folder…", cx));
-        let semantic_query_input = cx.new(|cx| ComposerInput::new("Search project memory…", cx));
-        cx.subscribe(&location_input, |this: &mut Self, _, event, cx| {
-            if matches!(event, ComposerInputEvent::Submitted) {
-                this.apply_location(cx);
-            }
-        })
-        .detach();
-        cx.subscribe(&semantic_query_input, |this: &mut Self, _, event, cx| {
-            if matches!(event, ComposerInputEvent::Submitted) {
-                this.search_semantic(cx);
-            }
-        })
-        .detach();
+        let export_input = cx.new(|cx| ComposerInput::new("Export folder…", cx));
         cx.observe(&state, |this: &mut Self, _, cx| this.on_state_changed(cx))
             .detach();
         let mut page = Self {
@@ -223,27 +182,22 @@ impl MemoryPage {
             status: Loadable::Idle,
             loading: false,
             task: None,
+            detail_task: None,
             error: None,
             notice: None,
             engine: None,
             generation: 0,
-            location_input,
             export_input,
-            semantic_query_input,
             expanded: None,
             exclusions_input: None,
             facts: Vec::new(),
-            semantic_results: Vec::new(),
-            semantic_loading: false,
-            semantic_generation: 0,
             graph_files: Vec::new(),
             activity: Vec::new(),
             facts_loading: false,
             facts_generation: 0,
             fact_filter: FactFilter::Current,
+            projects_open: true,
             confirm: None,
-            polling_model: false,
-            cancelling_model: false,
         };
         page.load(cx);
         page
@@ -268,17 +222,13 @@ impl MemoryPage {
         self.expanded = None;
         self.exclusions_input = None;
         self.facts.clear();
-        self.semantic_results.clear();
-        self.semantic_loading = false;
-        self.semantic_generation += 1;
         self.graph_files.clear();
         self.activity.clear();
         self.facts_loading = false;
         self.facts_generation += 1;
         self.fact_filter = FactFilter::Current;
+        self.projects_open = true;
         self.confirm = None;
-        self.polling_model = false;
-        self.cancelling_model = false;
         self.load(cx);
     }
 
@@ -334,37 +284,12 @@ impl MemoryPage {
     fn apply(
         &mut self,
         result: Result<serde_json::Value, komet_rpc::RpcError>,
-        cx: &mut Context<Self>,
+        _cx: &mut Context<Self>,
     ) {
         self.status = match result.map_err(|err| err.to_string()).and_then(|value| {
             serde_json::from_value::<MemoryStatus>(value).map_err(|e| e.to_string())
         }) {
-            Ok(status) => {
-                // Seed the location draft from the pending (not-yet-applied)
-                // value when there is one, else the live directory — but only
-                // when the field is empty or still shows the previous value,
-                // so a reload never clobbers something the user is typing.
-                let draft = status
-                    .pending_dir
-                    .clone()
-                    .or_else(|| status.dir.clone())
-                    .unwrap_or_default();
-                let current = self.location_input.read(cx).text().trim().to_string();
-                let previous = self
-                    .status
-                    .ready()
-                    .and_then(|old| old.pending_dir.clone().or_else(|| old.dir.clone()))
-                    .unwrap_or_default();
-                if current.is_empty() || current == previous {
-                    self.location_input
-                        .update(cx, |input, cx| input.set_text(draft, cx));
-                }
-                if status.embeddings_model.state == "downloading" && !self.polling_model {
-                    self.polling_model = true;
-                    self.poll_model_download(cx);
-                }
-                Loadable::Ready(status)
-            }
+            Ok(status) => Loadable::Ready(status),
             Err(message) => Loadable::Error(message),
         };
     }
@@ -410,180 +335,6 @@ impl MemoryPage {
         );
     }
 
-    fn toggle_embeddings(&mut self, cx: &mut Context<Self>) {
-        let Some(status) = self.status.ready() else {
-            return;
-        };
-        self.call(
-            methods::SET_MEMORY_EMBEDDINGS_ENABLED,
-            serde_json::json!({ "enabled": !status.embeddings_enabled }),
-            cx,
-        );
-    }
-
-    fn retry_embeddings(&mut self, cx: &mut Context<Self>) {
-        self.call(methods::RETRY_MEMORY_EMBEDDINGS, serde_json::json!({}), cx);
-    }
-
-    /// Refresh the status every second while the model download is in
-    /// flight so the progress bytes move; stops on any other state.
-    fn poll_model_download(&mut self, cx: &mut Context<Self>) {
-        cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor()
-                    .timer(std::time::Duration::from_secs(1))
-                    .await;
-                let downloading = this
-                    .update(cx, |page, cx| {
-                        let downloading = page
-                            .status
-                            .ready()
-                            .map(|status| status.embeddings_model.state == "downloading")
-                            .unwrap_or(false);
-                        if downloading {
-                            page.load(cx);
-                        } else {
-                            page.polling_model = false;
-                            page.cancelling_model = false;
-                        }
-                        downloading
-                    })
-                    .unwrap_or(false);
-                if !downloading {
-                    break;
-                }
-            }
-        })
-        .detach();
-    }
-
-    fn download_model(&mut self, cx: &mut Context<Self>) {
-        self.cancelling_model = false;
-        self.call(methods::DOWNLOAD_MEMORY_MODEL, serde_json::json!({}), cx);
-        self.notice = Some(SharedString::from(
-            "Downloading the local model — the network is used only for this one-shot fetch.",
-        ));
-        cx.notify();
-    }
-
-    fn cancel_model_download(&mut self, cx: &mut Context<Self>) {
-        self.cancelling_model = true;
-        self.call(
-            methods::CANCEL_MEMORY_MODEL_DOWNLOAD,
-            serde_json::json!({}),
-            cx,
-        );
-    }
-
-    fn ask_delete_model(&mut self, cx: &mut Context<Self>) {
-        self.confirm = Some(Confirm::DeleteModel);
-        cx.notify();
-    }
-
-    fn search_semantic(&mut self, cx: &mut Context<Self>) {
-        let Some(project_id) = self.expanded.clone() else {
-            self.notice = Some(SharedString::from(
-                "Open a project below before searching its semantic memory.",
-            ));
-            cx.notify();
-            return;
-        };
-        let query = self.semantic_query_input.read(cx).text().trim().to_string();
-        if query.is_empty() {
-            self.notice = Some(SharedString::from("Enter a search query first."));
-            cx.notify();
-            return;
-        }
-        let Some(engine) = self.state.read(cx).engine().cloned() else {
-            self.error = Some(SharedString::from("Engine not connected."));
-            cx.notify();
-            return;
-        };
-        self.notice = None;
-        self.semantic_results.clear();
-        self.semantic_loading = true;
-        self.semantic_generation += 1;
-        let generation = self.semantic_generation;
-        let params = self.with_target(
-            serde_json::json!({ "projectId": project_id, "query": query }),
-            cx,
-        );
-        self.task = Some(cx.spawn(async move |this, cx| {
-            let result = engine
-                .client()
-                .call(methods::SEARCH_MEMORY_SEMANTIC, params)
-                .await
-                .map_err(|error| error.to_string())
-                .and_then(|value| {
-                    value
-                        .get("results")
-                        .cloned()
-                        .ok_or_else(|| "semantic search reply omitted results".to_string())
-                })
-                .and_then(|value| {
-                    serde_json::from_value::<Vec<MemorySemanticResult>>(value)
-                        .map_err(|error| error.to_string())
-                });
-            this.update(cx, |page, cx| {
-                if page.semantic_generation != generation {
-                    return;
-                }
-                page.semantic_loading = false;
-                match result {
-                    Ok(results) => {
-                        page.error = None;
-                        page.semantic_results = results;
-                    }
-                    Err(error) => page.error = Some(SharedString::from(error)),
-                }
-                cx.notify();
-            })
-            .ok();
-        }));
-        cx.notify();
-    }
-
-    fn set_retention(&mut self, days: u32, cx: &mut Context<Self>) {
-        self.call(
-            methods::SET_MEMORY_RETENTION_DAYS,
-            serde_json::json!({ "days": days }),
-            cx,
-        );
-    }
-
-    fn apply_location(&mut self, cx: &mut Context<Self>) {
-        let draft = self.location_input.read(cx).text().trim().to_string();
-        if draft.is_empty() {
-            // Empty = back to the default location.
-            self.call(
-                methods::SET_MEMORY_LOCATION,
-                serde_json::json!({ "path": null }),
-                cx,
-            );
-            return;
-        }
-        if looks_risky_location(&draft) {
-            // Warn, don't refuse: the user may know their mount is fine.
-            // Second click in the strip applies it anyway.
-            self.confirm = Some(Confirm::UseRiskyLocation(draft));
-            cx.notify();
-            return;
-        }
-        self.call(
-            methods::SET_MEMORY_LOCATION,
-            serde_json::json!({ "path": draft }),
-            cx,
-        );
-    }
-
-    fn reset_location(&mut self, cx: &mut Context<Self>) {
-        self.call(
-            methods::SET_MEMORY_LOCATION,
-            serde_json::json!({ "path": null }),
-            cx,
-        );
-    }
-
     fn toggle_project(&mut self, project_id: String, enabled: bool, cx: &mut Context<Self>) {
         self.call(
             methods::SET_MEMORY_PROJECT_ENABLED,
@@ -597,13 +348,11 @@ impl MemoryPage {
             self.expanded = None;
             self.exclusions_input = None;
             self.facts.clear();
-            self.semantic_results.clear();
-            self.semantic_generation += 1;
+            self.graph_files.clear();
+            self.activity.clear();
             self.facts_generation += 1;
         } else {
             self.expanded = Some(project.project_id.clone());
-            self.semantic_results.clear();
-            self.semantic_generation += 1;
             let input = cx.new(|cx| ComposerInput::new("Path exclusions (one per line)", cx));
             input.update(cx, |input, cx| {
                 input.set_text(project.exclusions.join("\n"), cx)
@@ -614,6 +363,13 @@ impl MemoryPage {
         cx.notify();
     }
 
+    fn toggle_projects_open(&mut self, cx: &mut Context<Self>) {
+        self.projects_open = !self.projects_open;
+        cx.notify();
+    }
+
+    /// Facts + code graph + activity timeline for the expanded project, in
+    /// one task. Results are dropped when the expansion moved on.
     fn load_facts(&mut self, project_id: &str, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
@@ -640,7 +396,7 @@ impl MemoryPage {
             cx,
         );
         self.facts_loading = true;
-        self.task = Some(cx.spawn(async move |this, cx| {
+        self.detail_task = Some(cx.spawn(async move |this, cx| {
             let result = engine
                 .client()
                 .call(methods::GET_MEMORY_FACTS, params)
@@ -774,7 +530,7 @@ impl MemoryPage {
             }),
             cx,
         );
-        self.task = Some(cx.spawn(async move |this, cx| {
+        self.detail_task = Some(cx.spawn(async move |this, cx| {
             let result = engine
                 .client()
                 .call(methods::EXPORT_MEMORY_OBSIDIAN, params)
@@ -814,12 +570,6 @@ impl MemoryPage {
         cx.notify();
     }
 
-    /// Second click deletes the old store copy — the live store is untouched.
-    fn ask_delete_previous_copy(&mut self, dir: String, cx: &mut Context<Self>) {
-        self.confirm = Some(Confirm::DeletePreviousCopy(dir));
-        cx.notify();
-    }
-
     fn cancel_confirm(&mut self, cx: &mut Context<Self>) {
         self.confirm = None;
         cx.notify();
@@ -848,23 +598,6 @@ impl MemoryPage {
                 self.call(
                     methods::PROMOTE_MEMORY_FACT,
                     serde_json::json!({ "id": id, "confirmed": true }),
-                    cx,
-                );
-            }
-            Some(Confirm::DeleteModel) => {
-                self.call(methods::DELETE_MEMORY_MODEL, serde_json::json!({}), cx);
-            }
-            Some(Confirm::DeletePreviousCopy(_)) => {
-                self.call(
-                    methods::DELETE_MEMORY_PREVIOUS_COPY,
-                    serde_json::json!({}),
-                    cx,
-                );
-            }
-            Some(Confirm::UseRiskyLocation(path)) => {
-                self.call(
-                    methods::SET_MEMORY_LOCATION,
-                    serde_json::json!({ "path": path }),
                     cx,
                 );
             }
@@ -899,24 +632,6 @@ fn reveal_path(path: &str) {
     }
 }
 
-/// Synced/network folders can corrupt a WAL-mode SQLite database — warn
-/// rather than refuse (the user may know their mount is fine).
-fn looks_risky_location(path: &str) -> bool {
-    let lower = path.to_lowercase();
-    const NEEDLES: &[&str] = &[
-        "dropbox",
-        "google drive",
-        "googledrive",
-        "icloud",
-        "onedrive",
-        "nextcloud",
-        "box sync",
-        "\\\\",
-        "//",
-    ];
-    NEEDLES.iter().any(|needle| lower.contains(needle))
-}
-
 fn format_bytes(bytes: u64) -> String {
     const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
     let mut value = bytes as f64;
@@ -932,113 +647,13 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
-/// One-line model status under the "Semantic memory" title.
-fn model_status_line(status: &MemoryStatus, cancelling: bool) -> String {
-    let model = &status.embeddings_model;
-    if !status.embeddings_enabled {
-        return "Local semantic search — optional, fully on-device.".into();
-    }
-    match model.state.as_str() {
-        "downloading" if cancelling => "Cancelling the download…".into(),
-        "downloading" => format!(
-            "Downloading local model… {} so far",
-            format_bytes(model.bytes)
-        ),
-        "ready" => {
-            if status.embeddings_working {
-                format!(
-                    "Indexing {} of {} facts locally…",
-                    status.embeddings_indexed, status.embeddings_total
-                )
-            } else {
-                format!(
-                    "{} of {} facts indexed · local model, no network search",
-                    status.embeddings_indexed, status.embeddings_total
-                )
-            }
-        }
-        "failed" => "Model download failed — memory keeps working without it.".into(),
-        "unavailable" => "Semantic memory is not available in this build.".into(),
-        _ => {
-            "Local model required (~23 MB) — semantic indexing starts after the one-time download."
-                .into()
-        }
-    }
-}
-
-/// Download / cancel / remove buttons matching the reported model state.
-fn model_action_row(
-    status: &MemoryStatus,
-    cancelling: bool,
-    theme: &Theme,
-    cx: &mut Context<MemoryPage>,
-) -> AnyElement {
-    let state = status.embeddings_model.state.as_str();
-    let mut row = div().flex().flex_row().gap(px(8.0));
-    match state {
-        "downloading" => {
-            row = row.child(if cancelling {
-                div()
-                    .id("memory-model-cancelling")
-                    .text_size(px(12.0))
-                    .text_color(theme.text_muted)
-                    .child(SharedString::from("Cancelling…"))
-            } else {
-                widgets::ghost_action(theme)
-                    .id("memory-model-cancel")
-                    .text_size(px(12.0))
-                    .hover(|s| widgets::ghost_hover(theme, s))
-                    .on_click(cx.listener(|this, _, _, cx| this.cancel_model_download(cx)))
-                    .child(SharedString::from(format!(
-                        "Cancel ({})",
-                        format_bytes(status.embeddings_model.bytes)
-                    )))
-            });
-        }
-        "ready" => {
-            row = row.child(
-                widgets::ghost_action(theme)
-                    .id("memory-model-delete")
-                    .text_size(px(12.0))
-                    .hover(|s| widgets::ghost_hover(theme, s))
-                    .on_click(cx.listener(|this, _, _, cx| this.ask_delete_model(cx)))
-                    .child(SharedString::from("Remove model")),
-            );
-        }
-        "unavailable" => {}
-        _ => {
-            row = row.child(
-                widgets::ghost_action(theme)
-                    .id("memory-model-download")
-                    .text_size(px(12.0))
-                    .hover(|s| widgets::ghost_hover(theme, s))
-                    .on_click(cx.listener(|this, _, _, cx| this.download_model(cx)))
-                    .child(SharedString::from(
-                        if state == "failed" || status.embeddings_model.download_error.is_some() {
-                            "Retry download"
-                        } else {
-                            "Download model"
-                        },
-                    )),
-            );
-        }
-    }
-    widgets::card_row(theme, false)
-        .child(row)
-        .into_any_element()
-}
-
 fn format_cpu_duration(ms: u64) -> String {
-    let seconds = ms / 1000;
-    let hours = seconds / 3600;
-    let minutes = (seconds % 3600) / 60;
-    let seconds = seconds % 60;
-    if hours > 0 {
-        format!("{hours}h {minutes}m")
-    } else if minutes > 0 {
-        format!("{minutes}m {seconds}s")
+    if ms >= 60_000 {
+        format!("{:.1} min", ms as f64 / 60_000.0)
+    } else if ms >= 1_000 {
+        format!("{:.1} s", ms as f64 / 1_000.0)
     } else {
-        format!("{seconds}s")
+        format!("{ms} ms")
     }
 }
 
@@ -1059,6 +674,33 @@ fn project_label(project: &MemoryProject) -> String {
             let short = id.len().min(12);
             format!("{}…", id.get(..short).unwrap_or(id))
         })
+}
+
+/// The two instrumentation lines under Storage: what the week looked like,
+/// then the briefed/unbriefed `read_file` comparison the counters exist for.
+fn usage_lines(usage: &UsageWeek) -> Vec<String> {
+    let calls: u64 = usage.memory_calls.iter().map(|call| call.count).sum();
+    let mut lines = vec![format!(
+        "Last 7 days: {} briefing(s) injected · {} chars · {} memory tool call(s)",
+        usage.briefings, usage.briefing_chars, calls
+    )];
+    if usage.sessions_briefed + usage.sessions_unbriefed > 0 {
+        let per_session = |reads: u64, sessions: u64| {
+            if sessions == 0 {
+                "—".to_string()
+            } else {
+                format!("{:.1}", reads as f64 / sessions as f64)
+            }
+        };
+        lines.push(format!(
+            "read_file per session — briefed {} ({} sessions) · unbriefed {} ({} sessions)",
+            per_session(usage.read_files_briefed, usage.sessions_briefed),
+            usage.sessions_briefed,
+            per_session(usage.read_files_unbriefed, usage.sessions_unbriefed),
+            usage.sessions_unbriefed,
+        ));
+    }
+    lines
 }
 
 impl MemoryPage {
@@ -1106,27 +748,6 @@ impl MemoryPage {
                 )),
                 "memory-promote-fact-confirm",
                 "Promote",
-            ),
-            Confirm::DeleteModel => (
-                SharedString::from(
-                    "Delete the local embedding model? Semantic search stops until it is downloaded again.",
-                ),
-                "memory-delete-model-confirm",
-                "Delete",
-            ),
-            Confirm::DeletePreviousCopy(dir) => (
-                SharedString::from(format!(
-                    "Delete the old copy at {dir}? The memory store in use is not affected."
-                )),
-                "memory-delete-previous-confirm",
-                "Delete",
-            ),
-            Confirm::UseRiskyLocation(path) => (
-                SharedString::from(format!(
-                    "{path} looks like a synced or network drive — SQLite in WAL mode can corrupt there. Use it anyway?"
-                )),
-                "memory-risky-location-confirm",
-                "Use anyway",
             ),
         };
         Some(
@@ -1195,18 +816,20 @@ impl MemoryPage {
                             ],
                         )),
                 )
-                .child(
-                    widgets::ghost_action(theme)
-                        .id("memory-open-folder")
-                        .flex_none()
-                        .text_size(px(12.0))
-                        .hover(|s| widgets::ghost_hover(theme, s))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            let _ = cx;
-                            this.open_folder(&dir);
-                        }))
-                        .child(SharedString::from("Open folder")),
-                ),
+                .when(!dir.is_empty(), |el| {
+                    el.child(
+                        widgets::ghost_action(theme)
+                            .id("memory-open-folder")
+                            .flex_none()
+                            .text_size(px(12.0))
+                            .hover(|s| widgets::ghost_hover(theme, s))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                let _ = cx;
+                                this.open_folder(&dir);
+                            }))
+                            .child(SharedString::from("Open folder")),
+                    )
+                }),
         );
         if let Some(dir) = &status.dir {
             card = card.child(
@@ -1218,77 +841,26 @@ impl MemoryPage {
                     .child(SharedString::from(dir.clone())),
             );
         }
-        card = card.child(widgets::card_row(theme, false).child(widgets::meta_line(
-            theme,
-            vec![SharedString::from(
-                "Resource guardrails: one background scan per project, at most 5,000 workspace entries and 512 KiB per source file, with one file parsed at a time. No continuous graph simulation.",
-            )
-            .into_any_element()],
-        )));
-        let process_usage = match (status.process_cpu_ms, status.process_peak_rss_bytes) {
-            (Some(cpu_ms), Some(rss_bytes)) => format!(
-                "Komet engine lifetime: {} CPU · {} peak RAM",
-                format_cpu_duration(cpu_ms),
-                format_bytes(rss_bytes)
-            ),
-            _ => "Komet engine CPU/RAM metrics unavailable on this device.".into(),
-        };
-        card = card.child(widgets::card_row(theme, false).child(widgets::meta_line(
-            theme,
-            vec![SharedString::from(format!(
-                "{process_usage}. Disk usage includes the memory database, WAL files, and local model cache; CPU/RAM are engine-wide, not attributed only to memory."
-            ))
-            .into_any_element()],
-        )));
-        if status.restart_required
-            && let Some(pending) = &status.pending_dir
+        if let Some(usage) = &status.usage_week {
+            for line in usage_lines(usage) {
+                card = card.child(widgets::card_row(theme, false).child(widgets::meta_line(
+                    theme,
+                    vec![SharedString::from(line).into_any_element()],
+                )));
+            }
+        }
+        if let (Some(cpu_ms), Some(rss_bytes)) =
+            (status.process_cpu_ms, status.process_peak_rss_bytes)
         {
             card = card.child(widgets::card_row(theme, false).child(widgets::meta_line(
                 theme,
                 vec![SharedString::from(format!(
-                        "Moves to {pending} on next start — existing data is copied over."
-                    ))
-                    .into_any_element()],
+                    "Engine lifetime: {} CPU · {} peak RAM (engine-wide, not only memory).",
+                    format_cpu_duration(cpu_ms),
+                    format_bytes(rss_bytes)
+                ))
+                .into_any_element()],
             )));
-        }
-        if status.previous_bytes > 0
-            && let Some(previous) = &status.previous_dir
-        {
-            let previous = previous.clone();
-            let ask = previous.clone();
-            card = card.child(
-                widgets::card_row(theme, false)
-                    .child(widgets::row_tile(theme, crate::icons::HARD_DRIVE))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .flex()
-                            .flex_col()
-                            .child(widgets::row_title(theme, "Old copy"))
-                            .child(widgets::meta_line(
-                                theme,
-                                vec![SharedString::from(format!(
-                                    "{} ({}) — left behind by the move; the store in use is not affected.",
-                                    previous,
-                                    format_bytes(status.previous_bytes)
-                                ))
-                                .into_any_element()],
-                            )),
-                    )
-                    .child(
-                        widgets::ghost_action(theme)
-                            .id("memory-delete-previous-copy")
-                            .flex_none()
-                            .text_size(px(12.0))
-                            .text_color(theme.danger)
-                            .hover(|s| s.bg(crate::theme::ink(0.06)))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.ask_delete_previous_copy(ask.clone(), cx)
-                            }))
-                            .child(SharedString::from("Delete")),
-                    ),
-            );
         }
         card.into_any_element()
     }
@@ -1300,7 +872,7 @@ impl MemoryPage {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let enabled = status.enabled;
-        let mut card = widgets::section_card(theme)
+        widgets::section_card(theme)
             .child(
                 widgets::card_row(theme, true)
                     .child(widgets::row_tile(theme, crate::icons::CHECKLIST))
@@ -1314,7 +886,7 @@ impl MemoryPage {
                             .child(widgets::meta_line(
                                 theme,
                                 vec![SharedString::from(
-                                    "Local activity index shared by agents on this device. Turning it off stops recording — activity from the off period is never indexed later. Existing data is kept.",
+                                    "Local activity index shared by agents on this device. On by default; turning it off stops recording and activity from the off period is never indexed later. Existing data is kept.",
                                 )
                                 .into_any_element()],
                             )),
@@ -1326,263 +898,15 @@ impl MemoryPage {
                             .on_click(cx.listener(|this, _, _, cx| this.toggle_global(cx))),
                     ),
             )
-            .child(
-                widgets::card_row(theme, false)
-                    .child(widgets::row_tile(theme, crate::icons::HARD_DRIVE))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .flex()
-                            .flex_col()
-                            .child(widgets::row_title(theme, "Retention"))
-                            .child(widgets::meta_line(
-                                theme,
-                                vec![SharedString::from("Raw activity older than this is pruned.")
-                                    .into_any_element()],
-                            )),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .gap(px(6.0))
-                            .children(RETENTION_PRESETS.map(|days| {
-                                let active = status.retention_days == days;
-                                widgets::ghost_action(theme)
-                                    .id(SharedString::from(format!("memory-retention-{days}")))
-                                    .flex_none()
-                                    .text_size(px(11.5))
-                                    .when(active, |el| {
-                                        el.bg(crate::theme::ink(0.06)).text_color(theme.text)
-                                    })
-                                    .when(!active, |el| {
-                                        el.hover(|s| widgets::ghost_hover(theme, s))
-                                    })
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.set_retention(days, cx)
-                                    }))
-                                    .child(SharedString::from(format!("{days}d")))
-                                    .into_any_element()
-                            })),
-                    ),
-            );
-
-        // Custom location row: draft input + apply/reset.
-        let draft = self.location_input.clone();
-        let risky = looks_risky_location(draft.read(cx).text());
-        card = card.child(
-            div()
-                .px(px(20.0))
-                .py(px(10.0))
-                .flex()
-                .flex_col()
-                .gap(px(8.0))
-                .child(widgets::field_label(theme, "Storage location"))
-                .child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap(px(8.0))
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .child(draft),
-                        )
-                        .child(
-                            widgets::ghost_action(theme)
-                                .id("memory-location-apply")
-                                .flex_none()
-                                .text_size(px(12.0))
-                                .hover(|s| widgets::ghost_hover(theme, s))
-                                .on_click(cx.listener(|this, _, _, cx| this.apply_location(cx)))
-                                .child(SharedString::from("Apply")),
-                        )
-                        .child(
-                            widgets::ghost_action(theme)
-                                .id("memory-location-reset")
-                                .flex_none()
-                                .text_size(px(12.0))
-                                .hover(|s| widgets::ghost_hover(theme, s))
-                                .on_click(cx.listener(|this, _, _, cx| this.reset_location(cx)))
-                                .child(SharedString::from("Default")),
-                        ),
-                )
-                .child(widgets::meta_line(
-                    theme,
-                    vec![SharedString::from(
-                        "Changes apply on next start — the live database cannot be moved while open.",
-                    )
-                    .into_any_element()],
-                ))
-                .when(risky, |el| {
-                    el.child(widgets::warning_strip(
-                        theme,
-                        "That path looks like a synced or network folder. SQLite WAL databases can corrupt there — prefer a local folder.",
-                    ))
-                }),
-        );
-        card.into_any_element()
-    }
-
-    fn embeddings_card(
-        &self,
-        status: &MemoryStatus,
-        theme: &Theme,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let query_input = self.semantic_query_input.clone();
-        let mut card = widgets::section_card(theme)
-            .child(
-                widgets::card_row(theme, true)
-                    .child(widgets::row_tile(theme, crate::icons::EYE))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .flex()
-                            .flex_col()
-                            .child(widgets::row_title(theme, "Semantic memory"))
-                            .child(widgets::meta_line(
-                                theme,
-                                vec![SharedString::from(model_status_line(
-                                    status,
-                                    self.cancelling_model
-                                ))
-                                .into_any_element()],
-                            )),
-                    )
-                    .child(
-                        widgets::toggle_switch(theme, status.embeddings_enabled)
-                            .id("memory-embeddings-toggle")
-                            .cursor_pointer()
-                            .on_click(cx.listener(|this, _, _, cx| this.toggle_embeddings(cx))),
-                    ),
-            )
             .child(widgets::card_row(theme, false).child(widgets::meta_line(
                 theme,
-                vec![SharedString::from(
-                    "Optional local model (~23 MB), downloaded only on demand — the network is used once, for the download itself. FTS and graph remain available when off.",
-                )
+                vec![SharedString::from(format!(
+                    "Raw activity is kept for {} days, then pruned.",
+                    status.retention_days
+                ))
                 .into_any_element()],
-            )));
-
-        if status.embeddings_enabled {
-            card = card.child(model_action_row(status, self.cancelling_model, theme, cx));
-            if let Some(error) = status
-                .embeddings_model
-                .download_error
-                .clone()
-                .or_else(|| status.embeddings_model.error.clone())
-            {
-                card = card.child(
-                    widgets::card_row(theme, false)
-                        .child(widgets::error_strip(theme, SharedString::from(error))),
-                );
-            }
-        }
-
-        if status.embeddings_enabled && status.embeddings_model.state == "ready" {
-            card = card.child(
-                div()
-                    .px(px(20.0))
-                    .py(px(10.0))
-                    .flex()
-                    .flex_col()
-                    .gap(px(8.0))
-                    .child(widgets::field_label(
-                        theme,
-                        "Semantic search (open a project below first)",
-                    ))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap(px(8.0))
-                            .child(div().flex_1().min_w_0().child(query_input))
-                            .child(
-                                widgets::ghost_action(theme)
-                                    .id("memory-semantic-search")
-                                    .flex_none()
-                                    .text_size(px(12.0))
-                                    .hover(|s| widgets::ghost_hover(theme, s))
-                                    .on_click(
-                                        cx.listener(|this, _, _, cx| this.search_semantic(cx)),
-                                    )
-                                    .child(SharedString::from(if self.semantic_loading {
-                                        "Searching…"
-                                    } else {
-                                        "Search"
-                                    })),
-                            )
-                            .child(
-                                widgets::ghost_action(theme)
-                                    .id("memory-embeddings-refresh")
-                                    .flex_none()
-                                    .text_size(px(12.0))
-                                    .hover(|s| widgets::ghost_hover(theme, s))
-                                    .on_click(
-                                        cx.listener(|this, _, _, cx| this.retry_embeddings(cx)),
-                                    )
-                                    .child(SharedString::from("Refresh")),
-                            ),
-                    ),
-            );
-            if let Some(error) = &status.embeddings_error {
-                card = card.child(widgets::card_row(theme, false).child(widgets::error_strip(
-                    theme,
-                    SharedString::from(error.clone()),
-                )));
-            }
-            for result in &self.semantic_results {
-                card = card.child(
-                    widgets::card_row(theme, false).child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .flex()
-                            .flex_col()
-                            .gap(px(3.0))
-                            .child(
-                                div()
-                                    .text_size(px(12.5))
-                                    .text_color(theme.text)
-                                    .child(SharedString::from(result.fact.content.clone())),
-                            )
-                            .child(widgets::meta_line(
-                                theme,
-                                vec![
-                                    SharedString::from(format!(
-                                        "{} · distance {:.3} · confidence {:.0}%",
-                                        result.fact.source,
-                                        result.distance,
-                                        result.fact.confidence * 100.0
-                                    ))
-                                    .into_any_element(),
-                                ],
-                            )),
-                    ),
-                );
-            }
-            if !self.semantic_loading && self.semantic_results.is_empty() {
-                card = card.child(widgets::card_row(theme, false).child(widgets::meta_line(
-                    theme,
-                    vec![SharedString::from(
-                        "Select a project, enter a query, and search. Query text is embedded locally and is not stored.",
-                    )
-                    .into_any_element()],
-                )));
-            }
-        } else if let Some(error) = &status.embeddings_error {
-            card = card.child(widgets::card_row(theme, false).child(widgets::error_strip(
-                theme,
-                SharedString::from(error.clone()),
-            )));
-        }
-        card.into_any_element()
+            )))
+            .into_any_element()
     }
 
     fn projects_card(
@@ -1591,17 +915,47 @@ impl MemoryPage {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let mut card = widgets::section_card(theme);
-        if status.projects.is_empty() {
-            card = card.child(widgets::card_row(theme, true).child(SharedString::from(
-                "No projects indexed yet — memory appears here after the first agent session.",
-            )));
-            return card.into_any_element();
-        }
-        for (index, project) in status.projects.iter().enumerate() {
-            card = card.child(self.project_row(project, index == 0, theme, cx));
-            if self.expanded.as_deref() == Some(project.project_id.as_str()) {
-                card = card.child(self.project_detail(project, theme, cx));
+        let count = status.projects.len();
+        let mut card = widgets::section_card(theme).child(
+            widgets::card_row(theme, true)
+                .cursor_pointer()
+                .id("memory-projects-toggle")
+                .on_click(cx.listener(|this, _, _, cx| this.toggle_projects_open(cx)))
+                .child(widgets::row_tile(theme, crate::icons::FOLDER))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .child(widgets::row_title(theme, "Projects"))
+                        .child(widgets::meta_line(
+                            theme,
+                            vec![SharedString::from(if count == 0 {
+                                "No projects indexed yet — memory appears here after the first agent session.".to_string()
+                            } else {
+                                format!("{count} project(s) — expand a row for facts, graph, timeline and export.")
+                            })
+                            .into_any_element()],
+                        )),
+                )
+                .child(
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(theme.text_muted)
+                        .child(SharedString::from(if self.projects_open {
+                            "Hide"
+                        } else {
+                            "Show"
+                        })),
+                ),
+        );
+        if self.projects_open {
+            for (index, project) in status.projects.iter().enumerate() {
+                card = card.child(self.project_row(project, index == 0, theme, cx));
+                if self.expanded.as_deref() == Some(project.project_id.as_str()) {
+                    card = card.child(self.project_detail(project, theme, cx));
+                }
             }
         }
         card.into_any_element()
@@ -1716,13 +1070,6 @@ impl MemoryPage {
                 theme,
                 vec![SharedString::from(
                     "One-way Markdown with YAML frontmatter and wikilinks. Choose a new folder; existing folders are only updated when already owned by Komet.",
-                )
-                .into_any_element()],
-            ))
-            .child(widgets::meta_line(
-                theme,
-                vec![SharedString::from(
-                    "Re-exporting deletes the notes of facts you have forgotten — only notes Komet wrote are affected. Exports made by an older version are not cleaned up automatically.",
                 )
                 .into_any_element()],
             ));
@@ -1887,7 +1234,9 @@ impl MemoryPage {
             for event in self.activity.iter().take(15) {
                 let mut line = format!(
                     "{} · {} · {}",
-                    event.occurred_at_ms, event.agent, event.kind
+                    format_timestamp(event.occurred_at_ms, &chrono::Local),
+                    event.agent,
+                    event.kind
                 );
                 if let Some(tool) = &event.tool_name {
                     line.push_str(&format!(" · {tool}"));
@@ -1913,11 +1262,11 @@ impl MemoryPage {
         let forget_id = fact.id;
         let promote_id = fact.id;
         let mut details = format!(
-            "{} · {} · {}% confidence · valid from {}",
+            "{} · {} · {}% confidence · {}",
             fact.scope,
             fact.source,
             (fact.confidence * 100.0).round() as u32,
-            fact.valid_from_ms
+            format_timestamp(fact.valid_from_ms, &chrono::Local)
         );
         if let Some(agent) = &fact.source_agent {
             details.push_str(&format!(" · {agent}"));
@@ -1929,7 +1278,10 @@ impl MemoryPage {
             details.push_str(&format!(" · event {seq}"));
         }
         if let Some(stale_at) = fact.stale_at_ms {
-            details.push_str(&format!(" · potentially stale since {stale_at}"));
+            details.push_str(&format!(
+                " · potentially stale since {}",
+                format_timestamp(stale_at, &chrono::Local)
+            ));
         }
         if let Some(replaced_by) = fact.replaced_by {
             details.push_str(&format!(" · replaced by {replaced_by}"));
@@ -2067,13 +1419,10 @@ impl MemoryPage {
 impl Render for MemoryPage {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx).clone();
-        let mut page = widgets::page_column()
-            .id("memory-page")
-            .child(widgets::page_header(&theme, "Memory", None))
-            .child(widgets::page_subtitle(
-                &theme,
-                "A local activity index shared by agents on this device — what ran, which files were touched, and how sessions ended. Activity is stored as metadata only (never prompts, commands, file contents or credentials). Typed facts exist only when you approve an agent's note, and the code graph keeps symbol names, never source text. Nothing leaves this machine.",
-            ));
+        // Embedded only (Settings → General): the section header and the
+        // scroll container belong to the host page, so this renders the
+        // column content directly — no page chrome, no nested scroller.
+        let mut page = widgets::page_column();
 
         if let Some(error) = self.error.clone() {
             page = page.child(widgets::error_strip(&theme, error));
@@ -2090,7 +1439,6 @@ impl Render for MemoryPage {
                 page = page
                     .child(self.storage_card(status, &theme, cx))
                     .child(self.control_card(status, &theme, cx))
-                    .child(self.embeddings_card(status, &theme, cx))
                     .child(self.projects_card(status, &theme, cx))
                     .when_some(self.history_card(status, &theme, cx), |el, card| {
                         el.child(card)
@@ -2119,26 +1467,13 @@ impl Render for MemoryPage {
             }
         }
 
-        div()
-            .id("memory-page-scroll")
-            .size_full()
-            .overflow_y_scroll()
-            .child(page)
+        page.into_any_element()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn risky_locations_flagged() {
-        assert!(looks_risky_location("/home/u/Dropbox/memory"));
-        assert!(looks_risky_location("/Volumes/Google Drive/memory"));
-        assert!(looks_risky_location("\\\\nas\\share\\memory"));
-        assert!(!looks_risky_location("/home/u/.local/share/komet/memory"));
-        assert!(!looks_risky_location("/home/u/skyline-market-data"));
-    }
 
     #[test]
     fn bytes_format() {
@@ -2149,9 +1484,9 @@ mod tests {
 
     #[test]
     fn cpu_duration_format() {
-        assert_eq!(format_cpu_duration(59_000), "59s");
-        assert_eq!(format_cpu_duration(65_000), "1m 5s");
-        assert_eq!(format_cpu_duration(3_661_000), "1h 1m");
+        assert_eq!(format_cpu_duration(500), "500 ms");
+        assert_eq!(format_cpu_duration(1500), "1.5 s");
+        assert_eq!(format_cpu_duration(90_000), "1.5 min");
     }
 
     #[test]
@@ -2176,15 +1511,34 @@ mod tests {
     }
 
     #[test]
-    fn cancelling_state_reads_as_cancelling() {
-        let mut status = MemoryStatus {
-            enabled: true,
-            embeddings_enabled: true,
-            ..Default::default()
+    fn usage_lines_report_week_and_read_file_split() {
+        let usage = UsageWeek {
+            briefings: 12,
+            briefing_chars: 4800,
+            memory_calls: vec![
+                MemoryCallMetric {
+                    metric: "call.memory.read_file".into(),
+                    count: 30,
+                },
+                MemoryCallMetric {
+                    metric: "call.memory.search".into(),
+                    count: 4,
+                },
+            ],
+            sessions_briefed: 4,
+            sessions_unbriefed: 2,
+            read_files_briefed: 8,
+            read_files_unbriefed: 10,
         };
-        status.embeddings_model.state = "downloading".into();
-        status.embeddings_model.bytes = 1024;
-        assert!(model_status_line(&status, false).contains("Downloading"));
-        assert_eq!(model_status_line(&status, true), "Cancelling the download…");
+        let lines = usage_lines(&usage);
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("12 briefing(s)"));
+        assert!(lines[0].contains("34 memory tool call(s)"));
+        assert!(lines[1].contains("briefed 2.0 (4 sessions)"));
+        assert!(lines[1].contains("unbriefed 5.0 (2 sessions)"));
+
+        // No sessions yet → only the totals line, no empty comparison.
+        let quiet = UsageWeek::default();
+        assert_eq!(usage_lines(&quiet).len(), 1);
     }
 }

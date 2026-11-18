@@ -773,7 +773,6 @@ impl SessionsEngine {
                 Ok(true) => {
                     catalog = catalog.with_memory(crate::mcp::catalog::MemoryToolParams {
                         service: indexer.service().clone(),
-                        indexer: Some(indexer.clone()),
                         blackboard: indexer.blackboard().clone(),
                         project_id,
                         chat_id: chat_id.to_string(),
@@ -1381,6 +1380,16 @@ impl SessionsEngine {
                 None
             }
         };
+        if let Some(block) = &memory_briefing
+            && let Some(indexer) = self.inner.memory.get()
+        {
+            indexer.note_briefing(
+                &request.cwd,
+                chat_id,
+                harness_id.as_str(),
+                block.chars().count(),
+            );
+        }
         let run_id = new_id();
         let (steer_tx, steer_rx) = mpsc::channel::<SteerMessage>(32);
         let (cancel_tx, cancel_rx) = watch::channel(false);
@@ -1592,7 +1601,6 @@ impl SessionsEngine {
         // owns the chat: overwriting its cwd/project here would re-attribute
         // the run's remaining events (and its Done) to the steer's cwd.
         if let Some(indexer) = self.inner.memory.get() {
-            indexer.set_agent_active(chat_id, true);
             indexer.note_chat(chat_id, &request.cwd, harness_id);
             indexer.index_workspace(&request.cwd);
         }
@@ -2551,9 +2559,6 @@ impl Inner {
             // The live counters describe a turn that is over: whatever the
             // chips kept at their terminal write is the doc's record now.
             self.subagent_feeds.clear(chat_id);
-            if let Some(indexer) = self.memory.get() {
-                indexer.set_agent_active(chat_id, false);
-            }
         }
     }
 }

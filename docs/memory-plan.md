@@ -135,24 +135,14 @@ window close (needs a small gpui-fork patch exposing a drop path for
 (`transcript.rs` sync) could move to Arc-per-entry; boot-time warm-open of
 recent chats (PARITY gap) is unchanged.
 
-### Semantic memory (issue #78, phase 6, 2026-11)
+### Semantic memory — removed (issue #78)
 
-Optional local embeddings landed behind the `memory-embeddings` build feature
-and the off-by-default "Semantic memory" setting: facts are embedded with a
-small local model (fastembed + sqlite-vec, ~23 MB). The model is fetched by an
-explicit one-shot download only — turning the setting on never touches the
-network — and the download can be cancelled, retried after a failure, or
-deleted, each with its own state in Settings. Search stays text-first (FTS5 and
-the code graph); vectors only re-rank, so everything keeps working without the
-model. Embedding batches pause while a project has a live agent run.
-
-Same pass: internal MCP memory reads use the hybrid ranking when the indexer is
-wired in; Obsidian export prunes notes for facts that were forgotten or
-sessions that vanished (manifest-scoped, Komet-written notes only — older
-exports are not cleaned retroactively); store relocation snapshots with
-`VACUUM INTO` so rows living only in an uncheckpointed WAL survive the move,
-keeps the previous copy for rollback, and Settings can show its size and delete
-it (bounded to the store files and `.komet-relocate-backup-*` folders).
+The optional embedding tier (fastembed model download, sqlite-vec vectors,
+hybrid RRF search, Settings card and RPCs) was removed: relevance is now
+pure FTS5 BM25 over facts and event metadata — no model, no network, ~zero
+CPU. Custom store locations and configurable retention went with it: the
+store is always `<data_dir>/memory` with a fixed 90-day retention. The code
+graph and the coordination blackboard are unchanged.
 
 ## 8. Acceptance
 

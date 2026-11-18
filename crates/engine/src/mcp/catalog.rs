@@ -89,9 +89,6 @@ impl MemoryBlackboard {
 
 struct MemoryToolContext {
     service: Arc<MemoryService>,
-    /// Present when memory indexing is live: enables the hybrid (text +
-    /// semantic) fact search. `None` keeps the pure text ranking.
-    indexer: Option<Arc<crate::memory::MemoryIndexer>>,
     blackboard: Arc<MemoryBlackboard>,
     project_id: String,
     chat_id: String,
@@ -102,9 +99,6 @@ struct MemoryToolContext {
 /// Everything a run needs to expose the `memory.*` tools.
 pub struct MemoryToolParams {
     pub service: Arc<MemoryService>,
-    /// Present when memory indexing is live: enables the hybrid (text +
-    /// semantic) fact search. `None` keeps the pure text ranking.
-    pub indexer: Option<Arc<crate::memory::MemoryIndexer>>,
     pub blackboard: Arc<MemoryBlackboard>,
     pub project_id: String,
     pub chat_id: String,
@@ -294,7 +288,6 @@ impl McpCatalog {
         );
         self.memory = Some(MemoryToolContext {
             service: params.service,
-            indexer: params.indexer,
             blackboard: params.blackboard,
             project_id: params.project_id,
             chat_id: params.chat_id,
@@ -509,22 +502,17 @@ fn execute_memory_tool(
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(20)
         .clamp(1, 50) as usize;
-    match name {
+    let value = match name {
         "memory.search" => {
             let query = string_arg(&input, "query")?;
             let events = context
                 .service
                 .search(&context.project_id, query, limit)
                 .map_err(memory_tool_error)?;
-            let facts = match &context.indexer {
-                Some(indexer) => indexer
-                    .hybrid_search_facts(&context.project_id, &context.chat_id, query, limit)
-                    .map_err(memory_tool_error)?,
-                None => context
-                    .service
-                    .search_facts(&context.project_id, Some(&context.chat_id), query, limit)
-                    .map_err(memory_tool_error)?,
-            };
+            let facts = context
+                .service
+                .search_facts(&context.project_id, Some(&context.chat_id), query, limit)
+                .map_err(memory_tool_error)?;
             Ok(serde_json::json!({
                 "events": events.iter().map(memory_event_json).collect::<Vec<_>>(),
                 "facts": facts,
@@ -579,18 +567,13 @@ fn execute_memory_tool(
         }
         "memory.why" => {
             let decision = string_arg(&input, "decision")?;
-            let facts = match &context.indexer {
-                Some(indexer) => indexer
-                    .hybrid_search_facts(&context.project_id, &context.chat_id, decision, limit)
-                    .map_err(memory_tool_error)?,
-                None => context
-                    .service
-                    .search_facts(&context.project_id, Some(&context.chat_id), decision, limit)
-                    .map_err(memory_tool_error)?,
-            }
-            .into_iter()
-            .filter(|fact| fact.kind == FactKind::Decision)
-            .collect::<Vec<_>>();
+            let facts = context
+                .service
+                .search_facts(&context.project_id, Some(&context.chat_id), decision, limit)
+                .map_err(memory_tool_error)?
+                .into_iter()
+                .filter(|fact| fact.kind == FactKind::Decision)
+                .collect::<Vec<_>>();
             Ok(serde_json::json!({"decisions": facts}))
         }
         "memory.note" => {
@@ -665,7 +648,15 @@ fn execute_memory_tool(
             "claims": context.blackboard.list(&context.project_id)
         })),
         _ => Err(CatalogError::Unknown(name.into())),
-    }
+    }?;
+    let _ = context.service.bump_metric(
+        &context.project_id,
+        &context.agent,
+        &format!("call.{name}"),
+        1,
+        crate::now_ms(),
+    );
+    Ok(value)
 }
 
 fn string_arg<'a>(input: &'a serde_json::Value, key: &str) -> Result<&'a str, CatalogError> {
@@ -1331,7 +1322,6 @@ mod tests {
         let service = Arc::new(MemoryService::open(dir.path()).unwrap());
         let catalog = McpCatalog::komet_default(Arc::new(FakeHost)).with_memory(MemoryToolParams {
             service,
-            indexer: None,
             blackboard: Arc::new(MemoryBlackboard::default()),
             project_id: "project".into(),
             chat_id: "chat".into(),
@@ -1358,7 +1348,6 @@ mod tests {
         let blackboard = Arc::new(MemoryBlackboard::default());
         let context = MemoryToolContext {
             service,
-            indexer: None,
             blackboard: blackboard.clone(),
             project_id: "project".into(),
             chat_id: "chat".into(),
@@ -1403,7 +1392,6 @@ mod tests {
         let service = Arc::new(MemoryService::open(dir.path()).unwrap());
         let context = MemoryToolContext {
             service: service.clone(),
-            indexer: None,
             blackboard: Arc::new(MemoryBlackboard::default()),
             project_id: "project".into(),
             chat_id: "chat".into(),

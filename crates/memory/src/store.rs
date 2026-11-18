@@ -1,8 +1,6 @@
-//! The local SQLite memory store: one database per store directory
-//! (`<data_dir>/memory/memory.sqlite` by default, or the custom location in
-//! `memory-config.json`), WAL mode, FTS5 when the bundled SQLite provides it.
-//! With the `embeddings` feature the fact table also carries sqlite-vec
-//! vectors; text search stays authoritative, vectors only re-rank.
+//! The local SQLite memory store: one database under `<data_dir>/memory/`
+//! (`<data_dir>/memory/memory.sqlite`), WAL mode, FTS5 when the bundled
+//! SQLite provides it — BM25 ranks matches, no embedding model involved.
 //!
 //! Writers go through a single background thread fed by a bounded channel —
 //! the engine's publish path only ever does a `try_send`. All reads
@@ -19,8 +17,6 @@ use std::time::{Duration, Instant};
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use serde::Serialize;
 
-#[cfg(feature = "embeddings")]
-use crate::facts::SemanticMemoryMatch;
 use crate::facts::{FactKind, FactScope, FactSource, MemoryFact, NewMemoryFact};
 use crate::graph::{GraphNeighbor, MemorySymbol};
 use crate::policy;
@@ -39,10 +35,15 @@ const WRITE_BATCH: usize = 100;
 const WRITE_FLUSH: Duration = Duration::from_millis(100);
 /// Recency window for the handoff briefing.
 pub const BRIEFING_WINDOW_MS: i64 = 30 * 24 * 60 * 60 * 1000;
-/// Raw-event retention. Older rows are pruned by the engine's maintenance
-/// tick; replay cursors only move forward, so catch-up cannot re-create
-/// them.
-pub const RETENTION_MS: i64 = 90 * 24 * 60 * 60 * 1000;
+/// Raw-event retention in milliseconds, derived from the fixed
+/// [`crate::RETENTION_DAYS`]. Older rows are pruned by the engine's
+/// maintenance tick; replay cursors only move forward, so catch-up cannot
+/// re-create them.
+pub const RETENTION_MS: i64 = crate::config::RETENTION_DAYS as i64 * 24 * 60 * 60 * 1000;
+
+/// One day in milliseconds — `memory_metrics.day` buckets are
+/// `occurred_at_ms.div_euclid(DAY_MS)` (days since the Unix epoch).
+const DAY_MS: i64 = 24 * 60 * 60 * 1000;
 
 #[derive(Debug, thiserror::Error)]
 pub enum MemoryError {
@@ -350,8 +351,6 @@ pub struct MemoryService {
     dir: PathBuf,
     fts: bool,
     facts_fts: bool,
-    #[cfg(feature = "embeddings")]
-    vector_enabled: Mutex<bool>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -418,26 +417,11 @@ impl MemoryService {
     /// `<data_dir>/memory`. Creates the schema, enables WAL, and spawns the
     /// single writer thread.
     pub fn open(dir: impl AsRef<Path>) -> Result<Self, MemoryError> {
-        Self::open_with_embeddings(dir, false)
-    }
-
-    pub fn open_with_embeddings(
-        dir: impl AsRef<Path>,
-        embeddings_enabled: bool,
-    ) -> Result<Self, MemoryError> {
-        #[cfg(not(feature = "embeddings"))]
-        if embeddings_enabled {
-            return Err(MemoryError::Other(
-                "semantic embeddings are unavailable in this build".into(),
-            ));
-        }
         let dir = dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&dir)?;
         let path = dir.join(DB_FILE);
         let open_conn = |path: &Path| -> Result<Connection, MemoryError> {
             let conn = Connection::open(path)?;
-            #[cfg(feature = "embeddings")]
-            register_vector_extension(&conn)?;
             // auto_vacuum must be set before any table exists to take
             // effect; it is a no-op on databases that already have tables.
             conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
@@ -451,10 +435,6 @@ impl MemoryService {
         };
         let mut conn = open_conn(&path)?;
         migrate(&mut conn)?;
-        #[cfg(feature = "embeddings")]
-        if embeddings_enabled {
-            ensure_vector_table(&conn)?;
-        }
         // One-shot planner stats after migrations (cheap on a fresh/small db).
         conn.execute_batch("PRAGMA optimize;")?;
         let fts = ensure_fts(&conn)?;
@@ -474,21 +454,7 @@ impl MemoryService {
             dir,
             fts,
             facts_fts,
-            #[cfg(feature = "embeddings")]
-            vector_enabled: Mutex::new(embeddings_enabled),
         })
-    }
-
-    #[cfg(feature = "embeddings")]
-    pub fn enable_embeddings(&self) -> Result<(), MemoryError> {
-        let mut enabled = lock(&self.vector_enabled);
-        if *enabled {
-            return Ok(());
-        }
-        let conn = lock(&self.conn);
-        ensure_vector_table(&conn)?;
-        *enabled = true;
-        Ok(())
     }
 
     pub fn dir(&self) -> &Path {
@@ -666,22 +632,9 @@ impl MemoryService {
         let conn = lock(&self.conn);
         let limit = limit.clamp(1, 200) as i64;
         let events = if self.fts {
-            let match_expr = terms
-                .iter()
-                .enumerate()
-                .map(|(i, t)| {
-                    // Last term becomes a prefix query so the FTS
-                    // `prefix='2 3'` index is actually exercised
-                    // ("src/mai"* → src/main.rs).
-                    let quoted = format!("\"{}\"", t.replace('"', ""));
-                    if i + 1 == terms.len() {
-                        format!("{quoted}*")
-                    } else {
-                        quoted
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join(" AND ");
+            let Some(match_expr) = fts_match_expr(query) else {
+                return Ok(Vec::new());
+            };
             let mut stmt = conn.prepare(
                 "SELECT e.id, e.project_id, e.chat_id, e.source_seq, e.agent, e.model,
                         e.kind, e.occurred_at_ms, e.tool_name, e.relative_path, e.outcome,
@@ -690,7 +643,7 @@ impl MemoryService {
                  FROM memory_events e
                  JOIN memory_fts f ON f.rowid = e.id
                  WHERE memory_fts MATCH ?1 AND e.project_id = ?2
-                 ORDER BY e.occurred_at_ms DESC, e.id DESC
+                 ORDER BY bm25(memory_fts), e.occurred_at_ms DESC, e.id DESC
                  LIMIT ?3",
             )?;
             let rows = stmt.query_map(params![match_expr, project_id, limit], row_to_event)?;
@@ -750,17 +703,20 @@ impl MemoryService {
     /// Deterministic 300–500-token handoff briefing, or `None` when the
     /// project has no useful memory (disabled, empty, or all stale).
     /// `exclude` is the receiving (chat_id, agent) pair — see
-    /// [`Self::briefing_digest`].
+    /// [`Self::briefing_digest`]. `task_query` is the user's current
+    /// request: facts and touched paths are ranked toward it (BM25 /
+    /// term overlap) so the briefing surfaces what matters for THIS task.
     pub fn briefing(
         &self,
         project_id: &str,
         exclude: Option<(&str, &str)>,
+        task_query: Option<&str>,
     ) -> Result<Option<String>, MemoryError> {
         if !self.is_enabled(project_id)? {
             return Ok(None);
         }
         let since = now_ms().saturating_sub(BRIEFING_WINDOW_MS);
-        let digest = self.briefing_digest(project_id, exclude, since)?;
+        let digest = self.briefing_digest(project_id, exclude, since, task_query)?;
         Ok(crate::briefing::build(&digest, now_ms()))
     }
 
@@ -780,6 +736,7 @@ impl MemoryService {
         project_id: &str,
         exclude: Option<(&str, &str)>,
         since_ms: i64,
+        task_query: Option<&str>,
     ) -> Result<BriefingDigest, MemoryError> {
         let conn = lock(&self.conn);
         let (exclude_chat, exclude_agent) = match exclude {
@@ -898,6 +855,20 @@ impl MemoryService {
                 d.modified_paths.push(FileTouch { path, last_ms });
             }
         }
+        // Rank each agent's touched paths toward the task query: paths
+        // sharing query terms float to the top, recency breaks ties
+        // (stable sort keeps the SQL's last_ms order within equal scores).
+        if let Some(terms) = task_query.map(query_terms)
+            && !terms.is_empty()
+        {
+            for agent in &mut agents {
+                agent.modified_paths.sort_by(|a, b| {
+                    term_score(&b.path, &terms)
+                        .cmp(&term_score(&a.path, &terms))
+                        .then(b.last_ms.cmp(&a.last_ms))
+                });
+            }
+        }
 
         // Recent failures PER AGENT — same window-function fairness as the
         // path query.
@@ -956,28 +927,57 @@ impl MemoryService {
             }
         }
 
-        let mut stmt = conn.prepare(
-            "SELECT kind, content, source, source_agent, source_path, confidence, stale_at_ms
-             FROM memory_facts
-             WHERE (project_id = ?1 OR scope = 'global')
-               AND (scope != 'session' OR chat_id = ?2)
-               AND (stale_at_ms IS NULL OR stale_at_ms >= ?3)
-             ORDER BY stale_at_ms IS NOT NULL, confidence DESC, valid_from_ms DESC, id DESC
-             LIMIT 8",
-        )?;
-        let facts = stmt
-            .query_map(params![project_id, exclude_chat, since_ms], |r| {
-                Ok(FactDigest {
-                    kind: r.get(0)?,
-                    content: r.get(1)?,
-                    source: r.get(2)?,
-                    source_agent: r.get(3)?,
-                    source_path: r.get(4)?,
-                    confidence: r.get(5)?,
-                    stale: r.get::<_, Option<i64>>(6)?.is_some(),
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
+        // Facts: BM25-ranked FTS matches first when a task query is given,
+        // then the standard confidence/recency ordering fills the rest.
+        let mut facts: Vec<(i64, FactDigest)> = Vec::new();
+        let mut seen_fact_ids = std::collections::HashSet::new();
+        if let Some(expr) = task_query.and_then(fts_or_expr).filter(|_| self.facts_fts) {
+            let mut stmt = conn.prepare(
+                "SELECT fact.id, fact.kind, fact.content, fact.source,
+                        fact.source_agent, fact.source_path, fact.confidence, fact.stale_at_ms
+                 FROM memory_facts_fts
+                 JOIN memory_facts fact ON fact.id = memory_facts_fts.rowid
+                 WHERE memory_facts_fts MATCH ?1
+                   AND (fact.project_id = ?2 OR fact.scope = 'global')
+                   AND (fact.scope != 'session' OR fact.chat_id = ?3)
+                   AND (fact.stale_at_ms IS NULL OR fact.stale_at_ms >= ?4)
+                 ORDER BY bm25(memory_facts_fts), fact.confidence DESC
+                 LIMIT 8",
+            )?;
+            let rows = stmt.query_map(
+                params![expr, project_id, exclude_chat, since_ms],
+                fact_digest_row,
+            )?;
+            for row in rows {
+                let (id, digest) = row?;
+                seen_fact_ids.insert(id);
+                facts.push((id, digest));
+            }
+        }
+        {
+            let mut stmt = conn.prepare(
+                "SELECT id, kind, content, source, source_agent, source_path, confidence, stale_at_ms
+                 FROM memory_facts
+                 WHERE (project_id = ?1 OR scope = 'global')
+                   AND (scope != 'session' OR chat_id = ?2)
+                   AND (stale_at_ms IS NULL OR stale_at_ms >= ?3)
+                 ORDER BY stale_at_ms IS NOT NULL, confidence DESC, valid_from_ms DESC, id DESC
+                 LIMIT 24",
+            )?;
+            let rows =
+                stmt.query_map(params![project_id, exclude_chat, since_ms], fact_digest_row)?;
+            for row in rows {
+                let (id, digest) = row?;
+                if seen_fact_ids.insert(id) {
+                    facts.push((id, digest));
+                }
+                if facts.len() >= 8 {
+                    break;
+                }
+            }
+        }
+        facts.truncate(8);
+        let facts: Vec<FactDigest> = facts.into_iter().map(|(_, digest)| digest).collect();
 
         Ok(BriefingDigest {
             chats: chats.max(0) as u64,
@@ -1304,117 +1304,9 @@ impl MemoryService {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
-    #[cfg(feature = "embeddings")]
-    pub fn facts_missing_embeddings(
-        &self,
-        limit: usize,
-    ) -> Result<Vec<(i64, String)>, MemoryError> {
-        let conn = lock(&self.conn);
-        let mut stmt = conn.prepare(
-            "SELECT fact.id, fact.content
-             FROM memory_facts fact
-             LEFT JOIN memory_fact_vectors vector ON vector.rowid = fact.id
-             WHERE fact.stale_at_ms IS NULL AND vector.rowid IS NULL
-             ORDER BY fact.id
-             LIMIT ?1",
-        )?;
-        let rows = stmt.query_map([limit.clamp(1, 100) as i64], |row| {
-            Ok((row.get(0)?, row.get(1)?))
-        })?;
-        Ok(rows.collect::<Result<Vec<_>, _>>()?)
-    }
-
-    #[cfg(feature = "embeddings")]
-    pub fn store_fact_embeddings(&self, embeddings: &[(i64, Vec<f32>)]) -> Result<(), MemoryError> {
-        let conn = lock(&self.write);
-        let tx = conn.unchecked_transaction()?;
-        for (fact_id, vector) in embeddings {
-            if vector.len() != crate::EMBEDDING_DIMENSIONS
-                || vector.iter().any(|value| !value.is_finite())
-            {
-                return Err(MemoryError::Other("invalid fact embedding".into()));
-            }
-            let encoded = serde_json::to_string(vector)
-                .map_err(|error| MemoryError::Other(format!("encode fact embedding: {error}")))?;
-            tx.execute(
-                "INSERT OR REPLACE INTO memory_fact_vectors(
-                   rowid, embedding, project_id, scope
-                 )
-                 SELECT id, ?2, project_id, scope FROM memory_facts
-                 WHERE id = ?1 AND stale_at_ms IS NULL",
-                params![fact_id, encoded],
-            )?;
-        }
-        tx.commit()?;
-        Ok(())
-    }
-
-    #[cfg(feature = "embeddings")]
-    pub fn embedding_counts(&self) -> Result<(u64, u64), MemoryError> {
-        let conn = lock(&self.conn);
-        let total: u64 = conn.query_row(
-            "SELECT COUNT(*) FROM memory_facts WHERE stale_at_ms IS NULL",
-            [],
-            |row| row.get(0),
-        )?;
-        let indexed: u64 = conn.query_row(
-            "SELECT COUNT(*)
-             FROM memory_fact_vectors vector
-             JOIN memory_facts fact ON fact.id = vector.rowid
-             WHERE fact.stale_at_ms IS NULL",
-            [],
-            |row| row.get(0),
-        )?;
-        Ok((indexed, total))
-    }
-
-    #[cfg(feature = "embeddings")]
-    pub fn semantic_search_facts(
-        &self,
-        project_id: &str,
-        query_embedding: &[f32],
-        limit: usize,
-    ) -> Result<Vec<SemanticMemoryMatch>, MemoryError> {
-        if query_embedding.len() != crate::EMBEDDING_DIMENSIONS
-            || query_embedding.iter().any(|value| !value.is_finite())
-        {
-            return Err(MemoryError::Other("invalid search embedding".into()));
-        }
-        let encoded = serde_json::to_string(query_embedding)
-            .map_err(|error| MemoryError::Other(format!("encode search embedding: {error}")))?;
-        let conn = lock(&self.conn);
-        let mut stmt = conn.prepare(
-            "WITH vector_matches AS (
-               SELECT rowid, distance FROM memory_fact_vectors
-               WHERE embedding MATCH ?1 AND k = ?3
-                 AND project_id = ?2 AND scope != 'global' AND scope != 'session'
-               UNION ALL
-               SELECT rowid, distance FROM memory_fact_vectors
-               WHERE embedding MATCH ?1 AND k = ?3 AND scope = 'global'
-             )
-             SELECT fact.id, fact.project_id, fact.chat_id, fact.kind, fact.scope,
-                    fact.content, fact.source, fact.source_agent, fact.source_model,
-                    fact.source_event_seq, fact.source_path, fact.confidence,
-                    fact.user_confirmed, fact.valid_from_ms, fact.stale_at_ms,
-                    fact.replaced_by, vector.distance
-             FROM vector_matches vector
-             JOIN memory_facts fact ON fact.id = vector.rowid
-             ORDER BY vector.distance
-             LIMIT ?3",
-        )?;
-        let rows = stmt.query_map(
-            params![encoded, project_id, limit.clamp(1, 20) as i64],
-            |row| {
-                Ok(SemanticMemoryMatch {
-                    fact: row_to_fact(row)?,
-                    distance: row.get(16)?,
-                })
-            },
-        )?;
-        Ok(rows.collect::<Result<Vec<_>, _>>()?)
-    }
-
-    /// Bounded substring search over the project's valid facts.
+    /// Bounded substring search over the project's valid facts. With FTS5
+    /// the match is BM25-ranked; otherwise a substring scan ordered by
+    /// recency.
     pub fn search_facts(
         &self,
         project_id: &str,
@@ -1427,45 +1319,44 @@ impl MemoryService {
             return Ok(Vec::new());
         }
         let conn = lock(&self.conn);
-        let mut sql = String::from(
+        let limit = limit.clamp(1, 100) as i64;
+        if self.facts_fts {
+            let Some(search_query) = fts_match_expr(needle) else {
+                return Ok(Vec::new());
+            };
+            let mut stmt = conn.prepare(
+                "SELECT fact.id, fact.project_id, fact.chat_id, fact.kind, fact.scope,
+                        fact.content, fact.source, fact.source_agent, fact.source_model,
+                        fact.source_event_seq, fact.source_path, fact.confidence,
+                        fact.user_confirmed, fact.valid_from_ms, fact.stale_at_ms,
+                        fact.replaced_by
+                 FROM memory_facts_fts
+                 JOIN memory_facts fact ON fact.id = memory_facts_fts.rowid
+                 WHERE memory_facts_fts MATCH ?3
+                   AND (fact.project_id = ?1 OR fact.scope = 'global')
+                   AND (?2 IS NULL OR fact.scope != 'session' OR fact.chat_id = ?2)
+                   AND fact.stale_at_ms IS NULL
+                 ORDER BY bm25(memory_facts_fts), fact.valid_from_ms DESC, fact.id DESC
+                 LIMIT ?4",
+            )?;
+            let rows = stmt.query_map(
+                params![project_id, chat_id, search_query, limit],
+                row_to_fact,
+            )?;
+            return Ok(rows.collect::<Result<Vec<_>, _>>()?);
+        }
+        let mut stmt = conn.prepare(
             "SELECT id, project_id, chat_id, kind, scope, content, source,
                     source_agent, source_model, source_event_seq, source_path,
                     confidence, user_confirmed, valid_from_ms, stale_at_ms, replaced_by
              FROM memory_facts
              WHERE (project_id = ?1 OR scope = 'global')
                AND (?2 IS NULL OR scope != 'session' OR chat_id = ?2)
-               AND stale_at_ms IS NULL",
-        );
-        if self.facts_fts {
-            sql.push_str(
-                " AND id IN (
-                   SELECT rowid FROM memory_facts_fts WHERE memory_facts_fts MATCH ?3
-                 )",
-            );
-        } else {
-            sql.push_str(" AND instr(lower(content), lower(?3)) > 0");
-        }
-        sql.push_str(" ORDER BY valid_from_ms DESC, id DESC LIMIT ?4");
-        let mut stmt = conn.prepare(&sql)?;
-        let search_query = if self.facts_fts {
-            needle
-                .split_whitespace()
-                .take(8)
-                .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
-                .collect::<Vec<_>>()
-                .join(" AND ")
-        } else {
-            needle.to_string()
-        };
-        let rows = stmt.query_map(
-            params![
-                project_id,
-                chat_id,
-                search_query,
-                limit.clamp(1, 100) as i64
-            ],
-            row_to_fact,
+               AND stale_at_ms IS NULL
+               AND instr(lower(content), lower(?3)) > 0
+             ORDER BY valid_from_ms DESC, id DESC LIMIT ?4",
         )?;
+        let rows = stmt.query_map(params![project_id, chat_id, needle, limit], row_to_fact)?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
@@ -1782,6 +1673,10 @@ impl MemoryService {
             "DELETE FROM memory_chat_gaps WHERE chat_id = ?1",
             params![chat_id],
         )?;
+        tx.execute(
+            "DELETE FROM memory_briefings WHERE chat_id = ?1",
+            params![chat_id],
+        )?;
         tx.commit()?;
         // Sweep stragglers a straddling writer batch may have committed
         // after our delete (queue-ordered; see MemoryItem::PurgeChat).
@@ -1821,6 +1716,14 @@ impl MemoryService {
         )?;
         tx.execute(
             "DELETE FROM memory_graph_nodes WHERE project_id = ?1",
+            params![project_id],
+        )?;
+        tx.execute(
+            "DELETE FROM memory_briefings WHERE project_id = ?1",
+            params![project_id],
+        )?;
+        tx.execute(
+            "DELETE FROM memory_metrics WHERE project_id = ?1",
             params![project_id],
         )?;
         // Tombstones: jump every known chat's cursor past its journal tail
@@ -1877,6 +1780,8 @@ impl MemoryService {
         let removed = tx.execute("DELETE FROM memory_events", [])?;
         tx.execute("DELETE FROM memory_facts", [])?;
         tx.execute("DELETE FROM memory_graph_nodes", [])?;
+        tx.execute("DELETE FROM memory_briefings", [])?;
+        tx.execute("DELETE FROM memory_metrics", [])?;
         for (chat_id, seq) in horizons {
             let through = (*seq).min(i64::MAX as u64) as i64;
             tx.execute(
@@ -1985,11 +1890,145 @@ impl MemoryService {
             tx.commit()?;
             total += rows.len();
         }
+        {
+            let conn = lock(&self.write);
+            conn.execute(
+                "DELETE FROM memory_briefings WHERE occurred_at_ms < ?1",
+                params![cutoff_ms],
+            )?;
+            conn.execute(
+                "DELETE FROM memory_metrics WHERE day < ?1",
+                params![cutoff_ms.div_euclid(DAY_MS)],
+            )?;
+        }
         if total > 0 {
             let conn = lock(&self.write);
             let _ = conn.execute_batch("PRAGMA incremental_vacuum;");
         }
         Ok(total)
+    }
+
+    /// Record one briefing injection (session start): count + size in chars.
+    /// Written on the admin connection — one row per run launch, rare enough.
+    pub fn note_briefing(
+        &self,
+        project_id: &str,
+        chat_id: &str,
+        agent: &str,
+        chars: i64,
+        at_ms: i64,
+    ) -> Result<(), MemoryError> {
+        let conn = lock(&self.write);
+        conn.execute(
+            "INSERT INTO memory_briefings(project_id, chat_id, agent, occurred_at_ms, chars)
+             VALUES(?1, ?2, ?3, ?4, ?5)",
+            params![project_id, chat_id, agent, at_ms, chars],
+        )?;
+        Ok(())
+    }
+
+    /// Add `delta` to a daily counter (`day` = days since epoch). Used for
+    /// `call.<tool>` memory.* MCP calls; aggregates only, never content.
+    pub fn bump_metric(
+        &self,
+        project_id: &str,
+        agent: &str,
+        metric: &str,
+        delta: i64,
+        at_ms: i64,
+    ) -> Result<(), MemoryError> {
+        let conn = lock(&self.write);
+        conn.execute(
+            "INSERT INTO memory_metrics(day, project_id, agent, metric, value)
+             VALUES(?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(day, project_id, agent, metric)
+             DO UPDATE SET value = value + excluded.value",
+            params![at_ms.div_euclid(DAY_MS), project_id, agent, metric, delta],
+        )?;
+        Ok(())
+    }
+
+    /// Trailing-window aggregates for the "is the briefing paying off?"
+    /// block: injections, memory.* call counts, and read_file-per-session
+    /// split by whether the chat got a briefing. Counts only — the UI adds
+    /// the "not a controlled comparison" caveat itself.
+    pub fn usage_stats(&self, since_ms: i64) -> Result<MemoryUsageStats, MemoryError> {
+        let conn = lock(&self.conn);
+        let (briefings, briefing_chars): (i64, i64) = conn.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(chars), 0)
+             FROM memory_briefings WHERE occurred_at_ms >= ?1",
+            params![since_ms],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let mut memory_calls: Vec<(String, i64)> = Vec::new();
+        {
+            let mut stmt = conn.prepare(
+                "SELECT metric, SUM(value) FROM memory_metrics
+                 WHERE day >= ?1 AND metric LIKE 'call.%'
+                 GROUP BY metric ORDER BY SUM(value) DESC, metric",
+            )?;
+            let rows = stmt.query_map(params![since_ms.div_euclid(DAY_MS)], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+            })?;
+            for row in rows {
+                memory_calls.push(row?);
+            }
+        }
+        // Per RUN, not per chat: a run is "briefed" when a briefing landed
+        // between the previous run's start and its own `session_start` (the
+        // injection precedes it), and its reads are the read_file calls
+        // between its start and the next run's start. A chat-level split
+        // would count a resumed run (no briefing) as briefed just because
+        // the chat's first run got one. Runs that started before the window
+        // are not counted (their reads are not split across the edge).
+        let mut stats = MemoryUsageStats {
+            briefings,
+            briefing_chars,
+            memory_calls,
+            sessions_briefed: 0,
+            sessions_unbriefed: 0,
+            read_files_briefed: 0,
+            read_files_unbriefed: 0,
+        };
+        let mut stmt = conn.prepare(
+            "WITH starts AS (
+               SELECT project_id, chat_id, source_seq AS start_seq,
+                      occurred_at_ms AS start_ms,
+                      LAG(occurred_at_ms) OVER w AS prev_ms,
+                      LEAD(source_seq) OVER w AS next_seq
+               FROM memory_events
+               WHERE kind = 'session_start'
+               WINDOW w AS (PARTITION BY project_id, chat_id ORDER BY source_seq)
+             )
+             SELECT EXISTS (
+                      SELECT 1 FROM memory_briefings b
+                      WHERE b.chat_id = s.chat_id
+                        AND b.occurred_at_ms <= s.start_ms + 1000
+                        AND (s.prev_ms IS NULL OR b.occurred_at_ms > s.prev_ms)
+                    ) AS briefed,
+                    (SELECT COUNT(*) FROM memory_events r
+                      WHERE r.project_id = s.project_id AND r.chat_id = s.chat_id
+                        AND r.kind = 'tool_call' AND r.tool_name = 'read_file'
+                        AND r.source_seq > s.start_seq
+                        AND (s.next_seq IS NULL OR r.source_seq < s.next_seq)) AS reads
+             FROM starts s
+             WHERE s.start_ms >= ?1",
+        )?;
+        let rows = stmt.query_map(params![since_ms], |r| {
+            Ok((r.get::<_, bool>(0)?, r.get::<_, i64>(1)?))
+        })?;
+        for row in rows {
+            let (briefed, reads) = row?;
+            if briefed {
+                stats.sessions_briefed += 1;
+                stats.read_files_briefed += reads;
+            } else {
+                stats.sessions_unbriefed += 1;
+                stats.read_files_unbriefed += reads;
+            }
+        }
+        drop(stmt);
+        Ok(stats)
     }
 
     /// Storage footprint for the resource panel (Phase 5 consumes this).
@@ -2014,6 +2053,24 @@ impl MemoryService {
             bytes,
         })
     }
+}
+
+/// Trailing-window usage aggregates — counts only, never content.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct MemoryUsageStats {
+    /// Briefing injections in the window.
+    pub briefings: i64,
+    /// Total injected chars (the UI estimates tokens as chars ÷ 4).
+    pub briefing_chars: i64,
+    /// `call.<tool>` metric name → count, sorted by count desc.
+    pub memory_calls: Vec<(String, i64)>,
+    /// `session_start` rows in chats that got ≥1 briefing in the window.
+    pub sessions_briefed: i64,
+    /// `session_start` rows in chats with no briefing in the window.
+    pub sessions_unbriefed: i64,
+    /// `read_file` tool calls in briefed / unbriefed chats.
+    pub read_files_briefed: i64,
+    pub read_files_unbriefed: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2065,6 +2122,78 @@ fn row_to_event(r: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryEvent> {
         reasoning_tokens: r.get(14)?,
         duration_ms: r.get(15)?,
     })
+}
+
+/// `(id, FactDigest)` row for the briefing facts queries — `id` first so
+/// callers can dedupe BM25 matches against the fill query.
+fn fact_digest_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<(i64, FactDigest)> {
+    Ok((
+        r.get(0)?,
+        FactDigest {
+            kind: r.get(1)?,
+            content: r.get(2)?,
+            source: r.get(3)?,
+            source_agent: r.get(4)?,
+            source_path: r.get(5)?,
+            confidence: r.get(6)?,
+            stale: r.get::<_, Option<i64>>(7)?.is_some(),
+        },
+    ))
+}
+
+/// Function words (English + French) that carry no retrieval signal in a
+/// task prompt. Without this, "can you please fix the ..." spends the whole
+/// term budget on filler.
+const STOPWORDS: &[&str] = &[
+    "the", "and", "for", "you", "can", "could", "would", "should", "please", "this", "that",
+    "with", "from", "into", "about", "have", "has", "had", "are", "was", "were", "not", "but",
+    "its", "our", "your", "what", "how", "why", "when", "where", "which", "who", "also", "just",
+    "then", "than", "there", "here", "some", "any", "all", "now", "need", "want", "let", "make",
+    "it", "so", "to", "of", "in", "on", "is", "be", "do", "if", "as", "at", "by", "or", "an", "le",
+    "la", "les", "un", "une", "des", "du", "de", "et", "ou", "en", "dans", "sur", "pour", "par",
+    "avec", "sans", "que", "qui", "quoi", "est", "sont", "pas", "ne", "ce", "cet", "cette", "ces",
+    "mon", "ma", "mes", "ton", "ta", "tes", "son", "sa", "ses", "nous", "vous", "ils", "elle",
+    "elles", "je", "tu", "il", "on", "me", "te", "se", "si", "au", "aux", "plus", "peux", "veux",
+    "faut", "donc", "alors", "aussi", "comme", "tout", "tous", "qu", "ca", "ça",
+];
+
+/// Content terms of a task prompt: lowercase alphanumeric tokens of 2+ chars,
+/// stopwords removed, deduplicated, at most 10.
+fn query_terms(query: &str) -> Vec<String> {
+    let mut terms: Vec<String> = Vec::new();
+    for token in query.split(|c: char| !c.is_alphanumeric()) {
+        let term = token.to_lowercase();
+        if term.chars().count() < 2 || STOPWORDS.contains(&term.as_str()) || terms.contains(&term) {
+            continue;
+        }
+        terms.push(term);
+        if terms.len() == 10 {
+            break;
+        }
+    }
+    terms
+}
+
+/// OR-joined FTS5 expression over a task prompt's content terms, for BM25
+/// RANKING. `fts_match_expr` ANDs its terms, which suits an explicit search
+/// box but never matches a natural-language prompt: every word would have to
+/// sit in one single fact, so the ranking silently never applied. With OR,
+/// BM25 itself weighs rare terms above common ones.
+fn fts_or_expr(query: &str) -> Option<String> {
+    let terms = query_terms(query);
+    (!terms.is_empty()).then(|| {
+        terms
+            .iter()
+            .map(|term| format!("\"{term}\""))
+            .collect::<Vec<_>>()
+            .join(" OR ")
+    })
+}
+
+/// How many query terms appear in `path` (lowercase substring match).
+fn term_score(path: &str, terms: &[String]) -> usize {
+    let lower = path.to_lowercase();
+    terms.iter().filter(|t| lower.contains(t.as_str())).count()
 }
 
 fn row_to_fact(r: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryFact> {
@@ -2542,7 +2671,86 @@ fn migrate(conn: &mut Connection) -> Result<(), MemoryError> {
              PRAGMA user_version = 6;",
         )?;
     }
+    if version < 8 {
+        // v8: detail counters for the "is the briefing paying off?" block —
+        // aggregates only, never content. `memory_briefings` keeps one row
+        // per injection so sessions can be split briefed/unbriefed;
+        // `memory_metrics` is the daily counter for everything else
+        // (`call.<tool>` for memory.* MCP calls today).
+        conn.execute_batch(
+            "CREATE TABLE memory_briefings (
+               id INTEGER PRIMARY KEY,
+               project_id TEXT NOT NULL,
+               chat_id TEXT NOT NULL,
+               agent TEXT NOT NULL DEFAULT '',
+               occurred_at_ms INTEGER NOT NULL,
+               chars INTEGER NOT NULL
+             );
+             CREATE INDEX idx_memory_briefings_time
+               ON memory_briefings(occurred_at_ms);
+             CREATE INDEX idx_memory_briefings_chat
+               ON memory_briefings(chat_id, occurred_at_ms);
+
+             CREATE TABLE memory_metrics (
+               day INTEGER NOT NULL,
+               project_id TEXT NOT NULL,
+               agent TEXT NOT NULL DEFAULT '',
+               metric TEXT NOT NULL,
+               value INTEGER NOT NULL DEFAULT 0,
+               PRIMARY KEY(day, project_id, agent, metric)
+             );
+             PRAGMA user_version = 8;",
+        )?;
+    }
+    // Databases created while the optional embeddings tier existed may carry
+    // triggers that reference its vector table. That module is gone, so such
+    // a trigger would make every fact delete fail with "no such module".
+    let legacy_triggers: Vec<String> = {
+        let mut stmt = conn.prepare(
+            "SELECT name FROM sqlite_master
+             WHERE type = 'trigger' AND sql LIKE '%memory_fact_vectors%'",
+        )?;
+        stmt.query_map([], |r| r.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    for name in legacy_triggers {
+        conn.execute_batch(&format!(
+            "DROP TRIGGER IF EXISTS \"{}\"",
+            name.replace('"', "\"\"")
+        ))?;
+    }
     Ok(())
+}
+
+/// Build an FTS5 MATCH expression from free text: up to 8 whitespace terms,
+/// each quoted (embedded quotes doubled), ANDed; the last term becomes a
+/// prefix query so the `prefix='2 3'` index is exercised ("src/mai"* →
+/// src/main.rs). `None` when the query has no usable term.
+fn fts_match_expr(query: &str) -> Option<String> {
+    let terms: Vec<String> = query
+        .split_whitespace()
+        .take(8)
+        .map(|t| t.trim_matches('"').to_string())
+        .filter(|t| !t.is_empty())
+        .collect();
+    if terms.is_empty() {
+        return None;
+    }
+    Some(
+        terms
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                let quoted = format!("\"{}\"", t.replace('"', "\"\""));
+                if i + 1 == terms.len() {
+                    format!("{quoted}*")
+                } else {
+                    quoted
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" AND "),
+    )
 }
 
 /// FTS5 over the metadata `search_text` column (external content). Returns
@@ -2601,61 +2809,6 @@ fn ensure_facts_fts(conn: &Connection) -> Result<bool, MemoryError> {
             Ok(false)
         }
     }
-}
-
-#[cfg(feature = "embeddings")]
-fn register_vector_extension(conn: &Connection) -> Result<(), MemoryError> {
-    use std::ffi::{CStr, c_char, c_int, c_void};
-
-    type ExtensionInit =
-        unsafe extern "C" fn(*mut rusqlite::ffi::sqlite3, *mut *mut c_char, *const c_void) -> c_int;
-    let init: ExtensionInit =
-        unsafe { std::mem::transmute(sqlite_vec::sqlite3_vec_init as *const ()) };
-    let mut error_message = std::ptr::null_mut();
-    let result = unsafe { init(conn.handle(), &mut error_message, std::ptr::null()) };
-    if result == rusqlite::ffi::SQLITE_OK {
-        Ok(())
-    } else {
-        let detail = if error_message.is_null() {
-            String::new()
-        } else {
-            let detail = unsafe { CStr::from_ptr(error_message) }
-                .to_string_lossy()
-                .into_owned();
-            unsafe { rusqlite::ffi::sqlite3_free(error_message.cast()) };
-            detail
-        };
-        Err(MemoryError::Other(format!(
-            "register sqlite-vec extension: SQLite error {result}: {detail}"
-        )))
-    }
-}
-
-#[cfg(feature = "embeddings")]
-fn ensure_vector_table(conn: &Connection) -> Result<(), MemoryError> {
-    conn.execute_batch(
-        "CREATE VIRTUAL TABLE IF NOT EXISTS memory_fact_vectors USING vec0(
-           embedding FLOAT[384],
-           project_id TEXT,
-           scope TEXT
-         );
-         CREATE TRIGGER IF NOT EXISTS memory_fact_vectors_ad
-           AFTER DELETE ON memory_facts BEGIN
-           DELETE FROM memory_fact_vectors WHERE rowid = old.id;
-         END;
-         CREATE TRIGGER IF NOT EXISTS memory_fact_vectors_stale
-           AFTER UPDATE OF stale_at_ms ON memory_facts
-           WHEN new.stale_at_ms IS NOT NULL BEGIN
-           DELETE FROM memory_fact_vectors WHERE rowid = old.id;
-         END;
-         CREATE TRIGGER IF NOT EXISTS memory_fact_vectors_scope
-           AFTER UPDATE OF project_id, scope ON memory_facts BEGIN
-           UPDATE memory_fact_vectors
-           SET project_id = new.project_id, scope = new.scope
-           WHERE rowid = old.id;
-         END;",
-    )?;
-    Ok(())
 }
 
 // ── writer ────────────────────────────────────────────────────────────────
@@ -3003,217 +3156,8 @@ fn search_text(rec: &MemoryRecord, rel_path: Option<&str>) -> String {
     parts.join(" ")
 }
 
-/// Copy the store files from `src_dir` to `dst_dir`. Runs before the first
-/// open, so there is no live database to corrupt; idempotent (a no-op when
-/// the source has none, or the destination already holds a store at least
-/// as new as the source — a NEWER source replaces a stale destination,
-/// whose files are kept in a `.komet-relocate-backup-*` folder). The
-/// source is left in place: it is derived data and a free rollback if the
-/// new location misbehaves.
-///
-/// Staged: every file is copied into a scratch dir first and published by
-/// rename, `memory.sqlite` LAST — its presence is what marks the
-/// destination "already relocated", so an interrupted copy leaves a
-/// retryable state instead of a db without its WAL.
-pub fn relocate_store(src_dir: &Path, dst_dir: &Path) -> std::io::Result<()> {
-    let src_db = src_dir.join(DB_FILE);
-    if !src_db.exists() {
-        return Ok(());
-    }
-    if dst_dir.join(DB_FILE).exists() {
-        // The source is deliberately kept after a move, so moving A -> B -> A
-        // finds an OLD store at A. Silently adopting it would drop months of
-        // data that lives at B: when the source is newer, back the stale
-        // destination up and relocate over it; otherwise keep it as is.
-        if newest_store_mtime(src_dir) > newest_store_mtime(dst_dir) {
-            let backup = dst_dir.join(format!(".komet-relocate-backup-{}", now_ms()));
-            std::fs::create_dir_all(&backup)?;
-            for suffix in ["", "-wal", "-shm"] {
-                let name = format!("{DB_FILE}{suffix}");
-                let path = dst_dir.join(&name);
-                if path.exists() {
-                    std::fs::rename(&path, backup.join(&name))?;
-                }
-            }
-        } else {
-            return Ok(());
-        }
-    }
-    std::fs::create_dir_all(dst_dir)?;
-    let stage = dst_dir.join(".komet-relocate");
-    if stage.exists() {
-        std::fs::remove_dir_all(&stage)?;
-    }
-    std::fs::create_dir_all(&stage)?;
-    let publish = (|| -> std::io::Result<()> {
-        // Fold the source into ONE consistent file first: a crash can leave
-        // committed rows in the WAL only, and a three-file copy pairs a
-        // database with a WAL that may not match it. VACUUM INTO reads
-        // through the WAL, so the copy is complete and self-contained.
-        // Falls back to the file copy when the source cannot be vacuumed
-        // (corrupt, a loaded extension missing, disk too full).
-        let vacuumed = stage.join(DB_FILE);
-        let _ = std::fs::remove_file(&vacuumed);
-        let vac: Result<(), String> = (|| {
-            let conn = Connection::open(&src_db).map_err(|err| err.to_string())?;
-            #[cfg(feature = "embeddings")]
-            register_vector_extension(&conn).map_err(|err| err.to_string())?;
-            conn.busy_timeout(Duration::from_secs(5))
-                .map_err(|err| err.to_string())?;
-            conn.execute("VACUUM INTO ?1", [vacuumed.to_string_lossy().as_ref()])
-                .map(|_| ())
-                .map_err(|err| err.to_string())
-        })();
-        if let Err(err) = vac {
-            tracing::warn!(error = %err, "memory: VACUUM INTO failed, copying files instead");
-            let _ = std::fs::remove_file(&vacuumed);
-            for suffix in ["", "-wal", "-shm"] {
-                let name = format!("{DB_FILE}{suffix}");
-                let src = src_dir.join(&name);
-                if src.exists() {
-                    std::fs::copy(&src, stage.join(&name))?;
-                }
-            }
-        }
-        // WAL/SHM first, the main file last: until `memory.sqlite` lands the
-        // destination still looks un-relocated, so a crash here just retries.
-        for name in [
-            format!("{DB_FILE}-wal"),
-            format!("{DB_FILE}-shm"),
-            DB_FILE.to_string(),
-        ] {
-            let staged = stage.join(&name);
-            if staged.exists() {
-                std::fs::rename(&staged, dst_dir.join(&name))?;
-            } else {
-                // No staged file: drop any orphan left by an earlier attempt
-                // so a stale WAL can't pair with the fresh database.
-                let _ = std::fs::remove_file(dst_dir.join(&name));
-            }
-        }
-        Ok(())
-    })();
-    let _ = std::fs::remove_dir_all(&stage);
-    publish
-}
-
-/// The files a relocation may leave behind in the directory it moved FROM:
-/// the store's own database files and the `.komet-relocate-backup-*`
-/// folders `relocate_store` creates. Nothing else in that directory is
-/// ever touched — the folder may hold unrelated user files.
-fn previous_copy_entries(dir: &Path) -> std::io::Result<Vec<std::path::PathBuf>> {
-    let mut paths = Vec::new();
-    for suffix in ["", "-wal", "-shm"] {
-        let path = dir.join(format!("{DB_FILE}{suffix}"));
-        if std::fs::symlink_metadata(&path).is_ok_and(|meta| !meta.file_type().is_symlink()) {
-            paths.push(path);
-        }
-    }
-    match std::fs::read_dir(dir) {
-        Ok(entries) => {
-            for entry in entries {
-                let entry = entry?;
-                let name = entry.file_name();
-                let is_backup = name
-                    .to_str()
-                    .is_some_and(|name| name.starts_with(".komet-relocate-backup-"));
-                if is_backup && entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-                    paths.push(entry.path());
-                }
-            }
-        }
-        // A vanished directory means nothing left to clean.
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => return Err(err),
-    }
-    Ok(paths)
-}
-
-/// Bytes a previous relocation left in `dir` (0 = nothing to clean).
-pub fn previous_copy_bytes(dir: &Path) -> u64 {
-    previous_copy_entries(dir)
-        .map(|paths| {
-            paths
-                .iter()
-                .map(|path| {
-                    if path.is_dir() {
-                        dir_bytes(path)
-                    } else {
-                        std::fs::symlink_metadata(path)
-                            .map(|meta| meta.len())
-                            .unwrap_or(0)
-                    }
-                })
-                .sum()
-        })
-        .unwrap_or(0)
-}
-
-/// Delete only what [`previous_copy_bytes`] counted. Returns bytes freed.
-pub fn delete_previous_copy(dir: &Path) -> std::io::Result<u64> {
-    let paths = previous_copy_entries(dir)?;
-    let mut freed = 0;
-    for path in paths {
-        let bytes = if path.is_dir() {
-            dir_bytes(&path)
-        } else {
-            std::fs::symlink_metadata(&path)
-                .map(|meta| meta.len())
-                .unwrap_or(0)
-        };
-        let removed = if path.is_dir() {
-            std::fs::remove_dir_all(&path)
-        } else {
-            std::fs::remove_file(&path)
-        };
-        if let Err(err) = removed
-            && err.kind() != std::io::ErrorKind::NotFound
-        {
-            return Err(err);
-        }
-        freed += bytes;
-    }
-    Ok(freed)
-}
-
-/// Recursive byte total of a directory, symlinks not followed.
-fn dir_bytes(dir: &Path) -> u64 {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return 0;
-    };
-    let mut total = 0;
-    for entry in entries.flatten() {
-        let Ok(kind) = entry.file_type() else {
-            continue;
-        };
-        if kind.is_symlink() {
-            continue;
-        }
-        if kind.is_dir() {
-            total += dir_bytes(&entry.path());
-        } else if let Ok(meta) = entry.metadata() {
-            total += meta.len();
-        }
-    }
-    total
-}
-
 fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
-}
-
-/// Newest modification time among the store's database and WAL files — the
-/// WAL carries the latest committed writes until a checkpoint.
-fn newest_store_mtime(dir: &Path) -> Option<std::time::SystemTime> {
-    ["", "-wal"]
-        .iter()
-        .filter_map(|suffix| {
-            std::fs::metadata(dir.join(format!("{DB_FILE}{suffix}")))
-                .ok()?
-                .modified()
-                .ok()
-        })
-        .max()
 }
 
 #[cfg(test)]
@@ -3312,83 +3256,6 @@ mod tests {
         let cursor = svc.chat_cursor("chat-1").unwrap();
         assert_eq!(cursor.last_seq, 2);
         assert_eq!(cursor.gap_seq, None);
-    }
-
-    #[test]
-    #[cfg(feature = "embeddings")]
-    fn sqlite_vec_returns_nearest_valid_facts_and_deletes_forgotten_vectors() {
-        let (svc, _dir) = svc();
-        svc.enable_embeddings().unwrap();
-        let first = svc.create_fact(&fact("Use SQLite")).unwrap();
-        let second = svc.create_fact(&fact("Use Rust")).unwrap();
-        let mut first_vector = vec![0.0; crate::EMBEDDING_DIMENSIONS];
-        first_vector[0] = 1.0;
-        let mut second_vector = vec![0.0; crate::EMBEDDING_DIMENSIONS];
-        second_vector[1] = 1.0;
-        svc.store_fact_embeddings(&[(first, first_vector.clone()), (second, second_vector)])
-            .unwrap();
-        assert_eq!(svc.embedding_counts().unwrap(), (2, 2));
-        assert!(svc.store_fact_embeddings(&[(first, vec![0.0; 3])]).is_err());
-        assert!(svc.semantic_search_facts("p_test", &[0.0; 3], 5).is_err());
-
-        let results = svc
-            .semantic_search_facts("p_test", &first_vector, 5)
-            .unwrap();
-        assert_eq!(results.first().map(|result| result.fact.id), Some(first));
-        assert_eq!(results.len(), 2);
-
-        assert!(svc.forget_fact(first).unwrap());
-        let results = svc
-            .semantic_search_facts("p_test", &first_vector, 5)
-            .unwrap();
-        assert!(results.iter().all(|result| result.fact.id != first));
-        assert_eq!(svc.embedding_counts().unwrap(), (1, 1));
-        assert!(svc.mark_fact_stale(second, 123).unwrap());
-        assert_eq!(svc.embedding_counts().unwrap(), (0, 0));
-        assert!(
-            svc.semantic_search_facts("p_test", &first_vector, 5)
-                .unwrap()
-                .is_empty()
-        );
-        let global = svc.create_fact(&fact("Use shared conventions")).unwrap();
-        svc.store_fact_embeddings(&[(global, first_vector.clone())])
-            .unwrap();
-        assert!(svc.promote_fact_to_global(global, true).unwrap());
-        assert_eq!(
-            svc.semantic_search_facts("p_other", &first_vector, 5)
-                .unwrap()
-                .first()
-                .map(|result| result.fact.id),
-            Some(global)
-        );
-    }
-
-    #[test]
-    #[cfg(feature = "embeddings")]
-    fn sqlite_vec_is_opt_in_and_existing_vectors_remain_readable_when_reopened() {
-        let (svc, dir) = svc();
-        let has_vector_table = |service: &MemoryService| {
-            lock(&service.conn)
-                .query_row(
-                    "SELECT EXISTS(
-                       SELECT 1 FROM sqlite_master WHERE type = 'table'
-                         AND name = 'memory_fact_vectors'
-                     )",
-                    [],
-                    |row| row.get::<_, bool>(0),
-                )
-                .unwrap()
-        };
-
-        assert!(!has_vector_table(&svc));
-        svc.enable_embeddings().unwrap();
-        assert!(has_vector_table(&svc));
-        drop(svc);
-
-        let reopened = MemoryService::open(dir.path().join("memory")).unwrap();
-        assert!(has_vector_table(&reopened));
-        reopened.enable_embeddings().unwrap();
-        assert_eq!(reopened.stats("p_test").unwrap().events, 0);
     }
 
     #[test]
@@ -3591,7 +3458,7 @@ mod tests {
             .unwrap();
         wait_for(|| svc.chat_cursor("chat-1").unwrap().last_seq == 1);
         assert_eq!(svc.stats("p_test").unwrap().events, 0);
-        assert!(svc.briefing("p_test", None).unwrap().is_none());
+        assert!(svc.briefing("p_test", None, None).unwrap().is_none());
     }
 
     #[test]
@@ -3693,7 +3560,9 @@ mod tests {
         svc.enqueue(MemoryItem::Record(Box::new(end))).unwrap();
         wait_for(|| svc.stats("p_test").unwrap().events == 303);
 
-        let digest = svc.briefing_digest("p_test", None, now - 1000).unwrap();
+        let digest = svc
+            .briefing_digest("p_test", None, now - 1000, None)
+            .unwrap();
         let b = digest
             .agents
             .iter()
@@ -3741,7 +3610,7 @@ mod tests {
     #[test]
     fn briefing_is_none_for_empty_project() {
         let (svc, _dir) = svc();
-        assert!(svc.briefing("p_empty", None).unwrap().is_none());
+        assert!(svc.briefing("p_empty", None, None).unwrap().is_none());
     }
 
     #[test]
@@ -3839,107 +3708,6 @@ mod tests {
         assert_eq!(cursor.gap_seq, None);
         // Project settings survive a wipe.
         assert!(svc.is_enabled("p_test").unwrap());
-    }
-
-    #[test]
-    fn relocate_copies_db_and_is_idempotent() {
-        let src = tempfile::tempdir().unwrap();
-        let dst = tempfile::tempdir().unwrap();
-        let src_dir = src.path().join("memory");
-        let dst_dir = dst.path().join("memory");
-        let svc = MemoryService::open(&src_dir).unwrap();
-        svc.enqueue(MemoryItem::Record(Box::new(rec(1, "session_start"))))
-            .unwrap();
-        wait_for(|| svc.stats("p_test").unwrap().events == 1);
-        drop(svc);
-
-        relocate_store(&src_dir, &dst_dir).unwrap();
-        assert!(dst_dir.join("memory.sqlite").exists());
-        // Second run is a no-op: the destination already has a database.
-        relocate_store(&src_dir, &dst_dir).unwrap();
-        let reopened = MemoryService::open(&dst_dir).unwrap();
-        assert_eq!(reopened.stats("p_test").unwrap().events, 1);
-    }
-
-    #[test]
-    fn relocate_without_source_is_a_noop() {
-        let dst = tempfile::tempdir().unwrap();
-        let missing = dst.path().join("missing");
-        relocate_store(&missing, dst.path()).unwrap();
-        assert!(!dst.path().join("memory.sqlite").exists());
-    }
-
-    #[test]
-    fn relocate_keeps_rows_that_only_live_in_an_uncheckpointed_wal() {
-        let src = tempfile::tempdir().unwrap();
-        let dst = tempfile::tempdir().unwrap();
-        let src_dir = src.path().join("memory");
-        let dst_dir = dst.path().join("memory");
-        std::fs::create_dir_all(&src_dir).unwrap();
-        let db = src_dir.join("memory.sqlite");
-        // Snapshot db+WAL while the connection is open, then restore that
-        // snapshot: it is exactly what a crash leaves — rows committed in the
-        // WAL, never checkpointed into the database file.
-        {
-            let conn = Connection::open(&db).unwrap();
-            conn.pragma_update(None, "journal_mode", "WAL").unwrap();
-            conn.pragma_update(None, "wal_autocheckpoint", 0i64)
-                .unwrap();
-            conn.execute_batch("CREATE TABLE t (v TEXT); INSERT INTO t VALUES ('in-wal');")
-                .unwrap();
-            for suffix in ["", "-wal"] {
-                std::fs::copy(
-                    src_dir.join(format!("memory.sqlite{suffix}")),
-                    src.path().join(format!("keep{suffix}")),
-                )
-                .unwrap();
-            }
-        }
-        for suffix in ["", "-wal"] {
-            std::fs::copy(
-                src.path().join(format!("keep{suffix}")),
-                src_dir.join(format!("memory.sqlite{suffix}")),
-            )
-            .unwrap();
-        }
-        let _ = std::fs::remove_file(src_dir.join("memory.sqlite-shm"));
-        assert!(
-            std::fs::metadata(src_dir.join("memory.sqlite-wal"))
-                .unwrap()
-                .len()
-                > 0,
-            "the row must live in the WAL, not the database file"
-        );
-
-        relocate_store(&src_dir, &dst_dir).unwrap();
-        let conn = Connection::open(dst_dir.join("memory.sqlite")).unwrap();
-        let value: String = conn
-            .query_row("SELECT v FROM t", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(value, "in-wal");
-    }
-
-    #[test]
-    fn delete_previous_copy_only_touches_store_files() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        std::fs::write(root.join("memory.sqlite"), b"db").unwrap();
-        std::fs::write(root.join("memory.sqlite-wal"), b"wal").unwrap();
-        std::fs::write(root.join("notes.txt"), b"keep me").unwrap();
-        let backup = root.join(".komet-relocate-backup-1");
-        std::fs::create_dir_all(&backup).unwrap();
-        std::fs::write(backup.join("memory.sqlite"), b"old").unwrap();
-
-        assert_eq!(previous_copy_bytes(root), 8);
-        assert_eq!(delete_previous_copy(root).unwrap(), 8);
-        assert!(!root.join("memory.sqlite").exists());
-        assert!(!root.join("memory.sqlite-wal").exists());
-        assert!(!backup.exists());
-        assert!(
-            root.join("notes.txt").exists(),
-            "unrelated files in that folder must survive"
-        );
-        assert_eq!(previous_copy_bytes(root), 0);
     }
 
     #[test]
@@ -4081,7 +3849,7 @@ mod tests {
         wait_for(|| svc.stats("p_test").unwrap().events == 3);
 
         let digest = svc
-            .briefing_digest("p_test", Some(("chat-1", "agent-a")), now - 1000)
+            .briefing_digest("p_test", Some(("chat-1", "agent-a")), now - 1000, None)
             .unwrap();
         assert_eq!(digest.chats, 2, "chat-1 still counts via agent-b");
         let a = digest
@@ -4110,7 +3878,12 @@ mod tests {
             svc.create_fact(f).unwrap();
         }
         let digest = svc
-            .briefing_digest("p_test", Some(("chat-me", "agent-x")), now_ms() - 1000)
+            .briefing_digest(
+                "p_test",
+                Some(("chat-me", "agent-x")),
+                now_ms() - 1000,
+                None,
+            )
             .unwrap();
         let contents: Vec<&str> = digest.facts.iter().map(|f| f.content.as_str()).collect();
         assert!(contents.iter().any(|c| c.starts_with("Project:")));
@@ -4121,13 +3894,81 @@ mod tests {
         );
         // No receiving chat known: session-scoped facts stay out entirely.
         let digest = svc
-            .briefing_digest("p_test", None, now_ms() - 1000)
+            .briefing_digest("p_test", None, now_ms() - 1000, None)
             .unwrap();
         assert!(
             digest
                 .facts
                 .iter()
                 .all(|f| !f.content.starts_with("Mine:") && !f.content.starts_with("Theirs:"))
+        );
+    }
+
+    #[test]
+    fn briefing_task_query_ranks_matching_facts_first() {
+        let (svc, _dir) = svc();
+        // The matching fact deliberately carries the LOWEST confidence:
+        // only the task-query ranking can lift it above the filler order.
+        let mut match_fact = fact("Parser must stream tokens lazily");
+        match_fact.confidence = 0.1;
+        let mut other_fact = fact("Deploys run every Sunday night");
+        other_fact.confidence = 0.9;
+        svc.create_fact(&match_fact).unwrap();
+        svc.create_fact(&other_fact).unwrap();
+
+        let digest = svc
+            .briefing_digest("p_test", None, now_ms() - 1000, Some("parser stream"))
+            .unwrap();
+        let contents: Vec<&str> = digest.facts.iter().map(|f| f.content.as_str()).collect();
+        assert_eq!(contents.first(), Some(&"Parser must stream tokens lazily"));
+
+        // Without a query the confidence/recency order is unchanged.
+        let digest = svc
+            .briefing_digest("p_test", None, now_ms() - 1000, None)
+            .unwrap();
+        assert_eq!(
+            digest.facts.first().map(|f| f.content.as_str()),
+            Some("Deploys run every Sunday night")
+        );
+    }
+
+    #[test]
+    fn briefing_task_query_works_with_a_natural_language_prompt() {
+        let (svc, _dir) = svc();
+        let mut match_fact = fact("Parser must stream tokens lazily");
+        match_fact.confidence = 0.1;
+        let mut other_fact = fact("Deploys run every Sunday night");
+        other_fact.confidence = 0.9;
+        svc.create_fact(&match_fact).unwrap();
+        svc.create_fact(&other_fact).unwrap();
+
+        // A real prompt is mostly filler: ANDing its raw words would match
+        // no fact at all, and the ranking would silently never apply.
+        for prompt in [
+            "can you please fix the parser so it can stream tokens lazily today",
+            "peux-tu corriger le parser pour qu'il lise les tokens en streaming ?",
+        ] {
+            let digest = svc
+                .briefing_digest("p_test", None, now_ms() - 1000, Some(prompt))
+                .unwrap();
+            assert_eq!(
+                digest.facts.first().map(|f| f.content.as_str()),
+                Some("Parser must stream tokens lazily"),
+                "prompt not ranked: {prompt}"
+            );
+        }
+    }
+
+    #[test]
+    fn query_terms_drop_filler_and_duplicates() {
+        assert_eq!(
+            query_terms("Can you PLEASE fix the parser, the parser!"),
+            vec!["fix", "parser"]
+        );
+        assert!(fts_or_expr("le la de").is_none());
+        assert_eq!(
+            fts_or_expr("fix parser").as_deref(),
+            Some("\"fix\" OR \"parser\"")
         );
     }
 
@@ -4144,40 +3985,6 @@ mod tests {
             report.facts, 250,
             "export must not stop at the 200-row reader cap"
         );
-    }
-
-    #[test]
-    fn relocate_replaces_a_stale_destination_and_keeps_a_backup() {
-        let tmp = tempfile::tempdir().unwrap();
-        let a = tmp.path().join("a");
-        let b = tmp.path().join("b");
-        // An old store left at `a` by an earlier move away from it.
-        drop(MemoryService::open(&a).unwrap());
-        std::thread::sleep(Duration::from_millis(50));
-        // The live store moved on at `b` and holds newer data.
-        let live = MemoryService::open(&b).unwrap();
-        live.enqueue(MemoryItem::Record(Box::new(rec(1, "session_start"))))
-            .unwrap();
-        wait_for(|| live.stats("p_test").unwrap().events == 1);
-        drop(live);
-
-        relocate_store(&b, &a).unwrap();
-        let reopened = MemoryService::open(&a).unwrap();
-        assert_eq!(
-            reopened.stats("p_test").unwrap().events,
-            1,
-            "the newer store must win over the stale destination"
-        );
-        let backups = std::fs::read_dir(&a)
-            .unwrap()
-            .filter_map(Result::ok)
-            .filter(|e| {
-                e.file_name()
-                    .to_string_lossy()
-                    .starts_with(".komet-relocate-backup-")
-            })
-            .count();
-        assert_eq!(backups, 1, "the stale store must be backed up, not deleted");
     }
 
     #[test]
@@ -4238,5 +4045,166 @@ mod tests {
         assert!(svc.forget_fact(id).unwrap());
         svc.export_obsidian("p_test", &vault).unwrap();
         assert!(victim.exists(), "a manifest entry escaped the notes folder");
+    }
+    #[test]
+    fn usage_metrics_aggregate_per_day_and_tool() {
+        let (svc, _dir) = svc();
+        // Fresh databases migrate straight to v8 (memory_usage v7 + detail v8).
+        let version: i64 = lock(&svc.conn)
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 8);
+
+        let now = now_ms();
+        svc.bump_metric("p_test", "claude-code", "call.memory.search", 1, now)
+            .unwrap();
+        svc.bump_metric("p_test", "claude-code", "call.memory.search", 2, now)
+            .unwrap();
+        svc.bump_metric("p_test", "claude-code", "call.memory.why", 1, now)
+            .unwrap();
+        // Same metric name under another agent stays a separate row.
+        svc.bump_metric("p_test", "other-agent", "call.memory.search", 5, now)
+            .unwrap();
+        // Outside the 7-day window → excluded from usage_stats.
+        svc.bump_metric(
+            "p_test",
+            "claude-code",
+            "call.memory.old",
+            9,
+            now - 8 * DAY_MS,
+        )
+        .unwrap();
+
+        let stats = svc.usage_stats(now - 7 * DAY_MS).unwrap();
+        assert_eq!(
+            stats.memory_calls,
+            vec![
+                ("call.memory.search".to_string(), 8),
+                ("call.memory.why".to_string(), 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn briefings_split_sessions_for_read_file_stats() {
+        let (svc, _dir) = svc();
+        let now = now_ms();
+        svc.note_briefing("p_test", "chat-b", "claude-code", 400, now)
+            .unwrap();
+        // Briefed chat: 1 session_start + 4 read_file calls.
+        for seq in 1..=5u64 {
+            let mut r = rec(
+                seq,
+                if seq == 1 {
+                    "session_start"
+                } else {
+                    "tool_call"
+                },
+            );
+            r.chat_id = "chat-b".into();
+            if seq > 1 {
+                r.tool_name = Some("read_file".into());
+            }
+            svc.enqueue(MemoryItem::Record(Box::new(r))).unwrap();
+        }
+        // Unbriefed chat: 1 session_start + 8 read_file calls.
+        for seq in 1..=9u64 {
+            let mut r = rec(
+                seq,
+                if seq == 1 {
+                    "session_start"
+                } else {
+                    "tool_call"
+                },
+            );
+            r.chat_id = "chat-u".into();
+            if seq > 1 {
+                r.tool_name = Some("read_file".into());
+            }
+            svc.enqueue(MemoryItem::Record(Box::new(r))).unwrap();
+        }
+        for (chat, seq) in [("chat-b", 5), ("chat-u", 9)] {
+            svc.enqueue(MemoryItem::Checkpoint {
+                chat_id: chat.into(),
+                seq,
+            })
+            .unwrap();
+        }
+        wait_for(|| svc.totals().unwrap().0 == 14);
+
+        let stats = svc.usage_stats(now - DAY_MS).unwrap();
+        assert_eq!(stats.briefings, 1);
+        assert_eq!(stats.briefing_chars, 400);
+        assert_eq!(stats.sessions_briefed, 1);
+        assert_eq!(stats.sessions_unbriefed, 1);
+        assert_eq!(stats.read_files_briefed, 4);
+        assert_eq!(stats.read_files_unbriefed, 8);
+    }
+
+    #[test]
+    fn read_file_split_is_per_run_not_per_chat() {
+        let (svc, _dir) = svc();
+        let t0 = now_ms() - 60_000;
+        // Run 1 is briefed (the briefing lands just before its session_start);
+        // run 2 resumes the SAME chat without one. A chat-level split would
+        // count both runs as briefed.
+        svc.note_briefing("p_test", "chat-r", "claude-code", 400, t0 - 10)
+            .unwrap();
+        for (seq, kind, at) in [
+            (1u64, "session_start", t0),
+            (2, "tool_call", t0 + 1),
+            (3, "tool_call", t0 + 2),
+            (4, "session_start", t0 + 30_000),
+            (5, "tool_call", t0 + 30_001),
+            (6, "tool_call", t0 + 30_002),
+            (7, "tool_call", t0 + 30_003),
+            (8, "tool_call", t0 + 30_004),
+            (9, "tool_call", t0 + 30_005),
+        ] {
+            let mut r = rec(seq, kind);
+            r.chat_id = "chat-r".into();
+            r.occurred_at_ms = at;
+            if kind == "tool_call" {
+                r.tool_name = Some("read_file".into());
+            }
+            svc.enqueue(MemoryItem::Record(Box::new(r))).unwrap();
+        }
+        wait_for(|| svc.totals().unwrap().0 == 9);
+
+        let stats = svc.usage_stats(t0 - 1_000).unwrap();
+        assert_eq!(stats.sessions_briefed, 1);
+        assert_eq!(stats.sessions_unbriefed, 1);
+        assert_eq!(stats.read_files_briefed, 2);
+        assert_eq!(stats.read_files_unbriefed, 5);
+    }
+
+    #[test]
+    fn prune_and_forget_sweep_usage_rows() {
+        let (svc, _dir) = svc();
+        let now = now_ms();
+        let old = now - RETENTION_MS - DAY_MS;
+        svc.note_briefing("p_test", "chat-1", "claude-code", 100, old)
+            .unwrap();
+        svc.bump_metric("p_test", "claude-code", "call.memory.search", 3, old)
+            .unwrap();
+        svc.note_briefing("p_test", "chat-1", "claude-code", 200, now)
+            .unwrap();
+        svc.bump_metric("p_test", "claude-code", "call.memory.search", 1, now)
+            .unwrap();
+
+        svc.prune_older_than(now - RETENTION_MS).unwrap();
+        let stats = svc.usage_stats(0).unwrap();
+        assert_eq!(stats.briefings, 1);
+        assert_eq!(stats.briefing_chars, 200);
+        assert_eq!(
+            stats.memory_calls,
+            vec![("call.memory.search".to_string(), 1)]
+        );
+
+        // Forgetting the project wipes its counters too.
+        svc.forget_project("p_test", &[]).unwrap();
+        let stats = svc.usage_stats(0).unwrap();
+        assert_eq!(stats.briefings, 0);
+        assert!(stats.memory_calls.is_empty());
     }
 }
