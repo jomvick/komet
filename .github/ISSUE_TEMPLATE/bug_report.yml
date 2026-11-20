@@ -1,0 +1,37 @@
+---
+name: Bug report
+about: Something in Komet misbehaves — tell us how to reproduce it
+title: ""
+labels: bug
+assignees: ""
+---
+
+## What happened?
+
+<!-- Clear description of the bug. -->
+
+## Steps to reproduce
+
+1.
+2.
+3.
+
+## Expected behavior
+
+<!-- What you expected instead. -->
+
+## Environment
+
+- Komet version (`komet --version` or the release tag):
+- OS / distro / version:
+- Install type (AppImage, .deb/.rpm, one-line installer, `cargo run`):
+- Agent involved (Claude Code, Codex, Cursor, …) and its CLI version:
+
+## Logs / screenshots
+
+<!-- Paths and excerpts are fine. Relevant logs live under ~/.komet/ (e.g.
+     daemon.log, last-crash.log). Redact tokens and personal paths. -->
+
+## Additional context
+
+<!-- Anything else: sync enabled? self-hosted server? sandbox level used? -->

@@ -19,3 +19,8 @@ crates/harness/tests/fixtures/fake-acp-*.sh
 
 # Qoder CLI session artifacts
 .qoder/
+
+# Agent/tool local state — not for the public repo
+.superpowers/
+.hoplite/
+.freebuff/

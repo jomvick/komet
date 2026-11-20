@@ -13,6 +13,8 @@ queries are consumed from the pinned Rust crates listed in `Cargo.lock`.
 | Tree-sitter Python, Go, JSON, Bash, HTML, CSS, C, C++, C#, Java, Ruby and PHP grammars and queries | pinned in `Cargo.lock` | MIT | https://github.com/tree-sitter |
 | Tree-sitter TOML, Markdown, YAML, Kotlin, Swift, SQL, Lua, Nix, Make and Containerfile grammars and queries | pinned in `Cargo.lock` | MIT-compatible; see each crate | Crate repositories recorded in `Cargo.lock` |
 | comet (upstream) | — | MIT | https://github.com/zeronsh/comet — Komet is a direct fork; upstream logic ported per `crates/doc/src/parts.rs` and harness adapters |
+| gpui / gpui-platform / gpui-tokio (`jomvick/zed` fork, rev `e2ddcc6`) | 0.2.2 | Apache-2.0 | https://github.com/zed-industries/zed — GPU UI framework; GPL-licensed Zed crates (`markdown`, `ui`, `theme`, `editor`) are not used |
+| gpui-component / gpui-base (`jomvick/gpui-component` fork, rev `3634325`) | — | MIT | https://github.com/jsgrrchg/gpui-component — component library with gpui deps pointed at the fork above |
 | LobeHub Icons (`@lobehub/icons-static-svg`) | 1.101.0 | MIT | https://github.com/lobehub/lobe-icons — selected AI harness and model-provider SVGs |
 
 The full Komet distribution remains licensed under the terms in `LICENSE`.

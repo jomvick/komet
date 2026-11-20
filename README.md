@@ -1,8 +1,53 @@
-# Komet
+# Komet — native control plane for coding agents
 
-> Control your coding agents (Claude Code, Codex, Cursor, Devin, GitHub Copilot, Cline, Grok, Hermes, Muse Code, OpenCode, Pi, Antigravity, Qoder) — **100% local by default**, optional multi-device sync.
+<p align="center">
+  <img src="docs/media/demo.gif" alt="Komet demo: an agent streaming a reply, provider switching, shared memory" width="960">
+</p>
 
-Komet is a native **Rust + gpui** controller in a single binary. Each device runs a small engine that stores sessions locally. No account, no network required at install — sync only activates if you self-host it.
+> **Komet is the native control plane for coding agents.** One Rust binary drives Claude Code, Codex, Cursor, Devin, GitHub Copilot, Cline, Grok, Hermes, Muse Code, OpenCode, Pi, Antigravity and Qoder — 100% local by default, with optional self-hosted sync across your devices.
+
+## Why Komet
+
+- **Native Rust, single binary.** UI and engine ship as one executable built on [gpui](https://gpui.rs) (the framework behind Zed). No Electron, no runtime to install, no account required — `curl | sh` and you're running.
+- **Local-first, sync optional.** Every device keeps its own engine and store; nothing leaves your machine unless you deliberately self-host `komet-sync-server` (Loro CRDT, bearer-token auth, SQLite).
+- **13 agents, one interface.** Each agent is wired through its strongest native surface (stream-json, app-server, SDK, ACP, MSP) and normalized into a single session model — switch providers mid-conversation and the transcript carries over.
+
+> **Status: alpha → beta.** Core flows (run, steer, interrupt, questions, diffs, terminals, sync) are implemented and tested, but the architecture is still moving fast — expect breaking changes between releases. See [docs/PARITY.md](docs/PARITY.md) for the honest per-feature status.
+
+> **Security:** komet's sandbox settings constrain the agent CLI's own permissions — they are **not** an OS-level boundary. Agent processes run with your user's privileges. See [docs/security.md](docs/security.md) and [SECURITY.md](SECURITY.md).
+
+## Supported agents
+
+| Agent | Interface | Status |
+| --- | --- | --- |
+| Claude Code | native stream-json | stable |
+| Codex | native `codex app-server` | stable |
+| Cursor | pinned SDK shim | stable |
+| Muse Code | native Muse Session Protocol | stable |
+| Devin | ACP (`devin acp`) | experimental |
+| GitHub Copilot | ACP (`copilot --acp`) | experimental |
+| Cline | ACP (`cline --acp`) | experimental |
+| Grok | ACP (`grok agent stdio`) | experimental |
+| Hermes | ACP (`hermes acp`) | experimental |
+| OpenCode | ACP (`opencode acp`) | experimental |
+| Pi | ACP via `pi-acp` adapter | experimental |
+| Antigravity | native NDJSON run | experimental |
+| Qoder | ACP (`qoder --acp`) | experimental |
+
+"Stable" means a native protocol driver with end-to-end live verification.
+"Experimental" means the adapter is implemented and fixture-tested, but parts of
+the interaction surface (questions, compaction, subagent transcripts) are still
+gated pending live evidence — the UI shows no affordance it cannot honour.
+Details: [ARCHITECTURE.md §6](ARCHITECTURE.md) and `crates/harness/src/capabilities.rs`.
+
+## Fork notice
+
+Komet is a **fork of [Zeron / zeronsh/comet](https://github.com/zeronsh/comet)**
+(MIT, same author lineage — see [LICENSE](LICENSE) and
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)). The fork diverges on
+local-first sync, the self-hosted `komet-sync-server`, the Rust+gpui UI, and the
+agent harness layer; upstream history is preserved via the `upstream` git
+remote (`git fetch upstream`).
 
 ---
 
@@ -12,8 +57,6 @@ Komet is a native **Rust + gpui** controller in a single binary. Each device run
 - **Single binary** — UI + engine, headed or headless mode
 - **Multiple agents** — native CLI, MSP, and ACP integrations with mid-conversation provider switching
 - **Optional sync** — Loro CRDT via a self-hosted `komet-sync-server` (SQLite + bearer token)
-
-> **Security:** komet's sandbox settings constrain the agent CLI's own permissions — they are not an OS-level boundary. See [docs/security.md](docs/security.md).
 
 ---
 
@@ -223,4 +266,5 @@ Komet is a fork of [zeronsh/comet](https://github.com/zeronsh/comet) — same MI
 
 ## License
 
-[MIT](LICENSE) — contributions welcome.
+[MIT](LICENSE) — contributions welcome. See [CONTRIBUTING.md](CONTRIBUTING.md),
+[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) and [SECURITY.md](SECURITY.md).

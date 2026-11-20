@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Question or idea?
+    url: https://github.com/jomvick/komet/discussions
+    about: Ask questions and discuss ideas in GitHub Discussions.
+  - name: Security vulnerability?
+    url: https://github.com/jomvick/komet/security/advisories/new
+    about: Report vulnerabilities privately — do not open a public issue.
+  - name: Documentation
+    url: https://github.com/jomvick/komet/tree/main/docs
+    about: Architecture, parity status, sync and security notes.

@@ -1,0 +1,23 @@
+---
+name: Feature request
+about: Propose an idea or improvement for Komet
+title: ""
+labels: enhancement
+assignees: ""
+---
+
+## Problem / motivation
+
+<!-- What are you trying to do that Komet doesn't let you do (well) today? -->
+
+## Proposed solution
+
+<!-- Sketch the feature. Alternatives you considered are welcome. -->
+
+## Alternatives considered
+
+<!-- Other approaches or workarounds. -->
+
+## Additional context
+
+<!-- Links, screenshots, related issues, prior art in other agent UIs. -->
