@@ -1,34 +1,29 @@
 "use client";
 
 import { motion } from "framer-motion";
-import { ClaudeCode, Codex, Cursor, OpenCode } from "@lobehub/icons";
-import { ShieldCheck, Laptop2, Server } from "lucide-react";
+import { Laptop2, Server, ShieldCheck } from "lucide-react";
 
 const easing = [0.16, 1, 0.3, 1] as const;
-
-const agents = [
-  { label: "Claude Code", Icon: ClaudeCode, y: 12.5 },
-  { label: "Codex", Icon: Codex, y: 37.5 },
-  { label: "Cursor", Icon: Cursor, y: 62.5 },
-  { label: "OpenCode", Icon: OpenCode, y: 87.5 },
-];
 
 const destinations = [
   {
     label: "This machine",
-    detail: "local by default",
+    detail: "sessions · memory · credentials, on disk",
+    tag: "default",
     Icon: Laptop2,
     y: 16.5,
   },
   {
     label: "Sync relay",
-    detail: "Loro CRDT, encrypted, opt-in",
+    detail: "Loro CRDT · encrypted · your server",
+    tag: "opt-in",
     Icon: ShieldCheck,
     y: 50,
   },
   {
     label: "Other device",
     detail: "VPS or second machine",
+    tag: "opt-in",
     Icon: Server,
     y: 83.5,
   },
@@ -36,139 +31,133 @@ const destinations = [
 
 export default function Topology() {
   return (
-    <section className="py-24 md:py-32 border-t border-[var(--hairline)]">
-      <div className="mx-auto max-w-6xl px-5">
+    <section className="px-5 py-20 md:px-10 md:py-28">
+      <div className="grid items-center gap-14 lg:grid-cols-2">
+        {/* Copy */}
         <motion.div
-          initial={{ opacity: 0, y: 16 }}
+          initial={{ opacity: 0, y: 14 }}
           whileInView={{ opacity: 1, y: 0 }}
           viewport={{ once: true, margin: "-80px" }}
           transition={{ duration: 0.6, ease: easing }}
-          className="max-w-xl mb-16"
         >
-          <p className="font-mono text-[11px] uppercase tracking-wide text-fog mb-3">
-            Topologie
-          </p>
-          <h2 className="text-[30px] md:text-[36px] leading-tight tracking-tight font-medium text-paper">
-            Runs where you work.
+          <div className="font-mono text-[11px] tracking-[0.14em] text-muted-foreground/80 uppercase">
+            Local-first
+          </div>
+          <h2 className="mt-3 text-[30px] leading-tight font-medium tracking-tight text-foreground md:text-[36px]">
+            One binary. Your machine is home base.
           </h2>
-          <p className="mt-4 text-[15px] leading-relaxed text-mist max-w-lg">
-            komet drives your agents locally. No extra device
-            is required — the sync relay only exists if you
-            explicitly plug it in.
+          <p className="mt-4 max-w-md text-[15px] leading-relaxed text-muted-foreground">
+            Komet is a single Rust binary — the same engine runs headed in the
+            window or headless on a server. Projects, sessions, shared memory
+            and credentials live on your disk: no account, no telemetry, no
+            cloud between you and your agents.
           </p>
+          <ul className="mt-6 space-y-2 text-[13.5px] leading-relaxed text-muted-foreground">
+            <li className="flex gap-2.5">
+              <span className="text-muted-foreground/40">—</span>
+              Works fully offline; SQLite store under your data directory.
+            </li>
+            <li className="flex gap-2.5">
+              <span className="text-muted-foreground/40">—</span>
+              Self-hosted sync built in — Loro CRDT, per-device relay,
+              encrypted — off by default, enabled with komet sync-init.
+            </li>
+            <li className="flex gap-2.5">
+              <span className="text-muted-foreground/40">—</span>
+              Headless mode keeps agents running on a VPS while your laptop
+              sleeps.
+            </li>
+          </ul>
         </motion.div>
 
-        {/* Desktop: fan diagram */}
+        {/* Visual: komet fans out to where sessions can live */}
         <motion.div
           initial={{ opacity: 0, y: 20 }}
           whileInView={{ opacity: 1, y: 0 }}
           viewport={{ once: true, margin: "-60px" }}
-          transition={{ duration: 0.6, ease: easing }}
-          className="hidden md:block relative h-[380px]"
+          transition={{ duration: 0.7, ease: easing }}
+          className="rounded-2xl border border-border bg-charcoal/30 p-5 md:p-6"
         >
-          <svg
-            className="absolute inset-0 h-full w-full"
-            viewBox="0 0 100 100"
-            preserveAspectRatio="none"
-            aria-hidden="true"
-          >
-            {agents.map((a) => (
-              <path
-                key={a.label}
-                d={`M 20,${a.y} C 35,${a.y} 35,50 50,50`}
-                fill="none"
-                stroke="var(--hairline-strong)"
-                strokeWidth="0.3"
-                strokeDasharray="1.2 1.4"
-                vectorEffect="non-scaling-stroke"
-              />
-            ))}
-            {destinations.map((d) => (
-              <path
-                key={d.label}
-                d={`M 50,50 C 65,50 65,${d.y} 80,${d.y}`}
-                fill="none"
-                stroke="var(--hairline-strong)"
-                strokeWidth="0.3"
-                strokeDasharray="1.2 1.4"
-                vectorEffect="non-scaling-stroke"
-              />
-            ))}
-          </svg>
-
-          {/* left column — agents */}
-          <div className="absolute left-0 top-0 h-full w-[180px] flex flex-col justify-between py-1">
-            {agents.map(({ label, Icon }) => (
-              <div
-                key={label}
-                className="flex items-center gap-3 rounded-[var(--radius-control)] hairline bg-charcoal/70 px-4 py-3"
-              >
-                <Icon size={16} className="text-mist shrink-0" />
-                <span className="text-[13px] text-paper">{label}</span>
-              </div>
-            ))}
+          <div className="flex items-center justify-between">
+            <p className="text-[13px] font-medium text-foreground">komet</p>
+            <p className="font-mono text-[10.5px] text-muted-foreground/60">
+              one binary · headed or headless
+            </p>
           </div>
 
-          {/* center — komet */}
-          <div className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 w-[190px]">
-            <div className="rounded-[var(--radius-control)] hairline bg-graphite/60 px-5 py-4 text-center">
-              <p className="text-[13.5px] font-medium text-paper">komet</p>
-              <p className="mt-0.5 font-mono text-[10.5px] text-fog">
-                control room
-              </p>
+          <div className="relative mt-5 h-[280px]">
+            <svg
+              className="absolute inset-0 h-full w-full"
+              viewBox="0 0 100 100"
+              preserveAspectRatio="none"
+              aria-hidden="true"
+            >
+              {destinations.map((d, i) => (
+                <path
+                  key={d.label}
+                  d={`M 30,${d.y} C 40,${d.y} 44,${d.y} 58,${d.y}`}
+                  fill="none"
+                  stroke="var(--border-strong)"
+                  strokeWidth="1"
+                  strokeDasharray="2 5"
+                  vectorEffect="non-scaling-stroke"
+                  className="flow-line"
+                  style={{ animationDelay: `${i * 0.3}s` }}
+                />
+              ))}
+            </svg>
+
+            {/* centre-left — the binary itself */}
+            <div className="absolute left-0 top-1/2 w-[26%] -translate-y-1/2">
+              <div className="flex flex-col items-center gap-2 rounded-xl border border-border-strong bg-background px-3 py-4 text-center">
+                <img
+                  src="/komet.png"
+                  alt=""
+                  className="size-9 rounded-lg object-contain"
+                />
+                <p className="text-[12px] font-medium text-foreground">
+                  komet
+                </p>
+                <p className="font-mono text-[9px] tracking-wide text-muted-foreground/60 uppercase">
+                  engine + ui
+                </p>
+              </div>
+            </div>
+
+            {/* right — where sessions can live */}
+            <div className="absolute right-0 top-0 flex h-full w-[62%] flex-col justify-between py-1">
+              {destinations.map(({ label, detail, tag, Icon }) => (
+                <div
+                  key={label}
+                  className="flex items-center gap-3 rounded-xl border border-border bg-charcoal/70 px-4 py-3"
+                >
+                  <Icon
+                    className="size-4 shrink-0 text-muted-foreground"
+                    strokeWidth={1.6}
+                  />
+                  <div className="min-w-0 flex-1">
+                    <p className="text-[13px] leading-tight text-foreground">
+                      {label}
+                    </p>
+                    <p className="mt-0.5 truncate font-mono text-[10px] leading-tight text-muted-foreground/60">
+                      {detail}
+                    </p>
+                  </div>
+                  <span className="shrink-0 font-mono text-[9px] tracking-wide text-muted-foreground/50 uppercase">
+                    {tag}
+                  </span>
+                </div>
+              ))}
             </div>
           </div>
 
-          {/* right column — destinations */}
-          <div className="absolute right-0 top-0 h-full w-[220px] flex flex-col justify-between py-1">
-            {destinations.map(({ label, detail, Icon }) => (
-              <div
-                key={label}
-                className="flex items-center gap-3 rounded-[var(--radius-control)] hairline bg-charcoal/70 px-4 py-3"
-              >
-                <Icon className="h-4 w-4 text-mist shrink-0" strokeWidth={1.6} />
-                <div>
-                  <p className="text-[13px] text-paper leading-tight">{label}</p>
-                  <p className="font-mono text-[10.5px] text-fog leading-tight">
-                    {detail}
-                  </p>
-                </div>
-              </div>
-            ))}
-          </div>
-        </motion.div>
-
-        {/* Small screens: simple stacked flow */}
-        <motion.div
-          initial={{ opacity: 0, y: 20 }}
-          whileInView={{ opacity: 1, y: 0 }}
-          viewport={{ once: true, margin: "-60px" }}
-          transition={{ duration: 0.6, ease: easing }}
-          className="md:hidden hairline rounded-[var(--radius-panel)] bg-ash/40 divide-y divide-[var(--hairline)]"
-        >
-          <div className="px-5 py-4">
-            <p className="font-mono text-[10.5px] uppercase tracking-wide text-fog mb-2">
-              Agents driven
-            </p>
-            <p className="text-[13px] text-mist">
-              Claude Code, Codex, Cursor, OpenCode…
-            </p>
-          </div>
-          <div className="px-5 py-4">
-            <p className="text-[13.5px] font-medium text-paper">komet</p>
-            <p className="font-mono text-[10.5px] text-fog">local control room</p>
-          </div>
-          <div className="px-5 py-4">
-            <p className="font-mono text-[10.5px] uppercase tracking-wide text-fog mb-2">
-              Where your sessions live
-            </p>
-            <p className="text-[13px] text-mist">
-              This machine by default, or an encrypted sync relay if you
-              turn it on.
-            </p>
-          </div>
+          <p className="mt-4 font-mono text-[10px] leading-relaxed text-muted-foreground/50">
+            Sync stays off until you point it at your own relay — a VPS or a
+            Cloudflare Worker is enough.
+          </p>
         </motion.div>
       </div>
     </section>
   );
 }
+

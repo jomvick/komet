@@ -1,15 +1,17 @@
+import Link from "next/link";
+
 export default function Nav() {
   return (
     <header className="flex h-16 items-center justify-between px-5 md:px-10">
       {/* Logo */}
-      <a href="/" className="flex items-center gap-2.5">
+      <Link href="/" className="flex items-center gap-2.5">
         <img
           src="/komet.png"
           alt=""
           className="size-8 rounded-[6px] object-contain"
         />
         <span className="text-[15px] font-semibold tracking-tight">komet</span>
-      </a>
+      </Link>
 
       {/* Right actions */}
       <div className="flex items-center gap-5">

@@ -73,8 +73,31 @@ body {
   animation: pulse-soft 2.2s ease-in-out infinite;
 }
 
+/* Agents orbit — komet at the centre, agents revolving around it */
+@keyframes orbit-spin {
+  to { transform: rotate(360deg); }
+}
+@keyframes dash-flow {
+  to { stroke-dashoffset: 8; }
+}
+.orbit-spin {
+  animation: orbit-spin 64s linear infinite;
+}
+.orbit-counter {
+  animation: orbit-spin 64s linear infinite reverse;
+}
+.flow-line {
+  animation: dash-flow 2.2s linear infinite;
+}
+.group:hover .orbit-spin,
+.group:hover .orbit-counter,
+.group:hover .flow-line {
+  animation-play-state: paused;
+}
+
 @media (prefers-reduced-motion: reduce) {
-  .drift, .marquee, .caret-blink, .pulse-soft {
+  .drift, .marquee, .caret-blink, .pulse-soft,
+  .orbit-spin, .orbit-counter, .flow-line {
     animation: none !important;
   }
 }

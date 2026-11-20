@@ -1,4 +1,5 @@
 import { platforms } from "@/lib/data";
+import CopyCommand from "./CopyCommand";
 
 export default function Downloads() {
   return (
@@ -20,9 +21,7 @@ export default function Downloads() {
             <p className="mt-1.5 text-[13px] leading-relaxed text-muted-foreground">
               {p.detail}
             </p>
-            <pre className="mt-4 overflow-x-auto rounded-lg bg-background/60 border border-border px-3 py-2.5 font-mono text-[12px] text-foreground/90">
-              {p.command}
-            </pre>
+            <CopyCommand command={p.command} />
           </div>
         ))}
       </div>
