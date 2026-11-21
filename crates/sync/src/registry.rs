@@ -155,7 +155,7 @@ impl TextConnector for WsTextConnector {
         let provider = self.url.clone();
         Box::pin(async move {
             let url = provider.url().await?;
-            let (ws, _) = tokio_tungstenite::connect_async(&url)
+            let ws = crate::dial::connect_ws(&url)
                 .await
                 .map_err(|e| SyncError::WebSocket(e.to_string()))?;
             let (out_tx, out_rx) = mpsc::channel(64);
@@ -521,7 +521,9 @@ impl Actor {
     /// True = shutdown observed.
     async fn sleep_or_shutdown(&mut self, wait: Duration) -> bool {
         tokio::select! {
-            _ = tokio::time::sleep(wait) => false,
+            // Wake/online events cut the backoff short; an offline-reported
+            // path parks the wait instead of burning futile dials.
+            _ = crate::wake::reconnect_wait(wait) => false,
             _ = self.shutdown.changed() => *self.shutdown.borrow(),
         }
     }
@@ -532,6 +534,10 @@ impl Actor {
         ready: &mut Option<oneshot::Sender<Result<(), SyncError>>>,
     ) -> SessionEnd {
         use std::sync::atomic::Ordering::Relaxed;
+
+        // System wake: the socket sat through a suspend and is almost certainly
+        // half-dead — redial now instead of discovering it by probe deadline.
+        let mut wake = crate::wake::subscribe();
 
         // ── hello / state handshake ─────────────────────────────────────────
         let cursor = {
@@ -650,6 +656,10 @@ impl Actor {
                 }
                 _ = self.redial_rx.recv() => {
                     tracing::info!("registry: redial requested");
+                    return SessionEnd::Reconnect;
+                }
+                _ = wake.recv() => {
+                    tracing::info!("registry: system wake; redialing");
                     return SessionEnd::Reconnect;
                 }
                 _ = tokio::time::sleep_until(quiet_probe_at) => {

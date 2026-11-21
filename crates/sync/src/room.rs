@@ -245,7 +245,7 @@ impl Connector for WsConnector {
             // this fetch and the handshake below can hang; the actor bounds
             // the whole dial with CONNECT_TIMEOUT.
             let url = provider.url().await?;
-            let (ws, _) = tokio_tungstenite::connect_async(&url)
+            let ws = crate::dial::connect_ws(&url)
                 .await
                 .map_err(|e| SyncError::WebSocket(e.to_string()))?;
             let (out_tx, out_rx) = mpsc::channel(64);

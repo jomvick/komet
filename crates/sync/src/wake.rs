@@ -35,6 +35,10 @@ static ONLINE: OnceLock<broadcast::Sender<()>> = OnceLock::new();
 /// [`set_path_online(false)`] from a platform monitor flips this true.
 static PATH_OFFLINE: AtomicBool = AtomicBool::new(false);
 
+/// Test hook for e2e scripts: when this env var points at an existing path,
+/// the detector treats it as a suspend/resume event (see [`subscribe`]).
+const TEST_WAKE_FILE_ENV: &str = "KOMET_TEST_WAKE_FILE";
+
 /// Subscribe to system-wake events (the detector spawns on first call).
 pub fn subscribe() -> broadcast::Receiver<()> {
     CHANNEL
@@ -58,6 +62,14 @@ pub fn subscribe() -> broadcast::Receiver<()> {
                             slept_s = wall_elapsed.as_secs(),
                             "wake: system resumed from suspend"
                         );
+                        let _ = detector.send(());
+                    }
+                    // e2e hook: an existing path stands in for a real suspend.
+                    if std::env::var_os(TEST_WAKE_FILE_ENV)
+                        .map(|path| std::path::Path::new(&path).exists())
+                        .unwrap_or(false)
+                    {
+                        tracing::info!("wake: test hook fired (file present)");
                         let _ = detector.send(());
                     }
                     wall = SystemTime::now();
@@ -113,4 +125,32 @@ pub fn set_path_online(online: bool) {
 /// absent or wrong, so parked waits keep a coarse safety timer.
 pub fn path_is_offline() -> bool {
     PATH_OFFLINE.load(Ordering::Relaxed)
+}
+
+/// Safety timer when the path monitor reports offline: parked backoffs still
+/// wake every minute in case the monitor is stale or absent.
+const OFFLINE_PARK: Duration = Duration::from_secs(60);
+
+/// Wait out one reconnect-backoff step, cut short by a wake or online event.
+///
+/// While [`path_is_offline`] is true the dial is futile, so the full `wait`
+/// is parked (60 s safety timer): the loop burns no dial attempts the OS says
+/// cannot succeed, and a `set_path_online(true)` broadcast un-parks it
+/// instantly. Stale events are drained first so only events that happen
+/// DURING the wait cut it short.
+pub async fn reconnect_wait(wait: Duration) {
+    let wait = if path_is_offline() {
+        wait.min(OFFLINE_PARK)
+    } else {
+        wait
+    };
+    let mut wake = subscribe();
+    let mut online = subscribe_online();
+    let _ = wake.try_recv();
+    let _ = online.try_recv();
+    tokio::select! {
+        _ = tokio::time::sleep(wait) => {}
+        _ = wake.recv() => {}
+        _ = online.recv() => {}
+    }
 }

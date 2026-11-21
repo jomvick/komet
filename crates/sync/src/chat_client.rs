@@ -181,7 +181,7 @@ impl BinConnector for WsBinConnector {
         let provider = self.url.clone();
         Box::pin(async move {
             let url = provider.url().await?;
-            let (ws, _) = tokio_tungstenite::connect_async(&url)
+            let ws = crate::dial::connect_ws(&url)
                 .await
                 .map_err(|e| SyncError::WebSocket(e.to_string()))?;
             let (out_tx, out_rx) = mpsc::channel(64);
@@ -635,7 +635,9 @@ impl Actor {
     /// True = shutdown observed.
     async fn sleep_or_shutdown(&mut self, wait: Duration) -> bool {
         tokio::select! {
-            _ = tokio::time::sleep(wait) => false,
+            // Wake/online events cut the backoff short; an offline-reported
+            // path parks the wait instead of burning futile dials.
+            _ = crate::wake::reconnect_wait(wait) => false,
             _ = self.shutdown.changed() => *self.shutdown.borrow(),
         }
     }
@@ -803,6 +805,7 @@ impl Actor {
         // ── steady state ────────────────────────────────────────────────────
         let mut last_frame = tokio::time::Instant::now();
         let mut probe_deadline: Option<tokio::time::Instant> = None;
+        let mut wake = crate::wake::subscribe();
         loop {
             let quiet_probe_at = last_frame + self.tuning.probe_quiet;
             let deadline_at = probe_deadline
@@ -849,6 +852,13 @@ impl Actor {
                 }
                 _ = self.redial_rx.recv() => {
                     tracing::info!("chat2: redial requested");
+                    return SessionEnd::Reconnect;
+                }
+                // System wake: the socket sat through a suspend and is
+                // almost certainly half-dead — redial now instead of
+                // discovering it by silence-lease timeout.
+                _ = wake.recv() => {
+                    tracing::info!("chat2: system wake; redialing");
                     return SessionEnd::Reconnect;
                 }
                 // Transient (quota) rejection: probe with the HEAD batch on
