@@ -32,6 +32,7 @@
 //!   interrupt control request, then escalates to SIGTERM and SIGKILL.
 
 pub mod catalog;
+mod native_mcp;
 mod normalize;
 pub mod permissions;
 #[cfg(test)]
@@ -438,13 +439,41 @@ impl ClaudeHarness {
                 };
                 servers.insert(id, entry);
             }
-            if !servers.is_empty() {
-                let config = serde_json::json!({"mcpServers": servers}).to_string();
-                cmd.args(["--mcp-config", &config]);
-                tracing::debug!(
-                    server_count = servers.len(),
-                    "claude mcpServers injected (values masked)"
-                );
+            // Ext overlay: once the user has toggled ANY Claude MCP entry,
+            // komet takes over the whole MCP surface via --strict-mcp-config.
+            // The merged document reproduces every native source (plugins,
+            // user, project, project-scoped) minus overlay-disabled names,
+            // with komet-injected servers winning collisions. Until then the
+            // historical behavior is untouched: natives load from the user's
+            // own config and only komet servers ride --mcp-config.
+            let overlay = crate::ext::load_overlay();
+            // Per-agent overlay: a komet-managed MCP the user disabled for
+            // Claude is not injected at all (legacy path AND strict merge).
+            servers.retain(|name, _| {
+                overlay.decision(
+                    crate::ext::ExtKind::McpServer,
+                    crate::ext::Origin::Komet,
+                    komet_proto::HarnessId::ClaudeCode,
+                    name,
+                ) != Some(false)
+            });
+            match strict_mcp_config(&overlay, &request.cwd, &servers) {
+                Some((document, count)) => {
+                    cmd.args(["--mcp-config", &document, "--strict-mcp-config"]);
+                    tracing::debug!(
+                        server_count = count,
+                        "claude strict MCP config injected (values masked)"
+                    );
+                }
+                None if !servers.is_empty() => {
+                    let config = serde_json::json!({"mcpServers": servers}).to_string();
+                    cmd.args(["--mcp-config", &config]);
+                    tracing::debug!(
+                        server_count = servers.len(),
+                        "claude mcpServers injected (values masked)"
+                    );
+                }
+                None => {}
             }
         }
         if !request.cwd.is_empty() {
@@ -760,6 +789,49 @@ impl ClaudeHarness {
             Err(_) => Err(HarnessError::Protocol("get_context_usage timed out".into())),
         }
     }
+}
+
+/// Strict-mode `--mcp-config` document for the ext overlay: `Some` only when
+/// the user has at least one explicit Claude MCP entry. The merged document
+/// reproduces every native source minus overlay-disabled names, with
+/// komet-injected servers winning collisions. `None` keeps the legacy path.
+fn strict_mcp_config(
+    overlay: &crate::ext::ExtOverlay,
+    cwd: &str,
+    komet_servers: &serde_json::Map<String, Value>,
+) -> Option<(String, usize)> {
+    if !overlay.touches(
+        crate::ext::ExtKind::McpServer,
+        crate::ext::Origin::External,
+        komet_proto::HarnessId::ClaudeCode,
+    ) {
+        return None;
+    }
+    let mut merged = native_mcp::collect(cwd);
+    merged.retain(|name, _| {
+        overlay.decision(
+            crate::ext::ExtKind::McpServer,
+            crate::ext::Origin::External,
+            komet_proto::HarnessId::ClaudeCode,
+            name,
+        ) != Some(false)
+    });
+    for (name, config) in komet_servers {
+        // `servers` was already filtered by the caller; the check repeats
+        // here so the pure function stays honest about its contract.
+        if overlay.decision(
+            crate::ext::ExtKind::McpServer,
+            crate::ext::Origin::Komet,
+            komet_proto::HarnessId::ClaudeCode,
+            name,
+        ) == Some(false)
+        {
+            continue;
+        }
+        merged.insert(name.clone(), config.clone());
+    }
+    let count = merged.len();
+    Some((serde_json::json!({"mcpServers": merged}).to_string(), count))
 }
 
 /// Mark commands backed by a project-local `.claude/commands/<name>.md` or
