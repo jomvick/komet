@@ -17,3 +17,26 @@ mod scan;
 pub use model::{ExtItem, ExtKind, ExtSource, Origin};
 pub use overlay::ExtOverlay;
 pub use scan::scan;
+
+/// Well-known overlay location, mirroring `McpSecretStore::default_path`:
+/// `$KOMET_DATA_DIR/agent-ext-overlay.json`, else `~/.komet/…`, else `/tmp`.
+/// Engine and harness share the process (or the engine is spawned with
+/// `KOMET_DATA_DIR` set), so both resolve the same file.
+pub fn default_overlay_path() -> std::path::PathBuf {
+    if let Ok(dir) = std::env::var("KOMET_DATA_DIR")
+        && !dir.is_empty()
+    {
+        return std::path::PathBuf::from(dir).join("agent-ext-overlay.json");
+    }
+    if let Some(home) = crate::platform::home_dir() {
+        return home.join(".komet").join("agent-ext-overlay.json");
+    }
+    std::path::PathBuf::from("/tmp/komet-agent-ext-overlay.json")
+}
+
+/// Load the persisted overlay; a missing/corrupt file yields an empty overlay
+/// (launch must never fail because a preference file is unreadable).
+pub fn load_overlay() -> ExtOverlay {
+    ExtOverlay::load(default_overlay_path())
+        .unwrap_or_else(|_| ExtOverlay::empty(default_overlay_path()))
+}

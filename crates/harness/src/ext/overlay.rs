@@ -89,6 +89,22 @@ impl ExtOverlay {
         self.persist()
     }
 
+    /// Ids of `kind` items with an explicit `true` overlay entry for `agent`.
+    /// Launch-time consumers use this to re-enable agent-native items the
+    /// user switched on; absence of an entry never implies enabled.
+    pub fn explicitly_enabled(
+        &self,
+        kind: ExtKind,
+        agent: HarnessId,
+    ) -> std::collections::BTreeSet<String> {
+        let prefix = format!("{}|{}|", kind.as_str(), agent.as_str());
+        self.entries
+            .iter()
+            .filter(|(_, enabled)| **enabled)
+            .filter_map(|(k, _)| k.strip_prefix(&prefix).map(str::to_string))
+            .collect()
+    }
+
     /// Drop the explicit entry so resolution falls back to the agent-native
     /// hint again ("reset to agent default").
     pub fn clear(&mut self, kind: ExtKind, agent: HarnessId, id: &str) -> anyhow::Result<()> {
