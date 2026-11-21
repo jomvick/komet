@@ -214,6 +214,7 @@ pub mod claude;
 pub mod codex;
 pub mod cursor;
 pub mod errors;
+pub mod ext;
 pub(crate) mod jsonrpc;
 pub mod mock;
 mod muse;
