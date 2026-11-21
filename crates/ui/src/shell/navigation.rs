@@ -10,6 +10,8 @@ pub enum SettingsSection {
     Providers,
     /// Provider quota windows + Komet-measured token usage (issue #53).
     Usage,
+    /// Agent-native skills / MCP / plugins inventory + per-agent toggles.
+    Extensions,
     Appearance,
     /// Built-in browser settings (search engine, history, zoom, captures…).
     Browser,
@@ -21,10 +23,11 @@ pub enum SettingsSection {
 }
 
 impl SettingsSection {
-    pub const ALL: [SettingsSection; 10] = [
+    pub const ALL: [SettingsSection; 11] = [
         SettingsSection::General,
         SettingsSection::Providers,
         SettingsSection::Usage,
+        SettingsSection::Extensions,
         SettingsSection::Appearance,
         SettingsSection::Browser,
         SettingsSection::Notifications,
@@ -41,6 +44,7 @@ impl SettingsSection {
             SettingsSection::General => "General",
             SettingsSection::Providers => "Providers",
             SettingsSection::Usage => "Usage",
+            SettingsSection::Extensions => "Extensions",
             SettingsSection::Appearance => "Appearance",
             SettingsSection::Browser => "Browser",
             SettingsSection::Notifications => "Notifications",
@@ -59,6 +63,7 @@ impl SettingsSection {
             SettingsSection::General => icons::SETTINGS_MINIMALISTIC,
             SettingsSection::Providers => icons::WIDGET,
             SettingsSection::Usage => icons::SORT_VERTICAL,
+            SettingsSection::Extensions => icons::CHECKLIST,
             SettingsSection::Appearance => icons::TUNING,
             SettingsSection::Browser => icons::GLOBAL,
             SettingsSection::Notifications => icons::BELL,
@@ -73,7 +78,9 @@ impl SettingsSection {
     /// contiguous in `ALL` or the caption would repeat.
     pub const fn group(self) -> Option<&'static str> {
         match self {
-            SettingsSection::Providers | SettingsSection::Usage => Some("Agents"),
+            SettingsSection::Providers | SettingsSection::Usage | SettingsSection::Extensions => {
+                Some("Agents")
+            }
             SettingsSection::Appearance
             | SettingsSection::Browser
             | SettingsSection::Notifications
@@ -489,6 +496,19 @@ impl Shell {
                     page.update(cx, |page, cx| page.on_shown(cx));
                 }
                 match &self.usage_page {
+                    Some(page) => page.clone().into_any_element(),
+                    None => Empty.into_any_element(),
+                }
+            }
+            SettingsSection::Extensions => {
+                if self.extensions_page.is_none() {
+                    let state = self.state.clone();
+                    self.extensions_page = Some(cx.new(|cx| ExtensionsPage::new(state, cx)));
+                }
+                if let Some(page) = &self.extensions_page {
+                    page.update(cx, |page, cx| page.on_shown(cx));
+                }
+                match &self.extensions_page {
                     Some(page) => page.clone().into_any_element(),
                     None => Empty.into_any_element(),
                 }

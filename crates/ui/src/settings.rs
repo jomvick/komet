@@ -34,6 +34,7 @@ pub mod archived;
 pub mod browser;
 pub mod composer;
 pub mod devices;
+pub mod extensions;
 pub mod files;
 pub mod general;
 pub mod integrations;

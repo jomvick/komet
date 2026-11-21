@@ -58,7 +58,7 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use serde::Deserialize;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::Duration;
 use tokio::sync::watch;
 
@@ -103,6 +103,28 @@ struct ListModelsParams {
 struct SetHarnessEnabledParams {
     harness: HarnessId,
     enabled: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Agent-native extensions (skills / MCP / plugins). The inventory is read-only
+// (`komet_harness::ext::scan`); enablement lives only in komet's overlay file.
+#[derive(Debug, serde::Serialize)]
+struct ExtListEntry {
+    #[serde(flatten)]
+    item: komet_harness::ext::ExtItem,
+    /// Agent slug → effective enabled state for that agent (overlay decision,
+    /// else the agent-native hint, else `true`).
+    enabled: BTreeMap<String, bool>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SetExtEnabledParams {
+    kind: komet_harness::ext::ExtKind,
+    harness: HarnessId,
+    id: String,
+    /// `null` clears the overlay entry (back to the agent-native default).
+    enabled: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1982,6 +2004,40 @@ impl RpcService for EngineRpc {
                 // Fresh catalog in the reply: the page repaints from it in one
                 // round trip, and a refused/raced toggle self-corrects.
                 RpcReply::value(&self.registry.descriptors())
+            }
+            methods::LIST_HARNESS_EXTENSIONS => {
+                let home = home_dir();
+                let items = komet_harness::ext::scan(&home);
+                let overlay = komet_harness::ext::load_overlay();
+                let entries = items
+                    .into_iter()
+                    .map(|item| {
+                        let enabled = item
+                            .sources
+                            .iter()
+                            .map(|s| s.agent)
+                            .collect::<HashSet<_>>()
+                            .into_iter()
+                            .filter_map(|agent| {
+                                overlay
+                                    .enabled_for(&item, agent)
+                                    .map(|e| (agent.as_str().to_string(), e))
+                            })
+                            .collect();
+                        ExtListEntry { item, enabled }
+                    })
+                    .collect::<Vec<_>>();
+                RpcReply::value(&entries)
+            }
+            methods::SET_HARNESS_EXTENSION_ENABLED => {
+                let p: SetExtEnabledParams = parse_params(params)?;
+                let mut overlay = komet_harness::ext::load_overlay();
+                let result = match p.enabled {
+                    Some(enabled) => overlay.set_enabled(p.kind, p.harness, &p.id, enabled),
+                    None => overlay.clear(p.kind, p.harness, &p.id),
+                };
+                result.map_err(|e| RpcError::Failed(format!("ext overlay: {e}")))?;
+                RpcReply::value(&serde_json::json!({ "ok": true }))
             }
             methods::LIST_MODELS => {
                 let p: ListModelsParams = parse_params(params)?;
