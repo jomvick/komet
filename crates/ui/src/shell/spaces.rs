@@ -10,7 +10,7 @@
 
 use super::*;
 use gpui::FocusHandle;
-use komet_proto::{ChatIndicator, Device, RepoRef, Space};
+use komet_proto::{ChatIndicator, Device, FolderListing, RepoRef, Space};
 
 /// The space-filter dropdown, `Some` while open. The same searchable-menu
 /// recipe as the composer's ref picker: filter input on top
@@ -75,7 +75,28 @@ pub(super) fn status_dot_color(status: ChatIndicator, theme: &Theme) -> gpui::Hs
     }
 }
 
+/// The remote add-project browser, `Some` while open. Inside an environment
+/// workspace the OS folder picker can't see the environment's filesystem, so
+/// "+" opens this instead: LIST_FOLDERS on the env's engine, then createSpace
+/// on its device.
+pub(super) struct RemoteFolderBrowser {
+    /// The environment device the new space is created on.
+    device: Device,
+    /// Folder requested; `None` = the device's home dir (engine default).
+    path: Option<String>,
+    listing: Option<FolderListing>,
+    loading: bool,
+    error: Option<String>,
+    /// Bumped per navigation so a slow earlier listing can't overwrite a
+    /// newer one.
+    generation: u64,
+    focus: FocusHandle,
+    focus_pending: bool,
+    list_scroll: gpui::ScrollHandle,
+}
+
 mod add;
+mod browse;
 mod edit;
 mod menu;
 mod rows;

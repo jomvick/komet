@@ -8,6 +8,13 @@ impl Shell {
     /// them as projects and stays on the grouped project view — no redirect
     /// into the new space (the way file managers behave).
     pub(crate) fn open_project_folder_picker(&mut self, cx: &mut Context<Self>) {
+        // Inside an environment workspace the OS picker would browse THIS
+        // machine's filesystem — the project must live on the environment,
+        // so browse its folders over RPC instead.
+        if !self.state.read(cx).is_local_workspace() {
+            self.open_remote_folder_browser(cx);
+            return;
+        }
         let (local_id, devices) = {
             let state = self.state.read(cx);
             (state.local_device_id.clone(), state.devices.clone())

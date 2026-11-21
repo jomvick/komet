@@ -383,6 +383,8 @@ pub struct Shell {
     rename_space_dialog: Option<RenameSpaceDialog>,
     /// Space id awaiting delete confirmation (hard delete + session cascade).
     delete_space_confirm: Option<String>,
+    /// Remote add-project folder browser (environment workspaces only).
+    remote_folder_browser: Option<spaces::RemoteFolderBrowser>,
     /// Same keyboard treatment as the chat delete card (see `delete_focus`).
     space_delete_focus: gpui::FocusHandle,
     space_delete_focus_pending: bool,
@@ -790,6 +792,7 @@ impl Shell {
             space_menu: popover::Popup::default(),
             rename_space_dialog: None,
             delete_space_confirm: None,
+            remote_folder_browser: None,
             space_delete_focus: cx.focus_handle(),
             space_delete_focus_pending: false,
             project_picker_task: None,
