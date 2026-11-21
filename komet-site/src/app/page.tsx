@@ -2,6 +2,7 @@ import Nav from "@/components/Nav";
 import Hero from "@/components/Hero";
 import Features from "@/components/Features";
 import Downloads from "@/components/Downloads";
+import Vps from "@/components/Vps";
 import AgentsOrbit from "@/components/AgentsOrbit";
 import MemoryHandoff from "@/components/MemoryHandoff";
 import AgentSwitch from "@/components/AgentSwitch";
@@ -18,6 +19,7 @@ export default function Home() {
         <Hero />
         <Features />
         <Downloads />
+        <Vps />
         <AgentsOrbit />
         <MemoryHandoff />
         <AgentSwitch />
