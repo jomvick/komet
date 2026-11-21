@@ -670,6 +670,8 @@ pub struct EngineRpc {
     environment: Option<String>,
     /// Environment management, attached on local connections only.
     envs: Option<std::sync::Arc<crate::EnvHosts>>,
+    /// Project-transfer staging (archives + imports) on this device.
+    transfers: Option<std::sync::Arc<crate::project_transfer::TransferStore>>,
 }
 
 impl EngineRpc {
@@ -712,7 +714,17 @@ impl EngineRpc {
             mcp_secrets: None,
             environment: None,
             envs: None,
+            transfers: None,
         }
+    }
+
+    /// Attach the project-transfer staging store (plan/export/import).
+    pub fn with_transfers(
+        mut self,
+        transfers: std::sync::Arc<crate::project_transfer::TransferStore>,
+    ) -> Self {
+        self.transfers = Some(transfers);
+        self
     }
 
     /// Attach the auth service (AuthStatus + AuthRpc mutations).
@@ -1433,6 +1445,15 @@ fn forwardable(method: &str) -> bool {
             | methods::WATCH_WORKSPACE_FILES
             | methods::CREATE_WORKTREE
             | methods::DELETE_WORKTREE
+            // Project transfer: the folder, the archive and the checksum all
+            // live on the addressed device (this machine or a paired one).
+            | methods::PROJECT_TRANSFER_PLAN
+            | methods::PROJECT_EXPORT_OPEN
+            | methods::PROJECT_EXPORT_CHUNK
+            | methods::PROJECT_IMPORT_BEGIN
+            | methods::PROJECT_IMPORT_CHUNK
+            | methods::PROJECT_IMPORT_COMMIT
+            | methods::PROJECT_TRANSFER_CANCEL
             // Checkout diffs are produced on the device holding the checkout.
             | methods::WATCH_CHECKOUT_DIFFS
             | methods::GET_CHECKOUT_DIFF
@@ -1449,6 +1470,16 @@ fn forwardable(method: &str) -> bool {
             | methods::READ_TERMINAL_SCREEN
             | methods::READ_TERMINAL_TAIL
             | methods::READ_TERMINAL_DELTA
+            // Machine-owned settings: each device holds its own Composio
+            // session, MCP registry and agent-extension overlay, so a settings
+            // page in a paired workspace must reach THAT machine's copy.
+            | methods::GET_COMPOSIO_STATUS
+            | methods::SAVE_COMPOSIO_API_KEY
+            | methods::DELETE_COMPOSIO_API_KEY
+            | methods::SEARCH_COMPOSIO_INTEGRATIONS
+            | methods::LIST_COMPOSIO_ACCOUNTS
+            | methods::CONNECT_COMPOSIO_INTEGRATION
+            | methods::DISCONNECT_COMPOSIO_ACCOUNT
             // Agent accounts are per-device CLI logins (the device switcher
             // retargets which device's logins are shown).
             | methods::LIST_AGENT_ACCOUNTS
@@ -3072,6 +3103,142 @@ impl RpcService for EngineRpc {
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&listing)
+            }
+            methods::PROJECT_TRANSFER_PLAN => {
+                #[derive(Deserialize)]
+                struct P {
+                    path: String,
+                }
+                let p: P = parse_params(params)?;
+                let plan = tokio::task::spawn_blocking(move || {
+                    crate::project_transfer::plan(std::path::Path::new(&p.path))
+                })
+                .await
+                .map_err(|e| RpcError::Failed(e.to_string()))?
+                .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&plan)
+            }
+            methods::PROJECT_EXPORT_OPEN => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct P {
+                    path: String,
+                    #[serde(default)]
+                    include_secrets: bool,
+                }
+                let p: P = parse_params(params)?;
+                let store = self.transfers.clone().ok_or_else(|| {
+                    RpcError::Failed("project transfers unavailable on this device".into())
+                })?;
+                let staged = tokio::task::spawn_blocking(move || {
+                    store.export(std::path::Path::new(&p.path), p.include_secrets)
+                })
+                .await
+                .map_err(|e| RpcError::Failed(e.to_string()))?
+                .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&serde_json::json!({
+                    "transferId": staged.id,
+                    "files": staged.files,
+                    "bytes": staged.bytes,
+                    "sha256": staged.sha256,
+                }))
+            }
+            methods::PROJECT_EXPORT_CHUNK => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct P {
+                    transfer_id: String,
+                    offset: u64,
+                    #[serde(default)]
+                    max_bytes: Option<u64>,
+                }
+                use base64::Engine as _;
+                let p: P = parse_params(params)?;
+                let store = self.transfers.clone().ok_or_else(|| {
+                    RpcError::Failed("project transfers unavailable on this device".into())
+                })?;
+                let max = p.max_bytes.unwrap_or(crate::project_transfer::CHUNK_BYTES);
+                let (chunk, next, done) = store
+                    .read_chunk(&p.transfer_id, p.offset, max)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&serde_json::json!({
+                    "data": base64::engine::general_purpose::STANDARD.encode(chunk),
+                    "nextOffset": next,
+                    "done": done,
+                }))
+            }
+            methods::PROJECT_IMPORT_BEGIN => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct P {
+                    name: String,
+                    bytes: u64,
+                    #[serde(default)]
+                    sha256: String,
+                }
+                let p: P = parse_params(params)?;
+                let store = self.transfers.clone().ok_or_else(|| {
+                    RpcError::Failed("project transfers unavailable on this device".into())
+                })?;
+                let staged = store
+                    .begin_import(&p.name, p.bytes, &p.sha256)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "transferId": staged.id }))
+            }
+            methods::PROJECT_IMPORT_CHUNK => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct P {
+                    transfer_id: String,
+                    offset: u64,
+                    data: String,
+                }
+                use base64::Engine as _;
+                let p: P = parse_params(params)?;
+                let store = self.transfers.clone().ok_or_else(|| {
+                    RpcError::Failed("project transfers unavailable on this device".into())
+                })?;
+                let data = base64::engine::general_purpose::STANDARD
+                    .decode(&p.data)
+                    .map_err(|e| RpcError::BadParams(format!("data is not base64: {e}")))?;
+                let received = store
+                    .write_chunk(&p.transfer_id, p.offset, &data)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "received": received }))
+            }
+            methods::PROJECT_IMPORT_COMMIT => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct P {
+                    transfer_id: String,
+                    base_path: String,
+                    name: String,
+                }
+                let p: P = parse_params(params)?;
+                let store = self.transfers.clone().ok_or_else(|| {
+                    RpcError::Failed("project transfers unavailable on this device".into())
+                })?;
+                let created = tokio::task::spawn_blocking(move || {
+                    store.commit_import(&p.transfer_id, std::path::Path::new(&p.base_path), &p.name)
+                })
+                .await
+                .map_err(|e| RpcError::Failed(e.to_string()))?
+                .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&serde_json::json!({
+                    "path": created.to_string_lossy(),
+                }))
+            }
+            methods::PROJECT_TRANSFER_CANCEL => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct P {
+                    transfer_id: String,
+                }
+                let p: P = parse_params(params)?;
+                if let Some(store) = self.transfers.clone() {
+                    store.cancel(&p.transfer_id);
+                }
+                RpcReply::value(&serde_json::json!({ "ok": true }))
             }
             methods::SEARCH_FILES => {
                 let p: FileSearchParams = parse_params(params)?;

@@ -260,6 +260,34 @@ impl AppState {
             .unwrap_or_else(|| "Device".to_string())
     }
 
+    /// The device that owns a workspace's filesystem: this machine for `local`,
+    /// the paired workspace's home device otherwise.
+    pub fn workspace_device_for(&self, env_id: &str) -> Option<String> {
+        if env_id == komet_engine::environments::LOCAL_ENV_ID {
+            return self.local_device_id.clone().or(self.home_device_id.clone());
+        }
+        let devices = self.env_devices.get(env_id)?;
+        crate::state::workspace_home_device(devices, self.home_device_id.as_deref())
+            .or_else(|| devices.first().map(|d| d.id.clone()))
+    }
+
+    /// The device owning the ACTIVE workspace (settings pages target it).
+    pub fn active_workspace_device(&self) -> Option<String> {
+        self.workspace_device_for(&self.active_workspace)
+    }
+
+    /// Where the displayed workspace lives: the sync server's host for a paired
+    /// machine, empty for this computer. The sidebar badge shows it so the
+    /// active workspace is never ambiguous.
+    pub fn active_workspace_host(&self) -> String {
+        if self.is_local_workspace() {
+            return String::new();
+        }
+        self.workspace_row(&self.active_workspace)
+            .map(|row| row.host.clone())
+            .unwrap_or_default()
+    }
+
     /// Reachability of the displayed workspace, for the trigger's dot.
     pub fn active_workspace_status(&self) -> WorkspaceStatus {
         if self.is_local_workspace() {

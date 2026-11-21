@@ -480,10 +480,11 @@ impl Shell {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let (label, status, rows, active_id) = {
+        let (label, host, status, rows, active_id) = {
             let state = self.state.read(cx);
             (
                 state.active_workspace_label(),
+                state.active_workspace_host(),
                 state.active_workspace_status(),
                 state.workspace_switcher(),
                 state.active_workspace.clone(),
@@ -520,7 +521,28 @@ impl Shell {
             .on_hover(motion::hover_listener("workspace-switcher", cx.entity_id()))
             .on_click(cx.listener(|this, _, _, cx| this.toggle_devices_menu(cx)))
             .child(self.workspace_dot(status, theme))
-            .child(div().flex_1().min_w_0().truncate().child(label))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .child(div().truncate().child(label))
+                    // The host is the point of the badge: two workspaces can
+                    // carry the same label (a VPS re-paired later), and the
+                    // machine you are actually working on must be visible
+                    // without opening the switcher. This computer has no host.
+                    .when(!host.is_empty(), |el| {
+                        el.child(
+                            div()
+                                .truncate()
+                                .text_size(px(10.0))
+                                .font_weight(gpui::FontWeight::NORMAL)
+                                .text_color(theme.text_muted.opacity(0.8))
+                                .child(host),
+                        )
+                    }),
+            )
             .child(
                 icon(icons::ALT_ARROW_DOWN)
                     .size(px(12.0))
@@ -671,13 +693,18 @@ impl Shell {
 
     /// Show another device's workspace. The sidebar's lists, the composer's
     /// pickers and the transcript follow it; the project filter is a pick inside
-    /// one workspace, so it resets.
+    /// one workspace, so each workspace remembers its own and gets it back on
+    /// return.
     pub(super) fn select_workspace(&mut self, env_id: &str, cx: &mut Context<Self>) {
         self.close_devices_menu(cx);
         if self.state.read(cx).active_workspace == env_id {
             return;
         }
-        self.settings.space_filter = None;
+        self.remember_space_filter(cx);
+        // Apply the incoming workspace's own pick now if its rows are warm,
+        // otherwise as soon as they land (see `space_filter_pending`).
+        self.settings.space_filter = self.settings.space_filters.get(env_id).cloned();
+        self.space_filter_pending = true;
         self.settings.active_workspace = Some(env_id.to_string());
         let env_id = env_id.to_string();
         let state = self.state.clone();

@@ -920,6 +920,59 @@ fn apply_spaces_sorts_and_heals_selection() {
 }
 
 #[test]
+fn workspace_device_for_prefers_local_then_the_envs_home_device() {
+    let mut state = AppState::new();
+    state.local_device_id = Some("this-machine".into());
+    assert_eq!(
+        state.workspace_device_for(komet_engine::environments::LOCAL_ENV_ID),
+        Some("this-machine".into())
+    );
+    // A paired workspace: its own home device, never this machine.
+    state.home_device_id = Some("this-machine".into());
+    state.env_devices.insert(
+        "env-1".into(),
+        vec![
+            komet_proto::Device {
+                id: "vps".into(),
+                name: "VPS ovh".into(),
+                platform: "linux".into(),
+                last_seen_at: None,
+                created_at: None,
+                version: None,
+            },
+            komet_proto::Device {
+                id: "this-machine".into(),
+                name: "Fedora".into(),
+                platform: "linux".into(),
+                last_seen_at: None,
+                created_at: None,
+                version: None,
+            },
+        ],
+    );
+    assert_eq!(state.workspace_device_for("env-1"), Some("vps".into()));
+    assert_eq!(state.workspace_device_for("missing"), None);
+}
+
+#[test]
+fn active_workspace_host_is_empty_locally_and_names_the_server_remotely() {
+    let mut state = AppState::new();
+    state.active_workspace = komet_engine::environments::LOCAL_ENV_ID.to_string();
+    assert!(state.active_workspace_host().is_empty());
+    state.active_workspace = "env-1".into();
+    state.workspaces.push(crate::state::WorkspaceEntry {
+        id: "env-1".into(),
+        label: "komet VPS".into(),
+        host: "sync.example.com".into(),
+        status: crate::state::WorkspaceStatus::Online,
+        device_count: 1,
+        version: None,
+    });
+    assert_eq!(state.active_workspace_host(), "sync.example.com");
+    assert_eq!(state.active_workspace_label(), "komet VPS");
+}
+
+#[test]
 fn apply_sessions_stamps_context_usage_for_the_ring() {
     let mut state = AppState::new();
     state.selected_chat = Some("c1".into());

@@ -97,6 +97,7 @@ the current backend.
 | Sync rooms (sessions/devices) | done | Loro rooms via `komet-sync-server`; `KOMET_EDGE_URL` + `KOMET_SYNC_TOKEN` seams. |
 | Auth at sync | done | Bearer shared secret; dev mode `user@org` bearers. |
 | Durable nudges / sidecars | done | Replay on join (cap), sidecar slots — reimplemented sync-side. |
+| Workspaces par machine | done | Mémoire de navigation et filtre par workspace, badge libellé+hôte, libellés uniques, réglages machine relayés (`targetDeviceId`), import de projet par archive chunkée (`docs/workspaces.md`). |
 
 ## §7 Server → sync
 

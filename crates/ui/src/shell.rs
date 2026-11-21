@@ -81,7 +81,7 @@ mod github;
 mod spaces;
 mod tabs;
 
-use spaces::RenameSpaceDialog;
+use spaces::{ImportDialog, RenameSpaceDialog};
 
 actions!(
     shell,
@@ -383,6 +383,10 @@ pub struct Shell {
     /// Space-row context menu (dropdown rows): (space id, window position).
     space_menu: popover::Popup<(String, Point<Pixels>)>,
     rename_space_dialog: Option<RenameSpaceDialog>,
+    /// "Import project…" dialog: source workspace + folder, destination base,
+    /// and the previewed transfer plan.
+    import_dialog: Option<ImportDialog>,
+    import_focus_pending: bool,
     /// Space id awaiting delete confirmation (hard delete + session cascade).
     delete_space_confirm: Option<String>,
     /// Remote add-project folder browser (environment workspaces only).
@@ -406,6 +410,10 @@ pub struct Shell {
     space_boot_applied: bool,
     /// The remembered device workspace has been reopened once (paired list landed).
     workspace_boot_applied: bool,
+    /// A workspace switch parked its remembered project filter until the new
+    /// workspace's spaces arrive (rows are async; restoring against an empty
+    /// list would discard the pick).
+    space_filter_pending: bool,
     /// Last seen session status per chat — the chime trigger compares against
     /// it (a row's FIRST appearance never chimes, so boot stays silent).
     sound_prev: std::collections::HashMap<String, komet_proto::SessionStatus>,
@@ -795,6 +803,8 @@ impl Shell {
             delete_focus_pending: false,
             space_menu: popover::Popup::default(),
             rename_space_dialog: None,
+            import_dialog: None,
+            import_focus_pending: false,
             delete_space_confirm: None,
             remote_folder_browser: None,
             space_delete_focus: cx.focus_handle(),
@@ -806,6 +816,7 @@ impl Shell {
             sidebar_scroll: gpui::ScrollHandle::new(),
             space_boot_applied: false,
             workspace_boot_applied: false,
+            space_filter_pending: false,
             sound_prev: std::collections::HashMap::new(),
             user_menu: popover::Popup::default(),
             sidebar_notice: None,
@@ -1082,6 +1093,13 @@ impl Shell {
         if self.active_chat.is_empty() {
             self.remember_current_navigation(cx);
         }
+        // A workspace switch parked the remembered project filter until this
+        // workspace's rows landed; apply it once they have.
+        if self.space_filter_pending && state.read(cx).spaces_synced {
+            self.space_filter_pending = false;
+            self.restore_space_filter(cx);
+            self.schedule_save(cx);
+        }
         // Heal a dangling sidebar filter (space deleted, possibly elsewhere):
         // fall back to "All" rather than filtering everything out.
         if state.read(cx).spaces_synced
@@ -1276,6 +1294,34 @@ impl Shell {
     /// Debounced settings write: waits [`SAVE_DEBOUNCE_MS`], then persists the
     /// latest snapshot on the background executor. Re-scheduling drops (cancels)
     /// the previous timer.
+    /// Stash the ACTIVE workspace's project filter so switching away and back
+    /// restores its own pick. A `None` filter removes the entry (no stale
+    /// project id lingers for a workspace the user has since reset to "All").
+    pub(super) fn remember_space_filter(&mut self, cx: &mut App) {
+        let env_id = self.state.read(cx).active_workspace.clone();
+        match self.settings.space_filter.clone() {
+            Some(space_id) => {
+                self.settings.space_filters.insert(env_id, space_id);
+            }
+            None => {
+                self.settings.space_filters.remove(&env_id);
+            }
+        }
+    }
+
+    /// Re-apply the remembered filter for the workspace being shown, dropping a
+    /// pick whose project no longer exists there (deleted, or never synced).
+    pub(super) fn restore_space_filter(&mut self, cx: &mut App) {
+        let env_id = self.state.read(cx).active_workspace.clone();
+        let state = self.state.read(cx);
+        self.settings.space_filter = self
+            .settings
+            .space_filters
+            .get(&env_id)
+            .filter(|space_id| state.space_row(space_id).is_some())
+            .cloned();
+    }
+
     pub(super) fn schedule_save(&mut self, cx: &mut Context<Self>) {
         let dir = self.data_dir.clone();
         self.save_task = Some(cx.spawn(async move |this, cx| {

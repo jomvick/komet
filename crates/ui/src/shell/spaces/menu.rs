@@ -10,6 +10,9 @@ impl Shell {
     /// default is "the space you're looking at".
     pub(crate) fn set_space_filter(&mut self, filter: Option<String>, cx: &mut Context<Self>) {
         self.settings.space_filter = filter.clone();
+        // Keep the per-workspace memory in step with the live filter, so the
+        // pick survives a workspace round-trip without a save/reload.
+        self.remember_space_filter(cx);
         if let Some(space_id) = filter
             && self.state.read(cx).selected_chat.is_none()
         {
@@ -58,6 +61,7 @@ impl Shell {
                 .map(|ix| SpacesMenuRow::Space(spaces[ix].id.clone())),
         );
         rows.push(SpacesMenuRow::AddSpace);
+        rows.push(SpacesMenuRow::ImportProject);
         rows
     }
 
@@ -139,6 +143,7 @@ impl Shell {
                 self.close_spaces_menu(cx);
                 self.open_project_folder_picker(cx);
             }
+            SpacesMenuRow::ImportProject => self.open_import_dialog(cx),
         }
     }
 

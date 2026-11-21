@@ -276,18 +276,19 @@ impl AppState {
         if self.active_workspace == env_id && (is_local || self.display_engine.is_some()) {
             return;
         }
+        // Remember EVERY workspace, this computer included: leaving Fedora for
+        // the VPS and coming back must land on the same project/chat, not on
+        // the freshly-cleared defaults.
         let outgoing = self.active_workspace.clone();
-        if outgoing != LOCAL_ENV_ID {
-            self.env_memory.insert(
-                outgoing,
-                WorkspaceMemory {
-                    selected_space: self.selected_space.clone(),
-                    selected_device: self.selected_device.clone(),
-                    selected_chat: self.selected_chat.clone(),
-                    no_project: self.no_project,
-                },
-            );
-        }
+        self.env_memory.insert(
+            outgoing,
+            WorkspaceMemory {
+                selected_space: self.selected_space.clone(),
+                selected_device: self.selected_device.clone(),
+                selected_chat: self.selected_chat.clone(),
+                no_project: self.no_project,
+            },
+        );
         self.stop_workspace_watches();
         self.data_tasks.clear();
         self.transcript_task = None;
@@ -295,6 +296,12 @@ impl AppState {
         self.clear_lists();
         if is_local {
             self.local_device_id = self.home_device_id.clone();
+            if let Some(memory) = self.env_memory.get(&env_id) {
+                self.selected_space = memory.selected_space.clone();
+                self.selected_device = memory.selected_device.clone();
+                self.selected_chat = memory.selected_chat.clone();
+                self.no_project = memory.no_project;
+            }
             self.start_local_data_watches(cx);
         } else {
             // Warm rows mean the composer can target that machine before its

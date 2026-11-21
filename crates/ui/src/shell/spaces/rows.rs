@@ -362,6 +362,12 @@ impl Shell {
                             SpacesMenuRow::AddSpace => {
                                 (row.clone(), "New project…".into(), None, false)
                             }
+                            SpacesMenuRow::ImportProject => (
+                                row.clone(),
+                                "Import project…".into(),
+                                Some("copy from another workspace".into()),
+                                false,
+                            ),
                         })
                         .collect()
                 };
@@ -378,12 +384,12 @@ impl Shell {
                             let is_selected = match &row {
                                 SpacesMenuRow::All => filter.is_none(),
                                 SpacesMenuRow::Space(id) => filter.as_deref() == Some(id.as_str()),
-                                SpacesMenuRow::AddSpace => false,
+                                SpacesMenuRow::AddSpace | SpacesMenuRow::ImportProject => false,
                             };
-                            let leading = if matches!(row, SpacesMenuRow::AddSpace) {
-                                icons::PLUS
-                            } else {
-                                icons::FOLDER
+                            let leading = match row {
+                                SpacesMenuRow::AddSpace => icons::PLUS,
+                                SpacesMenuRow::ImportProject => icons::ARCHIVE_MINIMALISTIC,
+                                _ => icons::FOLDER,
                             };
                             let activate = row.clone();
                             popover::menu_row_nav(

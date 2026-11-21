@@ -1229,6 +1229,9 @@ impl Shell {
         }
 
         overlays.extend(self.render_space_overlays(viewport, window, cx));
+        if let Some(import) = self.render_import_overlay(viewport, window, cx) {
+            overlays.push(import);
+        }
 
         if let Some(chat_id) = self.delete_confirm.clone() {
             if std::mem::take(&mut self.delete_focus_pending) {
