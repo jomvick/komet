@@ -80,7 +80,8 @@ curl -fsSL https://raw.githubusercontent.com/jomvick/komet/main/install.sh \
 `--lan` sert en HTTP sur l'adresse locale de la machine ; le lien imprimé porte
 donc son bearer en clair, ce qui n'est correct que sur un réseau que vous contrôlez
 déjà. Sur Internet, passez par TLS et par `--serve
---public-url https://sync.example.com` (section ci-dessus).
+--public-url https://sync.your-domain.com` (section ci-dessus) — ou par l'URL
+https d'un tunnel si vous n'avez pas de domaine.
 
 Le lien `komet://pair/…` se colle dans **Komet → Settings → Sync → Add device**.
 La machine apparaît ensuite dans le sélecteur **Devices** en haut de la sidebar :

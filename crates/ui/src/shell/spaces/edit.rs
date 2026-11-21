@@ -252,6 +252,10 @@ impl Shell {
             overlays.push(popover::modal("delete-space-dialog", viewport, card));
         }
 
+        if let Some(browser) = self.render_remote_folder_browser(viewport, window, cx) {
+            overlays.push(browser);
+        }
+
         overlays
     }
 }
