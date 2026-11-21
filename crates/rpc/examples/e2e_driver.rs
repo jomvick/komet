@@ -233,8 +233,10 @@ async fn setup(a_port: u16, b_port: u16) -> Setup {
     Setup { b, a_dev, chat_id }
 }
 
-/// Queue a Run command on B through the doc (no targetDeviceId).
-async fn queue_run(b: &RpcClient, chat_id: &str, label: &str) {
+/// Queue a Run command on B through the doc (no targetDeviceId). Returns the
+/// client-minted message id, which the host writes as the USER entry's id —
+/// the handle that ties one completed response to one command.
+async fn queue_run(b: &RpcClient, chat_id: &str, label: &str) -> String {
     let message_id = uuid::Uuid::new_v4().to_string();
     b.call(
         methods::QUEUE_COMMAND,
@@ -260,14 +262,21 @@ async fn queue_run(b: &RpcClient, chat_id: &str, label: &str) {
     pass(&format!(
         "run command queued on B via the doc command queue ({label})"
     ));
+    message_id
 }
 
-/// Materialize the doc-transcript stream on B; returns once the chat holds at
-/// least `target` complete assistant entries, together with the entries.
-async fn wait_transcript(
+/// Materialize the doc-transcript stream on B until `message_id`'s own turn is
+/// complete. A completed response only counts for THIS command when it was
+/// created at/after the command's user entry — so a repeated earlier run (the
+/// restart/cut scenarios queue the same prompt twice) can never satisfy the
+/// later expectation. Also asserts the transcript holds exactly
+/// `expected_complete` complete assistant entries, proving nothing was lost or
+/// duplicated across the interruption.
+async fn wait_command_response(
     b: &RpcClient,
     chat_id: &str,
-    target: usize,
+    message_id: &str,
+    expected_complete: usize,
     what: &str,
 ) -> Vec<komet_doc::SessionMessageEntry> {
     let mut transcript = Vec::new();
@@ -279,17 +288,73 @@ async fn wait_transcript(
         |item| {
             apply_transcript_item(&mut transcript, item)
                 .unwrap_or_else(|err| fail(&format!("{what}: {err}")));
-            let complete = transcript
+            let user = transcript
                 .iter()
-                .filter(|entry| {
-                    entry.role == MessageRole::Assistant
-                        && entry.status == Some(komet_doc::MessageStatus::Complete)
-                })
-                .count();
-            (complete >= target).then(|| transcript.clone())
+                .find(|entry| entry.role == MessageRole::User && entry.id == message_id)
+                .cloned()?;
+            let served = transcript.iter().any(|entry| {
+                entry.role == MessageRole::Assistant
+                    && entry.status == Some(komet_doc::MessageStatus::Complete)
+                    && entry.created_at >= user.created_at
+            });
+            served.then(|| transcript.clone())
         },
     )
-    .await
+    .await;
+
+    let complete: Vec<_> = transcript
+        .iter()
+        .filter(|entry| {
+            entry.role == MessageRole::Assistant
+                && entry.status == Some(komet_doc::MessageStatus::Complete)
+        })
+        .collect();
+    if complete.len() != expected_complete {
+        fail(&format!(
+            "{what}: expected exactly {expected_complete} complete assistant \
+             entries, got {} (a lost or duplicated run)",
+            complete.len()
+        ));
+    }
+    transcript
+}
+
+/// Every completed assistant entry came from the host and carries the mock
+/// transcript — checked per entry so a stale entry cannot mask a broken one.
+fn assert_complete_responses(
+    transcript: &[komet_doc::SessionMessageEntry],
+    host: &str,
+    expected_complete: usize,
+    what: &str,
+) {
+    let complete: Vec<_> = transcript
+        .iter()
+        .filter(|entry| {
+            entry.role == MessageRole::Assistant
+                && entry.status == Some(komet_doc::MessageStatus::Complete)
+        })
+        .collect();
+    if complete.len() != expected_complete {
+        fail(&format!(
+            "{what}: expected {expected_complete} complete entries, got {}",
+            complete.len()
+        ));
+    }
+    for entry in complete {
+        if entry.device_id != host {
+            fail(&format!(
+                "{what}: assistant entry written by {}, expected host {host}",
+                entry.device_id
+            ));
+        }
+        let text = serde_json::to_string(entry)
+            .unwrap_or_else(|err| fail(&format!("{what}: serialize transcript: {err}")));
+        if !text.contains(MOCK_TEXT) {
+            fail(&format!(
+                "{what}: assistant entry lacks the mock transcript: {text}"
+            ));
+        }
+    }
 }
 
 fn marker_from_env(name: &str) -> PathBuf {
@@ -331,33 +396,22 @@ async fn commands(a_port: u16, b_port: u16) {
     // 4. Queue the run from B THROUGH THE DOC (no targetDeviceId): B commits
     //    the command into its replica; the nudge + room sync hand it to A's
     //    executor.
-    queue_run(&s.b, &s.chat_id, "B -> A").await;
+    let message_id = queue_run(&s.b, &s.chat_id, "B -> A").await;
 
     // 5a. Assistant entry executed by A arrives back on B, complete, with the
     // mock text. WatchDocMessages speaks the framed protocol: a full `reset`
     // list on attach, then `upsert`/`append` deltas. Materialize every frame
     // through the shared parser so candidates persist across incremental frames.
-    let transcript = wait_transcript(&s.b, &s.chat_id, 1, "assistant transcript on B").await;
-    let entry = transcript
-        .iter()
-        .find(|entry| {
-            entry.role == MessageRole::Assistant
-                && entry.status == Some(komet_doc::MessageStatus::Complete)
-        })
-        .expect("wait_transcript returned on a complete assistant entry");
-    if entry.device_id != s.a_dev {
-        fail(&format!(
-            "assistant entry written by {}, expected host {}",
-            entry.device_id, s.a_dev
-        ));
-    }
-    let text = serde_json::to_string(entry)
-        .unwrap_or_else(|err| fail(&format!("serialize assistant transcript: {err}")));
-    if !text.contains(MOCK_TEXT) {
-        fail(&format!(
-            "assistant entry lacks the mock transcript: {text}"
-        ));
-    }
+    // The command's own message id pins which response belongs to it.
+    let transcript = wait_command_response(
+        &s.b,
+        &s.chat_id,
+        &message_id,
+        1,
+        "assistant transcript on B",
+    )
+    .await;
+    assert_complete_responses(&transcript, &s.a_dev, 1, "assistant transcript on B");
     pass("assistant entry (host-executed, status=complete) synced back to B");
 
     // 5b. Session-status row round-trips: B sees A's session for this chat go idle.
@@ -389,42 +443,23 @@ async fn commands(a_port: u16, b_port: u16) {
 async fn restart(a_port: u16, b_port: u16, label: &str) {
     let s = setup(a_port, b_port).await;
 
-    queue_run(&s.b, &s.chat_id, "before the restart").await;
-    wait_transcript(&s.b, &s.chat_id, 1, "first transcript on B").await;
+    let before = queue_run(&s.b, &s.chat_id, "before the restart").await;
+    wait_command_response(&s.b, &s.chat_id, &before, 1, "first transcript on B").await;
     pass("first run synced B -> A -> B before the restart");
 
     let restarted_at = script_handoff(label).await;
 
-    queue_run(&s.b, &s.chat_id, "after the restart").await;
-    let transcript = wait_transcript(&s.b, &s.chat_id, 2, "second transcript on B").await;
-    let complete: Vec<_> = transcript
-        .iter()
-        .filter(|entry| {
-            entry.role == MessageRole::Assistant
-                && entry.status == Some(komet_doc::MessageStatus::Complete)
-        })
-        .collect();
-    if complete.len() != 2 {
-        fail(&format!(
-            "expected exactly 2 complete assistant entries after the restart, got {}",
-            complete.len()
-        ));
+    let after = queue_run(&s.b, &s.chat_id, "after the restart").await;
+    if before == after {
+        fail("the two commands share a message id — identity is not per command");
     }
-    for entry in &complete {
-        if entry.device_id != s.a_dev {
-            fail(&format!(
-                "assistant entry written by {}, expected host {}",
-                entry.device_id, s.a_dev
-            ));
-        }
-        let text = serde_json::to_string(entry)
-            .unwrap_or_else(|err| fail(&format!("serialize assistant transcript: {err}")));
-        if !text.contains(MOCK_TEXT) {
-            fail(&format!(
-                "assistant entry lacks the mock transcript: {text}"
-            ));
-        }
-    }
+    let transcript =
+        wait_command_response(&s.b, &s.chat_id, &after, 2, "second transcript on B").await;
+    // Exactly 2 complete entries, both from the host, both carrying the mock
+    // text: the restart lost nothing and duplicated nothing. The `after` id
+    // guarantees the second entry is the second command's own response, not a
+    // replay of the first.
+    assert_complete_responses(&transcript, &s.a_dev, 2, "second transcript on B");
     pass("second run synced after the restart; no loss, no duplicate (2/2)");
 
     // The sync must have recovered promptly: the second transcript entry
@@ -441,14 +476,19 @@ async fn restart(a_port: u16, b_port: u16, label: &str) {
 async fn cut(a_port: u16, b_port: u16) {
     let s = setup(a_port, b_port).await;
 
-    queue_run(&s.b, &s.chat_id, "before the cut").await;
-    wait_transcript(&s.b, &s.chat_id, 1, "first transcript on B").await;
+    let before = queue_run(&s.b, &s.chat_id, "before the cut").await;
+    wait_command_response(&s.b, &s.chat_id, &before, 1, "first transcript on B").await;
     pass("first run synced before the cut");
 
     let restored_at = script_handoff("proxy cut + restore").await;
 
-    queue_run(&s.b, &s.chat_id, "after the cut").await;
-    wait_transcript(&s.b, &s.chat_id, 2, "second transcript on B").await;
+    let after = queue_run(&s.b, &s.chat_id, "after the cut").await;
+    if before == after {
+        fail("the two commands share a message id — identity is not per command");
+    }
+    let transcript =
+        wait_command_response(&s.b, &s.chat_id, &after, 2, "second transcript on B").await;
+    assert_complete_responses(&transcript, &s.a_dev, 2, "second transcript on B");
     let elapsed = std::time::SystemTime::now()
         .duration_since(restored_at)
         .unwrap_or_else(|err| fail(&format!("clock: {err}")));

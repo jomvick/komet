@@ -449,6 +449,9 @@ struct Actor {
 enum SessionEnd {
     /// Transport died / probe deadline / requested redial: back off, redial.
     Reconnect,
+    /// System wake: the socket sat through a suspend, so redial at once with a
+    /// fresh backoff — sleeping first would delay the recovery it announced.
+    Wake,
     /// Shutdown requested: stop the actor.
     Stop,
 }
@@ -492,6 +495,11 @@ impl Actor {
 
             match self.run_session(pipe, &mut ready).await {
                 SessionEnd::Stop => return,
+                SessionEnd::Wake => {
+                    // Resume is an event, not a timeout: no backoff sleep, and
+                    // the next failure starts the ladder over.
+                    backoff = BACKOFF_BASE;
+                }
                 SessionEnd::Reconnect => {
                     lock(&self.doc).mark_disconnected();
                     self.stats
@@ -660,7 +668,7 @@ impl Actor {
                 }
                 _ = wake.recv() => {
                     tracing::info!("registry: system wake; redialing");
-                    return SessionEnd::Reconnect;
+                    return SessionEnd::Wake;
                 }
                 _ = tokio::time::sleep_until(quiet_probe_at) => {
                     if !self.send_probe(&mut pipe, &mut probe_deadline).await {

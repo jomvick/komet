@@ -335,17 +335,23 @@ pub(crate) async fn ws_handler(
     {
         return Err((StatusCode::UNAUTHORIZED, "unauthorized"));
     }
+    // Reserve the room BEFORE returning the upgrade response: an idle-prune
+    // tick between here and `serve` would otherwise drop the map entry, and the
+    // next `room()` would open a second `ChatLog` on the same database file.
+    // The lease is transferred into the socket task; if the upgrade never runs
+    // it is released by the closure being dropped.
     let Some(room) = state.chat.room(&chat_id) else {
         return Err((StatusCode::BAD_REQUEST, "invalid chat id"));
     };
+    let lease = room.attach_socket();
     let device = query_param(query.0.as_deref(), "device")
         .unwrap_or_default()
         .to_string();
-    Ok(ws.on_upgrade(move |socket| serve(room, device, socket)))
+    Ok(ws.on_upgrade(move |socket| serve(room, lease, device, socket)))
 }
 
-async fn serve(room: Arc<ChatRoom>, initial_device: String, socket: WebSocket) {
-    let _lease = room.attach_socket();
+async fn serve(room: Arc<ChatRoom>, lease: SocketLease, initial_device: String, socket: WebSocket) {
+    let _lease = lease;
     let origin = NEXT_ORIGIN.fetch_add(1, Ordering::Relaxed);
     let mut events = room.tx.subscribe();
     let (mut sender, mut receiver) = socket.split();

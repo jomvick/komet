@@ -128,11 +128,12 @@ pub struct Room {
     pub registry: Option<Arc<std::sync::Mutex<RegistryRoom>>>,
     /// Registry text frames, broadcast to every registry socket in the room.
     pub registry_tx: broadcast::Sender<String>,
-    /// Live sockets attached to this room (relay + registry). Idle rooms are
-    /// evicted from memory after a TTL — their data lives on in sqlite.
-    pub sockets: usize,
+    /// Live sockets attached to this room (relay + registry), shared with the
+    /// socket leases so a decrement never needs the room-map lock. Idle rooms
+    /// are evicted from memory after a TTL — their data lives on in sqlite.
+    pub sockets: Arc<std::sync::atomic::AtomicUsize>,
     /// Last moment a socket attached to (or left) this room.
-    pub last_seen: std::time::Instant,
+    pub last_seen: Arc<std::sync::Mutex<std::time::Instant>>,
 }
 
 /// A room with no socket attached is dropped from memory after this idle
@@ -144,14 +145,27 @@ const ROOM_IDLE_TTL: std::time::Duration = std::time::Duration::from_secs(10 * 6
 const MAX_ROOMS: usize = 512;
 
 /// Drop idle rooms past the TTL and enforce the ceiling (oldest idle first).
+fn room_sockets(room: &Room) -> usize {
+    room.sockets.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn room_last_seen(room: &Room) -> std::time::Instant {
+    *room
+        .last_seen
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 fn prune_rooms(rooms: &mut HashMap<String, Room>) {
     let now = std::time::Instant::now();
-    rooms.retain(|_, room| room.sockets > 0 || now.duration_since(room.last_seen) < ROOM_IDLE_TTL);
+    rooms.retain(|_, room| {
+        room_sockets(room) > 0 || now.duration_since(room_last_seen(room)) < ROOM_IDLE_TTL
+    });
     while rooms.len() >= MAX_ROOMS {
         let Some(oldest_idle) = rooms
             .iter()
-            .filter(|(_, room)| room.sockets == 0)
-            .min_by_key(|(_, room)| room.last_seen)
+            .filter(|(_, room)| room_sockets(room) == 0)
+            .min_by_key(|(_, room)| room_last_seen(room))
             .map(|(name, _)| name.clone())
         else {
             break;
@@ -160,24 +174,40 @@ fn prune_rooms(rooms: &mut HashMap<String, Room>) {
     }
 }
 
-/// RAII socket lease on a room: re-locks the map on drop to decrement the
-/// socket count and refresh `last_seen`.
+/// RAII socket lease on a room. It holds the room's shared counters, so the
+/// decrement is lock-free bookkeeping — lock contention on the room map can
+/// never lose it (the old `try_write` silently dropped the decrement, leaving
+/// a stale count that kept an idle room resident until process exit).
 struct RoomLease {
-    rooms: Arc<tokio::sync::RwLock<HashMap<String, Room>>>,
-    room: String,
+    sockets: Arc<std::sync::atomic::AtomicUsize>,
+    last_seen: Arc<std::sync::Mutex<std::time::Instant>>,
+}
+
+impl RoomLease {
+    /// Reserve a socket on `room` and return the lease; take it while holding
+    /// the room-map lock so a prune tick cannot evict the room in between.
+    fn reserve(room: &Room) -> Self {
+        room.sockets
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        *room
+            .last_seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = std::time::Instant::now();
+        Self {
+            sockets: room.sockets.clone(),
+            last_seen: room.last_seen.clone(),
+        }
+    }
 }
 
 impl Drop for RoomLease {
     fn drop(&mut self) {
-        if let Ok(mut rooms) = self.rooms.try_write() {
-            if let Some(entry) = rooms.get_mut(&self.room) {
-                entry.sockets = entry.sockets.saturating_sub(1);
-                entry.last_seen = std::time::Instant::now();
-            }
-            prune_rooms(&mut rooms);
-        }
-        // A contended lock here only delays the count fix until the next
-        // prune tick, which drops the whole room eventually.
+        self.sockets
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        *self
+            .last_seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = std::time::Instant::now();
     }
 }
 
@@ -193,8 +223,8 @@ fn new_room(data_dir: &std::path::Path, room: &str) -> Room {
         db_path: path,
         registry: None,
         registry_tx,
-        sockets: 0,
-        last_seen: std::time::Instant::now(),
+        sockets: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        last_seen: Arc::new(std::sync::Mutex::new(std::time::Instant::now())),
     }
 }
 
@@ -430,19 +460,15 @@ fn check_query_token(state: &AppState, query: Option<&str>) -> bool {
 }
 
 async fn handle_socket(state: AppState, room: String, socket: WebSocket) {
-    let (tx, db_path) = {
+    let (tx, db_path, _lease) = {
         let mut rooms = state.rooms.write().await;
         prune_rooms(&mut rooms);
         let entry = rooms
             .entry(room.clone())
             .or_insert_with(|| new_room(&state.data_dir, &room));
-        entry.sockets += 1;
-        entry.last_seen = std::time::Instant::now();
-        (entry.tx.clone(), entry.db_path.clone())
-    };
-    let _lease = RoomLease {
-        rooms: state.rooms.clone(),
-        room: room.clone(),
+        // Reserved under the map lock, released by the lease on drop.
+        let lease = RoomLease::reserve(entry);
+        (entry.tx.clone(), entry.db_path.clone(), lease)
     };
     // Subscribe before reading history: a frame persisted in between is then
     // delivered twice (CRDT updates are idempotent) instead of being lost.
@@ -525,31 +551,31 @@ async fn handle_socket(state: AppState, room: String, socket: WebSocket) {
 /// resync after a lag or a reconnect; `push` merges ops under the server's LWW and
 /// answers with `ack`, broadcasting the winning rows to every client in the room.
 async fn handle_registry_socket(state: AppState, room: String, socket: WebSocket) {
-    let (registry, registry_tx) = {
+    let (registry, registry_tx, _lease) = {
         let mut rooms = state.rooms.write().await;
         prune_rooms(&mut rooms);
         let entry = rooms
             .entry(room.clone())
             .or_insert_with(|| new_room(&state.data_dir, &room));
-        entry.sockets += 1;
-        entry.last_seen = std::time::Instant::now();
         if entry.registry.is_none() {
             match RegistryRoom::open(&entry.db_path) {
                 Ok(opened) => entry.registry = Some(Arc::new(std::sync::Mutex::new(opened))),
                 Err(err) => {
                     tracing::error!(room = %room, error = %err, "registry room open failed");
+                    // No socket attached yet, so nothing to release: the room
+                    // simply stays idle and is pruned later.
                     return;
                 }
             }
         }
+        // Only after the room initialized successfully: a failed open must not
+        // leave a stray socket count behind.
+        let lease = RoomLease::reserve(entry);
         (
             entry.registry.clone().expect("opened above"),
             entry.registry_tx.clone(),
+            lease,
         )
-    };
-    let _lease = RoomLease {
-        rooms: state.rooms.clone(),
-        room: room.clone(),
     };
     let mut rx = registry_tx.subscribe();
     let (mut sender, mut receiver) = socket.split();
@@ -1135,10 +1161,13 @@ mod tests {
     #[test]
     fn relay_rooms_are_evicted_when_idle_and_kept_while_attached() {
         let mut rooms = HashMap::new();
-        let mut attached = idle_room();
-        attached.sockets = 2;
-        let mut old_idle = idle_room();
-        old_idle.last_seen -= ROOM_IDLE_TTL + std::time::Duration::from_secs(60);
+        let attached = idle_room();
+        attached
+            .sockets
+            .store(2, std::sync::atomic::Ordering::Relaxed);
+        let old_idle = idle_room();
+        *old_idle.last_seen.lock().unwrap() =
+            std::time::Instant::now() - ROOM_IDLE_TTL - std::time::Duration::from_secs(60);
         rooms.insert("attached".into(), attached);
         rooms.insert("old-idle".into(), old_idle);
         rooms.insert("fresh-idle".into(), idle_room());
@@ -1155,8 +1184,10 @@ mod tests {
     #[test]
     fn the_relay_room_ceiling_only_claims_idle_rooms() {
         let mut rooms = HashMap::new();
-        let mut attached = idle_room();
-        attached.sockets = 1;
+        let attached = idle_room();
+        attached
+            .sockets
+            .store(1, std::sync::atomic::Ordering::Relaxed);
         rooms.insert("attached".into(), attached);
         for i in 0..MAX_ROOMS {
             rooms.insert(format!("fill-{i}"), idle_room());

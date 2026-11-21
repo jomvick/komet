@@ -568,7 +568,11 @@ struct Actor {
 }
 
 enum SessionEnd {
+    /// Transport died / probe deadline / requested redial: back off, redial.
     Reconnect,
+    /// System wake: the socket sat through a suspend, so redial at once with a
+    /// fresh backoff — sleeping first would delay the recovery it announced.
+    Wake,
     Stop,
 }
 
@@ -611,6 +615,13 @@ impl Actor {
 
             match self.run_session(pipe, &mut ready).await {
                 SessionEnd::Stop => return,
+                SessionEnd::Wake => {
+                    // Resume is an event, not a timeout: no backoff sleep, and
+                    // the next failure starts the ladder over (the network
+                    // path just changed, so the old delay says nothing about
+                    // the new one).
+                    backoff = BACKOFF_BASE;
+                }
                 SessionEnd::Reconnect => {
                     use std::sync::atomic::Ordering::Relaxed;
                     self.flags.connected.store(false, Relaxed);
@@ -859,7 +870,7 @@ impl Actor {
                 // discovering it by silence-lease timeout.
                 _ = wake.recv() => {
                     tracing::info!("chat2: system wake; redialing");
-                    return SessionEnd::Reconnect;
+                    return SessionEnd::Wake;
                 }
                 // Transient (quota) rejection: probe with the HEAD batch on
                 // a short clock (see `Shared::quota_blocked`); acks re-arm

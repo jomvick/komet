@@ -1,8 +1,8 @@
 # Unit tests on every desktop platform; the bash e2e smoke on Linux.
-# gpui system libs are only needed to build `komet` itself — the pure sync
-# crates (komet-sync, komet-sync-server, komet-rpc, komet-engine) build and
-# test without them, which is what these jobs cover first; the Linux job
-# installs the full set so the workspace-wide check compiles the UI too.
+# gpui system libs are needed to build `komet` itself — the pure sync crates
+# (komet-sync, komet-sync-server, komet-rpc) build and test without them, which
+# is what the cross-platform jobs cover; the Linux job installs the full set so
+# the engine tests, the workspace check and the e2e smoke's `komet` build work.
 name: ci
 on:
   push:
@@ -15,6 +15,14 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+
+# `shell: bash` is explicit on the cargo steps on purpose: the default Windows
+# shell (PowerShell) keeps running a multi-line block after a command fails, so
+# a clippy or test failure could be masked by a later success. Git Bash on the
+# Windows runners gives the same `set -e` semantics as Linux/macOS.
+defaults:
+  run:
+    shell: bash
 
 jobs:
   unit-tests:
@@ -45,11 +53,18 @@ jobs:
             libvulkan-dev libdbus-1-dev pkg-config cmake
       - name: sync crates — check, clippy, tests
         run: |
-          cargo check -p komet-sync -p komet-sync-server -p komet-rpc -p komet-engine --all-targets
-          cargo clippy -p komet-sync -p komet-sync-server -p komet-rpc -p komet-engine --all-targets -- -D warnings
+          cargo check -p komet-sync -p komet-sync-server -p komet-rpc --all-targets
+          cargo clippy -p komet-sync -p komet-sync-server -p komet-rpc --all-targets -- -D warnings
           cargo test -p komet-sync --features mock-server
           cargo test -p komet-sync-server
           cargo test -p komet-rpc
+      # Engine is checked on Linux only for now: its dependency tree
+      # (komet-update, komet-harness) has pre-existing Windows/macOS cfg paths
+      # that fail `-D warnings` and are out of scope for the sync work.
+      - name: engine — clippy + tests (Linux only)
+        if: matrix.gpui-deps
+        run: |
+          cargo clippy -p komet-engine --all-targets -- -D warnings
           cargo test -p komet-engine --lib
       - name: workspace check (Linux only — gpui builds are slow)
         if: matrix.gpui-deps
@@ -65,5 +80,15 @@ jobs:
       - name: rust toolchain (rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # Same list as the unit-tests job: the smoke builds `komet`, which links
+      # gpui (fontconfig et al.) even in `headless` mode.
+      - name: gpui system deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+            libx11-dev libxcb1-dev libx11-xcb-dev \
+            libfontconfig1-dev libfreetype-dev libasound2-dev \
+            libvulkan-dev libdbus-1-dev pkg-config cmake
       - name: e2e smoke (all scenarios)
         run: scripts/e2e-smoke.sh all

@@ -133,17 +133,14 @@ const OFFLINE_PARK: Duration = Duration::from_secs(60);
 
 /// Wait out one reconnect-backoff step, cut short by a wake or online event.
 ///
-/// While [`path_is_offline`] is true the dial is futile, so the full `wait`
-/// is parked (60 s safety timer): the loop burns no dial attempts the OS says
-/// cannot succeed, and a `set_path_online(true)` broadcast un-parks it
-/// instantly. Stale events are drained first so only events that happen
-/// DURING the wait cut it short.
+/// While [`path_is_offline`] is true the dial is futile, so the wait parks for
+/// [`OFFLINE_PARK`] regardless of the (shorter) backoff: the loop burns no
+/// dial attempts the OS says cannot succeed, and a `set_path_online(true)`
+/// broadcast un-parks it instantly. Stale events are drained first so only
+/// events that happen DURING the wait cut it short.
 pub async fn reconnect_wait(wait: Duration) {
-    let wait = if path_is_offline() {
-        wait.min(OFFLINE_PARK)
-    } else {
-        wait
-    };
+    let offline = path_is_offline();
+    let wait = if offline { OFFLINE_PARK } else { wait };
     let mut wake = subscribe();
     let mut online = subscribe_online();
     let _ = wake.try_recv();

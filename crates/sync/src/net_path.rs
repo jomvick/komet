@@ -48,6 +48,10 @@ mod linux_imp {
             .name("komet.net-path".into())
             .spawn(|| {
                 let mut online = has_default_route();
+                // Publish the initial result: if the machine boots with no
+                // route, parked dialers must know it before the first change
+                // (otherwise they only learn on the second poll).
+                crate::wake::set_path_online(online);
                 loop {
                     std::thread::sleep(POLL);
                     let now = has_default_route();
@@ -106,7 +110,9 @@ mod imp {
                 return;
             }
             let handler = RcBlock::new(|path: *mut c_void| {
-                let status = unsafe { nw_path_get_status(path) };
+                // Already inside the surrounding `unsafe` block's contract:
+                // `path` is the OS-owned nw_path_t handed to this callback.
+                let status = nw_path_get_status(path);
                 let online = status != NW_PATH_STATUS_UNSATISFIED;
                 crate::wake::set_path_online(online);
                 if online {

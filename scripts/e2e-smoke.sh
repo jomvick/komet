@@ -97,7 +97,7 @@ wait_for() { # wait_for <description> <timeout_s> <command...>
     waited=$((waited + 1))
     if [[ "$waited" -ge "$timeout" ]]; then
       echo "FAIL: timed out waiting for $what" >&2
-      exit 1
+      return 1
     fi
   done
 }
@@ -231,24 +231,24 @@ run_scenario() { # run_scenario <name>
 
   case "$name" in
     commands)
-      start_sync "$sync_dir"
-      start_engines "$a_dir" "$b_dir"
-      "$DRIVER" "$A_PORT" "$B_PORT" commands
+      start_sync "$sync_dir" || return 1
+      start_engines "$a_dir" "$b_dir" || return 1
+      "$DRIVER" "$A_PORT" "$B_PORT" commands || return 1
       ;;
 
     restart|wake)
-      start_sync "$sync_dir"
-      start_engines "$a_dir" "$b_dir"
+      start_sync "$sync_dir" || return 1
+      start_engines "$a_dir" "$b_dir" || return 1
       rm -f "$LOG_DIR/ready" "$LOG_DIR/signal" "$LOG_DIR/wake-file"
       KOMET_E2E_READY="$LOG_DIR/ready" KOMET_E2E_SIGNAL="$LOG_DIR/signal" \
         "$DRIVER" "$A_PORT" "$B_PORT" "$name" \
         >"$LOG_DIR/driver-$name.out" 2>&1 &
       local driver_pid=$!
-      wait_for_marker "ready" 300
+      wait_for_marker "ready" 300 || return 1
       echo "restart: killing the sync server mid-session"
       stop_sync
       sleep 3
-      start_sync "$sync_dir"
+      start_sync "$sync_dir" || return 1
       sleep 2
       if [[ "$name" == "wake" ]]; then
         touch "$LOG_DIR/wake-file"
@@ -257,7 +257,11 @@ run_scenario() { # run_scenario <name>
         rm -f "$LOG_DIR/wake-file"
       fi
       touch "$LOG_DIR/signal"
-      wait "$driver_pid"
+      if ! wait "$driver_pid"; then
+        echo "FAIL: $name driver exited nonzero" >&2
+        cat "$LOG_DIR/driver-$name.out" >&2
+        return 1
+      fi
       echo "PASS: scenario $name (driver output in $LOG_DIR/driver-$name.out)"
       if [[ "$name" == "wake" ]]; then
         for log in "$LOG_DIR/engine-a.log" "$LOG_DIR/engine-b.log"; do
@@ -275,34 +279,38 @@ run_scenario() { # run_scenario <name>
       ;;
 
     cut)
-      start_sync "$sync_dir"
-      start_proxy "$CUT_PORT" "$SYNC_PORT" "$LOG_DIR/proxy.log"
-      start_engines "$a_dir" "$b_dir" "http://127.0.0.1:${CUT_PORT}"
+      start_sync "$sync_dir" || return 1
+      start_proxy "$CUT_PORT" "$SYNC_PORT" "$LOG_DIR/proxy.log" || return 1
+      start_engines "$a_dir" "$b_dir" "http://127.0.0.1:${CUT_PORT}" || return 1
       rm -f "$LOG_DIR/ready" "$LOG_DIR/signal"
       KOMET_E2E_READY="$LOG_DIR/ready" KOMET_E2E_SIGNAL="$LOG_DIR/signal" \
         "$DRIVER" "$A_PORT" "$B_PORT" cut \
         >"$LOG_DIR/driver-cut.out" 2>&1 &
       local driver_pid=$!
-      wait_for_marker "ready" 300
+      wait_for_marker "ready" 300 || return 1
       echo "cut: killing the proxy (client-side TCP cut)"
       stop_proxy
       sleep 2
-      start_proxy "$CUT_PORT" "$SYNC_PORT" "$LOG_DIR/proxy.log"
+      start_proxy "$CUT_PORT" "$SYNC_PORT" "$LOG_DIR/proxy.log" || return 1
       touch "$LOG_DIR/signal"
-      wait "$driver_pid"
+      if ! wait "$driver_pid"; then
+        echo "FAIL: cut driver exited nonzero" >&2
+        cat "$LOG_DIR/driver-cut.out" >&2
+        return 1
+      fi
       local resume
       resume="$(sed -n 's/^RECONNECT_S=//p' "$LOG_DIR/driver-cut.out")"
-      [[ -n "$resume" ]] || { echo "FAIL: driver never reported RECONNECT_S" >&2; exit 1; }
+      [[ -n "$resume" ]] || { echo "FAIL: driver never reported RECONNECT_S" >&2; return 1; }
       if python3 -c "import sys; sys.exit(0 if float('$resume') < $BUDGET_S else 1)"; then
         echo "PASS: resumed ${resume}s after the cut (budget ${BUDGET_S}s)"
       else
         echo "FAIL: resume took ${resume}s, budget is ${BUDGET_S}s" >&2
-        exit 1
+        return 1
       fi
       ;;
 
     checkpoint)
-      start_sync "$sync_dir"
+      start_sync "$sync_dir" || return 1
       local chat="e2e-checkpoint"
       local body="$LOG_DIR/checkpoint-body.bin"
       python3 -c 'import os,sys; sys.stdout.buffer.write(os.urandom(1024*1024))' >"$body"
@@ -311,20 +319,38 @@ run_scenario() { # run_scenario <name>
         -H "Authorization: Bearer $SYNC_TOKEN" \
         -H "x-chat2-frontier;" \
         --data-binary "@$body" \
-        "$SYNC_URL/chat2/$chat/checkpoint?seqCovered=0" >/dev/null
-      # Simulate the cut: a download that aborts after ~64 KB, then resume
-      # the exact remainder with `bytes=N-` and byte-compare to the original.
-      head -c 65536 "$body" >"$LOG_DIR/part-0.bin"
-      local part1 resume
-      resume=65536
+        "$SYNC_URL/chat2/$chat/checkpoint?seqCovered=0" >/dev/null \
+        || { echo "FAIL: checkpoint upload failed" >&2; return 1; }
+      # Simulate the cut with a REAL interrupted download: fetch the checkpoint
+      # with no Range header and hang up after ~64 KB (the pipe closes, curl
+      # sees EPIPE). Resume from the bytes actually received and byte-compare.
+      # The hang-up makes curl exit nonzero (EPIPE) — that IS the simulated
+      # cut, so the pipeline's status is deliberately not the success signal;
+      # the bytes actually received are checked below.
+      curl -sf -m 30 \
+        -H "Authorization: Bearer $SYNC_TOKEN" \
+        "$SYNC_URL/chat2/$chat/checkpoint" 2>/dev/null \
+        | head -c 65536 >"$LOG_DIR/part-0.bin" || true
+      local received resume
+      received="$(stat -c %s "$LOG_DIR/part-0.bin" 2>/dev/null \
+        || stat -f %z "$LOG_DIR/part-0.bin")" \
+        || { echo "FAIL: cannot size the partial download" >&2; return 1; }
+      if [[ "$received" -le 0 || "$received" -ge "$(stat -c %s "$body" 2>/dev/null || stat -f %z "$body")" ]]; then
+        echo "FAIL: partial download got $received bytes — the transfer was not cut" >&2
+        return 1
+      fi
+      # Serve the remainder from the byte we actually stopped at.
+      resume="$received"
       curl -sf -m 30 \
         -H "Authorization: Bearer $SYNC_TOKEN" \
         -r "$resume-" \
-        "$SYNC_URL/chat2/$chat/checkpoint" >"$LOG_DIR/part-1.bin"
-      cat "$LOG_DIR/part-0.bin" "$LOG_DIR/part-1.bin" >"$LOG_DIR/part-joined.bin"
+        "$SYNC_URL/chat2/$chat/checkpoint" >"$LOG_DIR/part-1.bin" \
+        || { echo "FAIL: Range resume request failed" >&2; return 1; }
+      cat "$LOG_DIR/part-0.bin" "$LOG_DIR/part-1.bin" >"$LOG_DIR/part-joined.bin" \
+        || { echo "FAIL: cannot join the downloaded parts" >&2; return 1; }
       cmp "$body" "$LOG_DIR/part-joined.bin" \
-        || { echo "FAIL: Range-resumed checkpoint does not match the original" >&2; exit 1; }
-      echo "PASS: 1 MB checkpoint resumed by Range matches byte for byte"
+        || { echo "FAIL: Range-resumed checkpoint does not match the original" >&2; return 1; }
+      echo "PASS: 1 MB checkpoint resumed by Range from byte $resume matches byte for byte"
       ;;
 
     *) echo "FAIL: unknown scenario $name" >&2; exit 1 ;;
