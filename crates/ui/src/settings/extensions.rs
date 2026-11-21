@@ -56,10 +56,14 @@ pub struct ExtensionsPage {
     state: Entity<AppState>,
     entries: Vec<ExtEntry>,
     loaded: bool,
-    busy: bool,
+    /// Inventory fetch in flight. Separate from `mutation_task` so a row
+    /// toggle cannot cancel an in-flight refresh (or vice versa).
+    refresh_task: Option<Task<()>>,
+    /// At most one overlay mutation at a time: toggle/reset clicks while a
+    /// write is in flight are ignored (controls render disabled).
+    mutation_task: Option<Task<()>>,
     status: Option<SharedString>,
     status_is_error: bool,
-    task: Option<Task<()>>,
 }
 
 const KINDS: [(ExtKind, &str, &str); 3] = [
@@ -101,10 +105,10 @@ impl ExtensionsPage {
             state,
             entries: Vec::new(),
             loaded: false,
-            busy: false,
+            refresh_task: None,
+            mutation_task: None,
             status: None,
             status_is_error: false,
-            task: None,
         };
         page.refresh(cx);
         page
@@ -117,17 +121,18 @@ impl ExtensionsPage {
     }
 
     fn refresh(&mut self, cx: &mut Context<Self>) {
-        if self.busy {
+        // One refresh at a time: a second call would spawn a parallel fetch
+        // whose (possibly staler) reply could overwrite a newer one.
+        if self.refresh_task.is_some() {
             return;
         }
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             self.set_status("The local engine is unavailable.", true);
             return;
         };
-        self.busy = true;
         self.status = None;
         self.status_is_error = false;
-        self.task = Some(cx.spawn(async move |this, cx| {
+        self.refresh_task = Some(cx.spawn(async move |this, cx| {
             let result = engine
                 .client()
                 .call(methods::LIST_HARNESS_EXTENSIONS, serde_json::json!({}))
@@ -137,13 +142,90 @@ impl ExtensionsPage {
                     serde_json::from_value::<Vec<ExtEntry>>(value).map_err(|e| e.to_string())
                 });
             this.update(cx, |page, cx| {
-                page.busy = false;
+                page.refresh_task = None;
                 match result {
                     Ok(entries) => {
                         page.entries = entries;
                         page.loaded = true;
                     }
+                    // List failures and malformed replies surface as an
+                    // error strip with a retry — never silently swallowed.
                     Err(error) => page.set_status(error, true),
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// Shared mutation flow for toggle (`enabled: Some`) and reset
+    /// (`enabled: None`): the overlay write is followed by an inventory
+    /// refresh, which is the only place effective state (registry gate,
+    /// mediation policy) is reconciled. A failed refresh keeps the last good
+    /// list and reports the error — for a plain toggle the clicked state is
+    /// still applied locally so the row does not look stuck.
+    fn mutate(
+        &mut self,
+        entry_ix: usize,
+        agent_slug: String,
+        enabled: Option<bool>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.mutation_task.is_some() {
+            return;
+        }
+        let Some(entry) = self.entries.get(entry_ix) else {
+            return;
+        };
+        let params = serde_json::json!({
+            "kind": entry.item.kind.as_str(),
+            "origin": entry.item.origin.as_str(),
+            "harness": agent_slug,
+            "id": entry.item.id,
+            "enabled": enabled,
+        });
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            self.set_status("The local engine is unavailable.", true);
+            cx.notify();
+            return;
+        };
+        self.mutation_task = Some(cx.spawn(async move |this, cx| {
+            let write = engine
+                .client()
+                .call(methods::SET_HARNESS_EXTENSION_ENABLED, params)
+                .await;
+            let list = engine
+                .client()
+                .call(methods::LIST_HARNESS_EXTENSIONS, serde_json::json!({}))
+                .await
+                .ok()
+                .and_then(|value| serde_json::from_value::<Vec<ExtEntry>>(value).ok());
+            this.update(cx, |page, cx| {
+                page.mutation_task = None;
+                match write {
+                    Err(error) => page.set_status(error.to_string(), true),
+                    Ok(_) => match list {
+                        Some(entries) => {
+                            page.entries = entries;
+                            page.loaded = true;
+                        }
+                        None => {
+                            // The decision was recorded but the refresh
+                            // failed: reflect the toggle locally and say so.
+                            if let Some(e) = enabled
+                                && let Some(entry) = page.entries.get_mut(entry_ix)
+                            {
+                                entry.enabled.insert(agent_slug.clone(), e);
+                                if !entry.modified.iter().any(|m| m == &agent_slug) {
+                                    entry.modified.push(agent_slug.clone());
+                                }
+                            }
+                            page.set_status(
+                                "Enregistré, mais l'inventaire n'a pas pu être actualisé.",
+                                true,
+                            );
+                        }
+                    },
                 }
                 cx.notify();
             })
@@ -158,87 +240,13 @@ impl ExtensionsPage {
         enabled: bool,
         cx: &mut Context<Self>,
     ) {
-        let Some(entry) = self.entries.get(entry_ix) else {
-            return;
-        };
-        let params = serde_json::json!({
-            "kind": entry.item.kind.as_str(),
-            "harness": agent_slug,
-            "id": entry.item.id,
-            "enabled": !enabled,
-        });
-        let Some(engine) = self.state.read(cx).engine().cloned() else {
-            self.set_status("The local engine is unavailable.", true);
-            cx.notify();
-            return;
-        };
-        let next = !enabled;
-        self.task = Some(cx.spawn(async move |this, cx| {
-            let result = engine
-                .client()
-                .call(methods::SET_HARNESS_EXTENSION_ENABLED, params)
-                .await;
-            this.update(cx, |page, cx| {
-                match result {
-                    Ok(_) => {
-                        if let Some(entry) = page.entries.get_mut(entry_ix) {
-                            entry.enabled.insert(agent_slug.clone(), next);
-                            if !entry.modified.iter().any(|m| m == &agent_slug) {
-                                entry.modified.push(agent_slug);
-                            }
-                        }
-                    }
-                    Err(error) => page.set_status(error.to_string(), true),
-                }
-                cx.notify();
-            })
-            .ok();
-        }));
+        self.mutate(entry_ix, agent_slug, Some(!enabled), cx);
     }
 
-    /// Clear the overlay entry (`enabled: null`) then re-fetch the inventory
-    /// so the row shows the agent-native default again.
+    /// Clear the overlay entry (`enabled: null`); the follow-up inventory
+    /// fetch restores the agent-native default.
     fn reset(&mut self, entry_ix: usize, agent_slug: String, cx: &mut Context<Self>) {
-        let Some(entry) = self.entries.get(entry_ix) else {
-            return;
-        };
-        let params = serde_json::json!({
-            "kind": entry.item.kind.as_str(),
-            "harness": agent_slug,
-            "id": entry.item.id,
-            "enabled": serde_json::Value::Null,
-        });
-        let Some(engine) = self.state.read(cx).engine().cloned() else {
-            self.set_status("The local engine is unavailable.", true);
-            cx.notify();
-            return;
-        };
-        self.task = Some(cx.spawn(async move |this, cx| {
-            let result = engine
-                .client()
-                .call(methods::SET_HARNESS_EXTENSION_ENABLED, params)
-                .await
-                .map(|_| ());
-            // Re-fetch regardless of the clear outcome's shape: the list is
-            // the source of truth for effective state.
-            let list = engine
-                .client()
-                .call(methods::LIST_HARNESS_EXTENSIONS, serde_json::json!({}))
-                .await;
-            this.update(cx, |page, cx| {
-                if let Err(error) = result {
-                    page.set_status(error.to_string(), true);
-                }
-                if let Ok(value) = list
-                    && let Ok(entries) = serde_json::from_value::<Vec<ExtEntry>>(value)
-                {
-                    page.entries = entries;
-                    page.loaded = true;
-                }
-                cx.notify();
-            })
-            .ok();
-        }));
+        self.mutate(entry_ix, agent_slug, None, cx);
     }
 
     fn set_status(&mut self, message: impl Into<SharedString>, is_error: bool) {
@@ -291,7 +299,7 @@ impl Render for ExtensionsPage {
         let theme = Theme::of(cx).clone();
         let rows = self.rows();
         let loaded = self.loaded;
-        let busy = self.busy;
+        let mutating = self.mutation_task.is_some();
         let status = self.status.clone();
         let status_is_error = self.status_is_error;
         let total: usize = rows.iter().map(|(_, r)| r.len()).sum();
@@ -313,8 +321,27 @@ impl Render for ExtensionsPage {
                         } else {
                             widgets::warning_strip(&theme, message)
                         })
+                        // Any surfaced failure gets an explicit retry: the
+                        // inventory fetch is idempotent and cheap.
+                        .when(status_is_error, |strip| {
+                            strip.child(
+                                div()
+                                    .id("ext-retry")
+                                    .flex_none()
+                                    .mt(px(2.0))
+                                    .text_size(px(11.5))
+                                    .text_color(theme.accent)
+                                    .cursor_pointer()
+                                    .hover(|s| s.text_color(theme.text))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.refresh(cx);
+                                    }))
+                                    .child("Réessayer"),
+                            )
+                        })
                     })
-                    .when(!loaded && !busy, |page| {
+                    .when(loaded && total == 0, |page| {
                         page.child(
                             widgets::section_card(&theme).child(
                                 div()
@@ -389,19 +416,29 @@ impl Render for ExtensionsPage {
                                                 .items_center()
                                                 .gap(px(10.0))
                                                 .when(modified, |el| {
-                                                    el.child(
-                                                        div()
-                                                            .id(gpui::ElementId::named_usize(
-                                                                "ext-reset",
-                                                                row.uid,
-                                                            ))
-                                                            .text_size(px(11.0))
-                                                            .text_color(theme.accent)
-                                                            .cursor_pointer()
-                                                            .hover(|s| {
-                                                                s.text_color(theme.text)
-                                                            })
-                                                            .on_click(cx.listener(
+                                                    let reset = div()
+                                                        .id(gpui::ElementId::named_usize(
+                                                            "ext-reset",
+                                                            row.uid,
+                                                        ))
+                                                        .text_size(px(11.0))
+                                                        .text_color(theme.accent)
+                                                        .cursor_pointer()
+                                                        .hover(|s| {
+                                                            s.text_color(theme.text)
+                                                        })
+                                                        .child("Réinitialiser");
+                                                    // Mutations are
+                                                    // serialized: while one
+                                                    // is in flight the
+                                                    // control renders
+                                                    // inert instead of
+                                                    // dropping the click.
+                                                    if mutating {
+                                                        el.child(reset.opacity(0.4))
+                                                    } else {
+                                                        el.child(reset.on_click(
+                                                            cx.listener(
                                                                 move |this, _, _, cx| {
                                                                     cx.stop_propagation();
                                                                     this.reset(
@@ -410,36 +447,41 @@ impl Render for ExtensionsPage {
                                                                         cx,
                                                                     );
                                                                 },
-                                                            ))
-                                                            .child("Réinitialiser"),
-                                                    )
+                                                            ),
+                                                        ))
+                                                    }
                                                 })
                                                 // Read-only rows show the
                                                 // reason in the meta line;
                                                 // the toggle is omitted so
                                                 // nothing implies a no-op.
                                                 .when(read_only_reason.is_none(), |el| {
-                                                    el.child(
-                                                        widgets::toggle_switch(
-                                                            &theme, enabled,
-                                                        )
-                                                        .id(gpui::ElementId::named_usize(
-                                                            "ext-toggle",
-                                                            row.uid,
-                                                        ))
-                                                        .cursor_pointer()
-                                                        .on_click(cx.listener(
-                                                            move |this, _, _, cx| {
-                                                                cx.stop_propagation();
-                                                                this.toggle(
-                                                                    entry_ix,
-                                                                    agent_slug.clone(),
-                                                                    enabled,
-                                                                    cx,
-                                                                );
-                                                            },
-                                                        )),
+                                                    let toggle = widgets::toggle_switch(
+                                                        &theme, enabled,
                                                     )
+                                                    .id(gpui::ElementId::named_usize(
+                                                        "ext-toggle",
+                                                        row.uid,
+                                                    ));
+                                                    if mutating {
+                                                        el.child(toggle.opacity(0.4))
+                                                    } else {
+                                                        el.child(
+                                                            toggle
+                                                                .cursor_pointer()
+                                                                .on_click(cx.listener(
+                                                                    move |this, _, _, cx| {
+                                                                        cx.stop_propagation();
+                                                                        this.toggle(
+                                                                            entry_ix,
+                                                                            agent_slug.clone(),
+                                                                            enabled,
+                                                                            cx,
+                                                                        );
+                                                                    },
+                                                                )),
+                                                        )
+                                                    }
                                                 }),
                                         )
                                         .into_any_element()

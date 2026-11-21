@@ -33,11 +33,24 @@ impl ExtKind {
 
 /// Where an item comes from. `External` = found in an agent's own config
 /// (never written by komet). `Komet` = installed/managed by komet itself.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum Origin {
+    #[default]
     External,
     Komet,
+}
+
+impl Origin {
+    /// Stable key segment for the persisted overlay (`external`/`komet`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Origin::External => "external",
+            Origin::Komet => "komet",
+        }
+    }
 }
 
 /// One place an item was discovered for one agent.

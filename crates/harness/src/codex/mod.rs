@@ -501,13 +501,23 @@ impl Harness for CodexHarness {
         // config.toml for this process only — the file is never written.
         if let Some(home) = crate::platform::home_dir() {
             let overlay = crate::ext::load_overlay();
-            if overlay.touches(crate::ext::ExtKind::McpServer, HarnessId::Codex) {
+            if overlay.touches(
+                crate::ext::ExtKind::McpServer,
+                crate::ext::Origin::External,
+                HarnessId::Codex,
+            ) {
                 for name in crate::ext::codex_mcp_server_names(&home) {
-                    if let Some(enabled) =
-                        overlay.decision(crate::ext::ExtKind::McpServer, HarnessId::Codex, &name)
-                    {
+                    if let Some(enabled) = overlay.decision(
+                        crate::ext::ExtKind::McpServer,
+                        crate::ext::Origin::External,
+                        HarnessId::Codex,
+                        &name,
+                    ) {
+                        // TOML dotted-key segment: quote so names containing
+                        // dots or quotes still resolve to one table.
+                        let quoted = name.replace('\\', "\\\\").replace('"', "\\\"");
                         cmd.arg("-c")
-                            .arg(format!("mcp_servers.{name}.enabled={enabled}"));
+                            .arg(format!("mcp_servers.\"{quoted}\".enabled={enabled}"));
                     }
                 }
             }

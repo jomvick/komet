@@ -386,9 +386,30 @@ impl Shell {
         }
         self.route = Route::Settings(section);
         self.nav.push(NavEntry::Settings(section));
+        self.settings_section_entered(section, cx);
         self.close_user_menu(cx);
         self.close_chat_menu(cx);
         cx.notify();
+    }
+
+    /// A settings section just became visible — via [`Self::open_settings`]
+    /// or a back/forward [`NavEntry::Settings`]. Pages that re-probe on entry
+    /// refresh here, NOT inside `settings_outlet`: that runs on every shell
+    /// repaint, which would re-fire the fetch on unrelated renders.
+    fn settings_section_entered(&mut self, section: SettingsSection, cx: &mut Context<Self>) {
+        match section {
+            SettingsSection::Usage => {
+                if let Some(page) = &self.usage_page {
+                    page.update(cx, |page, cx| page.on_shown(cx));
+                }
+            }
+            SettingsSection::Extensions => {
+                if let Some(page) = &self.extensions_page {
+                    page.update(cx, |page, cx| page.on_shown(cx));
+                }
+            }
+            _ => {}
+        }
     }
 
     /// Open Settings → General, remembering the section the caller asked for
@@ -433,6 +454,7 @@ impl Shell {
             }
             NavEntry::Settings(section) => {
                 self.route = Route::Settings(section);
+                self.settings_section_entered(section, cx);
             }
         }
         self.close_user_menu(cx);
@@ -492,9 +514,6 @@ impl Shell {
                     ));
                     self.usage_page = Some(page);
                 }
-                if let Some(page) = &self.usage_page {
-                    page.update(cx, |page, cx| page.on_shown(cx));
-                }
                 match &self.usage_page {
                     Some(page) => page.clone().into_any_element(),
                     None => Empty.into_any_element(),
@@ -504,9 +523,6 @@ impl Shell {
                 if self.extensions_page.is_none() {
                     let state = self.state.clone();
                     self.extensions_page = Some(cx.new(|cx| ExtensionsPage::new(state, cx)));
-                }
-                if let Some(page) = &self.extensions_page {
-                    page.update(cx, |page, cx| page.on_shown(cx));
                 }
                 match &self.extensions_page {
                     Some(page) => page.clone().into_any_element(),

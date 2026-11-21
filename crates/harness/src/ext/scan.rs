@@ -223,36 +223,22 @@ fn scan_copilot_mcp(home: &Path, push: &mut Push<'_>) {
 }
 
 /// `~/.codex/config.toml` `[mcp_servers.<name>]` tables as `(name, enabled)`
-/// pairs. Line-scanned rather than TOML-parsed: we only need section names
-/// and an optional `enabled` flag, and a serde `toml` dependency is not in
-/// the workspace yet.
+/// pairs, parsed as real TOML so quoted names, dotted keys and end-of-line
+/// comments all behave.
 fn codex_mcp_tables(contents: &str) -> Vec<(String, Option<bool>)> {
-    let mut out = Vec::new();
-    let mut current: Option<String> = None;
-    let mut enabled: Option<bool> = None;
-    let mut flush = |name: &mut Option<String>, enabled: &mut Option<bool>| {
-        if let Some(n) = name.take() {
-            out.push((n, *enabled));
-            *enabled = None;
-        }
+    let Ok(config) = contents.parse::<toml::Value>() else {
+        return Vec::new();
     };
-    for line in contents.lines() {
-        let line = line.trim();
-        if line.starts_with('[') {
-            flush(&mut current, &mut enabled);
-            current = parse_mcp_server_section(line);
-            continue;
-        }
-        if current.is_some()
-            && let Some(value) = line
-                .strip_prefix("enabled")
-                .and_then(|rest| rest.trim_start().strip_prefix('='))
-        {
-            enabled = Some(matches!(value.trim(), "true"));
-        }
-    }
-    flush(&mut current, &mut enabled);
-    out
+    let Some(servers) = config.get("mcp_servers").and_then(toml::Value::as_table) else {
+        return Vec::new();
+    };
+    servers
+        .iter()
+        .map(|(name, table)| {
+            let enabled = table.get("enabled").and_then(toml::Value::as_bool);
+            (name.clone(), enabled)
+        })
+        .collect()
 }
 
 /// Names of the `[mcp_servers.*]` tables in `home/.codex/config.toml` — the
@@ -285,22 +271,6 @@ fn scan_codex_mcp(home: &Path, push: &mut Push<'_>) {
             },
         );
     }
-}
-
-/// `[mcp_servers.foo]` / `[mcp_servers."foo bar"]` → `foo`. Other tables
-/// (including bare `[mcp_servers]`) yield `None`.
-fn parse_mcp_server_section(header: &str) -> Option<String> {
-    let inner = header.trim().trim_start_matches('[').trim_end_matches(']');
-    let rest = inner.trim().strip_prefix("mcp_servers.")?;
-    let name = rest.trim().trim_end_matches('.');
-    if name.is_empty() || name.contains('.') {
-        return None;
-    }
-    let name = name.trim_matches('"').trim_matches('\'');
-    if name.is_empty() {
-        return None;
-    }
-    Some(name.to_string())
 }
 
 /// OpenCode global configs only: `OPENCODE_CONFIG`, XDG config dir,
@@ -431,8 +401,13 @@ fn scan_copilot_plugins(home: &Path, push: &mut Push<'_>) {
 /// registry itself persists header/env values empty, and this scanner does
 /// not depend on that: it simply never looks at them.
 fn scan_komet_mcp(home: &Path, items: &mut BTreeMap<(ExtKind, Origin, String), ExtItem>) {
-    let path = komet_mcp_registry_path(home);
-    let Ok(contents) = std::fs::read_to_string(&path) else {
+    scan_komet_mcp_at(&komet_mcp_registry_path(home), items);
+}
+
+/// Registry-file variant taking an explicit path so tests never mutate the
+/// process environment (`KOMET_DATA_DIR` is shared by parallel tests).
+fn scan_komet_mcp_at(path: &Path, items: &mut BTreeMap<(ExtKind, Origin, String), ExtItem>) {
+    let Ok(contents) = std::fs::read_to_string(path) else {
         return;
     };
     let Ok(value) = serde_json::from_str::<Value>(&contents) else {
@@ -484,7 +459,7 @@ fn scan_komet_mcp(home: &Path, items: &mut BTreeMap<(ExtKind, Origin, String), E
             .iter()
             .map(|agent| ExtSource {
                 agent: *agent,
-                path: path.clone(),
+                path: path.to_path_buf(),
                 enabled,
             })
             .collect();
@@ -608,7 +583,7 @@ mod tests {
         let home = home.path();
         write(
             &home.join(".codex/config.toml"),
-            "model = \"gpt-5\"\n\n[mcp_servers.codegraph]\ncommand = \"codegraph\"\n\n[mcp_servers.\"my server\"]\nurl = \"https://x\"\nenabled = false\n\n[other]\nx = 1\n",
+            "model = \"gpt-5\"\n\n[mcp_servers.codegraph]\ncommand = \"codegraph\"\n\n[mcp_servers.\"my server\"]\nurl = \"https://x\"\nenabled = false # trailing comment\n\n[other]\nx = 1\n",
         );
         let items = scan(home);
         let cg = find(&items, ExtKind::McpServer, "codegraph").unwrap();
@@ -633,25 +608,13 @@ mod tests {
 
     #[test]
     fn komet_mcp_items_never_leak_secrets() {
-        let home = tempfile::tempdir().unwrap();
-        let home = home.path();
+        let dir = tempfile::tempdir().unwrap();
+        let registry = dir.path().join("mcp-servers.json");
         // A registry entry carrying a fake secret in EVERY secret-capable
-        // field — the inventory must surface none of them.
+        // field — the inventory must surface none of them. The path is passed
+        // explicitly: mutating KOMET_DATA_DIR would race parallel tests.
         write(
-            &home.join(".komet/mcp-servers.json"),
-            r#"{"version":1,"servers":[{
-                "id":"composio","name":"Composio","enabled":true,
-                "transport":"http","url":"https://connect.composio.dev/mcp?token=FAKE-SECRET-123",
-                "headers":{"x-consumer-api-key":"FAKE-SECRET-123"},
-                "env":{"API_KEY":"FAKE-SECRET-123"},
-                "always_load":true
-            }]}"#,
-        );
-        // Point the data dir at the fixture so the real KOMET_DATA_DIR can't
-        // redirect the scan (parallel tests share the process env).
-        unsafe { std::env::set_var("KOMET_DATA_DIR", home.join(".komet-data")) };
-        write(
-            &home.join(".komet-data/mcp-servers.json"),
+            &registry,
             r#"{"version":1,"servers":[{
                 "id":"composio","name":"Composio","enabled":true,
                 "transport":"http","url":"https://connect.composio.dev/mcp?token=FAKE-SECRET-123",
@@ -661,7 +624,9 @@ mod tests {
             }]}"#,
         );
 
-        let items = scan(home);
+        let mut map = BTreeMap::new();
+        scan_komet_mcp_at(&registry, &mut map);
+        let items: Vec<ExtItem> = map.into_values().collect();
         let item = find(&items, ExtKind::McpServer, "composio").unwrap();
         assert_eq!(item.origin, Origin::Komet);
         assert!(item.available_to(HarnessId::ClaudeCode));

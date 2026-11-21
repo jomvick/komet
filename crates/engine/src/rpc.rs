@@ -128,23 +128,25 @@ struct ExtListEntry {
 /// Why a (kind, origin, agent) extension row cannot be toggled, if it cannot.
 /// `None` means the overlay decision is actually applied at launch.
 ///
-/// Komet-owned MCPs are exempt from `mediates_native_mcp`: they never touch
-/// the agent's native config — komet filters them out of the injected
-/// `mcpServers` set at launch (Claude `--mcp-config`, ACP `session/new`),
-/// which every agent in the komet inventory supports.
+/// Komet-owned MCPs never touch the agent's native config — komet filters
+/// them out of the injected `mcpServers` set at launch — but that only
+/// happens for agents komet actually injects into (`supports_dynamic_mcp`).
 fn ext_row_readonly(
     kind: komet_harness::ext::ExtKind,
     origin: komet_harness::ext::Origin,
     agent: HarnessId,
 ) -> Option<String> {
     match kind {
-        komet_harness::ext::ExtKind::McpServer => {
-            if origin == komet_harness::ext::Origin::Komet {
-                return None;
+        komet_harness::ext::ExtKind::McpServer => match origin {
+            komet_harness::ext::Origin::Komet => {
+                let (supported, reason) = komet_harness::capabilities::supports_dynamic_mcp(agent);
+                (!supported).then(|| reason.to_string())
             }
-            let (supported, reason) = komet_harness::capabilities::mediates_native_mcp(agent);
-            (!supported).then(|| reason.to_string())
-        }
+            komet_harness::ext::Origin::External => {
+                let (supported, reason) = komet_harness::capabilities::mediates_native_mcp(agent);
+                (!supported).then(|| reason.to_string())
+            }
+        },
         // Skills and plugins are inventoried but have no launch-time
         // mediation yet — a toggle would record a decision nothing applies.
         _ => Some(
@@ -154,35 +156,49 @@ fn ext_row_readonly(
     }
 }
 
-/// Read-only check for `SET_HARNESS_EXTENSION_ENABLED`, whose params carry
-/// no origin. Resolves it from the live inventory: an id matching a
-/// komet-owned MCP available to this agent is writable everywhere komet
-/// injects; anything else falls back to the external-MCP rule.
-fn ext_set_readonly(
-    kind: komet_harness::ext::ExtKind,
+/// Effective enabled state for one (item, agent) row — what launch will
+/// actually do, not just the overlay resolution:
+/// - komet MCPs additionally require the registry `enabled` flag: a
+///   registry-disabled server never reaches `prepare_mcp_for_run`, so an
+///   overlay `true` cannot resurrect it;
+/// - external MCPs on OpenCode/Devin are disabled at launch unless the
+///   overlay explicitly enables them — the native hint does not apply there.
+fn ext_effective_enabled(
+    item: &komet_harness::ext::ExtItem,
     agent: HarnessId,
-    id: &str,
-) -> Option<String> {
-    if kind == komet_harness::ext::ExtKind::McpServer {
-        let home = home_dir();
-        let komet_owned = komet_harness::ext::scan(&home).iter().any(|item| {
-            item.kind == kind
-                && item.id == id
-                && item.origin == komet_harness::ext::Origin::Komet
-                && item.sources.iter().any(|s| s.agent == agent)
-        });
-        if komet_owned {
-            return None;
+    overlay: &komet_harness::ext::ExtOverlay,
+) -> Option<bool> {
+    use komet_harness::ext::{ExtKind, Origin};
+    if !item.available_to(agent) {
+        return None;
+    }
+    if item.kind == ExtKind::McpServer {
+        match item.origin {
+            Origin::Komet => {
+                return Some(
+                    item.hint_for(agent).unwrap_or(true)
+                        && overlay.decision(item.kind, item.origin, agent, &item.id) != Some(false),
+                );
+            }
+            Origin::External if matches!(agent, HarnessId::Opencode | HarnessId::Devin) => {
+                return Some(
+                    overlay.decision(item.kind, item.origin, agent, &item.id) == Some(true),
+                );
+            }
+            Origin::External => {}
         }
     }
-    // Unknown ids and external rows share the conservative rule.
-    ext_row_readonly(kind, komet_harness::ext::Origin::External, agent)
+    overlay.enabled_for(item, agent)
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SetExtEnabledParams {
     kind: komet_harness::ext::ExtKind,
+    /// Which inventory the id belongs to — native (`external`) and
+    /// komet-managed entries with the same id toggle independently.
+    #[serde(default)]
+    origin: komet_harness::ext::Origin,
     harness: HarnessId,
     id: String,
     /// `null` clears the overlay entry (back to the agent-native default).
@@ -1380,6 +1396,8 @@ fn forwardable(method: &str) -> bool {
             | methods::GET_HARNESS_CLI_STATUS
             | methods::MANAGE_HARNESS_CLI
             | methods::SET_HARNESS_ENABLED
+            | methods::LIST_HARNESS_EXTENSIONS
+            | methods::SET_HARNESS_EXTENSION_ENABLED
             | methods::LIST_MODELS
             | methods::LIST_COMMANDS
             | methods::QUEUE_COMMAND
@@ -1945,6 +1963,10 @@ impl RpcService for EngineRpc {
             methods::GET_HARNESS_CLI_STATUS,
             methods::MANAGE_HARNESS_CLI,
             methods::SET_HARNESS_ENABLED,
+            // Extension inventory + overlay are per-device state (the agents
+            // and their config files live on the device that runs them).
+            methods::LIST_HARNESS_EXTENSIONS,
+            methods::SET_HARNESS_EXTENSION_ENABLED,
             // Project memory lives in a device-local SQLite store: inside an
             // environment the caller must name the device that owns it,
             // else the answer would describe the controller's own index.
@@ -2079,13 +2101,16 @@ impl RpcService for EngineRpc {
                         let mut modified = Vec::new();
                         for agent in item.sources.iter().map(|s| s.agent).collect::<HashSet<_>>() {
                             let slug = agent.as_str().to_string();
-                            if let Some(e) = overlay.enabled_for(&item, agent) {
+                            if let Some(e) = ext_effective_enabled(&item, agent, &overlay) {
                                 enabled.insert(slug.clone(), e);
                             }
                             if let Some(reason) = ext_row_readonly(item.kind, item.origin, agent) {
                                 read_only.insert(slug, reason);
                             }
-                            if overlay.decision(item.kind, agent, &item.id).is_some() {
+                            if overlay
+                                .decision(item.kind, item.origin, agent, &item.id)
+                                .is_some()
+                            {
                                 modified.push(agent.as_str().to_string());
                             }
                         }
@@ -2106,16 +2131,21 @@ impl RpcService for EngineRpc {
                 // (`enabled: null`) is always allowed so stale entries can
                 // be reset even if mediation for the agent went away.
                 if p.enabled.is_some()
-                    && let Some(reason) = ext_set_readonly(p.kind, p.harness, &p.id)
+                    && let Some(reason) = ext_row_readonly(p.kind, p.origin, p.harness)
                 {
                     return Err(RpcError::Unsupported(reason));
                 }
-                let mut overlay = komet_harness::ext::load_overlay();
-                let result = match p.enabled {
-                    Some(enabled) => overlay.set_enabled(p.kind, p.harness, &p.id, enabled),
-                    None => overlay.clear(p.kind, p.harness, &p.id),
-                };
-                result.map_err(|e| RpcError::Failed(format!("ext overlay: {e}")))?;
+                // Locked read-modify-write: concurrent toggles on different
+                // RPC connections must not lose each other's decisions, and
+                // a corrupt overlay must error out rather than be replaced
+                // by an empty one on the next persist.
+                komet_harness::ext::update_overlay(|overlay| match p.enabled {
+                    Some(enabled) => {
+                        overlay.set_enabled(p.kind, p.origin, p.harness, &p.id, enabled)
+                    }
+                    None => overlay.clear(p.kind, p.origin, p.harness, &p.id),
+                })
+                .map_err(|e| RpcError::Failed(format!("ext overlay: {e}")))?;
                 RpcReply::value(&serde_json::json!({ "ok": true }))
             }
             methods::LIST_MODELS => {

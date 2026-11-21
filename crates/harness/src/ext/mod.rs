@@ -52,3 +52,31 @@ pub fn load_overlay() -> ExtOverlay {
     }
     ExtOverlay::load(&path).unwrap_or_else(|_| ExtOverlay::empty(path))
 }
+
+/// Fallible load for MUTATION paths: a corrupt overlay must surface as an
+/// error, never be silently replaced — persisting an empty replacement would
+/// drop every stored decision.
+pub fn load_overlay_strict() -> anyhow::Result<ExtOverlay> {
+    let path = default_overlay_path();
+    if cfg!(test) {
+        return Ok(ExtOverlay::empty(path));
+    }
+    ExtOverlay::load(&path)
+}
+
+/// Serializes load → mutate → persist across the whole process: the engine
+/// can serve several RPC connections, each holding its own snapshot, and
+/// concurrent writers would otherwise lose each other's decisions (and race
+/// on the shared `*.tmp` rename target).
+static OVERLAY_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Locked read-modify-write for overlay mutations. `f` receives the freshly
+/// loaded overlay and applies its change; nothing is persisted unless `f`
+/// succeeds.
+pub fn update_overlay(f: impl FnOnce(&mut ExtOverlay) -> anyhow::Result<()>) -> anyhow::Result<()> {
+    let _guard = OVERLAY_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut overlay = load_overlay_strict()?;
+    f(&mut overlay)
+}

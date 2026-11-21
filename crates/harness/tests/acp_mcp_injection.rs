@@ -1,4 +1,5 @@
 use komet_harness::acp::build_acp_session_params;
+use komet_harness::ext::ExtOverlay;
 use komet_proto::{HarnessId, McpInjection, McpServerConfig, McpTransport, ResolvedMcpServer};
 use std::collections::HashMap;
 
@@ -21,16 +22,17 @@ fn acp_session_params_merges_internal_and_external() {
         resolved_headers: [("Authorization".into(), "Bearer x".into())].into(),
         resolved_env: Default::default(),
     };
-    // The overlay filter reads the persisted file in non-test builds; point it
-    // at a nonexistent path so these tests never depend on real ~/.komet state.
-    unsafe {
-        std::env::set_var(
-            "KOMET_EXT_OVERLAY_PATH",
-            std::env::temp_dir().join("komet-test-no-overlay.json"),
-        );
-    }
-    let params =
-        build_acp_session_params("/ws", Some(internal), vec![external], HarnessId::Opencode);
+    // The overlay is an explicit parameter: an empty in-memory fixture keeps
+    // these tests independent of the persisted ~/.komet state — no env
+    // mutation, which would race the other tests in this process.
+    let overlay = ExtOverlay::empty("/nonexistent/overlay.json");
+    let params = build_acp_session_params(
+        "/ws",
+        Some(internal),
+        vec![external],
+        HarnessId::Opencode,
+        &overlay,
+    );
     assert_eq!(params["mcpServers"].as_array().unwrap().len(), 2);
     assert_eq!(params["env"], serde_json::json!([]));
     // internal komet server should be first, type http with Bearer
@@ -87,8 +89,14 @@ fn acp_session_params_handles_all_transports() {
         resolved_headers: HashMap::new(),
         resolved_env: [("TOKEN".into(), "secret".into())].into(),
     };
-    let params =
-        build_acp_session_params("/ws", internal, vec![http, sse, stdio], HarnessId::Opencode);
+    let overlay = ExtOverlay::empty("/nonexistent/overlay.json");
+    let params = build_acp_session_params(
+        "/ws",
+        internal,
+        vec![http, sse, stdio],
+        HarnessId::Opencode,
+        &overlay,
+    );
     assert_eq!(params["mcpServers"].as_array().unwrap().len(), 3);
     assert_eq!(params["mcpServers"][0]["type"], "http");
     assert_eq!(params["mcpServers"][1]["type"], "sse");
@@ -100,7 +108,8 @@ fn acp_session_params_handles_all_transports() {
 
 #[test]
 fn acp_session_params_empty_is_env_only() {
-    let params = build_acp_session_params("/tmp", None, vec![], HarnessId::Opencode);
+    let overlay = ExtOverlay::empty("/nonexistent/overlay.json");
+    let params = build_acp_session_params("/tmp", None, vec![], HarnessId::Opencode, &overlay);
     assert_eq!(params["mcpServers"].as_array().unwrap().len(), 0);
     assert_eq!(params["env"], serde_json::json!([]));
 }

@@ -452,6 +452,7 @@ impl ClaudeHarness {
             servers.retain(|name, _| {
                 overlay.decision(
                     crate::ext::ExtKind::McpServer,
+                    crate::ext::Origin::Komet,
                     komet_proto::HarnessId::ClaudeCode,
                     name,
                 ) != Some(false)
@@ -801,6 +802,7 @@ fn strict_mcp_config(
 ) -> Option<(String, usize)> {
     if !overlay.touches(
         crate::ext::ExtKind::McpServer,
+        crate::ext::Origin::External,
         komet_proto::HarnessId::ClaudeCode,
     ) {
         return None;
@@ -809,6 +811,7 @@ fn strict_mcp_config(
     merged.retain(|name, _| {
         overlay.decision(
             crate::ext::ExtKind::McpServer,
+            crate::ext::Origin::External,
             komet_proto::HarnessId::ClaudeCode,
             name,
         ) != Some(false)
@@ -818,6 +821,7 @@ fn strict_mcp_config(
         // here so the pure function stays honest about its contract.
         if overlay.decision(
             crate::ext::ExtKind::McpServer,
+            crate::ext::Origin::Komet,
             komet_proto::HarnessId::ClaudeCode,
             name,
         ) == Some(false)

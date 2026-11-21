@@ -3,14 +3,19 @@ use std::path::{Path, PathBuf};
 
 use komet_proto::HarnessId;
 
-use crate::ext::model::{ExtItem, ExtKind};
+use crate::ext::model::{ExtItem, ExtKind, Origin};
 
-/// Persisted per-(kind, agent, item) enabled flags.
+/// Persisted per-(kind, origin, agent, item) enabled flags.
 ///
 /// Stored at `<data_dir>/agent-ext-overlay.json` (0600, atomic rename — same
 /// discipline as `McpRegistry`). This file is the ONLY place komet records an
 /// enable/disable decision for an agent-native extension; agent config files
 /// are never written.
+///
+/// `origin` is part of the decision identity: a komet-managed MCP and an
+/// agent-native MCP that happen to share `kind`+`agent`+`id` keep independent
+/// toggles — launch lookups for native mediation and komet-injection
+/// filtering never collide.
 ///
 /// Resolution order for `enabled_for`:
 /// 1. explicit overlay entry;
@@ -19,7 +24,7 @@ use crate::ext::model::{ExtItem, ExtKind};
 #[derive(Debug)]
 pub struct ExtOverlay {
     path: PathBuf,
-    /// `"{kind}|{agent}|{id}"` → enabled.
+    /// `"{kind}|{origin}|{agent}|{id}"` → enabled.
     entries: BTreeMap<String, bool>,
 }
 
@@ -29,8 +34,33 @@ struct VersionedWrapper {
     entries: BTreeMap<String, bool>,
 }
 
-fn key(kind: ExtKind, agent: HarnessId, id: &str) -> String {
-    format!("{}|{}|{}", kind.as_str(), agent.as_str(), id)
+fn key(kind: ExtKind, origin: Origin, agent: HarnessId, id: &str) -> String {
+    format!(
+        "{}|{}|{}|{}",
+        kind.as_str(),
+        origin.as_str(),
+        agent.as_str(),
+        id
+    )
+}
+
+/// Pre-origin key shape `"{kind}|{agent}|{id}"` — every entry written before
+/// origin entered the identity was an external/native decision (komet-owned
+/// items did not exist yet), so migration rewrites them as `external`.
+fn migrate_entry_key(old: &str) -> Option<String> {
+    let mut parts = old.splitn(4, '|');
+    let (kind, agent, id) = (parts.next()?, parts.next()?, parts.next()?);
+    if parts.next().is_some() || id.is_empty() {
+        return None;
+    }
+    let kind = match kind {
+        "skill" => ExtKind::Skill,
+        "mcp_server" => ExtKind::McpServer,
+        "plugin" => ExtKind::Plugin,
+        _ => return None,
+    };
+    let agent = HarnessId::from_slug(agent)?;
+    Some(key(kind, Origin::External, agent, id))
 }
 
 impl ExtOverlay {
@@ -51,7 +81,11 @@ impl ExtOverlay {
             let data = std::fs::read_to_string(&path)?;
             if !data.trim().is_empty() {
                 let wrapper: VersionedWrapper = serde_json::from_str(&data)?;
-                entries = wrapper.entries;
+                entries = wrapper
+                    .entries
+                    .into_iter()
+                    .map(|(k, v)| (migrate_entry_key(&k).unwrap_or(k), v))
+                    .collect();
             }
         }
         Ok(Self { path, entries })
@@ -69,7 +103,7 @@ impl ExtOverlay {
         }
         Some(
             self.entries
-                .get(&key(item.kind, agent, &item.id))
+                .get(&key(item.kind, item.origin, agent, &item.id))
                 .copied()
                 .unwrap_or_else(|| item.hint_for(agent).unwrap_or(true)),
         )
@@ -81,24 +115,31 @@ impl ExtOverlay {
     pub fn set_enabled(
         &mut self,
         kind: ExtKind,
+        origin: Origin,
         agent: HarnessId,
         id: &str,
         enabled: bool,
     ) -> anyhow::Result<()> {
-        self.entries.insert(key(kind, agent, id), enabled);
+        self.entries.insert(key(kind, origin, agent, id), enabled);
         self.persist()
     }
 
     /// Raw explicit decision for one item, if the user ever toggled it.
-    pub fn decision(&self, kind: ExtKind, agent: HarnessId, id: &str) -> Option<bool> {
-        self.entries.get(&key(kind, agent, id)).copied()
+    pub fn decision(
+        &self,
+        kind: ExtKind,
+        origin: Origin,
+        agent: HarnessId,
+        id: &str,
+    ) -> Option<bool> {
+        self.entries.get(&key(kind, origin, agent, id)).copied()
     }
 
-    /// Whether the user has ANY explicit entry for `kind`+`agent` — launch
-    /// code uses this to decide if komet must mediate that agent's native
-    /// config at all (e.g. Claude's `--strict-mcp-config`).
-    pub fn touches(&self, kind: ExtKind, agent: HarnessId) -> bool {
-        let prefix = format!("{}|{}|", kind.as_str(), agent.as_str());
+    /// Whether the user has ANY explicit entry for `kind`+`origin`+`agent` —
+    /// launch code uses this to decide if komet must mediate that agent's
+    /// native config at all (e.g. Claude's `--strict-mcp-config`).
+    pub fn touches(&self, kind: ExtKind, origin: Origin, agent: HarnessId) -> bool {
+        let prefix = format!("{}|{}|{}|", kind.as_str(), origin.as_str(), agent.as_str());
         self.entries.keys().any(|k| k.starts_with(&prefix))
     }
 
@@ -108,9 +149,10 @@ impl ExtOverlay {
     pub fn explicitly_enabled(
         &self,
         kind: ExtKind,
+        origin: Origin,
         agent: HarnessId,
     ) -> std::collections::BTreeSet<String> {
-        let prefix = format!("{}|{}|", kind.as_str(), agent.as_str());
+        let prefix = format!("{}|{}|{}|", kind.as_str(), origin.as_str(), agent.as_str());
         self.entries
             .iter()
             .filter(|(_, enabled)| **enabled)
@@ -120,8 +162,14 @@ impl ExtOverlay {
 
     /// Drop the explicit entry so resolution falls back to the agent-native
     /// hint again ("reset to agent default").
-    pub fn clear(&mut self, kind: ExtKind, agent: HarnessId, id: &str) -> anyhow::Result<()> {
-        self.entries.remove(&key(kind, agent, id));
+    pub fn clear(
+        &mut self,
+        kind: ExtKind,
+        origin: Origin,
+        agent: HarnessId,
+        id: &str,
+    ) -> anyhow::Result<()> {
+        self.entries.remove(&key(kind, origin, agent, id));
         self.persist()
     }
 
@@ -193,7 +241,13 @@ mod tests {
         assert_eq!(overlay.enabled_for(&it, HarnessId::Opencode), Some(false));
         // Explicit overlay enable wins.
         overlay
-            .set_enabled(ExtKind::Skill, HarnessId::Opencode, "foo", true)
+            .set_enabled(
+                ExtKind::Skill,
+                Origin::External,
+                HarnessId::Opencode,
+                "foo",
+                true,
+            )
             .unwrap();
         assert_eq!(overlay.enabled_for(&it, HarnessId::Opencode), Some(true));
         // Other agents: item not available → None.
@@ -206,10 +260,16 @@ mod tests {
         let path = dir.path().join("overlay.json");
         let mut overlay = ExtOverlay::load(&path).unwrap();
         overlay
-            .set_enabled(ExtKind::Skill, HarnessId::Opencode, "foo", true)
+            .set_enabled(
+                ExtKind::Skill,
+                Origin::External,
+                HarnessId::Opencode,
+                "foo",
+                true,
+            )
             .unwrap();
         overlay
-            .clear(ExtKind::Skill, HarnessId::Opencode, "foo")
+            .clear(ExtKind::Skill, Origin::External, HarnessId::Opencode, "foo")
             .unwrap();
         assert_eq!(
             overlay.enabled_for(&item("foo"), HarnessId::Opencode),
@@ -223,7 +283,13 @@ mod tests {
         let path = dir.path().join("overlay.json");
         let mut overlay = ExtOverlay::load(&path).unwrap();
         overlay
-            .set_enabled(ExtKind::McpServer, HarnessId::ClaudeCode, "gh", false)
+            .set_enabled(
+                ExtKind::McpServer,
+                Origin::External,
+                HarnessId::ClaudeCode,
+                "gh",
+                false,
+            )
             .unwrap();
         let reloaded = ExtOverlay::load(&path).unwrap();
         let it = ExtItem {
@@ -242,5 +308,90 @@ mod tests {
             reloaded.enabled_for(&it, HarnessId::ClaudeCode),
             Some(false)
         );
+    }
+
+    #[test]
+    fn origin_partitions_decisions_for_same_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("overlay.json");
+        let mut overlay = ExtOverlay::load(&path).unwrap();
+        // Same kind+agent+id, different origin → independent decisions.
+        overlay
+            .set_enabled(
+                ExtKind::McpServer,
+                Origin::External,
+                HarnessId::Opencode,
+                "srv",
+                false,
+            )
+            .unwrap();
+        overlay
+            .set_enabled(
+                ExtKind::McpServer,
+                Origin::Komet,
+                HarnessId::Opencode,
+                "srv",
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            overlay.decision(
+                ExtKind::McpServer,
+                Origin::External,
+                HarnessId::Opencode,
+                "srv"
+            ),
+            Some(false)
+        );
+        assert_eq!(
+            overlay.decision(
+                ExtKind::McpServer,
+                Origin::Komet,
+                HarnessId::Opencode,
+                "srv"
+            ),
+            Some(true)
+        );
+        // Clearing one origin leaves the other untouched.
+        overlay
+            .clear(
+                ExtKind::McpServer,
+                Origin::External,
+                HarnessId::Opencode,
+                "srv",
+            )
+            .unwrap();
+        assert_eq!(
+            overlay.decision(
+                ExtKind::McpServer,
+                Origin::Komet,
+                HarnessId::Opencode,
+                "srv"
+            ),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn legacy_three_segment_keys_migrate_as_external() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("overlay.json");
+        std::fs::write(
+            &path,
+            r#"{"version":1,"entries":{"mcp_server|opencode|gh":false}}"#,
+        )
+        .unwrap();
+        let overlay = ExtOverlay::load(&path).unwrap();
+        assert_eq!(
+            overlay.decision(
+                ExtKind::McpServer,
+                Origin::External,
+                HarnessId::Opencode,
+                "gh"
+            ),
+            Some(false)
+        );
+        // And the migrated key round-trips on the next persist.
+        assert!(overlay.touches(ExtKind::McpServer, Origin::External, HarnessId::Opencode));
     }
 }

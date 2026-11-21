@@ -212,6 +212,7 @@ async fn komet_owned_mcp_is_togglable_on_acp_agents() {
         methods::SET_HARNESS_EXTENSION_ENABLED,
         serde_json::json!({
             "kind": "mcp_server",
+            "origin": "komet",
             "harness": "grok",
             "id": "komet-srv",
             "enabled": false,
@@ -226,6 +227,7 @@ async fn komet_owned_mcp_is_togglable_on_acp_agents() {
         methods::SET_HARNESS_EXTENSION_ENABLED,
         serde_json::json!({
             "kind": "mcp_server",
+            "origin": "external",
             "harness": "cursor",
             "id": "komet-srv",
             "enabled": false,
