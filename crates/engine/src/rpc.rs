@@ -115,6 +115,68 @@ struct ExtListEntry {
     /// Agent slug → effective enabled state for that agent (overlay decision,
     /// else the agent-native hint, else `true`).
     enabled: BTreeMap<String, bool>,
+    /// Agent slug → reason this (kind, agent) row is read-only: komet has no
+    /// launch-time mediation for it, so a toggle would silently do nothing.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    read_only: BTreeMap<String, String>,
+    /// Agent slugs holding an explicit overlay decision — the UI marks these
+    /// rows "modified" and offers a reset (`enabled: null`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    modified: Vec<String>,
+}
+
+/// Why a (kind, origin, agent) extension row cannot be toggled, if it cannot.
+/// `None` means the overlay decision is actually applied at launch.
+///
+/// Komet-owned MCPs are exempt from `mediates_native_mcp`: they never touch
+/// the agent's native config — komet filters them out of the injected
+/// `mcpServers` set at launch (Claude `--mcp-config`, ACP `session/new`),
+/// which every agent in the komet inventory supports.
+fn ext_row_readonly(
+    kind: komet_harness::ext::ExtKind,
+    origin: komet_harness::ext::Origin,
+    agent: HarnessId,
+) -> Option<String> {
+    match kind {
+        komet_harness::ext::ExtKind::McpServer => {
+            if origin == komet_harness::ext::Origin::Komet {
+                return None;
+            }
+            let (supported, reason) = komet_harness::capabilities::mediates_native_mcp(agent);
+            (!supported).then(|| reason.to_string())
+        }
+        // Skills and plugins are inventoried but have no launch-time
+        // mediation yet — a toggle would record a decision nothing applies.
+        _ => Some(
+            "Le contrôle au lancement des skills et plugins n'est pas encore implémenté."
+                .to_string(),
+        ),
+    }
+}
+
+/// Read-only check for `SET_HARNESS_EXTENSION_ENABLED`, whose params carry
+/// no origin. Resolves it from the live inventory: an id matching a
+/// komet-owned MCP available to this agent is writable everywhere komet
+/// injects; anything else falls back to the external-MCP rule.
+fn ext_set_readonly(
+    kind: komet_harness::ext::ExtKind,
+    agent: HarnessId,
+    id: &str,
+) -> Option<String> {
+    if kind == komet_harness::ext::ExtKind::McpServer {
+        let home = home_dir();
+        let komet_owned = komet_harness::ext::scan(&home).iter().any(|item| {
+            item.kind == kind
+                && item.id == id
+                && item.origin == komet_harness::ext::Origin::Komet
+                && item.sources.iter().any(|s| s.agent == agent)
+        });
+        if komet_owned {
+            return None;
+        }
+    }
+    // Unknown ids and external rows share the conservative rule.
+    ext_row_readonly(kind, komet_harness::ext::Origin::External, agent)
 }
 
 #[derive(Debug, Deserialize)]
@@ -2012,25 +2074,42 @@ impl RpcService for EngineRpc {
                 let entries = items
                     .into_iter()
                     .map(|item| {
-                        let enabled = item
-                            .sources
-                            .iter()
-                            .map(|s| s.agent)
-                            .collect::<HashSet<_>>()
-                            .into_iter()
-                            .filter_map(|agent| {
-                                overlay
-                                    .enabled_for(&item, agent)
-                                    .map(|e| (agent.as_str().to_string(), e))
-                            })
-                            .collect();
-                        ExtListEntry { item, enabled }
+                        let mut enabled = BTreeMap::new();
+                        let mut read_only = BTreeMap::new();
+                        let mut modified = Vec::new();
+                        for agent in item.sources.iter().map(|s| s.agent).collect::<HashSet<_>>() {
+                            let slug = agent.as_str().to_string();
+                            if let Some(e) = overlay.enabled_for(&item, agent) {
+                                enabled.insert(slug.clone(), e);
+                            }
+                            if let Some(reason) = ext_row_readonly(item.kind, item.origin, agent) {
+                                read_only.insert(slug, reason);
+                            }
+                            if overlay.decision(item.kind, agent, &item.id).is_some() {
+                                modified.push(agent.as_str().to_string());
+                            }
+                        }
+                        ExtListEntry {
+                            item,
+                            enabled,
+                            read_only,
+                            modified,
+                        }
                     })
                     .collect::<Vec<_>>();
                 RpcReply::value(&entries)
             }
             methods::SET_HARNESS_EXTENSION_ENABLED => {
                 let p: SetExtEnabledParams = parse_params(params)?;
+                // Refuse decisions komet cannot apply at launch — a stored
+                // toggle that does nothing would lie to the user. Clearing
+                // (`enabled: null`) is always allowed so stale entries can
+                // be reset even if mediation for the agent went away.
+                if p.enabled.is_some()
+                    && let Some(reason) = ext_set_readonly(p.kind, p.harness, &p.id)
+                {
+                    return Err(RpcError::Unsupported(reason));
+                }
                 let mut overlay = komet_harness::ext::load_overlay();
                 let result = match p.enabled {
                     Some(enabled) => overlay.set_enabled(p.kind, p.harness, &p.id, enabled),

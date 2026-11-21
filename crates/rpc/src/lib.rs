@@ -280,6 +280,10 @@ pub enum RpcError {
     UnknownMethod(String),
     #[error("bad params: {0}")]
     BadParams(String),
+    /// The request is well-formed but this engine/agent cannot honor it
+    /// (e.g. an overlay toggle for an agent with no launch mediation).
+    #[error("unsupported: {0}")]
+    Unsupported(String),
     #[error("{0}")]
     Failed(String),
     #[error("transport: {0}")]

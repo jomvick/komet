@@ -16,6 +16,7 @@ mod scan;
 
 pub use model::{ExtItem, ExtKind, ExtSource, Origin};
 pub use overlay::ExtOverlay;
+pub(crate) use scan::codex_mcp_server_names;
 pub use scan::scan;
 
 /// Well-known overlay location, mirroring `McpSecretStore::default_path`:

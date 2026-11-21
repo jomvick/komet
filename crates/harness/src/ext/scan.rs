@@ -34,15 +34,21 @@ const SHARED_SKILL_AGENTS: &[HarnessId] = &[HarnessId::Devin, HarnessId::Copilot
 /// Project-level configs (`.claude/` inside a repo, opencode.json up the cwd
 /// chain) are intentionally out of scope: this inventory is the global one.
 pub fn scan(home: &Path) -> Vec<ExtItem> {
-    let mut items: BTreeMap<(ExtKind, String), ExtItem> = BTreeMap::new();
+    // Keyed by (kind, origin, id): the same id can legitimately exist both as
+    // an agent-native entry and as a komet-managed one — they are different
+    // items with different owners.
+    let mut items: BTreeMap<(ExtKind, Origin, String), ExtItem> = BTreeMap::new();
     let mut push = |kind: ExtKind, id: String, name: String, source: ExtSource| {
-        let entry = items.entry((kind, id.clone())).or_insert_with(|| ExtItem {
-            kind,
-            id,
-            name: name.clone(),
-            origin: Origin::External,
-            sources: Vec::new(),
-        });
+        let entry = items
+            .entry((kind, Origin::External, id.clone()))
+            .or_insert_with(|| ExtItem {
+                kind,
+                id,
+                name: name.clone(),
+                origin: Origin::External,
+                detail: None,
+                sources: Vec::new(),
+            });
         if entry.name.is_empty() {
             entry.name = name;
         }
@@ -54,9 +60,16 @@ pub fn scan(home: &Path) -> Vec<ExtItem> {
     scan_skills(home, &mut push);
     scan_mcp(home, &mut push);
     scan_plugins(home, &mut push);
+    scan_komet_mcp(home, &mut items);
 
     let mut out: Vec<ExtItem> = items.into_values().collect();
-    out.sort_by(|a, b| (a.kind.as_str(), &a.id).cmp(&(b.kind.as_str(), &b.id)));
+    out.sort_by(|a, b| {
+        (a.kind.as_str(), a.origin == Origin::Komet, &a.id).cmp(&(
+            b.kind.as_str(),
+            b.origin == Origin::Komet,
+            &b.id,
+        ))
+    });
     out
 }
 
@@ -209,28 +222,17 @@ fn scan_copilot_mcp(home: &Path, push: &mut Push<'_>) {
     }
 }
 
-/// `~/.codex/config.toml` `[mcp_servers.<name>]` tables. Line-scanned rather
-/// than TOML-parsed: we only need section names and an optional `enabled`
-/// flag, and a serde `toml` dependency is not in the workspace yet.
-fn scan_codex_mcp(home: &Path, push: &mut Push<'_>) {
-    let path = home.join(".codex/config.toml");
-    let Ok(contents) = std::fs::read_to_string(&path) else {
-        return;
-    };
+/// `~/.codex/config.toml` `[mcp_servers.<name>]` tables as `(name, enabled)`
+/// pairs. Line-scanned rather than TOML-parsed: we only need section names
+/// and an optional `enabled` flag, and a serde `toml` dependency is not in
+/// the workspace yet.
+fn codex_mcp_tables(contents: &str) -> Vec<(String, Option<bool>)> {
+    let mut out = Vec::new();
     let mut current: Option<String> = None;
     let mut enabled: Option<bool> = None;
     let mut flush = |name: &mut Option<String>, enabled: &mut Option<bool>| {
         if let Some(n) = name.take() {
-            push(
-                ExtKind::McpServer,
-                n.clone(),
-                n,
-                ExtSource {
-                    agent: HarnessId::Codex,
-                    path: path.clone(),
-                    enabled: *enabled,
-                },
-            );
+            out.push((n, *enabled));
             *enabled = None;
         }
     };
@@ -241,17 +243,48 @@ fn scan_codex_mcp(home: &Path, push: &mut Push<'_>) {
             current = parse_mcp_server_section(line);
             continue;
         }
-        if let Some(name) = &current
+        if current.is_some()
             && let Some(value) = line
                 .strip_prefix("enabled")
                 .and_then(|rest| rest.trim_start().strip_prefix('='))
         {
-            let value = value.trim();
-            enabled = Some(matches!(value, "true"));
-            let _ = name;
+            enabled = Some(matches!(value.trim(), "true"));
         }
     }
     flush(&mut current, &mut enabled);
+    out
+}
+
+/// Names of the `[mcp_servers.*]` tables in `home/.codex/config.toml` — the
+/// set Codex launch mediation may toggle via `-c` overrides.
+pub(crate) fn codex_mcp_server_names(home: &Path) -> Vec<String> {
+    let path = home.join(".codex/config.toml");
+    let Ok(contents) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    codex_mcp_tables(&contents)
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect()
+}
+
+fn scan_codex_mcp(home: &Path, push: &mut Push<'_>) {
+    let path = home.join(".codex/config.toml");
+    let Ok(contents) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    for (name, enabled) in codex_mcp_tables(&contents) {
+        push(
+            ExtKind::McpServer,
+            name.clone(),
+            name,
+            ExtSource {
+                agent: HarnessId::Codex,
+                path: path.clone(),
+                enabled,
+            },
+        );
+    }
 }
 
 /// `[mcp_servers.foo]` / `[mcp_servers."foo bar"]` → `foo`. Other tables
@@ -391,6 +424,110 @@ fn scan_copilot_plugins(home: &Path, push: &mut Push<'_>) {
     }
 }
 
+/// komet-managed MCP servers from `<data_dir>/mcp-servers.json` — the same
+/// file the engine's `McpRegistry` owns. Only secret-free fields are read:
+/// `id`, `name`, `enabled`, `transport` and the stdio `command`. Headers,
+/// env, URLs (they may embed tokens) and args are never touched — the
+/// registry itself persists header/env values empty, and this scanner does
+/// not depend on that: it simply never looks at them.
+fn scan_komet_mcp(home: &Path, items: &mut BTreeMap<(ExtKind, Origin, String), ExtItem>) {
+    let path = komet_mcp_registry_path(home);
+    let Ok(contents) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&contents) else {
+        return;
+    };
+    // Agents komet actually injects MCP servers into at launch: Claude via
+    // `--mcp-config`, the native ACP agents via `session/new`. Mock is the
+    // test double and is excluded.
+    const KOMET_MCP_AGENTS: &[HarnessId] = &[
+        HarnessId::ClaudeCode,
+        HarnessId::Opencode,
+        HarnessId::Grok,
+        HarnessId::Hermes,
+        HarnessId::Pi,
+        HarnessId::Cline,
+        HarnessId::Qoder,
+    ];
+    for server in komet_registry_servers(&value) {
+        let id = server
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        if id.is_empty() {
+            continue;
+        }
+        let name = server
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+            .unwrap_or(id)
+            .to_string();
+        let enabled = server.get("enabled").and_then(Value::as_bool);
+        let transport = server
+            .get("transport")
+            .and_then(Value::as_str)
+            .unwrap_or("stdio");
+        let command = server
+            .get("command")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|c| !c.is_empty());
+        let detail = match command {
+            Some(cmd) => Some(format!("{transport} · {cmd}")),
+            None => Some(transport.to_string()),
+        };
+        let sources = KOMET_MCP_AGENTS
+            .iter()
+            .map(|agent| ExtSource {
+                agent: *agent,
+                path: path.clone(),
+                enabled,
+            })
+            .collect();
+        items.insert(
+            (ExtKind::McpServer, Origin::Komet, id.to_string()),
+            ExtItem {
+                kind: ExtKind::McpServer,
+                id: id.to_string(),
+                name,
+                origin: Origin::Komet,
+                detail,
+                sources,
+            },
+        );
+    }
+}
+
+/// `$KOMET_DATA_DIR/mcp-servers.json`, else `~/.komet/mcp-servers.json` —
+/// mirrors `McpRegistry::file_path_for` + `default_data_dir` resolution.
+fn komet_mcp_registry_path(home: &Path) -> PathBuf {
+    if let Ok(dir) = std::env::var("KOMET_DATA_DIR")
+        && !dir.is_empty()
+    {
+        return PathBuf::from(dir).join("mcp-servers.json");
+    }
+    home.join(".komet/mcp-servers.json")
+}
+
+/// Registry file shapes the engine accepts: versioned wrapper
+/// `{version, servers: [...]}`, a bare array, or a `{id: config}` map.
+fn komet_registry_servers(value: &Value) -> Vec<&Value> {
+    if let Some(servers) = value.get("servers").and_then(Value::as_array) {
+        return servers.iter().collect();
+    }
+    if let Some(servers) = value.as_array() {
+        return servers.iter().collect();
+    }
+    if let Some(map) = value.as_object() {
+        return map.values().collect();
+    }
+    Vec::new()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -492,5 +629,51 @@ mod tests {
         let items = scan(home);
         let plugin = find(&items, ExtKind::Plugin, "ecc@ecc").unwrap();
         assert!(plugin.available_to(HarnessId::ClaudeCode));
+    }
+
+    #[test]
+    fn komet_mcp_items_never_leak_secrets() {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path();
+        // A registry entry carrying a fake secret in EVERY secret-capable
+        // field — the inventory must surface none of them.
+        write(
+            &home.join(".komet/mcp-servers.json"),
+            r#"{"version":1,"servers":[{
+                "id":"composio","name":"Composio","enabled":true,
+                "transport":"http","url":"https://connect.composio.dev/mcp?token=FAKE-SECRET-123",
+                "headers":{"x-consumer-api-key":"FAKE-SECRET-123"},
+                "env":{"API_KEY":"FAKE-SECRET-123"},
+                "always_load":true
+            }]}"#,
+        );
+        // Point the data dir at the fixture so the real KOMET_DATA_DIR can't
+        // redirect the scan (parallel tests share the process env).
+        unsafe { std::env::set_var("KOMET_DATA_DIR", home.join(".komet-data")) };
+        write(
+            &home.join(".komet-data/mcp-servers.json"),
+            r#"{"version":1,"servers":[{
+                "id":"composio","name":"Composio","enabled":true,
+                "transport":"http","url":"https://connect.composio.dev/mcp?token=FAKE-SECRET-123",
+                "headers":{"x-consumer-api-key":"FAKE-SECRET-123"},
+                "env":{"API_KEY":"FAKE-SECRET-123"},
+                "always_load":true
+            }]}"#,
+        );
+
+        let items = scan(home);
+        let item = find(&items, ExtKind::McpServer, "composio").unwrap();
+        assert_eq!(item.origin, Origin::Komet);
+        assert!(item.available_to(HarnessId::ClaudeCode));
+        assert!(item.available_to(HarnessId::Opencode));
+        assert!(!item.available_to(HarnessId::Codex));
+        assert_eq!(item.hint_for(HarnessId::ClaudeCode), Some(true));
+
+        // Serialize the whole inventory the way the RPC reply does: the fake
+        // secret must not appear anywhere.
+        let json = serde_json::to_string(&items).unwrap();
+        assert!(!json.contains("FAKE-SECRET-123"));
+        assert!(!json.contains("connect.composio.dev"));
+        assert_eq!(item.detail.as_deref(), Some("http"));
     }
 }

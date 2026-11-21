@@ -496,6 +496,22 @@ impl Harness for CodexHarness {
         cmd.no_console();
         cmd.arg("app-server");
         crate::compose_child_path(&mut cmd, &exe);
+        // Ext overlay: native MCP enable/disable rides per-run `-c` overrides
+        // (`mcp_servers.<name>.enabled=<bool>`), which codex merges above
+        // config.toml for this process only — the file is never written.
+        if let Some(home) = crate::platform::home_dir() {
+            let overlay = crate::ext::load_overlay();
+            if overlay.touches(crate::ext::ExtKind::McpServer, HarnessId::Codex) {
+                for name in crate::ext::codex_mcp_server_names(&home) {
+                    if let Some(enabled) =
+                        overlay.decision(crate::ext::ExtKind::McpServer, HarnessId::Codex, &name)
+                    {
+                        cmd.arg("-c")
+                            .arg(format!("mcp_servers.{name}.enabled={enabled}"));
+                    }
+                }
+            }
+        }
         if !request.cwd.is_empty() {
             cmd.current_dir(&request.cwd);
         }

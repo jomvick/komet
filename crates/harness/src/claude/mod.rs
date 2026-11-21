@@ -447,6 +447,15 @@ impl ClaudeHarness {
             // historical behavior is untouched: natives load from the user's
             // own config and only komet servers ride --mcp-config.
             let overlay = crate::ext::load_overlay();
+            // Per-agent overlay: a komet-managed MCP the user disabled for
+            // Claude is not injected at all (legacy path AND strict merge).
+            servers.retain(|name, _| {
+                overlay.decision(
+                    crate::ext::ExtKind::McpServer,
+                    komet_proto::HarnessId::ClaudeCode,
+                    name,
+                ) != Some(false)
+            });
             match strict_mcp_config(&overlay, &request.cwd, &servers) {
                 Some((document, count)) => {
                     cmd.args(["--mcp-config", &document, "--strict-mcp-config"]);
@@ -805,6 +814,16 @@ fn strict_mcp_config(
         ) != Some(false)
     });
     for (name, config) in komet_servers {
+        // `servers` was already filtered by the caller; the check repeats
+        // here so the pure function stays honest about its contract.
+        if overlay.decision(
+            crate::ext::ExtKind::McpServer,
+            komet_proto::HarnessId::ClaudeCode,
+            name,
+        ) == Some(false)
+        {
+            continue;
+        }
         merged.insert(name.clone(), config.clone());
     }
     let count = merged.len();

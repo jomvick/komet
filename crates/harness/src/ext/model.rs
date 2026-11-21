@@ -33,7 +33,7 @@ impl ExtKind {
 
 /// Where an item comes from. `External` = found in an agent's own config
 /// (never written by komet). `Komet` = installed/managed by komet itself.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Origin {
     External,
@@ -64,6 +64,11 @@ pub struct ExtItem {
     /// or the id itself).
     pub name: String,
     pub origin: Origin,
+    /// Optional safe-to-display detail (e.g. `"http"` or `"stdio · npx"` for a
+    /// komet MCP). NEVER carries secrets, header/env values, tokens in URLs,
+    /// or command arguments that may embed credentials.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
     /// Every (agent, path) location this item was found at. An item with no
     /// source for a given agent is simply not available to that agent.
     #[serde(default)]

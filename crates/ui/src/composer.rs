@@ -4031,7 +4031,9 @@ fn mention_error_message(err: &RpcError) -> SharedString {
             "The session's device runs an older Komet — update it to search its files".into()
         }
         RpcError::Transport(_) | RpcError::Closed => "The session's device is unreachable".into(),
-        RpcError::BadParams(_) | RpcError::Failed(_) => "File search failed".into(),
+        RpcError::BadParams(_) | RpcError::Failed(_) | RpcError::Unsupported(_) => {
+            "File search failed".into()
+        }
     }
 }
 

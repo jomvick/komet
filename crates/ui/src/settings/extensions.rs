@@ -28,6 +28,12 @@ struct ExtEntry {
     item: ExtItem,
     #[serde(default)]
     enabled: BTreeMap<String, bool>,
+    /// Agent slug → reason the row is read-only for that agent.
+    #[serde(default)]
+    read_only: BTreeMap<String, String>,
+    /// Agent slugs with an explicit overlay decision ("modified" marker).
+    #[serde(default)]
+    modified: Vec<String>,
 }
 
 /// A rendered row: one (item, agent) pair.
@@ -38,6 +44,10 @@ struct ExtRow {
     agent: HarnessId,
     agent_slug: String,
     enabled: bool,
+    /// `Some(reason)` → no toggle; the reason is shown instead.
+    read_only_reason: Option<String>,
+    /// Explicit overlay decision exists → offer "Réinitialiser".
+    modified: bool,
     /// Short source hint (config file name or skills dir) for the meta line.
     source_hint: String,
 }
@@ -172,10 +182,58 @@ impl ExtensionsPage {
                 match result {
                     Ok(_) => {
                         if let Some(entry) = page.entries.get_mut(entry_ix) {
-                            entry.enabled.insert(agent_slug, next);
+                            entry.enabled.insert(agent_slug.clone(), next);
+                            if !entry.modified.iter().any(|m| m == &agent_slug) {
+                                entry.modified.push(agent_slug);
+                            }
                         }
                     }
                     Err(error) => page.set_status(error.to_string(), true),
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// Clear the overlay entry (`enabled: null`) then re-fetch the inventory
+    /// so the row shows the agent-native default again.
+    fn reset(&mut self, entry_ix: usize, agent_slug: String, cx: &mut Context<Self>) {
+        let Some(entry) = self.entries.get(entry_ix) else {
+            return;
+        };
+        let params = serde_json::json!({
+            "kind": entry.item.kind.as_str(),
+            "harness": agent_slug,
+            "id": entry.item.id,
+            "enabled": serde_json::Value::Null,
+        });
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            self.set_status("The local engine is unavailable.", true);
+            cx.notify();
+            return;
+        };
+        self.task = Some(cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(methods::SET_HARNESS_EXTENSION_ENABLED, params)
+                .await
+                .map(|_| ());
+            // Re-fetch regardless of the clear outcome's shape: the list is
+            // the source of truth for effective state.
+            let list = engine
+                .client()
+                .call(methods::LIST_HARNESS_EXTENSIONS, serde_json::json!({}))
+                .await;
+            this.update(cx, |page, cx| {
+                if let Err(error) = result {
+                    page.set_status(error.to_string(), true);
+                }
+                if let Ok(value) = list
+                    && let Ok(entries) = serde_json::from_value::<Vec<ExtEntry>>(value)
+                {
+                    page.entries = entries;
+                    page.loaded = true;
                 }
                 cx.notify();
             })
@@ -217,6 +275,8 @@ impl ExtensionsPage {
                     agent,
                     agent_slug: slug.clone(),
                     enabled: *enabled,
+                    read_only_reason: entry.read_only.get(slug).cloned(),
+                    modified: entry.modified.iter().any(|m| m == slug),
                     source_hint,
                 });
                 uid += 1;
@@ -281,16 +341,30 @@ impl Render for ExtensionsPage {
                                     let enabled = row.enabled;
                                     let entry_ix = row.entry;
                                     let agent_slug = row.agent_slug.clone();
+                                    let reset_slug = agent_slug.clone();
                                     let agent_name = harness_display_name(row.agent);
                                     let origin = origin_label(entry.item.origin);
                                     let source_hint = row.source_hint.clone();
                                     let name = entry.item.name.clone();
-                                    let meta = match source_hint.is_empty() {
-                                        true => format!("{agent_name}  ·  {origin}"),
-                                        false => {
-                                            format!("{agent_name}  ·  {origin}  ·  {source_hint}")
-                                        }
-                                    };
+                                    let detail = entry.item.detail.clone();
+                                    let read_only_reason = row.read_only_reason.clone();
+                                    let modified = row.modified;
+                                    let mut meta_parts = vec![
+                                        agent_name.to_string(),
+                                        origin.to_string(),
+                                    ];
+                                    if !source_hint.is_empty() {
+                                        meta_parts.push(source_hint);
+                                    }
+                                    if let Some(detail) = detail
+                                        && !detail.is_empty()
+                                    {
+                                        meta_parts.push(detail);
+                                    }
+                                    if let Some(reason) = &read_only_reason {
+                                        meta_parts.push(reason.clone());
+                                    }
+                                    let meta = meta_parts.join("  ·  ");
                                     widgets::card_row(&theme, ix == 0)
                                         .child(widgets::row_tile(&theme, icon_path))
                                         .child(
@@ -308,23 +382,65 @@ impl Render for ExtensionsPage {
                                                 ),
                                         )
                                         .child(
-                                            widgets::toggle_switch(&theme, enabled)
-                                                .id(gpui::ElementId::named_usize(
-                                                    "ext-toggle",
-                                                    row.uid,
-                                                ))
-                                                .cursor_pointer()
-                                                .on_click(cx.listener(
-                                                    move |this, _, _, cx| {
-                                                        cx.stop_propagation();
-                                                        this.toggle(
-                                                            entry_ix,
-                                                            agent_slug.clone(),
-                                                            enabled,
-                                                            cx,
-                                                        );
-                                                    },
-                                                )),
+                                            div()
+                                                .flex_none()
+                                                .flex()
+                                                .flex_row()
+                                                .items_center()
+                                                .gap(px(10.0))
+                                                .when(modified, |el| {
+                                                    el.child(
+                                                        div()
+                                                            .id(gpui::ElementId::named_usize(
+                                                                "ext-reset",
+                                                                row.uid,
+                                                            ))
+                                                            .text_size(px(11.0))
+                                                            .text_color(theme.accent)
+                                                            .cursor_pointer()
+                                                            .hover(|s| {
+                                                                s.text_color(theme.text)
+                                                            })
+                                                            .on_click(cx.listener(
+                                                                move |this, _, _, cx| {
+                                                                    cx.stop_propagation();
+                                                                    this.reset(
+                                                                        entry_ix,
+                                                                        reset_slug.clone(),
+                                                                        cx,
+                                                                    );
+                                                                },
+                                                            ))
+                                                            .child("Réinitialiser"),
+                                                    )
+                                                })
+                                                // Read-only rows show the
+                                                // reason in the meta line;
+                                                // the toggle is omitted so
+                                                // nothing implies a no-op.
+                                                .when(read_only_reason.is_none(), |el| {
+                                                    el.child(
+                                                        widgets::toggle_switch(
+                                                            &theme, enabled,
+                                                        )
+                                                        .id(gpui::ElementId::named_usize(
+                                                            "ext-toggle",
+                                                            row.uid,
+                                                        ))
+                                                        .cursor_pointer()
+                                                        .on_click(cx.listener(
+                                                            move |this, _, _, cx| {
+                                                                cx.stop_propagation();
+                                                                this.toggle(
+                                                                    entry_ix,
+                                                                    agent_slug.clone(),
+                                                                    enabled,
+                                                                    cx,
+                                                                );
+                                                            },
+                                                        )),
+                                                    )
+                                                }),
                                         )
                                         .into_any_element()
                                 }),

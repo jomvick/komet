@@ -174,6 +174,7 @@ mod tests {
             id: id.into(),
             name: id.into(),
             origin: Origin::External,
+            detail: None,
             sources: vec![ExtSource {
                 agent: HarnessId::Opencode,
                 path: "/tmp/x".into(),
@@ -230,6 +231,7 @@ mod tests {
             id: "gh".into(),
             name: "gh".into(),
             origin: Origin::External,
+            detail: None,
             sources: vec![ExtSource {
                 agent: HarnessId::ClaudeCode,
                 path: "/home/u/.claude.json".into(),

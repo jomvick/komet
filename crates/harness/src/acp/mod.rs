@@ -1550,7 +1550,10 @@ impl AcpHarness {
             if commands.is_empty() {
                 let cwd = cwd.to_string_lossy();
                 let session = client
-                    .request("session/new", build_acp_session_params(&cwd, None, vec![]))
+                    .request(
+                        "session/new",
+                        build_acp_session_params(&cwd, None, vec![], self.spec.id),
+                    )
                     .await;
                 if session.is_ok() {
                     // The update usually arrives within milliseconds of the
@@ -1630,7 +1633,10 @@ impl AcpHarness {
                 .map(|h| h.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "/".into());
             let session = client
-                .request("session/new", build_acp_session_params(&cwd, None, vec![]))
+                .request(
+                    "session/new",
+                    build_acp_session_params(&cwd, None, vec![], self.spec.id),
+                )
                 .await?;
             let mut models = models_from_session(&session, &(self.spec.models)());
             // Sync with the real CLI: the wire list omits the CLI's own
@@ -2585,11 +2591,23 @@ fn mcp_servers(injection: Option<&komet_proto::McpInjection>) -> Vec<Value> {
 /// Build `session/new` params merging internal `komet` MCP + external resolved servers.
 /// Transport handling: Http→type http, Sse→type sse, Stdio→name/command/args/env.
 /// Always includes `env: []` for opencode 1.18.25+.
+///
+/// `agent` is the running harness: komet-managed externals the user disabled
+/// for that agent in the ext overlay are filtered out here — the overlay is
+/// the only place that decision lives, agent configs are never written.
 pub fn build_acp_session_params(
     cwd: &str,
     internal: Option<komet_proto::McpInjection>,
     externals: Vec<komet_proto::ResolvedMcpServer>,
+    agent: HarnessId,
 ) -> Value {
+    let overlay = crate::ext::load_overlay();
+    let externals = externals
+        .into_iter()
+        .filter(|ext| {
+            overlay.decision(crate::ext::ExtKind::McpServer, agent, &ext.config.id) != Some(false)
+        })
+        .collect::<Vec<_>>();
     let mut servers = mcp_servers(internal.as_ref());
     for ext in externals {
         match ext.config.transport {
@@ -4081,6 +4099,7 @@ async fn run_session(session: Session) {
             &request.cwd,
             request.mcp.clone(),
             request.mcp_external.clone(),
+            harness,
         );
         let (session_id, session_response) = if let Some(resume) = &request.resume {
             let mut load = session_params.clone();
