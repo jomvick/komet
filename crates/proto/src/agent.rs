@@ -352,6 +352,12 @@ impl SandboxOptions {
                         ],
                         ..Default::default()
                     },
+                    // Fail closed: without bubblewrap/socat the sandbox
+                    // can't start — refuse to run unsandboxed rather than
+                    // silently downgrade WorkspaceWrite to permission-prompt
+                    // only (sandbox.enabled is emitted for every claude
+                    // table, so this flag actually gates now).
+                    fail_if_unavailable: true,
                     ..Default::default()
                 }),
                 opencode: Some(OpenCodePerms {
