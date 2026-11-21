@@ -1,0 +1,69 @@
+# Unit tests on every desktop platform; the bash e2e smoke on Linux.
+# gpui system libs are only needed to build `komet` itself — the pure sync
+# crates (komet-sync, komet-sync-server, komet-rpc, komet-engine) build and
+# test without them, which is what these jobs cover first; the Linux job
+# installs the full set so the workspace-wide check compiles the UI too.
+name: ci
+on:
+  push:
+    branches: [main, sync]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  unit-tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            gpui-deps: true
+          - runner: macos-latest
+            gpui-deps: false
+          - runner: windows-latest
+            gpui-deps: false
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: rust toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: gpui system deps (Linux only)
+        if: matrix.gpui-deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+            libx11-dev libxcb1-dev libx11-xcb-dev \
+            libfontconfig1-dev libfreetype-dev libasound2-dev \
+            libvulkan-dev libdbus-1-dev pkg-config cmake
+      - name: sync crates — check, clippy, tests
+        run: |
+          cargo check -p komet-sync -p komet-sync-server -p komet-rpc -p komet-engine --all-targets
+          cargo clippy -p komet-sync -p komet-sync-server -p komet-rpc -p komet-engine --all-targets -- -D warnings
+          cargo test -p komet-sync --features mock-server
+          cargo test -p komet-sync-server
+          cargo test -p komet-rpc
+          cargo test -p komet-engine --lib
+      - name: workspace check (Linux only — gpui builds are slow)
+        if: matrix.gpui-deps
+        run: cargo check --workspace --all-targets
+
+  # Phase 2's net: the five sync-recovery scenarios (two-way exchange, server
+  # kill mid-push, injected wake, proxy TCP cut, 1 MB checkpoint Range resume)
+  # against the real self-hosted server, Linux only (the script is bash).
+  e2e-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: rust toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: e2e smoke (all scenarios)
+        run: scripts/e2e-smoke.sh all

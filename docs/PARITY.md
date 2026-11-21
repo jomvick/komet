@@ -97,6 +97,8 @@ the current backend.
 | Sync rooms (sessions/devices) | done | Loro rooms via `komet-sync-server`; `KOMET_EDGE_URL` + `KOMET_SYNC_TOKEN` seams. |
 | Auth at sync | done | Bearer shared secret; dev mode `user@org` bearers. |
 | Durable nudges / sidecars | done | Replay on join (cap), sidecar slots — reimplemented sync-side. |
+| Reprise réseau | done (Linux/macOS; Windows pending) | Happy-eyeballs dialing for every socket (`dial::connect_ws`); suspend/resume detector (`wake::subscribe`) cuts reconnect backoffs; backoff waits consume `subscribe_online` and park (60 s safety) while the OS reports no path; path monitors: macOS NWPathMonitor, Linux `/proc/net/route` poll — Windows `NotifyNetworkConnectivityHintChange` FFI still to do. E2e proven by `scripts/e2e-smoke.sh` scenarios (`restart`, `wake`, `cut`). |
+| Server hardening (phase 1 of the sync plan) | done | Atomic blob uploads (temp + rename), shared SQLite pragmas (`open_conn`), dead `frames` table gone from registry rooms, idle-room eviction (10-min TTL, 512-room ceiling, memory only — SQLite keeps the data). |
 
 ## §7 Server → sync
 

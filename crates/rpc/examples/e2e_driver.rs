@@ -1,7 +1,7 @@
 //! Two-device e2e smoke driver (`scripts/e2e-smoke.sh` runs it).
 //!
-//! Connects to two running headless engines over their localhost IPC ports and proves
-//! the cross-device command plane end to end against a real edge:
+//! Connects to two running headless engines over their localhost IPC ports and
+//! proves the cross-device command plane end to end against a real edge:
 //!
 //! 1. `LocalDevice` on both — distinct device ids;
 //! 2. `Mutate createChat` on A (A hosts the chat, mock harness config);
@@ -11,13 +11,33 @@
 //! 5. waits on **B** until the assistant entry lands `complete` with the mock
 //!    transcript (A → edge → B), and the session-status row round-trips.
 //!
+//! Scenarios (`argv[3]`):
+//! - `commands` (default): the flow above — B → A command, A → B transcript,
+//!   i.e. a two-way exchange.
+//! - `restart`: server killed and restarted between two runs — no loss, no
+//!   duplicate, the cursor resumes. With the engine-side
+//!   `KOMET_TEST_WAKE_FILE` hook armed this doubles as the wake scenario: the
+//!   script injects the wake event and greps the engines' logs for the
+//!   wake-triggered redial.
+//! - `cut`: engines dial through a TCP proxy; the script kills the proxy
+//!   (client-side cut) and brings it back — the driver reports the seconds
+//!   from "proxy restored" to the second transcript entry (`RECONNECT_S=`).
+//!
+//! Coordination with the driving script is by marker files: the driver writes
+//! `KOMET_E2E_READY` when the script may act (kill/restart), then waits for
+//! `KOMET_E2E_SIGNAL` to exist before resuming.
+//!
 //! Prints `PASS`/`FAIL` lines; exits nonzero on failure.
 
+use std::io::Write as _;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use komet_doc::MessageRole;
 use komet_rpc::{RpcClient, connect_ws, methods};
 
 const STEP_TIMEOUT: Duration = Duration::from_secs(90);
+const SIGNAL_TIMEOUT: Duration = Duration::from_secs(120);
 const MOCK_TEXT: &str = "Mock harness reporting in.";
 
 fn fail(message: &str) -> ! {
@@ -105,20 +125,17 @@ fn apply_transcript_item(
     komet_doc::apply_transcript_frame(current, frame).map_err(|err| err.to_string())
 }
 
-#[tokio::main]
-async fn main() {
-    let mut args = std::env::args().skip(1);
-    let a_port: u16 = args
-        .next()
-        .unwrap_or_else(|| "27801".into())
-        .parse()
-        .expect("A port");
-    let b_port: u16 = args
-        .next()
-        .unwrap_or_else(|| "27802".into())
-        .parse()
-        .expect("B port");
+// ── scenario plumbing ───────────────────────────────────────────────────────
 
+struct Setup {
+    b: RpcClient,
+    a_dev: String,
+    chat_id: String,
+}
+
+/// Connect to both engines and create a chat hosted by A with the mock
+/// harness, waiting until the space + chat rows sync A → edge → B.
+async fn setup(a_port: u16, b_port: u16) -> Setup {
     let a_token = komet_rpc::ipc_token::read_default(a_port)
         .unwrap_or_else(|err| fail(&format!("read engine token :{a_port}: {err}")));
     let a = connect_ws(&format!("ws://127.0.0.1:{a_port}"), &a_token)
@@ -213,8 +230,11 @@ async fn main() {
     }
     pass("chat row synced A -> edge -> B (host = A)");
 
-    // 4. Queue the run from B THROUGH THE DOC (no targetDeviceId): B commits the
-    //    command into its replica; the nudge + room sync hand it to A's executor.
+    Setup { b, a_dev, chat_id }
+}
+
+/// Queue a Run command on B through the doc (no targetDeviceId).
+async fn queue_run(b: &RpcClient, chat_id: &str, label: &str) {
     let message_id = uuid::Uuid::new_v4().to_string();
     b.call(
         methods::QUEUE_COMMAND,
@@ -224,7 +244,7 @@ async fn main() {
                 "kind": "run",
                 "messageId": message_id,
                 "request": {
-                    "prompt": "e2e smoke: report in",
+                    "prompt": format!("e2e smoke: report in ({label})"),
                     "model": null,
                     "reasoning": null,
                     "cwd": "/tmp",
@@ -236,38 +256,103 @@ async fn main() {
         }),
     )
     .await
-    .unwrap_or_else(|err| fail(&format!("QueueCommand on B: {err}")));
-    pass("run command queued on B via the doc command queue");
+    .unwrap_or_else(|err| fail(&format!("QueueCommand ({label}) on B: {err}")));
+    pass(&format!(
+        "run command queued on B via the doc command queue ({label})"
+    ));
+}
+
+/// Materialize the doc-transcript stream on B; returns once the chat holds at
+/// least `target` complete assistant entries, together with the entries.
+async fn wait_transcript(
+    b: &RpcClient,
+    chat_id: &str,
+    target: usize,
+    what: &str,
+) -> Vec<komet_doc::SessionMessageEntry> {
+    let mut transcript = Vec::new();
+    wait_stream(
+        b,
+        methods::WATCH_DOC_MESSAGES,
+        serde_json::json!({ "chatId": chat_id }),
+        what,
+        |item| {
+            apply_transcript_item(&mut transcript, item)
+                .unwrap_or_else(|err| fail(&format!("{what}: {err}")));
+            let complete = transcript
+                .iter()
+                .filter(|entry| {
+                    entry.role == MessageRole::Assistant
+                        && entry.status == Some(komet_doc::MessageStatus::Complete)
+                })
+                .count();
+            (complete >= target).then(|| transcript.clone())
+        },
+    )
+    .await
+}
+
+fn marker_from_env(name: &str) -> PathBuf {
+    std::env::var(name)
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| fail(&format!("{name} not set — the script must provide it")))
+}
+
+/// Tell the script it may act (kill/restart), then wait for its signal.
+async fn script_handoff(label: &str) -> std::time::SystemTime {
+    let ready = marker_from_env("KOMET_E2E_READY");
+    let signal = marker_from_env("KOMET_E2E_SIGNAL");
+    std::fs::File::create(&ready)
+        .and_then(|mut f| f.write_all(label.as_bytes()))
+        .unwrap_or_else(|err| fail(&format!("write ready marker {}: {err}", ready.display())));
+    pass(&format!("handed off to the script ({label})"));
+    let deadline = Instant::now() + SIGNAL_TIMEOUT;
+    while !signal.exists() {
+        if Instant::now() >= deadline {
+            fail(&format!(
+                "signal marker {} never appeared",
+                signal.display()
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    std::fs::metadata(&signal)
+        .and_then(|m| m.modified())
+        .unwrap_or_else(|err| fail(&format!("signal marker mtime: {err}")))
+}
+
+// ── scenarios ───────────────────────────────────────────────────────────────
+
+/// The original two-device flow: B → A command, A → B transcript + session
+/// status — the two-way exchange the smoke proves.
+async fn commands(a_port: u16, b_port: u16) {
+    let s = setup(a_port, b_port).await;
+
+    // 4. Queue the run from B THROUGH THE DOC (no targetDeviceId): B commits
+    //    the command into its replica; the nudge + room sync hand it to A's
+    //    executor.
+    queue_run(&s.b, &s.chat_id, "B -> A").await;
 
     // 5a. Assistant entry executed by A arrives back on B, complete, with the
     // mock text. WatchDocMessages speaks the framed protocol: a full `reset`
     // list on attach, then `upsert`/`append` deltas. Materialize every frame
     // through the shared parser so candidates persist across incremental frames.
-    let mut transcript = Vec::new();
-    let (by_device, text) = wait_stream(
-        &b,
-        methods::WATCH_DOC_MESSAGES,
-        serde_json::json!({ "chatId": chat_id }),
-        "assistant transcript on B",
-        |item| {
-            apply_transcript_item(&mut transcript, item)
-                .unwrap_or_else(|err| fail(&format!("assistant transcript on B: {err}")));
-            let entry = transcript.iter().find(|entry| {
-                entry.role == komet_doc::MessageRole::Assistant
-                    && entry.status == Some(komet_doc::MessageStatus::Complete)
-            })?;
-            let device = entry.device_id.clone();
-            let text = serde_json::to_string(entry)
-                .unwrap_or_else(|err| fail(&format!("serialize assistant transcript: {err}")));
-            Some((device, text))
-        },
-    )
-    .await;
-    if by_device != a_dev {
+    let transcript = wait_transcript(&s.b, &s.chat_id, 1, "assistant transcript on B").await;
+    let entry = transcript
+        .iter()
+        .find(|entry| {
+            entry.role == MessageRole::Assistant
+                && entry.status == Some(komet_doc::MessageStatus::Complete)
+        })
+        .expect("wait_transcript returned on a complete assistant entry");
+    if entry.device_id != s.a_dev {
         fail(&format!(
-            "assistant entry written by {by_device}, expected host {a_dev}"
+            "assistant entry written by {}, expected host {}",
+            entry.device_id, s.a_dev
         ));
     }
+    let text = serde_json::to_string(entry)
+        .unwrap_or_else(|err| fail(&format!("serialize assistant transcript: {err}")));
     if !text.contains(MOCK_TEXT) {
         fail(&format!(
             "assistant entry lacks the mock transcript: {text}"
@@ -277,14 +362,14 @@ async fn main() {
 
     // 5b. Session-status row round-trips: B sees A's session for this chat go idle.
     wait_stream(
-        &b,
+        &s.b,
         methods::WATCH_SESSIONS,
         serde_json::json!({}),
         "session status on B",
         |item| {
             item.as_array()?.iter().find(|session| {
-                session.get("chatId").and_then(|v| v.as_str()) == Some(chat_id.as_str())
-                    && session.get("deviceId").and_then(|v| v.as_str()) == Some(a_dev.as_str())
+                session.get("chatId").and_then(|v| v.as_str()) == Some(s.chat_id.as_str())
+                    && session.get("deviceId").and_then(|v| v.as_str()) == Some(s.a_dev.as_str())
                     && session.get("status").and_then(|v| v.as_str()) == Some("idle")
             })?;
             Some(())
@@ -294,6 +379,106 @@ async fn main() {
     pass("session status (A working -> idle) round-tripped to B");
 
     println!("PASS: two-device e2e smoke complete");
+}
+
+/// Server killed and restarted between two runs (script kills at the ready
+/// marker, restarts, then writes the signal): neither run is lost, nothing is
+/// duplicated, and the second run syncs over the resumed cursors. Also the
+/// wake scenario's driver half — with `KOMET_TEST_WAKE_FILE` armed the script
+/// injects the wake event and greps the engines' logs for the redial.
+async fn restart(a_port: u16, b_port: u16, label: &str) {
+    let s = setup(a_port, b_port).await;
+
+    queue_run(&s.b, &s.chat_id, "before the restart").await;
+    wait_transcript(&s.b, &s.chat_id, 1, "first transcript on B").await;
+    pass("first run synced B -> A -> B before the restart");
+
+    let restarted_at = script_handoff(label).await;
+
+    queue_run(&s.b, &s.chat_id, "after the restart").await;
+    let transcript = wait_transcript(&s.b, &s.chat_id, 2, "second transcript on B").await;
+    let complete: Vec<_> = transcript
+        .iter()
+        .filter(|entry| {
+            entry.role == MessageRole::Assistant
+                && entry.status == Some(komet_doc::MessageStatus::Complete)
+        })
+        .collect();
+    if complete.len() != 2 {
+        fail(&format!(
+            "expected exactly 2 complete assistant entries after the restart, got {}",
+            complete.len()
+        ));
+    }
+    for entry in &complete {
+        if entry.device_id != s.a_dev {
+            fail(&format!(
+                "assistant entry written by {}, expected host {}",
+                entry.device_id, s.a_dev
+            ));
+        }
+        let text = serde_json::to_string(entry)
+            .unwrap_or_else(|err| fail(&format!("serialize assistant transcript: {err}")));
+        if !text.contains(MOCK_TEXT) {
+            fail(&format!(
+                "assistant entry lacks the mock transcript: {text}"
+            ));
+        }
+    }
+    pass("second run synced after the restart; no loss, no duplicate (2/2)");
+
+    // The sync must have recovered promptly: the second transcript entry
+    // arriving is the cursor-resumed proof; report the lag for the script.
+    if let Ok(elapsed) = std::time::SystemTime::now().duration_since(restarted_at) {
+        println!("RESUME_S={:.1}", elapsed.as_secs_f64());
+    }
+    println!("PASS: {label} scenario complete");
+}
+
+/// Engines dial through a TCP proxy the script kills and restores (the
+/// client-side cut): report the seconds from "proxy restored" to the second
+/// transcript entry — the script bounds it.
+async fn cut(a_port: u16, b_port: u16) {
+    let s = setup(a_port, b_port).await;
+
+    queue_run(&s.b, &s.chat_id, "before the cut").await;
+    wait_transcript(&s.b, &s.chat_id, 1, "first transcript on B").await;
+    pass("first run synced before the cut");
+
+    let restored_at = script_handoff("proxy cut + restore").await;
+
+    queue_run(&s.b, &s.chat_id, "after the cut").await;
+    wait_transcript(&s.b, &s.chat_id, 2, "second transcript on B").await;
+    let elapsed = std::time::SystemTime::now()
+        .duration_since(restored_at)
+        .unwrap_or_else(|err| fail(&format!("clock: {err}")));
+    println!("RECONNECT_S={:.1}", elapsed.as_secs_f64());
+    println!("PASS: cut scenario complete");
+}
+
+#[tokio::main]
+async fn main() {
+    let mut args = std::env::args().skip(1);
+    let a_port: u16 = args
+        .next()
+        .unwrap_or_else(|| "27801".into())
+        .parse()
+        .expect("A port");
+    let b_port: u16 = args
+        .next()
+        .unwrap_or_else(|| "27802".into())
+        .parse()
+        .expect("B port");
+    let scenario = args.next().unwrap_or_else(|| "commands".into());
+
+    match scenario.as_str() {
+        "commands" => commands(a_port, b_port).await,
+        "restart" | "wake" => restart(a_port, b_port, &scenario).await,
+        "cut" => cut(a_port, b_port).await,
+        other => fail(&format!(
+            "unknown scenario {other:?} (commands|restart|wake|cut)"
+        )),
+    }
 }
 
 #[cfg(test)]
