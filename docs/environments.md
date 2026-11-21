@@ -14,8 +14,14 @@ environment's workspace you can also enable and manage that machine's agents
 ## One command on the VPS
 
 ```bash
-komet serve --public-url https://sync.example.com --install-service
+komet serve --public-url https://sync.your-domain.com --install-service
 ```
+
+`your-domain.com` is a placeholder — replace it with a domain you control
+(`example.com` and the reserved TLDs are rejected: the link would point
+nowhere). No domain? A tunnel URL works the same way: `instabox port publish
+<box> 8787` or `cloudflared tunnel` prints an `https://` origin — pass that as
+`--public-url`.
 
 Or install the machine from scratch, in one line — useful on a VM you have only
 an SSH shell on. It installs the CLI, registers the service, and prints the link:
@@ -81,7 +87,7 @@ The bearer travels in the WebSocket URL (`?token=…`), so never expose plain HT
 on the internet. Caddy on the same machine:
 
 ```
-sync.example.com {
+sync.your-domain.com {
     reverse_proxy 127.0.0.1:8787
     log {
         # The token rides in the query string; keep access logs off for `/`.
@@ -91,6 +97,10 @@ sync.example.com {
 
 Any reverse proxy works: forward WebSocket upgrades for `/session`, `/chat2`,
 `/registry`, `/device`, and the blob routes.
+
+No domain at all? Point a tunnel at `127.0.0.1:8787` instead of running your
+own proxy — `instabox port publish <box> 8787` prints an `https://` URL that
+already terminates TLS, and `--public-url` accepts it as-is.
 
 `--lan` is the deliberate exception to this rule, for a network you already
 control: it prints the warning next to the link, and the desktop pairing dialog
@@ -119,8 +129,15 @@ Desktop (controller)                     VPS (environment)
 ```bash
 komet daemon status          # is the service up?
 komet daemon restart         # after editing ~/.komet/serve.json
+komet daemon start           # service installed but not running → start it now
 komet daemon uninstall       # stop and remove the unit
 ```
+
+`--serve` already starts the service, so nothing extra is needed after
+install — `komet daemon status` confirms it. Re-run the same `install.sh`
+one-liner to update: it installs the latest release over the managed
+`~/.komet/app/current` symlink and keeps `serve.json` (token, URL, label).
+`komet update` does the same swap and restarts `komet.service` by itself.
 
 Data lives in `KOMET_DATA_DIR` (default `~/.komet`). Removing the desktop-side
 environment forgets it by default and can delete its local mirror on request.

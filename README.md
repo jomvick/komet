@@ -201,11 +201,17 @@ Paste the link in **Komet → Settings → Sync → Add device**, then pick the
 machine from the **Devices** menu at the top of the sidebar to chat on it and
 manage its agents. `--lan` serves plain HTTP, so the dialog asks you to confirm
 you are on a network you control; behind TLS, use
-`komet serve --public-url https://sync.example.com --install-service` instead.
+`komet serve --public-url https://sync.your-domain.com --install-service`
+instead (or the `https://` URL a tunnel like `instabox port publish` prints).
 The token and namespace are generated once and saved in `~/.komet/serve.json`
 (0600); the link is a secret — it grants the bearer a shell on that machine.
 On a VPS, also run `loginctl enable-linger $USER` so the user service keeps
 running after you log out.
+
+The service starts with the install — nothing else to run on the VPS
+(`komet daemon status` to check, `komet daemon start` if it is ever stopped).
+To update, re-run the same `install.sh` one-liner or `komet update`; both
+keep `~/.komet/serve.json` and restart the service.
 
 To stop being an environment: **Settings → Sync → Remove** on the desktop (tick
 *purge* to delete its local mirror too), then `systemctl --user disable --now

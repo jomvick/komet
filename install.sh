@@ -15,7 +15,7 @@
 # Komet → Settings → Sync → Add device:
 #
 #   sh install.sh --serve --lan
-#   sh install.sh --serve --public-url https://sync.example.com
+#   sh install.sh --serve --public-url https://sync.your-domain.com
 set -eu
 
 REPO="${KOMET_RELEASE_REPO:-jomvick/komet}"
@@ -34,7 +34,8 @@ install.sh — install Komet from GitHub Releases (no root needed)
   sh install.sh                          # the desktop app + CLI
   sh install.sh --serve --lan            # this machine becomes an environment,
                                          # served over plain HTTP on its LAN
-  sh install.sh --serve --public-url URL # ...behind TLS at URL
+  sh install.sh --serve --public-url URL # ...behind TLS at URL (your domain,
+                                         # or the https URL a tunnel prints)
     --port N      sync server port (default 8787)
     --label NAME  name shown in the desktop device switcher
 EOF

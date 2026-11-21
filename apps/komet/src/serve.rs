@@ -44,6 +44,17 @@ impl ServeConfig {
         label: Option<String>,
         lan: bool,
     ) -> anyhow::Result<(Self, bool)> {
+        // A `--public-url` copied verbatim from the docs points nowhere; fail
+        // here rather than printing a link that can only ever be "unreachable".
+        if let Some(url) = public_url.as_deref()
+            && url_host(url).is_some_and(|host| is_placeholder_host(&host))
+        {
+            anyhow::bail!(
+                "--public-url {url} is a documentation placeholder — pass the real public \
+                 origin clients will use: a domain you control behind TLS, or the URL a \
+                 tunnel prints (e.g. `instabox port publish <box> 8787`, cloudflared)"
+            );
+        }
         let path = data_dir.join(SERVE_FILE);
         let stored: Option<Self> = match std::fs::read(&path) {
             Ok(bytes) => Some(
@@ -142,14 +153,26 @@ pub fn print_pairing(config: &ServeConfig) {
                 "\nPairing link (a secret — paste it in Komet → Settings → Sync → Add \
                  device):\n\n{link}\n"
             );
-            if let Some(url) = config.public_url.as_deref()
-                && komet_sync_server::sync_url_is_insecure(url)
-            {
-                println!(
-                    "Warning: {url} is plain HTTP, so this link's token travels unencrypted and \
-                     anyone on that network can read it. Fine on a LAN you already trust, not on \
-                     the internet — pasting this link in Komet asks you to confirm that first."
-                );
+            if let Some(url) = config.public_url.as_deref() {
+                if komet_sync_server::sync_url_is_insecure(url) {
+                    println!(
+                        "Warning: {url} is plain HTTP, so this link's token travels unencrypted \
+                         and anyone on that network can read it. Fine on a LAN you already \
+                         trust, not on the internet — pasting this link in Komet asks you to \
+                         confirm that first."
+                    );
+                } else if url_host(url).is_some_and(|host| is_placeholder_host(&host)) {
+                    println!(
+                        "Warning: {url} is a documentation placeholder — the link points \
+                         nowhere. Pass the real public origin and re-run --print-link."
+                    );
+                } else if let Err(err) = probe_public_url(url) {
+                    println!(
+                        "Warning: {url} did not answer ({err}). If its TLS proxy or service \
+                         is not up yet this is expected; otherwise this link will fail the \
+                         same way on the desktop — check the URL before pasting it."
+                    );
+                }
             }
         }
         Err(_) => {
@@ -170,6 +193,62 @@ pub fn print_pairing(config: &ServeConfig) {
 /// on every boot.
 pub fn should_print_link(print_link_flag: bool, link_is_new: bool) -> bool {
     print_link_flag || link_is_new
+}
+
+/// Host of an http(s) URL — lowercase, no port, path or userinfo. `None` when
+/// the URL has no parseable authority (the pair-link decoder rejects those).
+fn url_host(url: &str) -> Option<String> {
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let authority = authority.rsplit('@').next().unwrap_or(authority);
+    let host = match authority.strip_prefix('[') {
+        Some(v6) => v6.split_once(']')?.0,
+        None => authority
+            .rsplit_once(':')
+            .map_or(authority, |(host, _)| host),
+    };
+    (!host.is_empty()).then(|| host.to_ascii_lowercase())
+}
+
+/// Documentation placeholders — `example.com` & friends and the reserved TLDs.
+/// A `--public-url` with one of these was copied verbatim from the docs.
+fn is_placeholder_host(host: &str) -> bool {
+    let host = host.trim_end_matches('.');
+    const DOMAINS: &[&str] = &["example.com", "example.net", "example.org"];
+    DOMAINS
+        .iter()
+        .any(|domain| host == *domain || host.ends_with(&format!(".{domain}")))
+        || matches!(
+            host.rsplit('.').next(),
+            Some("example" | "test" | "invalid" | "localhost")
+        )
+}
+
+/// Best-effort proof that the public URL answers: `GET {url}/env` without the
+/// bearer. Any HTTP response counts — the server answers 401, which still
+/// proves DNS, TLS and the proxy path work. Only a transport failure means the
+/// pasted link fails the same way on the desktop. Plain-HTTP LAN links are
+/// skipped by the caller: their address is auto-detected and the server may
+/// legitimately not be up yet when the link is printed.
+fn probe_public_url(url: &str) -> Result<(), String> {
+    let endpoint = format!("{}/env", url.trim_end_matches('/'));
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|err| err.to_string())?;
+    runtime.block_on(async {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .map_err(|err| err.to_string())?
+            .get(&endpoint)
+            .send()
+            .await
+            .map(|_| ())
+            .map_err(|err| err.to_string())
+    })
 }
 
 /// Loopback by default: the engine reaches its own server over 127.0.0.1, and
@@ -363,7 +442,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (first, link_is_new) = ServeConfig::load_or_create(
             dir.path(),
-            Some("https://sync.example.com/".into()),
+            Some("https://sync.acme.dev/".into()),
             Some(9000),
             Some("VPS ovh".into()),
             false,
@@ -371,10 +450,7 @@ mod tests {
         .unwrap();
         assert!(link_is_new);
         assert_eq!(first.token.len(), 32);
-        assert_eq!(
-            first.public_url.as_deref(),
-            Some("https://sync.example.com")
-        );
+        assert_eq!(first.public_url.as_deref(), Some("https://sync.acme.dev"));
         assert_eq!(first.port, 9000);
 
         let (reloaded, link_is_new) =
@@ -404,7 +480,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (explicit, _) = ServeConfig::load_or_create(
             dir.path(),
-            Some("https://sync.example.com".into()),
+            Some("https://sync.acme.dev".into()),
             Some(8787),
             None,
             true,
@@ -412,13 +488,13 @@ mod tests {
         .unwrap();
         assert_eq!(
             explicit.public_url.as_deref(),
-            Some("https://sync.example.com")
+            Some("https://sync.acme.dev")
         );
 
         let (stored, _) = ServeConfig::load_or_create(dir.path(), None, None, None, true).unwrap();
         assert_eq!(
             stored.public_url.as_deref(),
-            Some("https://sync.example.com"),
+            Some("https://sync.acme.dev"),
             "a second --lan run must not re-detect away the saved URL"
         );
         assert_eq!(stored.token, explicit.token, "the pairing stays valid");
@@ -458,11 +534,59 @@ mod tests {
 
     #[test]
     fn pair_link_round_trips_through_decoder() {
-        let link = pair_link(&config(Some("https://sync.example.com"))).unwrap();
+        let link = pair_link(&config(Some("https://sync.acme.dev"))).unwrap();
         let payload = decode_pair_link(&link).unwrap();
         assert_eq!(payload.label, "VPS ovh");
-        assert_eq!(payload.url, "https://sync.example.com");
+        assert_eq!(payload.url, "https://sync.acme.dev");
         assert_eq!(payload.token, "t0ken");
+    }
+
+    #[test]
+    fn placeholder_public_url_is_rejected_at_the_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        for url in [
+            "https://sync.example.com",
+            "https://example.com",
+            "https://vps.example.org:8443",
+            "https://box.test",
+            "https://printer.localhost",
+        ] {
+            let err = ServeConfig::load_or_create(dir.path(), Some(url.into()), None, None, false)
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("documentation placeholder"),
+                "{url}: {err}"
+            );
+        }
+        // Real origins — including tunnel URLs and LAN http — still pass.
+        for url in [
+            "https://sync.acme.dev",
+            "https://8787-abc123.instabox.tech",
+            "http://192.168.1.10:8787",
+        ] {
+            assert!(
+                ServeConfig::load_or_create(dir.path(), Some(url.into()), None, None, false)
+                    .is_ok(),
+                "{url}"
+            );
+        }
+    }
+
+    #[test]
+    fn url_host_strips_port_path_and_userinfo() {
+        assert_eq!(
+            url_host("https://Sync.Example.com:8443/path?x=1").as_deref(),
+            Some("sync.example.com")
+        );
+        assert_eq!(
+            url_host("http://user@192.168.1.2:8787").as_deref(),
+            Some("192.168.1.2")
+        );
+        assert_eq!(
+            url_host("https://[fd12::1]:8787/x").as_deref(),
+            Some("fd12::1")
+        );
+        assert_eq!(url_host("not-a-url"), None);
     }
 
     #[test]
@@ -477,7 +601,7 @@ mod tests {
     #[test]
     fn re_running_the_same_public_url_is_not_a_new_link() {
         let dir = tempfile::tempdir().unwrap();
-        let url = "https://sync.example.com";
+        let url = "https://sync.acme.dev";
         let (_, fresh) = ServeConfig::load_or_create(
             dir.path(),
             Some(url.into()),
@@ -498,7 +622,7 @@ mod tests {
         assert!(!again, "same URL, same label — nothing new to print");
         let (_, moved) = ServeConfig::load_or_create(
             dir.path(),
-            Some("https://sync-other.example.com".into()),
+            Some("https://sync-other.acme.dev".into()),
             None,
             Some("vm1".into()),
             false,
