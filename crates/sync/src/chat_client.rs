@@ -25,7 +25,7 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use crate::chat_frames::{self as wire, frame_type};
-use crate::room::{StaticUrl, SyncError, UrlProvider};
+use crate::types::{StaticUrl, SyncError, UrlProvider};
 
 const PING_INTERVAL: Duration = Duration::from_secs(15);
 const SILENCE_LEASE: Duration = Duration::from_secs(45);

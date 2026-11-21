@@ -8,7 +8,7 @@
 //!
 //! - the local `WatchCheckoutDiffs` stream (a watch channel of every checkout's
 //!   latest [`CheckoutDiff`]);
-//! - a [`DiffSidecar`] JSON `POST {edge}/diff/{chatId}` for every syncing chat of
+//! - a [`DiffSidecar`] JSON `PUT {edge}/chat2/{chatId}/diff` for every syncing chat of
 //!   the checkout (bearer = engine edge token), so "review pending changes while
 //!   the host sleeps" works;
 //! - `chat.branch` upkeep: the same fs events cover the checkout's git dir (HEAD),
@@ -61,7 +61,7 @@ const MAX_WATCH_DIRS: usize = 8_000;
 const EMPTY_TREE_SHA: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
 /// Latest-only diff sidecar published to each chat's session DO slot
-/// (`POST /diff/{chatId}`; shape: edge/src/session-doc/sidecar.ts).
+/// (`PUT /chat2/{chatId}/diff`, server side: `chat_room::diff_put`).
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DiffSidecar {
@@ -532,7 +532,7 @@ async fn sync_entry(inner: &Arc<DiffSyncInner>, entry: &Arc<CheckoutEntry>) {
                 truncated: snapshot.truncated,
                 published_at: chrono::Utc::now().timestamp_millis(),
             };
-            let url = format!("{}/diff/{}", edge.url.trim_end_matches('/'), chat.id);
+            let url = format!("{}/chat2/{}/diff", edge.url.trim_end_matches('/'), chat.id);
             // Fresh bearer per request — never the boot-time snapshot.
             let Some(bearer) = edge.bearer().await else {
                 tracing::debug!(chat = %chat.id, "diff-sync: sidecar skipped (signed out)");
@@ -540,18 +540,18 @@ async fn sync_entry(inner: &Arc<DiffSyncInner>, entry: &Arc<CheckoutEntry>) {
             };
             let result = inner
                 .http
-                .post(&url)
+                .put(&url)
                 .bearer_auth(&bearer)
                 .json(&sidecar)
                 .send()
                 .await;
             match result {
                 Ok(response) if !response.status().is_success() => {
-                    tracing::debug!(chat = %chat.id, status = %response.status(),
+                    tracing::warn!(chat = %chat.id, status = %response.status(),
                         "diff-sync: sidecar publish rejected");
                 }
                 Err(err) => {
-                    tracing::debug!(chat = %chat.id, error = %err, "diff-sync: sidecar publish failed");
+                    tracing::warn!(chat = %chat.id, error = %err, "diff-sync: sidecar publish failed");
                 }
                 Ok(_) => {}
             }

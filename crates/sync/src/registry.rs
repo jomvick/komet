@@ -27,7 +27,7 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use komet_doc::{PendingBatch, RegistryDoc, RegistryRow, StateOutcome};
 
-use crate::room::{RoomStatsSnapshot, StaticUrl, SyncError, UrlProvider};
+use crate::types::{RoomStatsSnapshot, StaticUrl, SyncError, UrlProvider};
 
 /// Text `"ping"` keepalive interval (answered by the DO auto-response pair
 /// without waking it — transport liveness only).

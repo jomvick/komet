@@ -71,7 +71,7 @@ impl ChatLog {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
-        let db = Connection::open(path)?;
+        let db = crate::open_conn(path)?;
         db.execute_batch(
             "CREATE TABLE IF NOT EXISTS rows (
                  seq INTEGER PRIMARY KEY,
