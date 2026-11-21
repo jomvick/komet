@@ -1753,6 +1753,10 @@ mod tests {
                 .any(|w| w == ["--permission-mode", "default"])
         );
         let settings = settings_json(&args);
+        // Claude Code only enforces the sandbox when `sandbox.enabled` is
+        // true (its default is false) — the generated table must emit it
+        // or every restriction below is dead config.
+        assert_eq!(settings["sandbox"]["enabled"], json!(true));
         let perms = settings["permissions"]
             .as_object()
             .expect("permissions object");
