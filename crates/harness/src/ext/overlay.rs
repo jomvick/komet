@@ -89,6 +89,19 @@ impl ExtOverlay {
         self.persist()
     }
 
+    /// Raw explicit decision for one item, if the user ever toggled it.
+    pub fn decision(&self, kind: ExtKind, agent: HarnessId, id: &str) -> Option<bool> {
+        self.entries.get(&key(kind, agent, id)).copied()
+    }
+
+    /// Whether the user has ANY explicit entry for `kind`+`agent` — launch
+    /// code uses this to decide if komet must mediate that agent's native
+    /// config at all (e.g. Claude's `--strict-mcp-config`).
+    pub fn touches(&self, kind: ExtKind, agent: HarnessId) -> bool {
+        let prefix = format!("{}|{}|", kind.as_str(), agent.as_str());
+        self.entries.keys().any(|k| k.starts_with(&prefix))
+    }
+
     /// Ids of `kind` items with an explicit `true` overlay entry for `agent`.
     /// Launch-time consumers use this to re-enable agent-native items the
     /// user switched on; absence of an entry never implies enabled.

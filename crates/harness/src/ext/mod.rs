@@ -23,6 +23,11 @@ pub use scan::scan;
 /// Engine and harness share the process (or the engine is spawned with
 /// `KOMET_DATA_DIR` set), so both resolve the same file.
 pub fn default_overlay_path() -> std::path::PathBuf {
+    if let Ok(path) = std::env::var("KOMET_EXT_OVERLAY_PATH")
+        && !path.is_empty()
+    {
+        return std::path::PathBuf::from(path);
+    }
     if let Ok(dir) = std::env::var("KOMET_DATA_DIR")
         && !dir.is_empty()
     {
@@ -36,7 +41,13 @@ pub fn default_overlay_path() -> std::path::PathBuf {
 
 /// Load the persisted overlay; a missing/corrupt file yields an empty overlay
 /// (launch must never fail because a preference file is unreadable).
+/// Unit tests always get an empty overlay so argv assertions never depend on
+/// the developer's real `~/.komet` state; `KOMET_EXT_OVERLAY_PATH` still wins
+/// for tests that want a fixture (integration tests link the non-test lib).
 pub fn load_overlay() -> ExtOverlay {
-    ExtOverlay::load(default_overlay_path())
-        .unwrap_or_else(|_| ExtOverlay::empty(default_overlay_path()))
+    let path = default_overlay_path();
+    if cfg!(test) {
+        return ExtOverlay::empty(path);
+    }
+    ExtOverlay::load(&path).unwrap_or_else(|_| ExtOverlay::empty(path))
 }

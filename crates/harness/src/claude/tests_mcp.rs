@@ -216,3 +216,29 @@ fn claude_mcp_dedup_by_url_suppresses_duplicate_url() {
     // komet + only one of the github ids
     assert_eq!(cfg["mcpServers"].as_object().unwrap().len(), 2);
 }
+
+#[test]
+fn strict_mcp_config_only_when_overlay_touches_claude_mcp() {
+    use crate::ext::{ExtKind, ExtOverlay};
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut overlay = ExtOverlay::empty(dir.path().join("overlay.json"));
+    let mut komet = serde_json::Map::new();
+    komet.insert(
+        "komet".into(),
+        serde_json::json!({"type": "http", "url": "http://127.0.0.1:9/mcp"}),
+    );
+
+    // No overlay entries → legacy path, no strict document.
+    assert!(super::strict_mcp_config(&overlay, "/tmp", &komet).is_none());
+
+    // Any explicit Claude MCP entry activates strict mode; the komet-injected
+    // server always survives the merge.
+    overlay
+        .set_enabled(ExtKind::McpServer, HarnessId::ClaudeCode, "native-x", false)
+        .unwrap();
+    let (document, count) = super::strict_mcp_config(&overlay, "/tmp", &komet).unwrap();
+    let value: Value = serde_json::from_str(&document).expect("valid mcp json");
+    assert!(value["mcpServers"]["komet"].is_object());
+    assert!(count >= 1);
+}
