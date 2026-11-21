@@ -40,6 +40,7 @@ use crate::settings::appearance::AppearancePage;
 use crate::settings::archived::ArchivedPage;
 use crate::settings::browser::BrowserPage;
 use crate::settings::devices::DevicesPage;
+use crate::settings::extensions::ExtensionsPage;
 use crate::settings::files::FilesSettingsPage;
 use crate::settings::general::GeneralPage;
 use crate::settings::integrations::IntegrationsPage;
@@ -354,6 +355,7 @@ pub struct Shell {
     shortcuts_page: Option<Entity<ShortcutsPage>>,
     providers_page: Option<Entity<ProvidersPage>>,
     usage_page: Option<Entity<UsagePage>>,
+    extensions_page: Option<Entity<ExtensionsPage>>,
     memory_page: Option<Entity<MemoryPage>>,
     security_page: Option<Entity<SecurityPage>>,
     sync_page: Option<Entity<SyncPage>>,
@@ -651,6 +653,7 @@ impl Shell {
             Some("settings/providers") | Some("settings/agents") | Some("settings/harnesses") => {
                 (Route::Settings(SettingsSection::Providers), None)
             }
+            Some("settings/extensions") => (Route::Settings(SettingsSection::Extensions), None),
             Some("settings/appearance") => (Route::Settings(SettingsSection::Appearance), None),
             Some("settings/notifications") => {
                 (Route::Settings(SettingsSection::Notifications), None)
@@ -770,6 +773,7 @@ impl Shell {
             shortcuts_page: None,
             providers_page: None,
             usage_page: None,
+            extensions_page: None,
             memory_page: None,
             security_page: None,
             sync_page: None,

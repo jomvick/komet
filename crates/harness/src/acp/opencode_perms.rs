@@ -93,14 +93,17 @@ pub fn permission_config(perms: &OpenCodePerms) -> String {
 /// `sandbox.json` is written to the workspace by the harness (see
 /// `sandbox_runtime_config`).
 pub fn opencode_config_document(perms: &OpenCodePerms) -> String {
-    opencode_config_document_with_disabled_mcp(perms, &[])
+    opencode_config_document_with_mcp_overlay(perms, &[], &[])
 }
 
-/// Permission overlay plus per-process disabling for MCP servers configured
+/// Permission overlay plus per-process MCP toggles for servers configured
 /// outside Komet. The ACP `mcpServers` list does not suppress these configs.
-pub fn opencode_config_document_with_disabled_mcp(
+/// `enabled_mcp` emits `disabled:false` — required to re-enable a server the
+/// user's own config marked disabled (OpenCode V2 has no `enabled` field).
+pub fn opencode_config_document_with_mcp_overlay(
     perms: &OpenCodePerms,
     disabled_mcp: &[String],
+    enabled_mcp: &[String],
 ) -> String {
     let perm = permission_config(perms);
     let mut document = if perms.opencode_sandbox_runtime == Some(true) {
@@ -108,15 +111,25 @@ pub fn opencode_config_document_with_disabled_mcp(
     } else {
         format!("{{\"permission\":{perm}")
     };
-    if !disabled_mcp.is_empty() {
+    if !disabled_mcp.is_empty() || !enabled_mcp.is_empty() {
         document.push_str(",\"mcp\":{\"servers\":{");
-        for (index, name) in disabled_mcp.iter().enumerate() {
-            if index > 0 {
+        let mut first = true;
+        for (name, disabled) in disabled_mcp
+            .iter()
+            .map(|n| (n, true))
+            .chain(enabled_mcp.iter().map(|n| (n, false)))
+        {
+            if !first {
                 document.push(',');
             }
+            first = false;
             document
                 .push_str(&serde_json::to_string(name).expect("serializing a string cannot fail"));
-            document.push_str(":{\"disabled\":true}");
+            document.push_str(if disabled {
+                ":{\"disabled\":true}"
+            } else {
+                ":{\"disabled\":false}"
+            });
         }
         document.push_str("}}");
     }
@@ -125,17 +138,31 @@ pub fn opencode_config_document_with_disabled_mcp(
 }
 
 /// MCP-only overlay for Devin, which reads the OpenCode user config too.
-pub fn opencode_mcp_disable_document(disabled_mcp: &[String]) -> Option<String> {
-    if disabled_mcp.is_empty() {
+/// `enabled_mcp` re-enables natively-disabled servers the overlay switched on.
+pub fn opencode_mcp_toggle_document(
+    disabled_mcp: &[String],
+    enabled_mcp: &[String],
+) -> Option<String> {
+    if disabled_mcp.is_empty() && enabled_mcp.is_empty() {
         return None;
     }
     let mut document = String::from("{\"mcp\":{\"servers\":{");
-    for (index, name) in disabled_mcp.iter().enumerate() {
-        if index > 0 {
+    let mut first = true;
+    for (name, disabled) in disabled_mcp
+        .iter()
+        .map(|n| (n, true))
+        .chain(enabled_mcp.iter().map(|n| (n, false)))
+    {
+        if !first {
             document.push(',');
         }
+        first = false;
         document.push_str(&serde_json::to_string(name).expect("serializing a string cannot fail"));
-        document.push_str(":{\"disabled\":true}");
+        document.push_str(if disabled {
+            ":{\"disabled\":true}"
+        } else {
+            ":{\"disabled\":false}"
+        });
     }
     document.push_str("}}}");
     Some(document)
@@ -286,16 +313,17 @@ mod tests {
     #[test]
     fn document_disables_native_mcp_without_affecting_explicit_config() {
         let p = perms(vec![("*", Perm::Ask)], vec![]);
-        let document = opencode_config_document_with_disabled_mcp(
+        let document = opencode_config_document_with_mcp_overlay(
             &p,
             &["supabase".to_owned(), "convex".to_owned()],
+            &[],
         );
         let value: serde_json::Value = serde_json::from_str(&document).expect("valid overlay");
         assert_eq!(value["permission"]["bash"]["*"], "ask");
         assert_eq!(value["mcp"]["servers"]["supabase"]["disabled"], true);
         assert_eq!(value["mcp"]["servers"]["convex"]["disabled"], true);
         assert_eq!(
-            opencode_mcp_disable_document(&[]),
+            opencode_mcp_toggle_document(&[], &[]),
             None,
             "an empty native MCP config needs no overlay"
         );

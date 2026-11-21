@@ -45,6 +45,15 @@ pub mod methods {
     /// Flip a harness's enablement on the target device (Settings → Agents);
     /// replies with the device's fresh `ListHarnesses` catalog.
     pub const SET_HARNESS_ENABLED: &str = "SetHarnessEnabled";
+    /// Agent-native extension inventory (skills / MCP servers / plugins found
+    /// in each agent's own config files, read-only) merged with the komet
+    /// overlay's effective enabled state per agent. No params; IPC-only.
+    pub const LIST_HARNESS_EXTENSIONS: &str = "ListHarnessExtensions";
+    /// Set or clear the komet overlay decision for one
+    /// `(kind, harness, id)` extension — agent config files are never
+    /// written. Params `{kind, harness, id, enabled}`; `enabled: null`
+    /// clears the entry so the agent-native default applies again.
+    pub const SET_HARNESS_EXTENSION_ENABLED: &str = "SetHarnessExtensionEnabled";
     pub const LIST_MODELS: &str = "ListModels";
     pub const LIST_COMMANDS: &str = "ListCommands";
     pub const QUEUE_COMMAND: &str = "QueueCommand";
@@ -271,6 +280,10 @@ pub enum RpcError {
     UnknownMethod(String),
     #[error("bad params: {0}")]
     BadParams(String),
+    /// The request is well-formed but this engine/agent cannot honor it
+    /// (e.g. an overlay toggle for an agent with no launch mediation).
+    #[error("unsupported: {0}")]
+    Unsupported(String),
     #[error("{0}")]
     Failed(String),
     #[error("transport: {0}")]
