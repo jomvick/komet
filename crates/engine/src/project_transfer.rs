@@ -155,9 +155,7 @@ fn has_credentialed_url(line: &str) -> bool {
     let mut rest = line;
     while let Some(idx) = rest.find("://") {
         rest = &rest[idx + 3..];
-        let end = rest
-            .find(['/', '?', '#', ' ', '\t'])
-            .unwrap_or(rest.len());
+        let end = rest.find(['/', '?', '#', ' ', '\t']).unwrap_or(rest.len());
         let authority = &rest[..end];
         if let Some(at) = authority.rfind('@')
             && authority[..at].contains(':')
