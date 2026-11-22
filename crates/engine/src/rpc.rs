@@ -2126,6 +2126,19 @@ impl RpcService for EngineRpc {
                     "chats": chats,
                 }))
             }
+            methods::SYNC_LEGACY => RpcReply::value(&serde_json::json!({
+                "deviceId": self.doc_host.device_id(),
+                "chats": self.doc_host.legacy_chat_rows(),
+            })),
+            methods::SYNC_MIGRATE => {
+                #[derive(serde::Deserialize)]
+                struct MigrateParams {
+                    #[serde(rename = "dryRun", default)]
+                    dry_run: bool,
+                }
+                let p: MigrateParams = parse_params(params)?;
+                RpcReply::value(&self.doc_host.migrate_legacy(p.dry_run).await)
+            }
             methods::WATCH_CHATS => {
                 Ok(RpcReply::Stream(watch_stream(self.workspace.watch_chats())))
             }

@@ -89,6 +89,15 @@ pub mod methods {
     /// counters for the workspace room and every open chat doc. No params;
     /// IPC-only.
     pub const SYNC_STATUS: &str = "SyncStatus";
+    /// s2→chat2 migration inventory (`komet sync status --legacy` /
+    /// `komet sync migrate --dry-run`): registry chats still on roomGen < 2,
+    /// with per-chat host/local-doc flags. Params: none; IPC-only.
+    pub const SYNC_LEGACY: &str = "SyncLegacy";
+    /// Drive the s2→chat2 migration on demand (`komet sync migrate`): opens
+    /// each legacy chat this device hosts so the quiet-seed flips it, then
+    /// waits (bounded) and reports per-chat outcomes. Params `{dryRun?}`;
+    /// IPC-only.
+    pub const SYNC_MIGRATE: &str = "SyncMigrate";
     pub const WATCH_CHATS: &str = "WatchChats";
     pub const WATCH_DEVICES: &str = "WatchDevices";
     pub const WATCH_SESSIONS: &str = "WatchSessions";
