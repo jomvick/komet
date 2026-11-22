@@ -115,6 +115,60 @@ pub fn is_secret_path(path: &Path) -> bool {
     )
 }
 
+/// True when `path` is a `.git/config` file whose contents look credentialed:
+/// a URL with `user:password@` userinfo, or an `extraHeader` key (which git
+/// uses for Authorization headers). Read is bounded — config files are tiny.
+fn git_config_has_credentials(path: &Path) -> bool {
+    if path.file_name().and_then(|n| n.to_str()) != Some("config")
+        || path
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            != Some(".git")
+    {
+        return false;
+    }
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut text = String::new();
+    use std::io::Read as _;
+    if file.take(256 * 1024).read_to_string(&mut text).is_err() {
+        return false;
+    }
+    text.lines().any(|line| {
+        let line = line.trim();
+        if line.starts_with('#') || line.starts_with(';') {
+            return false;
+        }
+        let key = line.split('=').next().unwrap_or("").trim();
+        if key.to_ascii_lowercase().ends_with("extraheader") {
+            return true;
+        }
+        has_credentialed_url(line)
+    })
+}
+
+/// `scheme://user:password@host` anywhere in the line. A bare `user@host`
+/// (no password) is not a secret.
+fn has_credentialed_url(line: &str) -> bool {
+    let mut rest = line;
+    while let Some(idx) = rest.find("://") {
+        rest = &rest[idx + 3..];
+        let end = rest
+            .find(['/', '?', '#', ' ', '\t'])
+            .unwrap_or(rest.len());
+        let authority = &rest[..end];
+        if let Some(at) = authority.rfind('@')
+            && authority[..at].contains(':')
+        {
+            return true;
+        }
+        rest = &rest[end..];
+    }
+    false
+}
+
 /// Walk `root` applying `.gitignore` + the secret list and return the plan.
 ///
 /// Git metadata and the dirty flag come from the `git` CLI (the engine already
@@ -173,6 +227,22 @@ pub fn plan(path: &Path) -> Result<ProjectTransferPlan, EngineError> {
             let (git_files, git_bytes) = walk_git_dir(entry.path());
             files += git_files;
             bytes += git_bytes;
+            // `.git/config` is the one file whose CONTENTS can be a secret
+            // even though its name is not: a remote URL may embed
+            // `user:token@host`, and `http.*.extraHeader` may carry an
+            // Authorization value. Surface it like any other secret so the
+            // dialog warns and the archive skips it without opt-in.
+            let config = entry.path().join("config");
+            if git_config_has_credentials(&config) {
+                let size = std::fs::metadata(&config).map(|m| m.len()).unwrap_or(0);
+                files = files.saturating_sub(1);
+                bytes = bytes.saturating_sub(size);
+                secrets.push(TransferFile {
+                    path: rel.join("config").to_string_lossy().replace('\\', "/"),
+                    bytes: size,
+                    secret: true,
+                });
+            }
             continue;
         }
         if ignored {
@@ -395,11 +465,7 @@ pub fn resolve_destination(base: &Path, name: &str) -> Result<PathBuf, EngineErr
     if !candidate.exists() {
         return Ok(candidate);
     }
-    let is_empty_dir = candidate.is_dir()
-        && std::fs::read_dir(&candidate)
-            .map(|mut entries| entries.next().is_none())
-            .unwrap_or(false);
-    if is_empty_dir {
+    if crate::repos::is_empty_dir(&candidate) {
         return Ok(candidate);
     }
     for n in 2..1000 {
@@ -474,6 +540,55 @@ mod tests {
             plan.warnings
                 .contains(&TransferWarning::IgnoredFilesExcluded)
         );
+    }
+
+    #[test]
+    fn credentialed_git_config_is_a_secret() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("proj");
+        write(&root.join("src/lib.rs"), b"code");
+        write(
+            &root.join(".git/config"),
+            b"[remote \"origin\"]\n\turl = https://user:tok_abc123@github.com/o/r.git\n",
+        );
+        write(&root.join(".git/HEAD"), b"ref: refs/heads/main\n");
+
+        let plan = plan(&root).expect("plan");
+        let secrets: Vec<&str> = plan.secrets.iter().map(|f| f.path.as_str()).collect();
+        assert!(secrets.contains(&".git/config"), "{secrets:?}");
+        assert!(plan.warnings.contains(&TransferWarning::SecretsExcluded));
+        // The rest of `.git` still counts toward the transfer.
+        assert!(plan.files >= 2, "{plan:?}");
+    }
+
+    #[test]
+    fn clean_git_config_is_not_a_secret() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("proj");
+        write(&root.join("src/lib.rs"), b"code");
+        write(
+            &root.join(".git/config"),
+            b"[remote \"origin\"]\n\turl = git@github.com:o/r.git\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n",
+        );
+
+        let plan = plan(&root).expect("plan");
+        assert!(plan.secrets.is_empty(), "{:?}", plan.secrets);
+    }
+
+    #[test]
+    fn credentialed_url_detection() {
+        assert!(has_credentialed_url(
+            "url = https://user:pass@github.com/o/r.git"
+        ));
+        assert!(has_credentialed_url(
+            "[url \"https://a:b@x\"] insteadOf = https://y"
+        ));
+        // Username without a password is not a secret.
+        assert!(!has_credentialed_url(
+            "url = https://user@github.com/o/r.git"
+        ));
+        assert!(!has_credentialed_url("url = git@github.com:o/r.git"));
+        assert!(!has_credentialed_url("url = https://github.com/o/r.git"));
     }
 
     #[test]
@@ -614,7 +729,8 @@ pub fn build_archive(
         if entry.file_type().is_some_and(|t| t.is_dir()) {
             continue;
         }
-        if !include_secrets && is_secret_path(rel) {
+        if !include_secrets && (is_secret_path(rel) || git_config_has_credentials(&root.join(rel)))
+        {
             continue;
         }
         paths.push(rel.to_path_buf());
@@ -805,6 +921,33 @@ mod archive_tests {
             b"fn main() {}"
         );
         assert!(!dest.join(".env").exists());
+    }
+
+    #[test]
+    fn archive_skips_credentialed_git_config_unless_opted_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("proj");
+        write(&root.join("src/lib.rs"), b"code");
+        write(
+            &root.join(".git/config"),
+            b"[remote \"origin\"]\n\turl = https://user:tok@github.com/o/r.git\n",
+        );
+        write(&root.join(".git/HEAD"), b"ref: refs/heads/main\n");
+
+        let archive = dir.path().join("out.karch");
+        build_archive(&root, &archive, false).expect("build");
+        let (header, _) = read_archive_header(&archive).expect("header");
+        let paths: Vec<&str> = header.files.iter().map(|f| f.path.as_str()).collect();
+        assert!(paths.contains(&".git/HEAD"), "{paths:?}");
+        assert!(!paths.contains(&".git/config"), "{paths:?}");
+
+        let archive = dir.path().join("out-all.karch");
+        build_archive(&root, &archive, true).expect("build");
+        let (header, _) = read_archive_header(&archive).expect("header");
+        assert!(
+            header.files.iter().any(|f| f.path == ".git/config"),
+            "opt-in must carry the file"
+        );
     }
 
     #[test]

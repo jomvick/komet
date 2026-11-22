@@ -120,6 +120,15 @@ pub(crate) fn home_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/"))
 }
 
+/// An existing directory with no entries — the only existing target a transfer
+/// may reuse (both `git clone` and archive extraction accept it).
+pub(crate) fn is_empty_dir(path: &Path) -> bool {
+    path.is_dir()
+        && std::fs::read_dir(path)
+            .map(|mut entries| entries.next().is_none())
+            .unwrap_or(false)
+}
+
 /// Where new worktrees live. Deliberately NOT under the backend data dir —
 /// worktrees are user-facing working checkouts. `KOMET_WORKTREES_DIR` overrides
 /// (test isolation); empty reads as unset.
@@ -457,7 +466,11 @@ impl Repos {
         if trimmed.is_empty() {
             return Err(EngineError::Other("empty git remote".into()));
         }
-        if target.exists() {
+        // Same reuse rule as the archive import: an existing EMPTY directory is
+        // fine (git accepts it as the clone destination), anything else is
+        // never overwritten. `project_transfer::resolve_destination` already
+        // picked a free name, so this only catches a race or a caller error.
+        if target.exists() && !is_empty_dir(target) {
             return Err(EngineError::Other(format!(
                 "Already exists: {}",
                 target.display()
@@ -1741,16 +1754,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn clone_into_refuses_an_existing_target() {
+    async fn clone_into_refuses_a_non_empty_target() {
         let data = tempfile::tempdir().unwrap();
         let repos = Repos::new(data.path(), "device");
         let target = data.path().join("already-there");
         std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("keep.txt"), b"keep").unwrap();
         let err = repos
             .clone_into("https://example.invalid/repo.git", None, &target)
             .await
-            .expect_err("existing target must not be overwritten");
+            .expect_err("existing non-empty target must not be overwritten");
         assert!(err.to_string().contains("Already exists"), "{err}");
+        assert_eq!(std::fs::read(target.join("keep.txt")).unwrap(), b"keep");
+    }
+
+    #[tokio::test]
+    async fn clone_into_reuses_an_empty_target() {
+        let data = tempfile::tempdir().unwrap();
+        let repos = Repos::new(data.path(), "device");
+        // Local source repo: no network, git refuses a remote that is not one,
+        // so a success also proves the destination was accepted.
+        let source = data.path().join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        let init = tokio::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&source)
+            .output()
+            .await
+            .unwrap();
+        assert!(init.status.success(), "git init failed");
+
+        let target = data.path().join("empty-target");
+        std::fs::create_dir_all(&target).unwrap();
+        let cloned = repos
+            .clone_into(&source.to_string_lossy(), None, &target)
+            .await
+            .expect("an empty existing directory is reused");
+        assert_eq!(cloned, target);
+        assert!(target.join(".git").is_dir());
     }
 
     #[tokio::test]
