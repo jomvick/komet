@@ -8,7 +8,7 @@
 //!
 //! - the local `WatchCheckoutDiffs` stream (a watch channel of every checkout's
 //!   latest [`CheckoutDiff`]);
-//! - a [`DiffSidecar`] JSON `POST {edge}/diff/{chatId}` for every syncing chat of
+//! - a [`DiffSidecar`] JSON `PUT {edge}/chat2/{chatId}/diff` for every syncing chat of
 //!   the checkout (bearer = engine edge token), so "review pending changes while
 //!   the host sleeps" works;
 //! - `chat.branch` upkeep: the same fs events cover the checkout's git dir (HEAD),
@@ -60,8 +60,13 @@ const MAX_WATCH_DIRS: usize = 8_000;
 /// `git hash-object -t tree /dev/null` — diff base for repos with no commits yet.
 const EMPTY_TREE_SHA: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
+/// Mirror of the sync server's `chat_room::MAX_SIDECAR_BYTES`: a body over it
+/// is rejected with 413, so the client checks the serialized sidecar first
+/// rather than spending the upload to learn it.
+const MAX_SIDECAR_BYTES: usize = 16 * 1024 * 1024;
+
 /// Latest-only diff sidecar published to each chat's session DO slot
-/// (`POST /diff/{chatId}`; shape: edge/src/session-doc/sidecar.ts).
+/// (`PUT /chat2/{chatId}/diff`, server side: `chat_room::diff_put`).
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DiffSidecar {
@@ -494,7 +499,6 @@ async fn sync_entry(inner: &Arc<DiffSyncInner>, entry: &Arc<CheckoutEntry>) {
     if lock(&entry.checksum).as_deref() == Some(snapshot.checksum.as_str()) {
         return; // unchanged — publish nothing
     }
-    *lock(&entry.checksum) = Some(snapshot.checksum.clone());
 
     let diff = CheckoutDiff {
         checkout_id: entry.identity.id.clone(),
@@ -516,7 +520,11 @@ async fn sync_entry(inner: &Arc<DiffSyncInner>, entry: &Arc<CheckoutEntry>) {
     }
     publish_watch_with(inner, Some(diff));
 
-    // Latest-only sidecar to every syncing chat's session DO slot.
+    // Latest-only sidecar to every syncing chat's session DO slot. `published`
+    // stays false unless EVERY chat took the body: the checksum is the retry
+    // latch, so recording it after a failed/rejected PUT would silently drop
+    // this snapshot (the tree is unchanged, so no later event would resend it).
+    let mut published = true;
     if let Some(edge) = &inner.edge {
         for chat in &chats {
             let sidecar = DiffSidecar {
@@ -532,30 +540,61 @@ async fn sync_entry(inner: &Arc<DiffSyncInner>, entry: &Arc<CheckoutEntry>) {
                 truncated: snapshot.truncated,
                 published_at: chrono::Utc::now().timestamp_millis(),
             };
-            let url = format!("{}/diff/{}", edge.url.trim_end_matches('/'), chat.id);
+            let url = format!("{}/chat2/{}/diff", edge.url.trim_end_matches('/'), chat.id);
             // Fresh bearer per request — never the boot-time snapshot.
             let Some(bearer) = edge.bearer().await else {
                 tracing::debug!(chat = %chat.id, "diff-sync: sidecar skipped (signed out)");
+                published = false; // retry once signed in
                 continue;
             };
+            // Judge the REAL body the server will measure (patch + file
+            // summaries + envelope), not the raw patch length: an oversized
+            // sidecar must never be sent, and must leave the checksum latch
+            // open so the next sync retries instead of calling it synced.
+            let body = match serde_json::to_vec(&sidecar) {
+                Ok(body) => body,
+                Err(err) => {
+                    tracing::warn!(chat = %chat.id, error = %err,
+                        "diff-sync: sidecar serialization failed");
+                    published = false;
+                    continue;
+                }
+            };
+            if body.len() > MAX_SIDECAR_BYTES {
+                tracing::warn!(
+                    chat = %chat.id,
+                    bytes = body.len(),
+                    limit = MAX_SIDECAR_BYTES,
+                    "diff-sync: sidecar too large; not published"
+                );
+                published = false;
+                continue;
+            }
             let result = inner
                 .http
-                .post(&url)
+                .put(&url)
                 .bearer_auth(&bearer)
-                .json(&sidecar)
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(body)
                 .send()
                 .await;
             match result {
                 Ok(response) if !response.status().is_success() => {
-                    tracing::debug!(chat = %chat.id, status = %response.status(),
+                    tracing::warn!(chat = %chat.id, status = %response.status(),
                         "diff-sync: sidecar publish rejected");
+                    published = false;
                 }
                 Err(err) => {
-                    tracing::debug!(chat = %chat.id, error = %err, "diff-sync: sidecar publish failed");
+                    tracing::warn!(chat = %chat.id, error = %err, "diff-sync: sidecar publish failed");
+                    published = false;
                 }
                 Ok(_) => {}
             }
         }
+    }
+    if published {
+        // Only a fully published snapshot closes the retry latch.
+        *lock(&entry.checksum) = Some(snapshot.checksum.clone());
     }
 }
 

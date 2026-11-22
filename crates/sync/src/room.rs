@@ -44,6 +44,8 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
+pub use crate::types::{RoomStatsSnapshot, StaticUrl, SyncError, UrlProvider};
+
 /// Payload bytes per outbound fragment — mirrors the edge's `FRAGMENT_BYTES`
 /// (leaves envelope room under loro-protocol's 256KB message cap).
 const FRAGMENT_BYTES: usize = 200_000;
@@ -145,42 +147,6 @@ const MAX_INVALID_REJOINS: u32 = 3;
 /// original loop protection without the permanent freeze.
 const MAX_FULL_RESYNCS: u32 = 3;
 
-/// Errors surfaced by [`RoomClient`].
-#[derive(Debug, Clone, thiserror::Error)]
-pub enum SyncError {
-    #[error("websocket: {0}")]
-    WebSocket(String),
-    #[error("protocol: {0}")]
-    Protocol(String),
-    #[error("join refused: {0}")]
-    JoinRefused(String),
-    #[error("loro: {0}")]
-    Loro(String),
-    #[error("auth: {0}")]
-    Auth(String),
-    #[error("client is shut down")]
-    Closed,
-}
-
-/// Per-dial WebSocket URL provider — consulted before EVERY connection attempt,
-/// including background reconnects, so a short-lived auth token embedded in the
-/// URL (`?token=…`) is re-read fresh rather than frozen at first connect.
-/// Return [`SyncError::Auth`] when no valid credential is available (signed
-/// out); the reconnect loop backs off and retries.
-pub trait UrlProvider: Send + Sync + 'static {
-    fn url(&self) -> BoxFuture<'static, Result<String, SyncError>>;
-}
-
-/// Fixed URL (dev bearers and tests — tokens that never expire).
-pub struct StaticUrl(pub String);
-
-impl UrlProvider for StaticUrl {
-    fn url(&self) -> BoxFuture<'static, Result<String, SyncError>> {
-        let url = self.0.clone();
-        Box::pin(async move { Ok(url) })
-    }
-}
-
 /// Connection/sync lifecycle notifications (best-effort broadcast; receivers
 /// may lag and miss intermediate events).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -195,32 +161,6 @@ pub enum RoomEvent {
     EphemeralUpdate,
     /// The server evicted us; the client will NOT reconnect.
     Evicted,
-}
-
-/// Live sync introspection for one room — the data behind the engine's
-/// `SyncStatus` RPC and `komet sync`. Every 2026-08 incident was debugged
-/// blind because none of this was observable at runtime.
-#[derive(Debug, Clone, Default)]
-pub struct RoomStatsSnapshot {
-    /// A `%LOR` join is currently established.
-    pub connected: bool,
-    /// Epoch ms of the last SERVER-PUSHED `%LOR` frame (broadcast, backfill,
-    /// join answer) — 0 = never. The deaf-socket tell: fresh acks + stale
-    /// pushes.
-    pub last_pushed_ms: i64,
-    /// Epoch ms of the last `%LOR` ack for our own writes — 0 = never.
-    pub last_ack_ms: i64,
-    /// Mid-session rejoins (reconnect resyncs, stale-peer, full resyncs).
-    pub rejoins: u64,
-    /// Liveness probes sent (background cadence + on-demand hints).
-    pub probes: u64,
-    /// Full-snapshot resyncs requested after failed imports.
-    pub full_resyncs: u64,
-    /// Sessions lost (transport drops, deadlines, requested redials).
-    pub disconnects: u64,
-    /// Our writes the server REJECTED (InvalidUpdate/PermissionDenied acks).
-    /// Nonzero while `last_ack_ms` goes stale is the latched-session tell.
-    pub rejected: u64,
 }
 
 #[derive(Default)]
@@ -305,7 +245,7 @@ impl Connector for WsConnector {
             // this fetch and the handshake below can hang; the actor bounds
             // the whole dial with CONNECT_TIMEOUT.
             let url = provider.url().await?;
-            let (ws, _) = tokio_tungstenite::connect_async(&url)
+            let ws = crate::dial::connect_ws(&url)
                 .await
                 .map_err(|e| SyncError::WebSocket(e.to_string()))?;
             let (out_tx, out_rx) = mpsc::channel(64);

@@ -25,6 +25,10 @@ uuid.workspace = true
 mock-server = []
 
 [dev-dependencies]
+# Self dev-dependency so this crate's own integration tests see `mock-server`:
+# they compile the lib without `cfg(test)`, and a plain
+# `cargo check/test -p komet-sync` must not fail on a gated module.
+komet-sync = { path = ".", features = ["mock-server"] }
 chrono.workspace = true
 # chat2_live example only (live checkpoint fetch against a deployed worker).
 reqwest.workspace = true

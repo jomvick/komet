@@ -1,13 +1,12 @@
 //! OS network-path monitoring → [`crate::wake::set_path_online`].
 //!
 //! macOS: `NWPathMonitor` (Network.framework, plain C surface + one ObjC
-//! block). The instant the OS says the path is back, every parked reconnect
-//! backoff redials; while the OS says there is no path, backoff waiters park
-//! on the event buses instead of burning dial attempts (see `wake.rs`).
-//!
-//! Other platforms: no-op — `path_is_offline()` stays false and the empirical
-//! signals (suspend detector, sibling-dial successes, focus probe) carry the
-//! recovery story unchanged, exactly as before this module existed.
+//! block). Linux: the default route is polled via `/proc/net/route` every 2s
+//! (dependency-free; a real netlink subscription would only shave the
+//! detection latency below the 2s poll). Windows: not implemented yet —
+//! `NotifyNetworkConnectivityHintChange` FFI is the planned backend; until
+//! then the empirical signals (suspend detector, sibling-dial successes,
+//! focus probe) carry recovery, exactly as before this module existed.
 
 /// Start the process-wide path monitor. Idempotent; call from engine startup.
 pub fn spawn_path_monitor() {
@@ -15,8 +14,64 @@ pub fn spawn_path_monitor() {
     STARTED.call_once(|| {
         #[cfg(target_os = "macos")]
         imp::start();
+        #[cfg(target_os = "linux")]
+        imp::start();
     });
 }
+
+#[cfg(target_os = "linux")]
+mod linux_imp {
+    use std::time::Duration;
+
+    /// Poll cadence. The kernel pushes netlink events for route/interface
+    /// changes, but a poll this coarse is cheap (one /proc read per 2 s),
+    /// dependency-free, and only ever wrong for two seconds — the wake/online
+    /// signals (a sibling dial succeeding) cover the gap either way.
+    const POLL: Duration = Duration::from_secs(2);
+
+    /// `/proc/net/route` row for the default route (hex, destination 0).
+    fn has_default_route() -> bool {
+        let Ok(table) = std::fs::read_to_string("/proc/net/route") else {
+            // No route table readable: assume a path rather than go silent
+            // (same bias as the macOS monitor's non-`unsatisfied` statuses).
+            return true;
+        };
+        table.lines().skip(1).any(|line| {
+            let mut fields = line.split_whitespace();
+            let _iface = fields.next();
+            matches!(fields.next(), Some("00000000"))
+        })
+    }
+
+    pub(super) fn start() {
+        std::thread::Builder::new()
+            .name("komet.net-path".into())
+            .spawn(|| {
+                let mut online = has_default_route();
+                // Publish the initial result: if the machine boots with no
+                // route, parked dialers must know it before the first change
+                // (otherwise they only learn on the second poll).
+                crate::wake::set_path_online(online);
+                loop {
+                    std::thread::sleep(POLL);
+                    let now = has_default_route();
+                    if now != online {
+                        tracing::info!(
+                            "net_path: default route {}, reporting {}",
+                            if now { "restored" } else { "gone" },
+                            if now { "online" } else { "offline" }
+                        );
+                        online = now;
+                        crate::wake::set_path_online(online);
+                    }
+                }
+            })
+            .expect("net_path: spawn Linux monitor thread");
+    }
+}
+
+#[cfg(target_os = "linux")]
+use linux_imp as imp;
 
 #[cfg(target_os = "macos")]
 mod imp {
@@ -55,7 +110,9 @@ mod imp {
                 return;
             }
             let handler = RcBlock::new(|path: *mut c_void| {
-                let status = unsafe { nw_path_get_status(path) };
+                // Already inside the surrounding `unsafe` block's contract:
+                // `path` is the OS-owned nw_path_t handed to this callback.
+                let status = nw_path_get_status(path);
                 let online = status != NW_PATH_STATUS_UNSATISFIED;
                 crate::wake::set_path_online(online);
                 if online {

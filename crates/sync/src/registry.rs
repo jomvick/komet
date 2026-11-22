@@ -27,7 +27,7 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use komet_doc::{PendingBatch, RegistryDoc, RegistryRow, StateOutcome};
 
-use crate::room::{RoomStatsSnapshot, StaticUrl, SyncError, UrlProvider};
+use crate::types::{RoomStatsSnapshot, StaticUrl, SyncError, UrlProvider};
 
 /// Text `"ping"` keepalive interval (answered by the DO auto-response pair
 /// without waking it — transport liveness only).
@@ -155,7 +155,7 @@ impl TextConnector for WsTextConnector {
         let provider = self.url.clone();
         Box::pin(async move {
             let url = provider.url().await?;
-            let (ws, _) = tokio_tungstenite::connect_async(&url)
+            let ws = crate::dial::connect_ws(&url)
                 .await
                 .map_err(|e| SyncError::WebSocket(e.to_string()))?;
             let (out_tx, out_rx) = mpsc::channel(64);
@@ -449,6 +449,9 @@ struct Actor {
 enum SessionEnd {
     /// Transport died / probe deadline / requested redial: back off, redial.
     Reconnect,
+    /// System wake: the socket sat through a suspend, so redial at once with a
+    /// fresh backoff — sleeping first would delay the recovery it announced.
+    Wake,
     /// Shutdown requested: stop the actor.
     Stop,
 }
@@ -492,15 +495,19 @@ impl Actor {
 
             match self.run_session(pipe, &mut ready).await {
                 SessionEnd::Stop => return,
+                SessionEnd::Wake => {
+                    // The socket sat through a suspend: it is dead even though
+                    // no transport error was reported, so the session must be
+                    // unwound exactly as a drop is — otherwise a push that was
+                    // in flight keeps its batch marked `in_flight` and is never
+                    // replayed on the replacement connection.
+                    self.note_session_end();
+                    // Resume is an event, not a timeout: no backoff sleep, and
+                    // the next failure starts the ladder over.
+                    backoff = BACKOFF_BASE;
+                }
                 SessionEnd::Reconnect => {
-                    lock(&self.doc).mark_disconnected();
-                    self.stats
-                        .connected
-                        .store(false, std::sync::atomic::Ordering::Relaxed);
-                    self.stats
-                        .disconnects
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let _ = self.events.send(RegistryEvent::Disconnected);
+                    self.note_session_end();
                     if ready.is_some() {
                         // Handshake failed on the very first session.
                         if let Some(ready) = ready.take() {
@@ -518,10 +525,24 @@ impl Actor {
         }
     }
 
+    /// Unwind a session that is no longer usable: everything unacked becomes
+    /// pushable again and the public stats stop claiming a live connection.
+    /// Called for `Reconnect` (transport died) and `Wake` (suspend killed the
+    /// socket silently) so both recover the same way.
+    fn note_session_end(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        lock(&self.doc).mark_disconnected();
+        self.stats.connected.store(false, Relaxed);
+        self.stats.disconnects.fetch_add(1, Relaxed);
+        let _ = self.events.send(RegistryEvent::Disconnected);
+    }
+
     /// True = shutdown observed.
     async fn sleep_or_shutdown(&mut self, wait: Duration) -> bool {
         tokio::select! {
-            _ = tokio::time::sleep(wait) => false,
+            // Wake/online events cut the backoff short; an offline-reported
+            // path parks the wait instead of burning futile dials.
+            _ = crate::wake::reconnect_wait(wait) => false,
             _ = self.shutdown.changed() => *self.shutdown.borrow(),
         }
     }
@@ -532,6 +553,10 @@ impl Actor {
         ready: &mut Option<oneshot::Sender<Result<(), SyncError>>>,
     ) -> SessionEnd {
         use std::sync::atomic::Ordering::Relaxed;
+
+        // System wake: the socket sat through a suspend and is almost certainly
+        // half-dead — redial now instead of discovering it by probe deadline.
+        let mut wake = crate::wake::subscribe();
 
         // ── hello / state handshake ─────────────────────────────────────────
         let cursor = {
@@ -652,6 +677,10 @@ impl Actor {
                     tracing::info!("registry: redial requested");
                     return SessionEnd::Reconnect;
                 }
+                _ = wake.recv() => {
+                    tracing::info!("registry: system wake; redialing");
+                    return SessionEnd::Wake;
+                }
                 _ = tokio::time::sleep_until(quiet_probe_at) => {
                     if !self.send_probe(&mut pipe, &mut probe_deadline).await {
                         return SessionEnd::Reconnect;
@@ -762,3 +791,103 @@ impl Actor {
 
 #[cfg(any(test, feature = "mock-server"))]
 pub mod mock_server;
+
+#[cfg(test)]
+mod session_end_tests {
+    use super::*;
+    use komet_proto::Device;
+
+    /// A dialer that is never used: these tests exercise the post-session
+    /// bookkeeping, not the transport.
+    struct NoDial;
+
+    impl TextConnector for NoDial {
+        fn connect(&self) -> BoxFuture<'static, Result<TextPipe, SyncError>> {
+            Box::pin(async { Err(SyncError::WebSocket("not dialed in this test".into())) })
+        }
+    }
+
+    fn actor(doc: Arc<Mutex<RegistryDoc>>) -> (Actor, broadcast::Receiver<RegistryEvent>) {
+        let (events, events_rx) = broadcast::channel(8);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        std::mem::forget(shutdown_tx); // keep the channel open for the actor
+        let (_nudge_tx, nudge_rx) = mpsc::channel(1);
+        let (_probe_tx, probe_rx) = mpsc::channel(1);
+        let (_redial_tx, redial_rx) = mpsc::channel(1);
+        let (_presence_tx, presence_rx) = mpsc::channel(1);
+        let actor = Actor {
+            doc,
+            device_id: "dev-a".into(),
+            connector: Arc::new(NoDial),
+            tuning: RegistryTuning::default(),
+            events,
+            shutdown: shutdown_rx,
+            nudge_rx,
+            probe_rx,
+            redial_rx,
+            presence_rx,
+            presence: Arc::new(Mutex::new(HashMap::new())),
+            stats: Arc::new(Stats::default()),
+        };
+        (actor, events_rx)
+    }
+
+    /// A wake ends the session without any transport error, so a push that was
+    /// in flight must be released for replay — otherwise `take_pushable()`
+    /// (which skips `in_flight` batches) would never resend that write on the
+    /// replacement connection.
+    #[test]
+    fn wake_releases_in_flight_batches_for_replay() {
+        let doc = Arc::new(Mutex::new(RegistryDoc::new("dev-a")));
+        {
+            let mut d = lock(&doc);
+            d.upsert_device(&Device {
+                id: "dev-a".into(),
+                name: "A".into(),
+                platform: "linux".into(),
+                last_seen_at: None,
+                created_at: None,
+                version: None,
+            })
+            .expect("local write");
+            let pushed = d.take_pushable();
+            assert_eq!(pushed.len(), 1, "the local write is queued for push");
+            assert!(
+                d.take_pushable().is_empty(),
+                "in flight until acked or disconnected"
+            );
+        }
+
+        let (actor, mut events_rx) = actor(doc.clone());
+        actor
+            .stats
+            .connected
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        actor.note_session_end(); // the `SessionEnd::Wake` path
+
+        assert!(
+            !actor
+                .stats
+                .connected
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "stats must not claim a live connection during the redial"
+        );
+        assert_eq!(
+            actor
+                .stats
+                .disconnects
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert!(matches!(
+            events_rx.try_recv(),
+            Ok(RegistryEvent::Disconnected)
+        ));
+        assert_eq!(
+            lock(&doc).take_pushable().len(),
+            1,
+            "the interrupted batch must be pushable on the new connection"
+        );
+    }
+}

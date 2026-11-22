@@ -31,7 +31,7 @@ impl RegistryRoom {
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
-        let db = Connection::open(db_path)?;
+        let db = crate::open_conn(db_path)?;
         db.execute_batch(
             "CREATE TABLE IF NOT EXISTS registry_rows (
                  kind TEXT NOT NULL,

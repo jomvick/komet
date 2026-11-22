@@ -25,7 +25,7 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use crate::chat_frames::{self as wire, frame_type};
-use crate::room::{StaticUrl, SyncError, UrlProvider};
+use crate::types::{StaticUrl, SyncError, UrlProvider};
 
 const PING_INTERVAL: Duration = Duration::from_secs(15);
 const SILENCE_LEASE: Duration = Duration::from_secs(45);
@@ -181,7 +181,7 @@ impl BinConnector for WsBinConnector {
         let provider = self.url.clone();
         Box::pin(async move {
             let url = provider.url().await?;
-            let (ws, _) = tokio_tungstenite::connect_async(&url)
+            let ws = crate::dial::connect_ws(&url)
                 .await
                 .map_err(|e| SyncError::WebSocket(e.to_string()))?;
             let (out_tx, out_rx) = mpsc::channel(64);
@@ -568,7 +568,11 @@ struct Actor {
 }
 
 enum SessionEnd {
+    /// Transport died / probe deadline / requested redial: back off, redial.
     Reconnect,
+    /// System wake: the socket sat through a suspend, so redial at once with a
+    /// fresh backoff — sleeping first would delay the recovery it announced.
+    Wake,
     Stop,
 }
 
@@ -611,6 +615,13 @@ impl Actor {
 
             match self.run_session(pipe, &mut ready).await {
                 SessionEnd::Stop => return,
+                SessionEnd::Wake => {
+                    // Resume is an event, not a timeout: no backoff sleep, and
+                    // the next failure starts the ladder over (the network
+                    // path just changed, so the old delay says nothing about
+                    // the new one).
+                    backoff = BACKOFF_BASE;
+                }
                 SessionEnd::Reconnect => {
                     use std::sync::atomic::Ordering::Relaxed;
                     self.flags.connected.store(false, Relaxed);
@@ -635,7 +646,9 @@ impl Actor {
     /// True = shutdown observed.
     async fn sleep_or_shutdown(&mut self, wait: Duration) -> bool {
         tokio::select! {
-            _ = tokio::time::sleep(wait) => false,
+            // Wake/online events cut the backoff short; an offline-reported
+            // path parks the wait instead of burning futile dials.
+            _ = crate::wake::reconnect_wait(wait) => false,
             _ = self.shutdown.changed() => *self.shutdown.borrow(),
         }
     }
@@ -803,6 +816,7 @@ impl Actor {
         // ── steady state ────────────────────────────────────────────────────
         let mut last_frame = tokio::time::Instant::now();
         let mut probe_deadline: Option<tokio::time::Instant> = None;
+        let mut wake = crate::wake::subscribe();
         loop {
             let quiet_probe_at = last_frame + self.tuning.probe_quiet;
             let deadline_at = probe_deadline
@@ -850,6 +864,13 @@ impl Actor {
                 _ = self.redial_rx.recv() => {
                     tracing::info!("chat2: redial requested");
                     return SessionEnd::Reconnect;
+                }
+                // System wake: the socket sat through a suspend and is
+                // almost certainly half-dead — redial now instead of
+                // discovering it by silence-lease timeout.
+                _ = wake.recv() => {
+                    tracing::info!("chat2: system wake; redialing");
+                    return SessionEnd::Wake;
                 }
                 // Transient (quota) rejection: probe with the HEAD batch on
                 // a short clock (see `Shared::quota_blocked`); acks re-arm
