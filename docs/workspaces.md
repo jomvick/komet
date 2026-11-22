@@ -62,7 +62,9 @@ restent dans le workspace d'origine.
 
 - `.gitignore` est respecté (donc `node_modules`, `target` restent derrière), et les
   fichiers de type secret (`.env*`, `*.pem`, `*.key`, `.git-credentials`, clés SSH)
-  sont exclus sauf opt-in explicite.
+  sont exclus sauf opt-in explicite. `.git/config` est inspecté par contenu : une
+  URL de remote avec `user:motdepasse@hôte` ou une clé `http.*.extraHeader` le fait
+  basculer dans la liste des secrets (le reste de `.git` est transporté normalement).
 - L'extraction refuse les chemins absolus, les `..`, et tout chemin qui traverse un
   lien symbolique ; les liens symboliques ne sont pas transportés.
 - Rien n'est jamais extrait dans un dossier existant non vide : un suffixe `-2` est
