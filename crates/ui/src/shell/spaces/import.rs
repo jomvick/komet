@@ -62,6 +62,17 @@ pub(crate) struct ImportDialog {
     done: Option<String>,
 }
 
+impl ImportDialog {
+    /// A clone carries whatever the repository tracks, so it cannot honour the
+    /// archive's secret filter. Git mode therefore needs either a project with
+    /// no secret-looking file, or the explicit opt-in.
+    fn git_allowed(&self) -> bool {
+        self.plan
+            .as_ref()
+            .is_some_and(|plan| git_mode_allowed(plan, self.include_secrets))
+    }
+}
+
 impl Shell {
     /// "Import project…" from the spaces menu: seed source = the workspace in
     /// view, source folder = the selected project (when there is one).
@@ -163,8 +174,10 @@ impl Shell {
                         Ok(value) => match serde_json::from_value::<PlanView>(value) {
                             Ok(plan) => {
                                 // Git mode is the cheap path: no project bytes
-                                // travel, so prefer it whenever a remote exists.
-                                dialog.git_mode = plan.git_ready;
+                                // travel, so prefer it whenever a remote exists
+                                // AND the clone may carry the project (see
+                                // `git_allowed`).
+                                dialog.git_mode = plan.git_ready && plan.secrets.is_empty();
                                 dialog.plan = Some(plan);
                             }
                             Err(err) => dialog.error = Some(format!("unexpected plan: {err}")),
@@ -190,7 +203,7 @@ impl Shell {
         };
         let source_env = dialog.source_env.clone();
         let include_secrets = dialog.include_secrets;
-        let git_mode = dialog.git_mode;
+        let git_mode = dialog.git_mode && dialog.git_allowed();
         let dest_base = dialog.dest_input.read(cx).text().trim().to_string();
         let dest_env = self.state.read(cx).active_workspace.clone();
         let Some(engine) = self.state.read(cx).engine().cloned() else {
@@ -223,6 +236,17 @@ impl Shell {
         if git_mode && !plan.git_ready {
             if let Some(dialog) = self.import_dialog.as_mut() {
                 dialog.error = Some("No git remote for this project; use the archive mode.".into());
+            }
+            cx.notify();
+            return;
+        }
+        if git_mode && !dialog.git_allowed() {
+            if let Some(dialog) = self.import_dialog.as_mut() {
+                dialog.error = Some(
+                    "A clone carries the files this repository tracks, including secrets; \
+                     tick the secrets opt-in or use the archive mode."
+                        .into(),
+                );
             }
             cx.notify();
             return;
@@ -345,7 +369,7 @@ impl Shell {
             dialog.source_env.clone(),
             dialog.busy,
             dialog.include_secrets,
-            dialog.git_mode,
+            dialog.git_mode && dialog.git_allowed(),
         );
         let workspaces = self.state.read(cx).workspace_switcher();
         let plan = dialog.plan.clone();
@@ -482,7 +506,7 @@ impl Shell {
                             div()
                                 .text_color(theme.warning_muted)
                                 .child(SharedString::from(format!(
-                                    "{} secret-looking file(s) will be skipped: {}",
+                                    "{} secret-looking file(s) will be skipped by the archive: {}",
                                     plan.secrets.len(),
                                     plan.secrets
                                         .iter()
@@ -530,7 +554,7 @@ impl Shell {
                     .child(SharedString::from(format!("{moved}/{total} chunks"))),
             );
         }
-        if !git_mode {
+        {
             card = card.child(
                 div()
                     .mt(px(6.0))
@@ -576,7 +600,11 @@ impl Shell {
                         div()
                             .text_size(px(12.0))
                             .text_color(theme.text_muted)
-                            .child("Include .env and key-like files (not recommended)"),
+                            .child(if plan.as_ref().is_some_and(|plan| plan.git_ready) {
+                            "Include .env and key-like files (required for a clone of a repo that tracks them)"
+                        } else {
+                            "Include .env and key-like files (not recommended)"
+                        }),
                     ),
             );
         }
@@ -609,6 +637,13 @@ impl Shell {
             card.into_any_element(),
         ))
     }
+}
+
+/// A clone carries whatever the repository tracks, so it cannot honour the
+/// archive's secret filter: it needs either no secret-looking file at all, or
+/// the explicit opt-in.
+fn git_mode_allowed(plan: &PlanView, include_secrets: bool) -> bool {
+    plan.git_ready && (plan.secrets.is_empty() || include_secrets)
 }
 
 /// Git mode: the destination device clones the remote itself. Nothing but the
@@ -787,4 +822,49 @@ async fn transfer_archive(
         chunks,
         total_chunks,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn plan(git_ready: bool, secrets: usize) -> PlanView {
+        PlanView {
+            files: 1,
+            bytes: 10,
+            ignored_files: 0,
+            secrets: (0..secrets)
+                .map(|n| PlanSecret {
+                    path: format!(".env.{n}"),
+                    bytes: 1,
+                })
+                .collect(),
+            git: None,
+            git_ready,
+            within_limit: true,
+            warnings: vec![],
+            path: "/p".into(),
+            name: "p".into(),
+        }
+    }
+
+    #[test]
+    fn git_mode_needs_a_remote_and_a_secret_opt_in() {
+        // No remote: archive only.
+        assert!(!git_mode_allowed(&plan(false, 0), false));
+        // Clean repo: a clone is the default.
+        assert!(git_mode_allowed(&plan(true, 0), false));
+        // Tracked secrets without the opt-in: the clone is refused, because it
+        // cannot skip them the way the archive does.
+        assert!(!git_mode_allowed(&plan(true, 2), false));
+        assert!(git_mode_allowed(&plan(true, 2), true));
+    }
+
+    #[test]
+    fn tilde_destinations_are_expanded_by_the_engine() {
+        // The dialog seeds "~" when no project matched; the engine expands it.
+        assert!(
+            komet_engine::project_transfer::expand_base(std::path::Path::new("~")).is_absolute()
+        );
+    }
 }

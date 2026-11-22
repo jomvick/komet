@@ -3240,11 +3240,11 @@ impl RpcService for EngineRpc {
                     name: String,
                 }
                 let p: P = parse_params(params)?;
-                let base = std::path::Path::new(&p.base_path);
-                std::fs::create_dir_all(base)
+                let base = crate::project_transfer::expand_base(std::path::Path::new(&p.base_path));
+                std::fs::create_dir_all(&base)
                     .map_err(|e| RpcError::Failed(format!("destination: {e}")))?;
                 // Same "never overwrite" rule as the archive path.
-                let target = crate::project_transfer::resolve_destination(base, &p.name)
+                let target = crate::project_transfer::resolve_destination(&base, &p.name)
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 let created = self
                     .repos

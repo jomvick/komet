@@ -451,11 +451,12 @@ impl Shell {
                 let body = if let Some(space) = context_space {
                     let rename_id = space.id.clone();
                     let delete_id = space.id.clone();
-                    // A file manager exists only where the files are. On a
-                    // paired (headless) workspace the row is hidden rather
-                    // than opening a folder on the wrong machine.
-                    let local_device = self.state.read(cx).local_device_id.clone();
-                    let space_is_local = local_device.as_deref() == Some(space.device_id.as_str());
+                    // A file manager exists only where the files are: the row
+                    // is hidden on a paired (headless) workspace instead of
+                    // opening a folder on another machine. `local_device_id`
+                    // follows the displayed workspace, so the predicate uses
+                    // `home_device_id` — and matches the keyboard mapping.
+                    let space_is_local = self.project_is_local(cx);
                     let reveal_path = space.path.clone();
                     div()
                         .flex()

@@ -48,8 +48,11 @@ restent dans le workspace d'origine.
 3. **Transfert** : deux modes, choisis dans le dialogue.
    - **Clone git** (par défaut quand le plan trouve un remote) : la destination
      clone le remote elle-même à la branche annoncée (`ProjectClone` → `git clone
-     --branch`). Aucun octet de projet ne traverse le réseau, et l'état git est
-     exact. Limite assumée : le travail non commité ne suit pas.
+     --branch`). Les octets du projet ne passent pas par le canal de transfert de
+     l'UI, mais la destination télécharge bien les données du dépôt depuis le
+     remote. Le clone reflète la **branche distante**, pas la copie locale : les
+     commits non poussés et le travail non commité ne suivent pas, et une branche
+     qui avance entre l'aperçu et le clone peut donner une autre révision.
    - **Archive** (fallback, ou pour emporter le travail non commité) : archive
      `komet archive v1` construite dans un fichier de staging sur la source, puis
      envoyée par morceaux de 1 Mio (`ProjectExportChunk` → `ProjectImportChunk`).
@@ -80,6 +83,11 @@ Le clone comme l'extraction refusent un dossier existant (suffixe `-2`).
 - Le mode clone git suppose que la destination sait s'authentifier sur le remote
   (clé SSH/credential helper de l'hôte) ; sinon l'erreur de `git clone` est
   remontée et l'archive reste disponible en un clic.
+- Un clone ne peut pas appliquer le filtre de secrets (il emporte ce que le
+  dépôt suit). Le mode git n'est donc proposé que si l'aperçu ne trouve aucun
+  fichier de type secret, ou si l'utilisateur coche explicitement l'option.
+- Les destinations saisies sont relatives à **cette** machine : un `~` initial
+  est développé côté machine cible (`~` ou `~/…`), jamais par un shell.
 - « Open in file manager » n'apparaît que pour un projet local : sur un workspace
   distant les fichiers sont sur l'autre machine (headless).
 - Le switcher affiche un compteur d'activité (« · N running ») par workspace, lu

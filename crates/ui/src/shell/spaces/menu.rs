@@ -147,24 +147,28 @@ impl Shell {
         }
     }
 
-    /// "Open in file manager" for a LOCAL project. The row only renders for a
-    /// local space (the files are on this machine); the call still targets this
-    /// machine's engine explicitly, never the displayed workspace's.
+    /// True when the context project's files live on the machine running the
+    /// UI. `local_device_id` follows the displayed workspace, so it is the
+    /// wrong reference here; `home_device_id` names this machine.
+    pub(crate) fn project_is_local(&self, cx: &App) -> bool {
+        let home = self.state.read(cx).home_device_id.clone();
+        self.context_space(cx)
+            .is_some_and(|space| home.as_deref() == Some(space.device_id.as_str()))
+    }
+
+    /// "Open in file manager" for a LOCAL project. The row only renders when
+    /// the files are on this machine, so the call deliberately carries no
+    /// `targetDeviceId`: it stays local instead of following the displayed
+    /// workspace's device.
     pub(crate) fn reveal_project_in_file_manager(&mut self, path: String, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
-        let device = self.state.read(cx).local_device_id.clone();
         cx.spawn(async move |_this, _cx| {
-            let mut params = serde_json::json!({
+            let params = serde_json::json!({
                 "repoPath": path,
                 "target": "files",
             });
-            if let Some(device) = device
-                && let Some(object) = params.as_object_mut()
-            {
-                object.insert("targetDeviceId".into(), device.into());
-            }
             if let Err(err) = engine.client().call(methods::OPEN_PROJECT, params).await {
                 tracing::warn!(error = %err, "could not reveal project in file manager");
                 // The menu already closed; a notification is the only surface
@@ -293,7 +297,7 @@ impl Shell {
                             self.project_menu_action_availability(cx);
                         1 + usize::from(worktrees_enabled) + usize::from(settings_enabled)
                     }
-                    Some(SpacesMenuPage::Settings) => 2,
+                    Some(SpacesMenuPage::Settings) => 2 + usize::from(self.project_is_local(cx)),
                     Some(SpacesMenuPage::Worktrees) => self
                         .context_space(cx)
                         .map(|space| {
@@ -348,8 +352,21 @@ impl Shell {
                         }
                         return;
                     }
-                    Some((SpacesMenuPage::Settings, 1)) => {
+                    // Row order matches the rendered page: Rename,
+                    // [Open in file manager], Remove — the reveal row only
+                    // exists for a project stored on this machine.
+                    Some((SpacesMenuPage::Settings, 1)) if self.project_is_local(cx) => {
                         if let Some(space) = self.context_space(cx) {
+                            self.close_spaces_menu(cx);
+                            self.reveal_project_in_file_manager(space.path.clone(), cx);
+                        }
+                        return;
+                    }
+                    Some((SpacesMenuPage::Settings, active)) => {
+                        let remove = if self.project_is_local(cx) { 2 } else { 1 };
+                        if active == remove
+                            && let Some(space) = self.context_space(cx)
+                        {
                             self.close_spaces_menu(cx);
                             self.delete_space_confirm = Some(space.id);
                             self.space_delete_focus_pending = true;

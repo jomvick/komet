@@ -368,6 +368,27 @@ pub fn safe_join(root: &Path, rel: &Path) -> Result<PathBuf, EngineError> {
     Ok(out)
 }
 
+/// Expand a leading `~` in a destination typed by the user. The dialog seeds
+/// `~` when no space matched, and `std::path` has no shell to expand it.
+pub fn expand_base(base: &Path) -> PathBuf {
+    let text = base.to_string_lossy();
+    let rest = text
+        .strip_prefix('~')
+        .filter(|rest| rest.is_empty() || rest.starts_with('/') || rest.starts_with('\\'));
+    match rest {
+        Some(rest) => {
+            let rest = rest.trim_start_matches(['/', '\\']);
+            let home = crate::repos::home_dir();
+            if rest.is_empty() {
+                home
+            } else {
+                home.join(rest)
+            }
+        }
+        None => base.to_path_buf(),
+    }
+}
+
 /// Refuse to import onto an existing non-empty folder; suggest a free suffix.
 pub fn resolve_destination(base: &Path, name: &str) -> Result<PathBuf, EngineError> {
     let candidate = base.join(name);
@@ -396,6 +417,19 @@ pub fn resolve_destination(base: &Path, name: &str) -> Result<PathBuf, EngineErr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expand_base_handles_tilde_and_passes_other_paths_through() {
+        let home = crate::repos::home_dir();
+        assert_eq!(expand_base(Path::new("~")), home);
+        assert_eq!(expand_base(Path::new("~/projects")), home.join("projects"));
+        // Not a home prefix: `~other` is a literal folder name.
+        assert_eq!(
+            expand_base(Path::new("~other/x")),
+            PathBuf::from("~other/x")
+        );
+        assert_eq!(expand_base(Path::new("/tmp/x")), PathBuf::from("/tmp/x"));
+    }
 
     fn write(path: &Path, bytes: &[u8]) {
         if let Some(parent) = path.parent() {
@@ -1017,6 +1051,7 @@ impl TransferStore {
     /// Returns the created folder.
     pub fn commit_import(&self, id: &str, base: &Path, name: &str) -> Result<PathBuf, EngineError> {
         let staged = self.verify(id)?;
+        let base = &expand_base(base);
         std::fs::create_dir_all(base)?;
         let dest = resolve_destination(base, name)?;
         let written = extract_archive(&staged.path, &dest)?;
