@@ -50,9 +50,9 @@ const DAY: Duration = Duration::from_secs(86_400);
 /// One live session's frame channels: `tx` feeds the socket, `rx` yields what
 /// the peer sent. `F` is `String` for JSON-text protocols, `Vec<u8>` for the
 /// binary chat2 codec.
-pub(crate) struct Pipe<F> {
-    pub(crate) tx: mpsc::Sender<F>,
-    pub(crate) rx: mpsc::Receiver<F>,
+pub struct Pipe<F> {
+    pub tx: mpsc::Sender<F>,
+    pub rx: mpsc::Receiver<F>,
 }
 
 /// Dials one session. Production uses [`WsConnector`]; tests inject fakes.
@@ -91,15 +91,7 @@ async fn connect_text(provider: Arc<dyn UrlProvider>) -> Result<Pipe<String>, Sy
     let ws = crate::dial::connect_ws(&url)
         .await
         .map_err(|e| SyncError::WebSocket(e.to_string()))?;
-    Ok(ws_pipe(ws, WsMessage::Text, |msg| match msg {
-        WsMessage::Text(text) => {
-            let text = text.to_string();
-            // The runtime answers our "ping" keepalive with "pong";
-            // transport liveness only — never a protocol frame.
-            (text != "pong").then_some(text)
-        }
-        _ => None,
-    }))
+    Ok(text_pipe(ws, SILENCE_LEASE))
 }
 
 async fn connect_bin(provider: Arc<dyn UrlProvider>) -> Result<Pipe<Vec<u8>>, SyncError> {
@@ -107,20 +99,47 @@ async fn connect_bin(provider: Arc<dyn UrlProvider>) -> Result<Pipe<Vec<u8>>, Sy
     let ws = crate::dial::connect_ws(&url)
         .await
         .map_err(|e| SyncError::WebSocket(e.to_string()))?;
-    Ok(ws_pipe(ws, WsMessage::Binary, |msg| match msg {
+    Ok(binary_pipe(ws, SILENCE_LEASE))
+}
+
+/// Wrap an already-established WebSocket in text-frame channels plus the
+/// keepalive/silence-lease pump. `silence_lease` is per-protocol: the device
+/// relay runs a shorter lease than the room clients.
+pub fn text_pipe(
+    ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
+    silence_lease: Duration,
+) -> Pipe<String> {
+    ws_pipe(ws, silence_lease, WsMessage::Text, |msg| match msg {
+        WsMessage::Text(text) => {
+            let text = text.to_string();
+            // The runtime answers our "ping" keepalive with "pong";
+            // transport liveness only — never a protocol frame.
+            (text != "pong").then_some(text)
+        }
+        _ => None,
+    })
+}
+
+/// Binary-frame sibling of [`text_pipe`].
+pub fn binary_pipe(
+    ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
+    silence_lease: Duration,
+) -> Pipe<Vec<u8>> {
+    ws_pipe(ws, silence_lease, WsMessage::Binary, |msg| match msg {
         WsMessage::Binary(bytes) => Some(bytes.to_vec()),
         _ => None,
-    }))
+    })
 }
 
 fn ws_pipe<F: Send + 'static>(
     ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
+    silence_lease: Duration,
     to_msg: fn(F) -> WsMessage,
     from_msg: fn(WsMessage) -> Option<F>,
 ) -> Pipe<F> {
     let (out_tx, out_rx) = mpsc::channel(64);
     let (in_tx, in_rx) = mpsc::channel(64);
-    tokio::spawn(pump(ws, out_rx, in_tx, to_msg, from_msg));
+    tokio::spawn(pump(ws, out_rx, in_tx, silence_lease, to_msg, from_msg));
     Pipe {
         tx: out_tx,
         rx: in_rx,
@@ -133,6 +152,7 @@ async fn pump<F: Send + 'static>(
     ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
     mut out_rx: mpsc::Receiver<F>,
     in_tx: mpsc::Sender<F>,
+    silence_lease: Duration,
     to_msg: fn(F) -> WsMessage,
     from_msg: fn(WsMessage) -> Option<F>,
 ) {
@@ -155,6 +175,19 @@ async fn pump<F: Send + 'static>(
                 }
             },
             frame = stream.next() => match frame {
+                Some(Ok(WsMessage::Close(close))) => {
+                    // Peer-initiated close: log the code/reason (relay close
+                    // codes like 4409 "superseded host" are diagnostic gold)
+                    // and end — the stream is finished either way.
+                    if let Some(close) = close {
+                        tracing::info!(
+                            code = %close.code,
+                            reason = %close.reason,
+                            "ws closed by peer"
+                        );
+                    }
+                    break;
+                }
                 Some(Ok(msg)) => {
                     last_rx = tokio::time::Instant::now();
                     if let Some(frame) = from_msg(msg)
@@ -170,7 +203,7 @@ async fn pump<F: Send + 'static>(
                     break;
                 }
             }
-            _ = tokio::time::sleep_until(last_rx + SILENCE_LEASE) => {
+            _ = tokio::time::sleep_until(last_rx + silence_lease) => {
                 tracing::warn!("socket silent past lease; treating as dead");
                 break;
             }
