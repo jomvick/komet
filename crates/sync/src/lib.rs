@@ -16,7 +16,7 @@ pub mod net_path;
 pub mod registry;
 mod room;
 mod store;
-mod transport;
+pub mod transport;
 mod types;
 pub mod wake;
 
