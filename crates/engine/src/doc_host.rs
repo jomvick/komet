@@ -1893,6 +1893,123 @@ impl DocHost {
         rows
     }
 
+    /// s2→chat2 migration inventory for `komet sync status --legacy` and
+    /// `SyncMigrate`: every registry chat still on roomGen < 2, flagged with
+    /// whether THIS device hosts it and whether a local doc (or rollback
+    /// copy) exists to seed from.
+    pub fn legacy_chat_rows(&self) -> Vec<serde_json::Value> {
+        let Some(ws) = self.workspace() else {
+            return Vec::new();
+        };
+        let device = self.inner.config.device_id.clone();
+        let open_ids: std::collections::HashSet<String> =
+            lock(&self.inner.handles).keys().cloned().collect();
+        ws.watch_chats()
+            .borrow()
+            .iter()
+            .filter(|c| c.room_gen.unwrap_or(1) < 2)
+            .map(|c| {
+                let local_doc = matches!(self.inner.store.load_snapshot(&c.id), Ok(Some(_)))
+                    || matches!(
+                        self.inner
+                            .store
+                            .load_snapshot(&format!("{}.pre-chat2", c.id)),
+                        Ok(Some(_))
+                    );
+                serde_json::json!({
+                    "chatId": c.id,
+                    "title": c.title,
+                    "hostedHere": c.device_id == device,
+                    "hostDevice": c.device_id,
+                    "archived": c.archived,
+                    "localDoc": local_doc,
+                    "open": open_ids.contains(&c.id),
+                })
+            })
+            .collect()
+    }
+
+    /// `komet sync migrate`: open each legacy chat THIS device hosts so the
+    /// normal quiet-seed path (s2 join → frontier quiet → thin rebuild →
+    /// checkpoint POST → registry flip) migrates it, then wait — bounded —
+    /// for the flips and report per-chat outcomes. Idempotent: gen-2 chats
+    /// are skipped, a chat still on s2 at the deadline stays `pending` (the
+    /// background migration sweep keeps retrying it), and chats hosted on
+    /// other devices are reported `hostedElsewhere` — their host migrates
+    /// them. `dry_run` returns the inventory without touching anything.
+    pub async fn migrate_legacy(&self, dry_run: bool) -> serde_json::Value {
+        let rows = self.legacy_chat_rows();
+        if dry_run {
+            return serde_json::json!({ "dryRun": true, "chats": rows });
+        }
+        let edgeless = self.inner.config.edge.is_none();
+        let mut outcomes: Vec<serde_json::Value> = Vec::new();
+        let mut attempted: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for row in &rows {
+            let chat_id = row["chatId"].as_str().unwrap_or_default().to_string();
+            if row["hostedHere"].as_bool() == Some(true) {
+                if edgeless {
+                    outcomes.push(serde_json::json!({
+                        "chatId": chat_id, "result": "skipped",
+                        "reason": "no edge configured",
+                    }));
+                } else if let Err(err) = self.open(&chat_id) {
+                    outcomes.push(serde_json::json!({
+                        "chatId": chat_id, "result": "failed",
+                        "reason": format!("open failed: {err}"),
+                    }));
+                } else {
+                    attempted.insert(chat_id);
+                }
+            } else {
+                outcomes.push(serde_json::json!({
+                    "chatId": chat_id, "result": "hostedElsewhere",
+                    "hostDevice": row["hostDevice"],
+                }));
+            }
+        }
+        // Wait for the quiet-seed flips, bounded: join wait ≤60s + quiet
+        // 2s + POST, so 150s covers a slow edge without hanging the CLI.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(150);
+        let mut pending: Vec<String> = attempted.iter().cloned().collect();
+        while !pending.is_empty() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            let Some(ws) = self.workspace() else { break };
+            pending.retain(|id| {
+                ws.chat(id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|c| c.room_gen.unwrap_or(1) < 2)
+            });
+        }
+        let migrated: std::collections::HashSet<&String> = attempted
+            .iter()
+            .filter(|id| {
+                self.workspace()
+                    .and_then(|ws| ws.chat(id).ok().flatten())
+                    .is_some_and(|c| c.room_gen.unwrap_or(1) >= 2)
+            })
+            .collect();
+        for id in &attempted {
+            if migrated.contains(id) {
+                outcomes.push(serde_json::json!({ "chatId": id, "result": "migrated" }));
+            } else {
+                outcomes.push(serde_json::json!({
+                    "chatId": id, "result": "pending",
+                    "reason": "still on s2 at deadline; background sweep keeps retrying",
+                }));
+            }
+        }
+        serde_json::json!({
+            "dryRun": false,
+            "chats": rows,
+            "outcomes": outcomes,
+            "unrecoverable": rows.iter().filter(|r| {
+                r["hostedHere"] == true && r["localDoc"] == false
+            }).count(),
+        })
+    }
+
     /// Drop a chat's doc unconditionally and delete its local snapshot — the
     /// chat is gone (DeleteChat / DeleteSpace cascade). Watchers see the
     /// stream end; a racing writer keeps its orphaned doc until the run ends.
