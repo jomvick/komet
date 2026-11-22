@@ -51,6 +51,9 @@ pub(crate) struct ImportDialog {
     /// Base folder on the DESTINATION workspace.
     dest_input: Entity<ComposerInput>,
     include_secrets: bool,
+    /// Git mode clones the remote on the destination instead of streaming the
+    /// archive; only offered when the plan found a reachable remote.
+    git_mode: bool,
     plan: Option<PlanView>,
     busy: bool,
     /// Bytes moved / total while the archive streams.
@@ -93,6 +96,7 @@ impl Shell {
             source_input,
             dest_input,
             include_secrets: false,
+            git_mode: true,
             plan: None,
             busy: false,
             progress: None,
@@ -158,7 +162,9 @@ impl Shell {
                     match result {
                         Ok(value) => match serde_json::from_value::<PlanView>(value) {
                             Ok(plan) => {
-                                // Seed the destination name field from the plan.
+                                // Git mode is the cheap path: no project bytes
+                                // travel, so prefer it whenever a remote exists.
+                                dialog.git_mode = plan.git_ready;
                                 dialog.plan = Some(plan);
                             }
                             Err(err) => dialog.error = Some(format!("unexpected plan: {err}")),
@@ -184,6 +190,7 @@ impl Shell {
         };
         let source_env = dialog.source_env.clone();
         let include_secrets = dialog.include_secrets;
+        let git_mode = dialog.git_mode;
         let dest_base = dialog.dest_input.read(cx).text().trim().to_string();
         let dest_env = self.state.read(cx).active_workspace.clone();
         let Some(engine) = self.state.read(cx).engine().cloned() else {
@@ -206,9 +213,16 @@ impl Shell {
             cx.notify();
             return;
         }
-        if !plan.within_limit {
+        if !git_mode && !plan.within_limit {
             if let Some(dialog) = self.import_dialog.as_mut() {
                 dialog.error = Some("This project is too large for an archive transfer.".into());
+            }
+            cx.notify();
+            return;
+        }
+        if git_mode && !plan.git_ready {
+            if let Some(dialog) = self.import_dialog.as_mut() {
+                dialog.error = Some("No git remote for this project; use the archive mode.".into());
             }
             cx.notify();
             return;
@@ -224,24 +238,47 @@ impl Shell {
         let client = engine.client_arc();
         let source_path = plan.path.clone();
         let name = plan.name.clone();
+        let remote = plan.git.as_ref().and_then(|git| git.remote.clone());
+        let branch = plan.git.as_ref().and_then(|git| git.branch.clone());
         cx.spawn(async move |this, cx| {
-            let outcome = transfer_archive(
-                client.clone(),
-                &source_dev,
-                &source_path,
-                include_secrets,
-                &dest_dev,
-                &dest_base,
-                &name,
-            )
-            .await;
-            let (created_path, progress, transfer_error) = match outcome {
-                Ok(done) => (
-                    Some(done.created_path),
-                    Some((done.chunks, done.total_chunks)),
-                    None,
-                ),
-                Err(err) => (None, None, Some(err)),
+            let (created_path, progress, transfer_error) = if git_mode {
+                let outcome = match remote {
+                    Some(remote) => {
+                        clone_project(
+                            client.clone(),
+                            &dest_dev,
+                            &remote,
+                            branch.as_deref(),
+                            &dest_base,
+                            &name,
+                        )
+                        .await
+                    }
+                    None => Err("no git remote for this project".to_string()),
+                };
+                match outcome {
+                    Ok(path) => (Some(path), Some((1, 1)), None),
+                    Err(err) => (None, None, Some(err)),
+                }
+            } else {
+                match transfer_archive(
+                    client.clone(),
+                    &source_dev,
+                    &source_path,
+                    include_secrets,
+                    &dest_dev,
+                    &dest_base,
+                    &name,
+                )
+                .await
+                {
+                    Ok(done) => (
+                        Some(done.created_path),
+                        Some((done.chunks, done.total_chunks)),
+                        None,
+                    ),
+                    Err(err) => (None, None, Some(err)),
+                }
             };
             // Register the copied folder on the destination device. A failure
             // leaves the files on disk (never silently deleted) and shows the
@@ -304,10 +341,11 @@ impl Shell {
             let focus = dialog.source_input.read(cx).focus_handle(cx);
             window.focus(&focus, cx);
         }
-        let (source_env, busy, include_secrets) = (
+        let (source_env, busy, include_secrets, git_mode) = (
             dialog.source_env.clone(),
             dialog.busy,
             dialog.include_secrets,
+            dialog.git_mode,
         );
         let workspaces = self.state.read(cx).workspace_switcher();
         let plan = dialog.plan.clone();
@@ -366,6 +404,47 @@ impl Shell {
                 .as_ref()
                 .and_then(|git| git.remote.clone())
                 .unwrap_or_else(|| "no git remote".into());
+            if plan.git_ready {
+                card = card.child(
+                    div()
+                        .mt(px(10.0))
+                        .flex()
+                        .flex_row()
+                        .gap(px(6.0))
+                        .child(
+                            popover::btn_ghost(
+                                &theme,
+                                "Git clone (recommended)",
+                                "import-mode-git",
+                                cx.entity_id(),
+                            )
+                            .id("import-mode-git")
+                            .when(git_mode, |el| el.border_color(theme.text))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if let Some(dialog) = this.import_dialog.as_mut() {
+                                    dialog.git_mode = true;
+                                }
+                                cx.notify();
+                            })),
+                        )
+                        .child(
+                            popover::btn_ghost(
+                                &theme,
+                                "Archive (uncommitted work)",
+                                "import-mode-archive",
+                                cx.entity_id(),
+                            )
+                            .id("import-mode-archive")
+                            .when(!git_mode, |el| el.border_color(theme.text))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if let Some(dialog) = this.import_dialog.as_mut() {
+                                    dialog.git_mode = false;
+                                }
+                                cx.notify();
+                            })),
+                        ),
+                );
+            }
             card = card.child(
                 div()
                     .mt(px(12.0))
@@ -451,54 +530,56 @@ impl Shell {
                     .child(SharedString::from(format!("{moved}/{total} chunks"))),
             );
         }
-        card = card.child(
-            div()
-                .mt(px(6.0))
-                .id("import-secrets-toggle")
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(8.0))
-                .cursor_pointer()
-                .on_click(cx.listener(|this, _, _, cx| {
-                    if let Some(dialog) = this.import_dialog.as_mut() {
-                        dialog.include_secrets = !dialog.include_secrets;
-                    }
-                    cx.notify();
-                }))
-                .child(
-                    div()
-                        .size(px(14.0))
-                        .rounded(px(4.0))
-                        .border_1()
-                        .border_color(if include_secrets {
-                            theme.text
-                        } else {
-                            theme.border
-                        })
-                        .bg(if include_secrets {
-                            theme.text
-                        } else {
-                            crate::theme::ink(0.03)
-                        })
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .when(include_secrets, |el| {
-                            el.child(
-                                icons::icon(icons::CHECK)
-                                    .size(px(10.0))
-                                    .text_color(theme.on_solid),
-                            )
-                        }),
-                )
-                .child(
-                    div()
-                        .text_size(px(12.0))
-                        .text_color(theme.text_muted)
-                        .child("Include .env and key-like files (not recommended)"),
-                ),
-        );
+        if !git_mode {
+            card = card.child(
+                div()
+                    .mt(px(6.0))
+                    .id("import-secrets-toggle")
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .cursor_pointer()
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(dialog) = this.import_dialog.as_mut() {
+                            dialog.include_secrets = !dialog.include_secrets;
+                        }
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .size(px(14.0))
+                            .rounded(px(4.0))
+                            .border_1()
+                            .border_color(if include_secrets {
+                                theme.text
+                            } else {
+                                theme.border
+                            })
+                            .bg(if include_secrets {
+                                theme.text
+                            } else {
+                                crate::theme::ink(0.03)
+                            })
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .when(include_secrets, |el| {
+                                el.child(
+                                    icons::icon(icons::CHECK)
+                                        .size(px(10.0))
+                                        .text_color(theme.on_solid),
+                                )
+                            }),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .text_color(theme.text_muted)
+                            .child("Include .env and key-like files (not recommended)"),
+                    ),
+            );
+        }
         card = card.child(
             div()
                 .mt(px(18.0))
@@ -528,6 +609,36 @@ impl Shell {
             card.into_any_element(),
         ))
     }
+}
+
+/// Git mode: the destination device clones the remote itself. Nothing but the
+/// URL/branch metadata crosses the wire.
+async fn clone_project(
+    client: std::sync::Arc<komet_rpc::RpcClient>,
+    dest_dev: &str,
+    remote: &str,
+    branch: Option<&str>,
+    base_path: &str,
+    name: &str,
+) -> Result<String, String> {
+    let value = client
+        .call(
+            methods::PROJECT_CLONE,
+            serde_json::json!({
+                "remote": remote,
+                "branch": branch,
+                "basePath": base_path,
+                "name": name,
+                "targetDeviceId": dest_dev,
+            }),
+        )
+        .await
+        .map_err(|err| format!("git clone failed: {err}"))?;
+    Ok(value
+        .get("path")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string())
 }
 
 fn human_bytes(bytes: u64) -> String {

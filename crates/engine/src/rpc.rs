@@ -1454,6 +1454,7 @@ fn forwardable(method: &str) -> bool {
             | methods::PROJECT_IMPORT_CHUNK
             | methods::PROJECT_IMPORT_COMMIT
             | methods::PROJECT_TRANSFER_CANCEL
+            | methods::PROJECT_CLONE
             // Checkout diffs are produced on the device holding the checkout.
             | methods::WATCH_CHECKOUT_DIFFS
             | methods::GET_CHECKOUT_DIFF
@@ -3224,6 +3225,32 @@ impl RpcService for EngineRpc {
                 .await
                 .map_err(|e| RpcError::Failed(e.to_string()))?
                 .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&serde_json::json!({
+                    "path": created.to_string_lossy(),
+                }))
+            }
+            methods::PROJECT_CLONE => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct P {
+                    remote: String,
+                    #[serde(default)]
+                    branch: Option<String>,
+                    base_path: String,
+                    name: String,
+                }
+                let p: P = parse_params(params)?;
+                let base = std::path::Path::new(&p.base_path);
+                std::fs::create_dir_all(base)
+                    .map_err(|e| RpcError::Failed(format!("destination: {e}")))?;
+                // Same "never overwrite" rule as the archive path.
+                let target = crate::project_transfer::resolve_destination(base, &p.name)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                let created = self
+                    .repos
+                    .clone_into(&p.remote, p.branch.as_deref(), &target)
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&serde_json::json!({
                     "path": created.to_string_lossy(),
                 }))

@@ -444,6 +444,41 @@ impl Repos {
         self.to_repo(&target).await
     }
 
+    /// Clone `url` into an explicit `target` directory (project import's git
+    /// mode). The caller picks the base and name; this only enforces the
+    /// "never overwrite" rule and the optional branch.
+    pub async fn clone_into(
+        &self,
+        url: &str,
+        branch: Option<&str>,
+        target: &Path,
+    ) -> Result<PathBuf, EngineError> {
+        let trimmed = url.trim();
+        if trimmed.is_empty() {
+            return Err(EngineError::Other("empty git remote".into()));
+        }
+        if target.exists() {
+            return Err(EngineError::Other(format!(
+                "Already exists: {}",
+                target.display()
+            )));
+        }
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let target_str = target.to_string_lossy().to_string();
+        let mut args: Vec<&str> = vec!["clone"];
+        if let Some(branch) = branch.filter(|b| !b.is_empty()) {
+            args.push("--branch");
+            args.push(branch);
+        }
+        args.push(trimmed);
+        args.push(&target_str);
+        self.git(&args, None).await?;
+        self.register(&target_str)?;
+        Ok(target.to_path_buf())
+    }
+
     /// `git init -b main` a fresh repository under `{data_dir}/repos`.
     pub async fn create(&self, name: &str) -> Result<Repo, EngineError> {
         let clean: String = name
@@ -1703,6 +1738,32 @@ mod tests {
             serde_json::from_str::<ProjectOpenTarget>("\"files\""),
             Ok(ProjectOpenTarget::Files)
         ));
+    }
+
+    #[tokio::test]
+    async fn clone_into_refuses_an_existing_target() {
+        let data = tempfile::tempdir().unwrap();
+        let repos = Repos::new(data.path(), "device");
+        let target = data.path().join("already-there");
+        std::fs::create_dir_all(&target).unwrap();
+        let err = repos
+            .clone_into("https://example.invalid/repo.git", None, &target)
+            .await
+            .expect_err("existing target must not be overwritten");
+        assert!(err.to_string().contains("Already exists"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn clone_into_rejects_an_empty_remote() {
+        let data = tempfile::tempdir().unwrap();
+        let repos = Repos::new(data.path(), "device");
+        let target = data.path().join("fresh");
+        let err = repos
+            .clone_into("   ", Some("main"), &target)
+            .await
+            .expect_err("empty remote must be refused");
+        assert!(err.to_string().contains("empty git remote"), "{err}");
+        assert!(!target.exists());
     }
 
     #[test]

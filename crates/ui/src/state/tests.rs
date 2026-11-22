@@ -955,6 +955,19 @@ fn workspace_device_for_prefers_local_then_the_envs_home_device() {
 }
 
 #[test]
+fn workspace_activity_is_recorded_and_cleared_per_workspace() {
+    let mut state = AppState::new();
+    state
+        .env_activity
+        .insert("env-1".into(), crate::state::WorkspaceActivity { busy: 2 });
+    // Another workspace's indicator is untouched, and rows are never merged.
+    assert_eq!(state.env_activity.get("env-1").map(|a| a.busy), Some(2));
+    assert_eq!(state.env_activity.get("env-2"), None);
+    state.env_activity.clear();
+    assert!(state.env_activity.is_empty());
+}
+
+#[test]
 fn active_workspace_host_is_empty_locally_and_names_the_server_remotely() {
     let mut state = AppState::new();
     state.active_workspace = komet_engine::environments::LOCAL_ENV_ID.to_string();

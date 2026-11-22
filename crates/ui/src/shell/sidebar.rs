@@ -598,7 +598,7 @@ impl Shell {
             } else {
                 icons::CLOUD
             };
-            let subline = if row.host.is_empty() {
+            let mut subline = if row.host.is_empty() {
                 format!(
                     "{} device{}",
                     row.device_count,
@@ -607,6 +607,12 @@ impl Shell {
             } else {
                 row.host.clone()
             };
+            // Cross-workspace activity: a count, never merged rows.
+            if let Some(activity) = self.state.read(cx).env_activity.get(&row.id)
+                && activity.busy > 0
+            {
+                subline.push_str(&format!(" · {} running", activity.busy));
+            }
             menu = menu.child(
                 popover::menu_row(theme, active, key.clone(), cx.entity_id())
                     .id(key)

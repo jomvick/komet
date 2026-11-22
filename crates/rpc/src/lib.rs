@@ -256,6 +256,10 @@ pub mod methods {
     pub const PROJECT_IMPORT_COMMIT: &str = "ProjectImportCommit";
     /// `{transferId}` — drop a staged archive/import.
     pub const PROJECT_TRANSFER_CANCEL: &str = "ProjectTransferCancel";
+    /// `{remote, branch?, basePath, name}` → `{path}`: git-mode import — the
+    /// destination clones the remote at the branch instead of receiving the
+    /// archive. No project bytes cross the wire.
+    pub const PROJECT_CLONE: &str = "ProjectClone";
     /// `{id}` — re-encode the pairing link for one environment: `{link}`. Only
     /// the engine holds the bearer (every other reply is redacted), so copying a
     /// link has to go through it.

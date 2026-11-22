@@ -147,6 +147,34 @@ impl Shell {
         }
     }
 
+    /// "Open in file manager" for a LOCAL project. The row only renders for a
+    /// local space (the files are on this machine); the call still targets this
+    /// machine's engine explicitly, never the displayed workspace's.
+    pub(crate) fn reveal_project_in_file_manager(&mut self, path: String, cx: &mut Context<Self>) {
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        let device = self.state.read(cx).local_device_id.clone();
+        cx.spawn(async move |_this, _cx| {
+            let mut params = serde_json::json!({
+                "repoPath": path,
+                "target": "files",
+            });
+            if let Some(device) = device
+                && let Some(object) = params.as_object_mut()
+            {
+                object.insert("targetDeviceId".into(), device.into());
+            }
+            if let Err(err) = engine.client().call(methods::OPEN_PROJECT, params).await {
+                tracing::warn!(error = %err, "could not reveal project in file manager");
+                // The menu already closed; a notification is the only surface
+                // left for a failed hand-off.
+                crate::notify::post("Could not open folder", &err.to_string());
+            }
+        })
+        .detach();
+    }
+
     pub(crate) fn context_space(&self, cx: &App) -> Option<Space> {
         let state = self.state.read(cx);
         let id = self

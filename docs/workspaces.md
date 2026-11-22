@@ -45,9 +45,15 @@ restent dans le workspace d'origine.
    par `.gitignore`, fichiers ressemblant à des secrets, remote/branche/état git et
    avertissements (projet volumineux, collision de casse macOS/Windows).
 2. **Destination** : dossier de base sur le workspace affiché + nom du projet.
-3. **Transfert** : archive `komet archive v1` construite dans un fichier de staging
-   sur la source, puis envoyée par morceaux de 1 Mio (`ProjectExportChunk` →
-   `ProjectImportChunk`). Le SHA-256 est vérifié avant toute extraction.
+3. **Transfert** : deux modes, choisis dans le dialogue.
+   - **Clone git** (par défaut quand le plan trouve un remote) : la destination
+     clone le remote elle-même à la branche annoncée (`ProjectClone` → `git clone
+     --branch`). Aucun octet de projet ne traverse le réseau, et l'état git est
+     exact. Limite assumée : le travail non commité ne suit pas.
+   - **Archive** (fallback, ou pour emporter le travail non commité) : archive
+     `komet archive v1` construite dans un fichier de staging sur la source, puis
+     envoyée par morceaux de 1 Mio (`ProjectExportChunk` → `ProjectImportChunk`).
+     Le SHA-256 est vérifié avant toute extraction.
 
 ### Sécurité
 
@@ -66,12 +72,18 @@ restent dans le workspace d'origine.
 
 `ProjectTransferPlan`, `ProjectExportOpen`, `ProjectExportChunk`,
 `ProjectImportBegin`, `ProjectImportChunk`, `ProjectImportCommit`,
-`ProjectTransferCancel` — toutes relayables avec `targetDeviceId`.
+`ProjectTransferCancel`, `ProjectClone` — toutes relayables avec `targetDeviceId`.
+Le clone comme l'extraction refusent un dossier existant (suffixe `-2`).
 
 ### Limites v1
 
-- Pas de mode « clone git » : l'archive est le seul transport pour l'instant (le
-  plan renvoie `gitReady` et le remote pour préparer ce mode).
+- Le mode clone git suppose que la destination sait s'authentifier sur le remote
+  (clé SSH/credential helper de l'hôte) ; sinon l'erreur de `git clone` est
+  remontée et l'archive reste disponible en un clic.
+- « Open in file manager » n'apparaît que pour un projet local : sur un workspace
+  distant les fichiers sont sur l'autre machine (headless).
+- Le switcher affiche un compteur d'activité (« · N running ») par workspace, lu
+  via un flux `WatchSessions` par workspace ; il n'fusionne jamais les listes.
 - Les chats ne suivent pas le projet.
 - La progression survit à la fermeture du dialogue mais le transfert est orchestré
   par le moteur local (pas encore de reprise après redémarrage).

@@ -451,6 +451,12 @@ impl Shell {
                 let body = if let Some(space) = context_space {
                     let rename_id = space.id.clone();
                     let delete_id = space.id.clone();
+                    // A file manager exists only where the files are. On a
+                    // paired (headless) workspace the row is hidden rather
+                    // than opening a folder on the wrong machine.
+                    let local_device = self.state.read(cx).local_device_id.clone();
+                    let space_is_local = local_device.as_deref() == Some(space.device_id.as_str());
+                    let reveal_path = space.path.clone();
                     div()
                         .flex()
                         .flex_col()
@@ -479,6 +485,27 @@ impl Shell {
                             .child(icon(icons::PEN).size(px(15.0)).text_color(theme.text_muted))
                             .child(SharedString::from("Rename…")),
                         )
+                        .when(space_is_local, |el| {
+                            el.child(
+                                popover::menu_row(
+                                    theme,
+                                    false,
+                                    "project-settings-reveal",
+                                    cx.entity_id(),
+                                )
+                                .id("project-settings-reveal")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.reveal_project_in_file_manager(reveal_path.clone(), cx);
+                                    this.close_spaces_menu(cx);
+                                }))
+                                .child(
+                                    icon(icons::FOLDER)
+                                        .size(px(15.0))
+                                        .text_color(theme.text_muted),
+                                )
+                                .child(SharedString::from("Open in file manager")),
+                            )
+                        })
                         .child(
                             popover::menu_row(
                                 theme,
