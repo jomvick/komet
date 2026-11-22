@@ -3815,6 +3815,7 @@ dependencies = [
  "futures",
  "komet-doc",
  "komet-proto",
+ "komet-sync",
  "loro",
  "loro-protocol",
  "reqwest",

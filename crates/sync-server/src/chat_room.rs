@@ -19,7 +19,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -61,6 +61,14 @@ static NEXT_ORIGIN: AtomicU64 = AtomicU64::new(1);
 
 /// A live chat2 hub. Rooms are opened lazily and kept for the process lifetime
 /// (reopening a sqlite file per frame would be pure overhead).
+/// A chat room with no socket attached is dropped from memory after this idle
+/// period; reopening re-reads everything from the chat database.
+const ROOM_IDLE_TTL: Duration = Duration::from_secs(10 * 60);
+
+/// Global ceiling on chat rooms held in memory. Only idle rooms are evicted to
+/// stay under it, so a room with attached sockets is never dropped.
+const MAX_ROOMS: usize = 512;
+
 #[derive(Clone)]
 pub struct ChatHub {
     data_dir: PathBuf,
@@ -82,6 +90,7 @@ impl ChatHub {
         if !chat_id_is_valid(chat_id) {
             return None;
         }
+        self.prune();
         let mut rooms = lock(&self.rooms);
         if let Some(room) = rooms.get(chat_id) {
             return Some(room.clone());
@@ -101,9 +110,34 @@ impl ChatHub {
             publish: Mutex::new(()),
             presence: Mutex::new(HashMap::new()),
             quotas: Mutex::new(HashMap::new()),
+            sockets: AtomicUsize::new(0),
+            last_seen: Mutex::new(Instant::now()),
         });
         rooms.insert(chat_id.to_string(), room.clone());
         Some(room)
+    }
+
+    /// Evict idle chat rooms (no attached socket) past the TTL and enforce the
+    /// ceiling. Safe while a socket holds an `Arc<ChatRoom>`: the room is only
+    /// dropped once its socket count is zero, and the data lives in sqlite.
+    pub(crate) fn prune(&self) {
+        let now = Instant::now();
+        let mut rooms = lock(&self.rooms);
+        rooms.retain(|_, room| {
+            room.sockets.load(Ordering::Relaxed) > 0
+                || now.duration_since(room.last_seen()) < ROOM_IDLE_TTL
+        });
+        while rooms.len() >= MAX_ROOMS {
+            let Some(oldest_idle) = rooms
+                .iter()
+                .filter(|(_, room)| room.sockets.load(Ordering::Relaxed) == 0)
+                .min_by_key(|(_, room)| room.last_seen())
+                .map(|(name, _)| name.clone())
+            else {
+                break;
+            };
+            rooms.remove(&oldest_idle);
+        }
     }
 }
 
@@ -137,6 +171,19 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// RAII socket lease on a chat room: decrements the socket count and refreshes
+/// `last_seen` when the connection ends, so idle eviction can reclaim it.
+struct SocketLease {
+    room: Arc<ChatRoom>,
+}
+
+impl Drop for SocketLease {
+    fn drop(&mut self) {
+        self.room.sockets.fetch_sub(1, Ordering::Relaxed);
+        *lock(&self.room.last_seen) = Instant::now();
+    }
+}
+
 /// One live chat room: its log, the fan-out channel, and the memory-only
 /// side tables.
 struct ChatRoom {
@@ -147,6 +194,10 @@ struct ChatRoom {
     publish: Mutex<()>,
     presence: Mutex<HashMap<String, i64>>,
     quotas: Mutex<HashMap<String, QuotaWindow>>,
+    /// Live sockets attached to this room (idle-eviction bookkeeping).
+    sockets: AtomicUsize,
+    /// Last moment a socket attached to (or left) this room.
+    last_seen: Mutex<Instant>,
 }
 
 /// What fan-out carries. `origin` identifies the emitting socket so its own
@@ -193,6 +244,18 @@ struct QuotaWindow {
 }
 
 impl ChatRoom {
+    /// Idle-eviction bookkeeping (single-writer: prune, eviction checks).
+    fn last_seen(&self) -> Instant {
+        *lock(&self.last_seen)
+    }
+
+    /// RAII attachment: bump the socket count while the connection lives.
+    fn attach_socket(self: &Arc<Self>) -> SocketLease {
+        self.sockets.fetch_add(1, Ordering::Relaxed);
+        *lock(&self.last_seen) = Instant::now();
+        SocketLease { room: self.clone() }
+    }
+
     fn admit_quota(&self, device: &str, bytes: usize) -> bool {
         let now = Instant::now();
         let key = if device.is_empty() {
@@ -272,16 +335,23 @@ pub(crate) async fn ws_handler(
     {
         return Err((StatusCode::UNAUTHORIZED, "unauthorized"));
     }
+    // Reserve the room BEFORE returning the upgrade response: an idle-prune
+    // tick between here and `serve` would otherwise drop the map entry, and the
+    // next `room()` would open a second `ChatLog` on the same database file.
+    // The lease is transferred into the socket task; if the upgrade never runs
+    // it is released by the closure being dropped.
     let Some(room) = state.chat.room(&chat_id) else {
         return Err((StatusCode::BAD_REQUEST, "invalid chat id"));
     };
+    let lease = room.attach_socket();
     let device = query_param(query.0.as_deref(), "device")
         .unwrap_or_default()
         .to_string();
-    Ok(ws.on_upgrade(move |socket| serve(room, device, socket)))
+    Ok(ws.on_upgrade(move |socket| serve(room, lease, device, socket)))
 }
 
-async fn serve(room: Arc<ChatRoom>, initial_device: String, socket: WebSocket) {
+async fn serve(room: Arc<ChatRoom>, lease: SocketLease, initial_device: String, socket: WebSocket) {
+    let _lease = lease;
     let origin = NEXT_ORIGIN.fetch_add(1, Ordering::Relaxed);
     let mut events = room.tx.subscribe();
     let (mut sender, mut receiver) = socket.split();
@@ -848,4 +918,61 @@ fn sidecar_put(
         return internal_error(err);
     }
     Json(serde_json::json!({"ok": true, "bytes": body.len()})).into_response()
+}
+
+#[cfg(test)]
+mod idle_eviction_tests {
+    use super::*;
+
+    // An idle room (no socket) is evicted past the TTL; a room with an
+    // attached socket survives the same age. Data stays in sqlite either way.
+    #[test]
+    fn idle_rooms_are_evicted_after_the_ttl() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let hub = ChatHub::new(dir.path().to_path_buf());
+        hub.room("chat-a").expect("room opens");
+        hub.room("chat-b").expect("room opens");
+        {
+            let rooms = lock(&hub.rooms);
+            assert_eq!(rooms.len(), 2);
+        }
+        // Age both rooms beyond the TTL, then attach a socket to chat-b.
+        for room in lock(&hub.rooms).values_mut() {
+            *lock(&room.last_seen) = Instant::now() - ROOM_IDLE_TTL - Duration::from_secs(60);
+        }
+        let lease = hub.room("chat-b").expect("room reopens").attach_socket();
+        hub.prune();
+        {
+            let rooms = lock(&hub.rooms);
+            assert!(!rooms.contains_key("chat-a"), "idle room should be evicted");
+            assert!(rooms.contains_key("chat-b"), "attached room must survive");
+        }
+        drop(lease);
+        hub.prune();
+        {
+            // Fresh again from the drop: both gone only after the TTL elapses.
+            let rooms = lock(&hub.rooms);
+            assert!(rooms.contains_key("chat-b"));
+        }
+    }
+
+    // The ceiling only ever claims idle rooms; a busy room is never dropped.
+    #[test]
+    fn the_ceiling_only_claims_idle_rooms() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let hub = ChatHub::new(dir.path().to_path_buf());
+        let lease = hub.room("busy").expect("room opens").attach_socket();
+        // Fill to the ceiling with idle rooms.
+        for i in 0..MAX_ROOMS {
+            hub.room(&format!("fill-{i}")).expect("room opens");
+        }
+        hub.prune();
+        let rooms = lock(&hub.rooms);
+        assert!(
+            rooms.contains_key("busy"),
+            "a room with a socket must survive the ceiling"
+        );
+        assert!(rooms.len() <= MAX_ROOMS);
+        drop(lease);
+    }
 }

@@ -16,13 +16,13 @@ pub mod net_path;
 pub mod registry;
 mod room;
 mod store;
+mod types;
 pub mod wake;
 
 pub use chat_client::{
     ChatClient, ChatDocSink, ChatEvent, ChatStatsSnapshot, ChatTuning, CheckpointFetcher,
 };
 pub use registry::{RegistryClient, RegistryEvent, RegistryTuning};
-pub use room::{
-    RoomClient, RoomEvent, RoomStatsSnapshot, RoomTuning, StaticUrl, SyncError, UrlProvider,
-};
+pub use room::{RoomClient, RoomEvent, RoomTuning};
 pub use store::{DocsStore, StoreError};
+pub use types::{RoomStatsSnapshot, StaticUrl, SyncError, UrlProvider};

@@ -128,13 +128,94 @@ pub struct Room {
     pub registry: Option<Arc<std::sync::Mutex<RegistryRoom>>>,
     /// Registry text frames, broadcast to every registry socket in the room.
     pub registry_tx: broadcast::Sender<String>,
+    /// Live sockets attached to this room (relay + registry), shared with the
+    /// socket leases so a decrement never needs the room-map lock. Idle rooms
+    /// are evicted from memory after a TTL — their data lives on in sqlite.
+    pub sockets: Arc<std::sync::atomic::AtomicUsize>,
+    /// Last moment a socket attached to (or left) this room.
+    pub last_seen: Arc<std::sync::Mutex<std::time::Instant>>,
+}
+
+/// A room with no socket attached is dropped from memory after this idle
+/// period; reopening re-reads everything from the room database.
+const ROOM_IDLE_TTL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// Global ceiling on relay/registry rooms held in memory. Only idle rooms are
+/// evicted to stay under it, so a room with attached sockets is never dropped.
+const MAX_ROOMS: usize = 512;
+
+/// Drop idle rooms past the TTL and enforce the ceiling (oldest idle first).
+fn room_sockets(room: &Room) -> usize {
+    room.sockets.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn room_last_seen(room: &Room) -> std::time::Instant {
+    *room
+        .last_seen
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn prune_rooms(rooms: &mut HashMap<String, Room>) {
+    let now = std::time::Instant::now();
+    rooms.retain(|_, room| {
+        room_sockets(room) > 0 || now.duration_since(room_last_seen(room)) < ROOM_IDLE_TTL
+    });
+    while rooms.len() >= MAX_ROOMS {
+        let Some(oldest_idle) = rooms
+            .iter()
+            .filter(|(_, room)| room_sockets(room) == 0)
+            .min_by_key(|(_, room)| room_last_seen(room))
+            .map(|(name, _)| name.clone())
+        else {
+            break;
+        };
+        rooms.remove(&oldest_idle);
+    }
+}
+
+/// RAII socket lease on a room. It holds the room's shared counters, so the
+/// decrement is lock-free bookkeeping — lock contention on the room map can
+/// never lose it (the old `try_write` silently dropped the decrement, leaving
+/// a stale count that kept an idle room resident until process exit).
+struct RoomLease {
+    sockets: Arc<std::sync::atomic::AtomicUsize>,
+    last_seen: Arc<std::sync::Mutex<std::time::Instant>>,
+}
+
+impl RoomLease {
+    /// Reserve a socket on `room` and return the lease; take it while holding
+    /// the room-map lock so a prune tick cannot evict the room in between.
+    fn reserve(room: &Room) -> Self {
+        room.sockets
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        *room
+            .last_seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = std::time::Instant::now();
+        Self {
+            sockets: room.sockets.clone(),
+            last_seen: room.last_seen.clone(),
+        }
+    }
+}
+
+impl Drop for RoomLease {
+    fn drop(&mut self) {
+        self.sockets
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        *self
+            .last_seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = std::time::Instant::now();
+    }
 }
 
 fn new_room(data_dir: &std::path::Path, room: &str) -> Room {
+    // The `frames` table is created on demand in `handle_socket` — registry
+    // rooms (`/registry`) never store relay frames, so creating the table here
+    // left a dead table behind in their databases.
     let path = room_db_path(data_dir, room);
-    if let Err(err) = open_room_db(&path) {
-        tracing::warn!(room, %err, "could not initialise room database");
-    }
     let (tx, _) = broadcast::channel(1024);
     let (registry_tx, _) = broadcast::channel(1024);
     Room {
@@ -142,6 +223,8 @@ fn new_room(data_dir: &std::path::Path, room: &str) -> Room {
         db_path: path,
         registry: None,
         registry_tx,
+        sockets: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        last_seen: Arc::new(std::sync::Mutex::new(std::time::Instant::now())),
     }
 }
 
@@ -176,11 +259,19 @@ fn room_db_path(data_dir: &std::path::Path, room: &str) -> PathBuf {
     dir.join(format!("{safe}-{tag}.db"))
 }
 
+pub(crate) fn open_conn(path: &std::path::Path) -> rusqlite::Result<rusqlite::Connection> {
+    let conn = rusqlite::Connection::open(path)?;
+    conn.pragma_update(None, "journal_mode", "WAL")?;
+    conn.pragma_update(None, "synchronous", "NORMAL")?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    Ok(conn)
+}
+
 fn open_room_db(path: &std::path::Path) -> rusqlite::Result<rusqlite::Connection> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).ok();
     }
-    let conn = rusqlite::Connection::open(path)?;
+    let conn = open_conn(path)?;
     conn.execute(
         "CREATE TABLE IF NOT EXISTS frames (id INTEGER PRIMARY KEY AUTOINCREMENT, data BLOB NOT NULL)",
         [],
@@ -369,12 +460,15 @@ fn check_query_token(state: &AppState, query: Option<&str>) -> bool {
 }
 
 async fn handle_socket(state: AppState, room: String, socket: WebSocket) {
-    let (tx, db_path) = {
+    let (tx, db_path, _lease) = {
         let mut rooms = state.rooms.write().await;
+        prune_rooms(&mut rooms);
         let entry = rooms
             .entry(room.clone())
             .or_insert_with(|| new_room(&state.data_dir, &room));
-        (entry.tx.clone(), entry.db_path.clone())
+        // Reserved under the map lock, released by the lease on drop.
+        let lease = RoomLease::reserve(entry);
+        (entry.tx.clone(), entry.db_path.clone(), lease)
     };
     // Subscribe before reading history: a frame persisted in between is then
     // delivered twice (CRDT updates are idempotent) instead of being lost.
@@ -457,8 +551,9 @@ async fn handle_socket(state: AppState, room: String, socket: WebSocket) {
 /// resync after a lag or a reconnect; `push` merges ops under the server's LWW and
 /// answers with `ack`, broadcasting the winning rows to every client in the room.
 async fn handle_registry_socket(state: AppState, room: String, socket: WebSocket) {
-    let (registry, registry_tx) = {
+    let (registry, registry_tx, _lease) = {
         let mut rooms = state.rooms.write().await;
+        prune_rooms(&mut rooms);
         let entry = rooms
             .entry(room.clone())
             .or_insert_with(|| new_room(&state.data_dir, &room));
@@ -467,13 +562,19 @@ async fn handle_registry_socket(state: AppState, room: String, socket: WebSocket
                 Ok(opened) => entry.registry = Some(Arc::new(std::sync::Mutex::new(opened))),
                 Err(err) => {
                     tracing::error!(room = %room, error = %err, "registry room open failed");
+                    // No socket attached yet, so nothing to release: the room
+                    // simply stays idle and is pruned later.
                     return;
                 }
             }
         }
+        // Only after the room initialized successfully: a failed open must not
+        // leave a stray socket count behind.
+        let lease = RoomLease::reserve(entry);
         (
             entry.registry.clone().expect("opened above"),
             entry.registry_tx.clone(),
+            lease,
         )
     };
     let mut rx = registry_tx.subscribe();
@@ -600,6 +701,39 @@ fn registry_frame(
 /// with a dot, which rules out `.` and `..`. The final check also catches a
 /// Windows drive prefix such as `C:name`, which `join` would treat as a new root.
 fn blob_path(data_dir: &std::path::Path, chat: &str, part: &str) -> Option<PathBuf> {
+    let chat_dir = data_dir.join("blobs").join(chat);
+    blob_name_valid(chat, part)?;
+    let path = chat_dir.join(encode_part(part));
+    path.starts_with(&chat_dir).then_some(path)
+}
+
+/// Legacy layout: blobs written before the encoding was introduced keep the
+/// raw id as the file name. Only read paths fall back to it.
+fn blob_path_legacy(data_dir: &std::path::Path, chat: &str, part: &str) -> Option<PathBuf> {
+    let chat_dir = data_dir.join("blobs").join(chat);
+    blob_name_valid(chat, part)?;
+    let path = chat_dir.join(part);
+    path.starts_with(&chat_dir).then_some(path)
+}
+
+/// Filename-safe spelling of a part id. `:` is illegal in Windows file names
+/// (and `C:name` reads as a drive), so every byte outside a conservative set is
+/// percent-encoded. The URL keeps the raw id; the mapping is reversible.
+fn encode_part(part: &str) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(part.len());
+    for byte in part.bytes() {
+        match byte {
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'.' | b'_' | b'-' => out.push(byte as char),
+            _ => {
+                let _ = write!(out, "%{byte:02X}");
+            }
+        }
+    }
+    out
+}
+
+fn blob_name_valid(chat: &str, part: &str) -> Option<()> {
     let chat_valid = (1..=128).contains(&chat.len())
         && chat
             .bytes()
@@ -609,12 +743,7 @@ fn blob_path(data_dir: &std::path::Path, chat: &str, part: &str) -> Option<PathB
         && part
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"._:#~-".contains(&b));
-    if !(chat_valid && part_valid) {
-        return None;
-    }
-    let chat_dir = data_dir.join("blobs").join(chat);
-    let path = chat_dir.join(part);
-    path.starts_with(&chat_dir).then_some(path)
+    (chat_valid && part_valid).then_some(())
 }
 
 async fn get_blob(
@@ -628,10 +757,17 @@ async fn get_blob(
     let Some(path) = blob_path(&state.data_dir, &chat, &part) else {
         return Err((StatusCode::BAD_REQUEST, "invalid blob path"));
     };
-    match tokio::fs::read(&path).await {
-        Ok(b) => Ok(b.into_response()),
-        Err(_) => Err((StatusCode::NOT_FOUND, "not_found")),
+    if let Ok(b) = tokio::fs::read(&path).await {
+        return Ok(b.into_response());
     }
+    // Blobs stored before the filename encoding existed.
+    if let Some(legacy) = blob_path_legacy(&state.data_dir, &chat, &part)
+        && legacy != path
+        && let Ok(b) = tokio::fs::read(&legacy).await
+    {
+        return Ok(b.into_response());
+    }
+    Err((StatusCode::NOT_FOUND, "not_found"))
 }
 
 async fn put_blob(
@@ -649,12 +785,31 @@ async fn put_blob(
     if let Some(dir) = path.parent() {
         let _ = tokio::fs::create_dir_all(dir).await;
     }
-    match tokio::fs::write(&path, &body).await {
+    // Atomic write: temp file in the same directory + rename, so an interrupted
+    // upload never leaves a truncated blob behind (the old temp may be a
+    // partial write; the rename either happens fully or not at all).
+    let tmp = path.with_extension(format!(
+        "{}.tmp-{}",
+        path.extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or_default(),
+        uuid::Uuid::new_v4()
+    ));
+    match tokio::fs::write(&tmp, &body).await {
+        Ok(_) => {}
+        Err(e) => {
+            tracing::warn!(chat, part, error = %e, "blob upload: temp write failed");
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, "blob write failed"));
+        }
+    }
+    match tokio::fs::rename(&tmp, &path).await {
         Ok(_) => Ok(Json(serde_json::json!({"ok":true, "bytes": body.len()})).into_response()),
-        Err(e) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Box::leak(e.to_string().into_boxed_str()) as &str,
-        )),
+        Err(e) => {
+            tracing::warn!(chat, part, error = %e, "blob upload: rename failed");
+            let _ = tokio::fs::remove_file(&tmp).await;
+            Err((StatusCode::INTERNAL_SERVER_ERROR, "blob write failed"))
+        }
     }
 }
 
@@ -741,6 +896,17 @@ pub async fn serve_listener_with_identity(
         chat: ChatHub::new(data_dir),
         identity,
     };
+    // Idle-room reaper: relay/registry rooms and chat2 rooms with no socket
+    // are evicted from memory after the TTL; their data stays in sqlite.
+    let reaper_rooms = state.rooms.clone();
+    let reaper_chat = state.chat.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            prune_rooms(&mut *reaper_rooms.write().await);
+            reaper_chat.prune();
+        }
+    });
     axum::serve(listener, router(state)).await?;
     Ok(())
 }
@@ -869,6 +1035,47 @@ mod tests {
             let body = get.into_body().collect().await.unwrap().to_bytes();
             assert_eq!(&body[..], b"output");
         }
+    }
+
+    // Windows rejects `:` in file names, and the client's part ids contain it.
+    #[tokio::test]
+    async fn blob_files_are_filesystem_safe_and_legacy_names_still_read() {
+        let root = tempfile::tempdir().unwrap();
+        let app = router(test_state(root.path()));
+        let chat = "0b7f1c4e-9d2a-4e55-8a61-3c9f0e2d7b11";
+        let part = "toolu_01ABC:call#1";
+        let uri = format!("/blob/{chat}/{}", part.replace('#', "%23"));
+        let put = app
+            .clone()
+            .oneshot(request(Method::PUT, &uri, "output"))
+            .await
+            .unwrap();
+        assert_eq!(put.status(), StatusCode::OK);
+
+        let chat_dir = root.path().join("blobs").join(chat);
+        let names: Vec<String> = std::fs::read_dir(&chat_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["toolu_01ABC%3Acall%231".to_string()]);
+
+        // A blob written under the old raw name keeps serving.
+        let legacy_chat = "1b7f1c4e-9d2a-4e55-8a61-3c9f0e2d7b11";
+        let legacy_dir = root.path().join("blobs").join(legacy_chat);
+        std::fs::create_dir_all(&legacy_dir).unwrap();
+        std::fs::write(legacy_dir.join(part), b"legacy").unwrap();
+        let get = app
+            .clone()
+            .oneshot(request(
+                Method::GET,
+                &format!("/blob/{legacy_chat}/{}", part.replace('#', "%23")),
+                "",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(get.status(), StatusCode::OK);
+        let body = get.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"legacy");
     }
 
     // Finding 2: a server must never start without a real token.
@@ -1021,5 +1228,76 @@ mod tests {
         // The override is persisted, so the next boot without it keeps the identity.
         let reloaded = load_or_create_identity_with(dir.path(), None, None, None).unwrap();
         assert_eq!(reloaded, overridden);
+    }
+
+    fn idle_room() -> Room {
+        new_room(tempfile::tempdir().unwrap().path(), "test-room")
+    }
+
+    #[test]
+    fn relay_rooms_are_evicted_when_idle_and_kept_while_attached() {
+        let mut rooms = HashMap::new();
+        let attached = idle_room();
+        attached
+            .sockets
+            .store(2, std::sync::atomic::Ordering::Relaxed);
+        let old_idle = idle_room();
+        *old_idle.last_seen.lock().unwrap() =
+            std::time::Instant::now() - ROOM_IDLE_TTL - std::time::Duration::from_secs(60);
+        rooms.insert("attached".into(), attached);
+        rooms.insert("old-idle".into(), old_idle);
+        rooms.insert("fresh-idle".into(), idle_room());
+
+        prune_rooms(&mut rooms);
+        assert!(rooms.contains_key("attached"));
+        assert!(
+            !rooms.contains_key("old-idle"),
+            "idle past TTL must be evicted"
+        );
+        assert!(rooms.contains_key("fresh-idle"));
+    }
+
+    #[test]
+    fn the_relay_room_ceiling_only_claims_idle_rooms() {
+        let mut rooms = HashMap::new();
+        let attached = idle_room();
+        attached
+            .sockets
+            .store(1, std::sync::atomic::Ordering::Relaxed);
+        rooms.insert("attached".into(), attached);
+        for i in 0..MAX_ROOMS {
+            rooms.insert(format!("fill-{i}"), idle_room());
+        }
+        prune_rooms(&mut rooms);
+        assert!(rooms.contains_key("attached"));
+        assert!(rooms.len() <= MAX_ROOMS);
+    }
+
+    // A registry room (`/registry`) must not get a relay `frames` table: the
+    // table is created on demand in `handle_socket` only.
+    #[test]
+    fn registry_rooms_do_not_create_a_frames_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path());
+        let room = "chat-1";
+        let db_path = {
+            let mut rooms = state.rooms.blocking_write();
+            rooms
+                .entry(room.to_string())
+                .or_insert_with(|| new_room(&state.data_dir, room))
+                .db_path
+                .clone()
+        };
+        let opened = RegistryRoom::open(&db_path).expect("registry room opens");
+        drop(opened);
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let tables: Vec<String> = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table'")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(!tables.contains(&"frames".to_string()), "{tables:?}");
     }
 }

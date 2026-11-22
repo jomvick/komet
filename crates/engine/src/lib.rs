@@ -226,6 +226,10 @@ impl EngineCore {
         // marker) before any store opens, then arm the panic hook. Every
         // construction path funnels through here.
         crash_shield::install(data_dir);
+        // OS network-path monitor (macOS NWPathMonitor; no-op elsewhere): the
+        // instant the path returns, every parked reconnect backoff redials —
+        // daemon and embedded mode funnel through this assembly.
+        komet_sync::net_path::spawn_path_monitor();
         tracing::info!(
             elapsed_ms = assembly_start.elapsed().as_millis(),
             "crash shield installed"

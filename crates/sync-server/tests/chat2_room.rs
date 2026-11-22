@@ -691,3 +691,106 @@ async fn nudge_queues_for_an_offline_host_and_replays_on_join() {
     assert_eq!(invalid.0, StatusCode::BAD_REQUEST);
     assert_eq!(json_body(&invalid.2)["error"], "bad_chat_id");
 }
+
+// --- Phase 1: atomic blob upload, diff sidecar route -------------------------
+
+// An interrupted upload must never leave a truncated blob behind: the write
+// lands in a same-directory temp file and is renamed, so a reader either sees
+// the previous blob or the complete new one — never a partial file.
+#[tokio::test]
+async fn blob_upload_is_atomic_and_leaves_no_temp_file_behind() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let server = start_server(&root.path().join("data")).await;
+    let app = router(server.state.clone());
+
+    let body = b"checkpoint-body".repeat(16);
+    let (status, _, _) = http(
+        &app,
+        Method::PUT,
+        "/blob/chat-1/checkpoint",
+        &[],
+        body.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (_, _, fetched) = http(&app, Method::GET, "/blob/chat-1/checkpoint", &[], vec![]).await;
+    assert_eq!(fetched, body, "blob readable after upload");
+
+    let blobs = root.path().join("data").join("blobs").join("chat-1");
+    let names: Vec<String> = std::fs::read_dir(&blobs)
+        .expect("blob dir exists")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, vec!["checkpoint"], "no temp files left behind");
+
+    // A stale temp file from a crashed previous upload does not break (or get
+    // adopted by) the next upload, and the new content replaces the blob.
+    let stale = blobs.join("checkpoint.tmp-stale");
+    std::fs::write(&stale, b"partial-from-a-crash").expect("stale tmp");
+    let replacement = b"replacement".to_vec();
+    let (status, _, _) = http(
+        &app,
+        Method::PUT,
+        "/blob/chat-1/checkpoint",
+        &[],
+        replacement.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, _, fetched) = http(&app, Method::GET, "/blob/chat-1/checkpoint", &[], vec![]).await;
+    assert_eq!(fetched, replacement);
+}
+
+// The engine's diff_sync publishes `PUT {edge}/chat2/{chatId}/diff`; a publish
+// receives a 2xx and the sidecar is readable back.
+#[tokio::test]
+async fn diff_sidecar_publish_receives_a_2xx() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let server = start_server(&root.path().join("data")).await;
+    let app = router(server.state.clone());
+    let sidecar = serde_json::json!({
+        "chatId": CHAT, "deviceId": "dev-1", "checkoutPath": "/repo",
+        "branch": "main", "headSha": "abc", "patch": "diff...",
+        "files": [], "additions": 1, "deletions": 0, "truncated": false,
+        "publishedAt": 0
+    });
+
+    let (status, _, body) = http(
+        &app,
+        Method::PUT,
+        &format!("/chat2/{CHAT}/diff"),
+        &[("content-type", "application/json".to_string())],
+        serde_json::to_vec(&sidecar).expect("sidecar json"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "diff publish is accepted with a 2xx"
+    );
+    assert_eq!(json_body(&body)["ok"], true);
+
+    let (status, _, fetched) = http(
+        &app,
+        Method::GET,
+        &format!("/chat2/{CHAT}/diff"),
+        &[],
+        vec![],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "diff readable back");
+    assert!(!fetched.is_empty());
+
+    // And the unauthorized case is refused.
+    let builder = Request::builder()
+        .method(Method::PUT)
+        .uri(format!("/chat2/{CHAT}/diff"))
+        .header("content-type", "application/json");
+    let response = app
+        .oneshot(builder.body(Body::from("{}")).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
