@@ -21,10 +21,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, watch};
-use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use crate::{RpcClient, RpcError, RpcService, serve_connection};
 
@@ -46,16 +44,15 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Text `"ping"` keepalive — answered by the DO's hibernation-safe auto-response
-/// pair (`edge/src/device-room.ts`) without waking it.
-///
-/// 15s, not 30: a laptop's uplink (corporate proxy, VPN split-tunnel extension,
-/// consumer NAT) can reap an idle flow well inside a minute, and a keepalive
-/// that races the reaper loses. The frame is 4 bytes and never wakes the DO, so
-/// the only cost of halving the interval is that the host stays reachable.
-const PING_INTERVAL: Duration = Duration::from_secs(15);
+/// The shared transport pump sends a text `"ping"` every 15s — answered by
+/// the DO's hibernation-safe auto-response pair (`edge/src/device-room.ts`)
+/// without waking it. 15s, not 30: a laptop's uplink (corporate proxy, VPN
+/// split-tunnel extension, consumer NAT) can reap an idle flow well inside a
+/// minute, and a keepalive that races the reaper loses. The frame is 4 bytes
+/// and never wakes the DO, so the only cost of halving the interval is that
+/// the host stays reachable.
 /// Silence lease: every ping elicits an auto-pong, so a healthy socket sees
-/// inbound traffic at least once per `PING_INTERVAL`. No inbound frame for a
+/// inbound traffic at least once per keepalive interval. No inbound frame for a
 /// couple of intervals plus grace = dead socket (half-open TCP after NAT
 /// timeout or sleep/wake) — drop it and reconnect instead of waiting on a TCP
 /// write error. Must stay well under the relay's own host-liveness window
@@ -404,54 +401,14 @@ async fn host_session(
         .await
         .map_err(|e| RpcError::Transport(format!("device room unreachable: {e}")))?;
     tracing::info!("device-room: host connected");
-    let (mut sink, mut stream) = ws.split();
-    // All writers (per-conn pumps) funnel through one outbound queue → one socket writer.
-    let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(256);
+    // Shared transport pump owns the ws sink/stream, the "ping" keepalive and
+    // the silence lease; `pipe.tx` is the single outbound queue every per-conn
+    // pump funnels through.
+    let mut pipe = komet_sync::transport::binary_pipe(ws, SILENCE_LEASE);
     let mut conns: HashMap<String, VirtualConn> = HashMap::new();
-    let mut ping = tokio::time::interval(PING_INTERVAL);
-    ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    ping.tick().await; // consume the immediate first tick
-    let mut last_rx = tokio::time::Instant::now();
 
-    loop {
-        tokio::select! {
-            frame = out_rx.recv() => match frame {
-                Some(bytes) => {
-                    if sink.send(WsMessage::Binary(bytes)).await.is_err() {
-                        break;
-                    }
-                }
-                None => break, // unreachable: we hold out_tx
-            },
-            message = stream.next() => match message {
-                Some(Ok(WsMessage::Binary(bytes))) => {
-                    last_rx = tokio::time::Instant::now();
-                    handle_host_frame(&bytes, &mut conns, service, &out_tx, on_nudge).await;
-                }
-                Some(Ok(WsMessage::Close(frame))) => {
-                    if let Some(frame) = frame {
-                        tracing::info!(code = %frame.code, reason = %frame.reason,
-                            "device-room: host socket closed by relay");
-                    }
-                    break;
-                }
-                Some(Err(_)) | None => break,
-                // Text "pong" / control frames: proof of life for the lease.
-                Some(Ok(_)) => last_rx = tokio::time::Instant::now(),
-            },
-            _ = ping.tick() => {
-                if let Err(err) = sink.send(WsMessage::Text("ping".into())).await {
-                    // The usual way a silently-reaped uplink surfaces: reads
-                    // saw nothing, the keepalive write is what finds the body.
-                    tracing::warn!(error = %err, "device-room: host keepalive failed; reconnecting");
-                    break;
-                }
-            }
-            _ = tokio::time::sleep_until(last_rx + SILENCE_LEASE) => {
-                tracing::warn!("device-room: host socket silent past lease; reconnecting");
-                break;
-            }
-        }
+    while let Some(bytes) = pipe.rx.recv().await {
+        handle_host_frame(&bytes, &mut conns, service, &pipe.tx, on_nudge).await;
     }
     // Dropping the conns aborts every per-client dispatch loop (terminals etc. reaped).
     conns.clear();
@@ -531,16 +488,15 @@ impl DeviceLink {
         let ws = komet_sync::dial::connect_ws(url)
             .await
             .map_err(|e| RpcError::Transport(format!("device room unreachable: {e}")))?;
-        let (mut sink, mut stream) = ws.split();
+        // Shared transport pump owns the ws sink/stream, the "ping" keepalive
+        // and the silence lease; this task only marshals RPC text ⇄ device
+        // frames and names the drop reason for `closed_rx`.
+        let mut pipe = komet_sync::transport::binary_pipe(ws, SILENCE_LEASE);
         let (out_tx, mut out_rx) = mpsc::channel::<String>(256);
         let (in_tx, in_rx) = mpsc::channel::<String>(256);
         let (closed_tx, closed_rx) = watch::channel::<Option<String>>(None);
 
         let pump = tokio::spawn(async move {
-            let mut ping = tokio::time::interval(PING_INTERVAL);
-            ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            ping.tick().await; // consume the immediate first tick
-            let mut last_rx = tokio::time::Instant::now();
             let reason = loop {
                 tokio::select! {
                     frame = out_rx.recv() => match frame {
@@ -553,52 +509,36 @@ impl DeviceLink {
                                     continue;
                                 }
                             };
-                            if sink.send(WsMessage::Binary(encoded)).await.is_err() {
+                            if pipe.tx.send(encoded).await.is_err() {
                                 break "connection lost".to_string();
                             }
                         }
-                        None => {
-                            let _ = sink.send(WsMessage::Close(None)).await;
-                            break "closed".to_string();
-                        }
+                        // RpcClient dropped: dropping `pipe` makes the transport
+                        // pump send the WS close frame.
+                        None => break "closed".to_string(),
                     },
-                    message = stream.next() => match message {
-                        Some(Ok(WsMessage::Binary(bytes))) => {
-                            last_rx = tokio::time::Instant::now();
-                            match decode_device_frame(&bytes) {
-                                Ok((header, payload)) if header.k == RELAY_KIND => {
-                                    // host_offline / host_closed: surface as link-down.
-                                    let code = relay_error_code(&payload)
-                                        .unwrap_or_else(|| "relay error".into());
-                                    tracing::info!(%code, "device-room: link down");
-                                    break code;
-                                }
-                                Ok((header, payload)) if header.k == RPC_KIND => {
-                                    let text = String::from_utf8_lossy(&payload).into_owned();
-                                    if in_tx.send(text).await.is_err() {
-                                        break "client dropped".to_string();
-                                    }
-                                }
-                                Ok(_) => {}
-                                Err(err) => {
-                                    tracing::warn!(error = %err, "device-room: malformed frame");
+                    bytes = pipe.rx.recv() => match bytes {
+                        Some(bytes) => match decode_device_frame(&bytes) {
+                            Ok((header, payload)) if header.k == RELAY_KIND => {
+                                // host_offline / host_closed: surface as link-down.
+                                let code = relay_error_code(&payload)
+                                    .unwrap_or_else(|| "relay error".into());
+                                tracing::info!(%code, "device-room: link down");
+                                break code;
+                            }
+                            Ok((header, payload)) if header.k == RPC_KIND => {
+                                let text = String::from_utf8_lossy(&payload).into_owned();
+                                if in_tx.send(text).await.is_err() {
+                                    break "client dropped".to_string();
                                 }
                             }
-                        }
-                        Some(Ok(WsMessage::Close(_))) | Some(Err(_)) | None => {
-                            break "connection lost".to_string();
-                        }
-                        // Text "pong" / control frames: proof of life for the lease.
-                        Some(Ok(_)) => last_rx = tokio::time::Instant::now(),
+                            Ok(_) => {}
+                            Err(err) => {
+                                tracing::warn!(error = %err, "device-room: malformed frame");
+                            }
+                        },
+                        None => break "connection lost".to_string(),
                     },
-                    _ = ping.tick() => {
-                        if sink.send(WsMessage::Text("ping".into())).await.is_err() {
-                            break "connection lost".to_string();
-                        }
-                    }
-                    _ = tokio::time::sleep_until(last_rx + SILENCE_LEASE) => {
-                        break "silent past lease".to_string();
-                    }
                 }
             };
             // Dropping in_tx ends the RpcClient reader → pending calls fail Closed.
