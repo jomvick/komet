@@ -104,6 +104,14 @@ pub(crate) struct WorkspaceMemory {
     pub(crate) no_project: bool,
 }
 
+/// Live cross-workspace activity shown beside a device row. Read-only and
+/// deliberately tiny: the switcher shows a count without merging any list.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WorkspaceActivity {
+    /// Sessions currently working or awaiting input in that workspace.
+    pub busy: usize,
+}
+
 /// Host part of a sync server URL, for the switcher's sub-label.
 pub fn url_host(url: &str) -> String {
     let Some(rest) = url.split_once("://").map(|(_, rest)| rest) else {

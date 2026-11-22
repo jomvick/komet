@@ -6,10 +6,75 @@ use komet_proto::{Device, EngineInfo, Environment};
 use komet_rpc::methods;
 
 use super::{
-    AppState, EngineHandle, WatchOwner, WorkspaceEntry, WorkspaceMemory, WorkspaceStatus,
-    spawn_chats_watch, spawn_transcript_watch, spawn_watch, url_host, workspace_home_device,
-    workspace_version,
+    AppState, EngineHandle, WatchOwner, WorkspaceActivity, WorkspaceEntry, WorkspaceMemory,
+    WorkspaceStatus, spawn_chats_watch, spawn_transcript_watch, spawn_watch, url_host,
+    workspace_home_device, workspace_version,
 };
+
+/// Pump the device and session streams of one workspace until either ends.
+/// Device frames rebuild the workspace's rows; session frames only refresh the
+/// switcher's busy count.
+async fn discover_streams(
+    this: &gpui::WeakEntity<AppState>,
+    cx: &mut gpui::AsyncApp,
+    env_id: &str,
+    client: &std::sync::Arc<komet_rpc::RpcClient>,
+    devices: &mut tokio::sync::mpsc::Receiver<serde_json::Value>,
+    sessions: &mut Option<tokio::sync::mpsc::Receiver<serde_json::Value>>,
+) {
+    loop {
+        let device_value = devices.recv();
+        let session_value = async {
+            match sessions {
+                Some(rx) => rx.recv().await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::select! {
+            value = device_value => {
+                let Some(value) = value else { return };
+                match serde_json::from_value::<Vec<Device>>(value) {
+                    Ok(devices) => {
+                        let client = client.clone();
+                        let alive = this.update(cx, |state, cx| {
+                            state.env_clients.insert(env_id.to_string(), client);
+                            state.record_workspace_devices(env_id, devices, cx);
+                        });
+                        if alive.is_err() {
+                            return;
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!(%env_id, error = %err, "dropping malformed device frame");
+                    }
+                }
+            }
+            value = session_value => {
+                let Some(value) = value else { return };
+                let Ok(sessions) = serde_json::from_value::<Vec<komet_proto::Session>>(value) else {
+                    continue;
+                };
+                let busy = sessions
+                    .iter()
+                    .filter(|session| {
+                        matches!(
+                            session.status,
+                            komet_proto::SessionStatus::Working
+                                | komet_proto::SessionStatus::AwaitingInput
+                        )
+                    })
+                    .count();
+                let alive = this.update(cx, |state, cx| {
+                    state.record_workspace_activity(env_id, busy, cx);
+                });
+                if alive.is_err() {
+                    return;
+                }
+            }
+            else => return,
+        }
+    }
+}
 
 impl AppState {
     // ---- paired-device workspaces ----
@@ -117,6 +182,7 @@ impl AppState {
 
     /// Drop a removed device's connection, pumps, rows and navigation memory.
     fn forget_workspace(&mut self, env_id: &str) {
+        self.env_activity.remove(env_id);
         self.env_presence.remove(env_id);
         self.env_clients.remove(env_id);
         self.env_devices.remove(env_id);
@@ -135,6 +201,7 @@ impl AppState {
         self.env_clients.clear();
         self.env_devices.clear();
         self.env_memory.clear();
+        self.env_activity.clear();
         self.workspaces.clear();
         self.paired_envs.clear();
         self.env_list_synced = false;
@@ -176,6 +243,14 @@ impl AppState {
                         continue;
                     }
                 };
+                // ONE extra lightweight stream per workspace for the
+                // switcher's indicator (busy count). It never merges rows into
+                // this workspace's lists; both streams share the connection,
+                // so they end together and the outer loop re-dials.
+                let sessions = client
+                    .subscribe(methods::WATCH_SESSIONS, serde_json::json!({}))
+                    .await
+                    .ok();
                 match client
                     .subscribe(methods::WATCH_DEVICES, serde_json::json!({}))
                     .await
@@ -190,24 +265,8 @@ impl AppState {
                         }
                     }
                     Ok(mut rx) => {
-                        while let Some(value) = rx.recv().await {
-                            match serde_json::from_value::<Vec<Device>>(value) {
-                                Ok(devices) => {
-                                    let client = client.clone();
-                                    let alive = this.update(cx, |state, cx| {
-                                        state.env_clients.insert(env_id.clone(), client);
-                                        state.record_workspace_devices(&env_id, devices, cx);
-                                    });
-                                    if alive.is_err() {
-                                        return;
-                                    }
-                                }
-                                Err(err) => {
-                                    tracing::warn!(%env_id, error = %err, "dropping malformed device frame");
-                                }
-                            }
-                        }
-                        tracing::debug!(%env_id, "device stream ended; re-dialing");
+                        let mut sessions = sessions;
+                        discover_streams(&this, cx, &env_id, &client, &mut rx, &mut sessions).await;
                         if this
                             .update(cx, |state, cx| state.handle_workspace_lost(&env_id, cx))
                             .is_err()
@@ -220,6 +279,20 @@ impl AppState {
             }
         });
         self.env_presence.insert(task_env_id, task);
+    }
+
+    /// Store one workspace's activity counts for the switcher's dot/subline.
+    pub(crate) fn record_workspace_activity(
+        &mut self,
+        env_id: &str,
+        busy: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let activity = WorkspaceActivity { busy };
+        if self.env_activity.get(env_id) != Some(&activity) {
+            self.env_activity.insert(env_id.to_string(), activity);
+            cx.notify();
+        }
     }
 
     /// Device rows of one paired workspace. This machine is a controller there,
@@ -276,18 +349,19 @@ impl AppState {
         if self.active_workspace == env_id && (is_local || self.display_engine.is_some()) {
             return;
         }
+        // Remember EVERY workspace, this computer included: leaving Fedora for
+        // the VPS and coming back must land on the same project/chat, not on
+        // the freshly-cleared defaults.
         let outgoing = self.active_workspace.clone();
-        if outgoing != LOCAL_ENV_ID {
-            self.env_memory.insert(
-                outgoing,
-                WorkspaceMemory {
-                    selected_space: self.selected_space.clone(),
-                    selected_device: self.selected_device.clone(),
-                    selected_chat: self.selected_chat.clone(),
-                    no_project: self.no_project,
-                },
-            );
-        }
+        self.env_memory.insert(
+            outgoing,
+            WorkspaceMemory {
+                selected_space: self.selected_space.clone(),
+                selected_device: self.selected_device.clone(),
+                selected_chat: self.selected_chat.clone(),
+                no_project: self.no_project,
+            },
+        );
         self.stop_workspace_watches();
         self.data_tasks.clear();
         self.transcript_task = None;
@@ -295,6 +369,12 @@ impl AppState {
         self.clear_lists();
         if is_local {
             self.local_device_id = self.home_device_id.clone();
+            if let Some(memory) = self.env_memory.get(&env_id) {
+                self.selected_space = memory.selected_space.clone();
+                self.selected_device = memory.selected_device.clone();
+                self.selected_chat = memory.selected_chat.clone();
+                self.no_project = memory.no_project;
+            }
             self.start_local_data_watches(cx);
         } else {
             // Warm rows mean the composer can target that machine before its

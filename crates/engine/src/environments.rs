@@ -117,6 +117,11 @@ impl EnvironmentStore {
         {
             return AddOutcome::Existing(existing.id.clone());
         }
+        // Two paired servers named "komet VPS" would make the switcher's rows
+        // indistinguishable; suffix the newcomer rather than refusing the
+        // pairing (the label is cosmetic — the id, url and token are the
+        // identity).
+        env.label = unique_label(&self.envs, &env.id, &env.label);
         self.envs.retain(|e| e.id != env.id);
         self.envs.push(env);
         AddOutcome::Added
@@ -133,6 +138,28 @@ impl EnvironmentStore {
             .ok_or(EnvStoreError::NotFound)?;
         Ok(self.envs.remove(index))
     }
+}
+
+/// `label`, or "label (2)", "label (3)"… — the first free one among the OTHER
+/// environments. The local workspace's label is not in this store, so the UI
+/// compares against it separately; a duplicate there is harmless (different
+/// namespaces) but the suffix keeps the switcher readable either way.
+fn unique_label(envs: &[Environment], own_id: &str, label: &str) -> String {
+    let taken = |candidate: &str| {
+        envs.iter()
+            .filter(|e| e.id != own_id)
+            .any(|e| e.label.eq_ignore_ascii_case(candidate))
+    };
+    if label.is_empty() || !taken(label) {
+        return label.to_string();
+    }
+    for n in 2..1000 {
+        let candidate = format!("{label} ({n})");
+        if !taken(&candidate) {
+            return candidate;
+        }
+    }
+    format!("{label} ({})", uuid::Uuid::new_v4())
 }
 
 fn normalize(env: &mut Environment) {
@@ -172,6 +199,32 @@ mod tests {
             namespace: None,
             added_at_ms: 1,
         }
+    }
+
+    #[test]
+    fn duplicate_labels_get_a_suffix_instead_of_colliding() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = EnvironmentStore::load(dir.path()).unwrap();
+        let mut first = env("a", "https://one.example", "t1");
+        first.label = "komet VPS".into();
+        assert_eq!(store.upsert(first), AddOutcome::Added);
+
+        let mut second = env("b", "https://two.example", "t2");
+        second.label = "komet vps".into(); // case-insensitive collision
+        assert_eq!(store.upsert(second), AddOutcome::Added);
+        let labels: Vec<&str> = store.list().iter().map(|e| e.label.as_str()).collect();
+        assert!(labels.contains(&"komet VPS"), "{labels:?}");
+        assert!(labels.contains(&"komet vps (2)"), "{labels:?}");
+
+        // Re-pairing the SAME environment keeps its own label (a refresh must
+        // not rename it against itself).
+        let mut third = env("c", "https://one.example", "t1");
+        third.label = "komet VPS".into();
+        assert!(matches!(store.upsert(third), AddOutcome::Existing(_)));
+        assert_eq!(
+            store.list().iter().find(|e| e.id == "a").unwrap().label,
+            "komet VPS"
+        );
     }
 
     #[test]

@@ -99,6 +99,14 @@ fn origin_label(origin: komet_harness::ext::Origin) -> &'static str {
     }
 }
 
+/// Params carrying the workspace's owning device, when it has one.
+fn target_param(device: &Option<String>) -> serde_json::Value {
+    match device {
+        Some(device) => serde_json::json!({ "targetDeviceId": device }),
+        None => serde_json::json!({}),
+    }
+}
+
 impl ExtensionsPage {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let mut page = Self {
@@ -132,10 +140,14 @@ impl ExtensionsPage {
         };
         self.status = None;
         self.status_is_error = false;
+        // The overlay belongs to ONE machine: a settings page open in a paired
+        // workspace must show (and edit) that machine's agents, not this one's.
+        let target = self.state.read(cx).active_workspace_device();
         self.refresh_task = Some(cx.spawn(async move |this, cx| {
+            let params = target_param(&target);
             let result = engine
                 .client()
-                .call(methods::LIST_HARNESS_EXTENSIONS, serde_json::json!({}))
+                .call(methods::LIST_HARNESS_EXTENSIONS, params)
                 .await
                 .map_err(|error| error.to_string())
                 .and_then(|value| {
@@ -177,13 +189,19 @@ impl ExtensionsPage {
         let Some(entry) = self.entries.get(entry_ix) else {
             return;
         };
-        let params = serde_json::json!({
+        let target = self.state.read(cx).active_workspace_device();
+        let mut params = serde_json::json!({
             "kind": entry.item.kind.as_str(),
             "origin": entry.item.origin.as_str(),
             "harness": agent_slug,
             "id": entry.item.id,
             "enabled": enabled,
         });
+        if let Some(device) = &target
+            && let Some(object) = params.as_object_mut()
+        {
+            object.insert("targetDeviceId".into(), device.clone().into());
+        }
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             self.set_status("The local engine is unavailable.", true);
             cx.notify();
@@ -196,7 +214,7 @@ impl ExtensionsPage {
                 .await;
             let list = engine
                 .client()
-                .call(methods::LIST_HARNESS_EXTENSIONS, serde_json::json!({}))
+                .call(methods::LIST_HARNESS_EXTENSIONS, target_param(&target))
                 .await
                 .ok()
                 .and_then(|value| serde_json::from_value::<Vec<ExtEntry>>(value).ok());

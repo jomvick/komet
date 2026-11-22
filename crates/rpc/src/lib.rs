@@ -236,6 +236,30 @@ pub mod methods {
     pub const REMOVE_ENVIRONMENT: &str = "RemoveEnvironment";
     /// `{link}` — decode only, for the paste preview: `{label, url}`.
     pub const PREVIEW_ENVIRONMENT: &str = "PreviewEnvironment";
+    // Project transfer — copy one project folder between workspaces (this
+    // machine ⇄ a paired one, or between two paired ones). Device-local: the
+    // folder, the archive and the checksum all live on the addressed device.
+    /// `{path}` → plan preview (files, bytes, ignored files, secrets, git
+    /// state, warnings). Nothing is written.
+    pub const PROJECT_TRANSFER_PLAN: &str = "ProjectTransferPlan";
+    /// `{path, includeSecrets}` → `{transferId, files, bytes, sha256}`: build
+    /// the archive in a staging file and announce it.
+    pub const PROJECT_EXPORT_OPEN: &str = "ProjectExportOpen";
+    /// `{transferId, offset, maxBytes?}` → `{data, nextOffset, done}`.
+    pub const PROJECT_EXPORT_CHUNK: &str = "ProjectExportChunk";
+    /// `{name, bytes, sha256}` → `{transferId}`: reserve a staging file.
+    pub const PROJECT_IMPORT_BEGIN: &str = "ProjectImportBegin";
+    /// `{transferId, offset, data}` → `{received}` (idempotent per range).
+    pub const PROJECT_IMPORT_CHUNK: &str = "ProjectImportChunk";
+    /// `{transferId, basePath, name}` → `{path}`: verify, extract safely, and
+    /// return the created folder (the caller registers the space).
+    pub const PROJECT_IMPORT_COMMIT: &str = "ProjectImportCommit";
+    /// `{transferId}` — drop a staged archive/import.
+    pub const PROJECT_TRANSFER_CANCEL: &str = "ProjectTransferCancel";
+    /// `{remote, branch?, basePath, name}` → `{path}`: git-mode import — the
+    /// destination clones the remote at the branch instead of receiving the
+    /// archive. No project bytes cross the wire.
+    pub const PROJECT_CLONE: &str = "ProjectClone";
     /// `{id}` — re-encode the pairing link for one environment: `{link}`. Only
     /// the engine holds the bearer (every other reply is redacted), so copying a
     /// link has to go through it.

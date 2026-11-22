@@ -42,8 +42,8 @@ mod runtime;
 mod workspaces;
 
 pub use engine::{
-    EngineBootConfig, EngineHandle, EngineMode, ThreadCompactions, WorkspaceEntry, WorkspaceStatus,
-    url_host,
+    EngineBootConfig, EngineHandle, EngineMode, ThreadCompactions, WorkspaceActivity,
+    WorkspaceEntry, WorkspaceStatus, url_host,
 };
 pub(crate) use engine::{
     WatchOwner, WorkspaceMemory, wait_for_deferred_engine, workspace_home_device, workspace_version,
@@ -179,6 +179,9 @@ pub struct AppState {
     env_presence: HashMap<String, Task<()>>,
     /// Device rows of the paired devices, kept warm for status and switching.
     env_devices: HashMap<String, Vec<Device>>,
+    /// Live activity per paired workspace (busy session count), for the
+    /// switcher's indicator. Never merges rows across workspaces.
+    pub env_activity: HashMap<String, WorkspaceActivity>,
     /// Per-device navigation memory (space/device/chat selection).
     env_memory: HashMap<String, WorkspaceMemory>,
     /// The `WatchEnvironments` stream of the local engine.
@@ -295,6 +298,7 @@ impl AppState {
             env_watches: Vec::new(),
             env_presence: HashMap::new(),
             env_devices: HashMap::new(),
+            env_activity: HashMap::new(),
             env_memory: HashMap::new(),
             workspaces_task: None,
             update: None,

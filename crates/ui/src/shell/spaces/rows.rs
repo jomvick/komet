@@ -362,6 +362,12 @@ impl Shell {
                             SpacesMenuRow::AddSpace => {
                                 (row.clone(), "New project…".into(), None, false)
                             }
+                            SpacesMenuRow::ImportProject => (
+                                row.clone(),
+                                "Import project…".into(),
+                                Some("copy from another workspace".into()),
+                                false,
+                            ),
                         })
                         .collect()
                 };
@@ -378,12 +384,12 @@ impl Shell {
                             let is_selected = match &row {
                                 SpacesMenuRow::All => filter.is_none(),
                                 SpacesMenuRow::Space(id) => filter.as_deref() == Some(id.as_str()),
-                                SpacesMenuRow::AddSpace => false,
+                                SpacesMenuRow::AddSpace | SpacesMenuRow::ImportProject => false,
                             };
-                            let leading = if matches!(row, SpacesMenuRow::AddSpace) {
-                                icons::PLUS
-                            } else {
-                                icons::FOLDER
+                            let leading = match row {
+                                SpacesMenuRow::AddSpace => icons::PLUS,
+                                SpacesMenuRow::ImportProject => icons::ARCHIVE_MINIMALISTIC,
+                                _ => icons::FOLDER,
                             };
                             let activate = row.clone();
                             popover::menu_row_nav(
@@ -445,6 +451,13 @@ impl Shell {
                 let body = if let Some(space) = context_space {
                     let rename_id = space.id.clone();
                     let delete_id = space.id.clone();
+                    // A file manager exists only where the files are: the row
+                    // is hidden on a paired (headless) workspace instead of
+                    // opening a folder on another machine. `local_device_id`
+                    // follows the displayed workspace, so the predicate uses
+                    // `home_device_id` — and matches the keyboard mapping.
+                    let space_is_local = self.project_is_local(cx);
+                    let reveal_path = space.path.clone();
                     div()
                         .flex()
                         .flex_col()
@@ -473,6 +486,27 @@ impl Shell {
                             .child(icon(icons::PEN).size(px(15.0)).text_color(theme.text_muted))
                             .child(SharedString::from("Rename…")),
                         )
+                        .when(space_is_local, |el| {
+                            el.child(
+                                popover::menu_row(
+                                    theme,
+                                    false,
+                                    "project-settings-reveal",
+                                    cx.entity_id(),
+                                )
+                                .id("project-settings-reveal")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.reveal_project_in_file_manager(reveal_path.clone(), cx);
+                                    this.close_spaces_menu(cx);
+                                }))
+                                .child(
+                                    icon(icons::FOLDER)
+                                        .size(px(15.0))
+                                        .text_color(theme.text_muted),
+                                )
+                                .child(SharedString::from("Open in file manager")),
+                            )
+                        })
                         .child(
                             popover::menu_row(
                                 theme,
