@@ -150,6 +150,11 @@ pub fn build_claude_settings_maps(
         "failIfUnavailable".into(),
         Value::Bool(c.fail_if_unavailable),
     );
+    // Claude Code gates the whole sandbox on `sandbox.enabled` (default
+    // false) — without this key every restriction above is dead config
+    // and commands run unsandboxed through the regular permission flow.
+    // `enabled: false` never reaches this function (filtered upstream).
+    sandbox.insert("enabled".into(), Value::Bool(true));
 
     if let Some(extra) = c.settings_permissions.as_object() {
         for (k, v) in extra {

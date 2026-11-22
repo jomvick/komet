@@ -43,6 +43,8 @@ pub(crate) enum SpacesMenuRow {
     All,
     Space(String),
     AddSpace,
+    /// "Import project…": copy a folder from another workspace.
+    ImportProject,
 }
 
 /// The space-row Rename dialog (same shape as [`RenameChatDialog`]).
@@ -95,8 +97,11 @@ pub(super) struct RemoteFolderBrowser {
     list_scroll: gpui::ScrollHandle,
 }
 
+pub(super) use import::ImportDialog;
+
 mod add;
 mod browse;
 mod edit;
+mod import;
 mod menu;
 mod rows;

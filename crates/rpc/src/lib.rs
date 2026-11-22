@@ -45,6 +45,15 @@ pub mod methods {
     /// Flip a harness's enablement on the target device (Settings → Agents);
     /// replies with the device's fresh `ListHarnesses` catalog.
     pub const SET_HARNESS_ENABLED: &str = "SetHarnessEnabled";
+    /// Agent-native extension inventory (skills / MCP servers / plugins found
+    /// in each agent's own config files, read-only) merged with the komet
+    /// overlay's effective enabled state per agent. No params; IPC-only.
+    pub const LIST_HARNESS_EXTENSIONS: &str = "ListHarnessExtensions";
+    /// Set or clear the komet overlay decision for one
+    /// `(kind, harness, id)` extension — agent config files are never
+    /// written. Params `{kind, harness, id, enabled}`; `enabled: null`
+    /// clears the entry so the agent-native default applies again.
+    pub const SET_HARNESS_EXTENSION_ENABLED: &str = "SetHarnessExtensionEnabled";
     pub const LIST_MODELS: &str = "ListModels";
     pub const LIST_COMMANDS: &str = "ListCommands";
     pub const QUEUE_COMMAND: &str = "QueueCommand";
@@ -236,6 +245,30 @@ pub mod methods {
     pub const REMOVE_ENVIRONMENT: &str = "RemoveEnvironment";
     /// `{link}` — decode only, for the paste preview: `{label, url}`.
     pub const PREVIEW_ENVIRONMENT: &str = "PreviewEnvironment";
+    // Project transfer — copy one project folder between workspaces (this
+    // machine ⇄ a paired one, or between two paired ones). Device-local: the
+    // folder, the archive and the checksum all live on the addressed device.
+    /// `{path}` → plan preview (files, bytes, ignored files, secrets, git
+    /// state, warnings). Nothing is written.
+    pub const PROJECT_TRANSFER_PLAN: &str = "ProjectTransferPlan";
+    /// `{path, includeSecrets}` → `{transferId, files, bytes, sha256}`: build
+    /// the archive in a staging file and announce it.
+    pub const PROJECT_EXPORT_OPEN: &str = "ProjectExportOpen";
+    /// `{transferId, offset, maxBytes?}` → `{data, nextOffset, done}`.
+    pub const PROJECT_EXPORT_CHUNK: &str = "ProjectExportChunk";
+    /// `{name, bytes, sha256}` → `{transferId}`: reserve a staging file.
+    pub const PROJECT_IMPORT_BEGIN: &str = "ProjectImportBegin";
+    /// `{transferId, offset, data}` → `{received}` (idempotent per range).
+    pub const PROJECT_IMPORT_CHUNK: &str = "ProjectImportChunk";
+    /// `{transferId, basePath, name}` → `{path}`: verify, extract safely, and
+    /// return the created folder (the caller registers the space).
+    pub const PROJECT_IMPORT_COMMIT: &str = "ProjectImportCommit";
+    /// `{transferId}` — drop a staged archive/import.
+    pub const PROJECT_TRANSFER_CANCEL: &str = "ProjectTransferCancel";
+    /// `{remote, branch?, basePath, name}` → `{path}`: git-mode import — the
+    /// destination clones the remote at the branch instead of receiving the
+    /// archive. No project bytes cross the wire.
+    pub const PROJECT_CLONE: &str = "ProjectClone";
     /// `{id}` — re-encode the pairing link for one environment: `{link}`. Only
     /// the engine holds the bearer (every other reply is redacted), so copying a
     /// link has to go through it.
@@ -280,6 +313,10 @@ pub enum RpcError {
     UnknownMethod(String),
     #[error("bad params: {0}")]
     BadParams(String),
+    /// The request is well-formed but this engine/agent cannot honor it
+    /// (e.g. an overlay toggle for an agent with no launch mediation).
+    #[error("unsupported: {0}")]
+    Unsupported(String),
     #[error("{0}")]
     Failed(String),
     #[error("transport: {0}")]

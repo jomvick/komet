@@ -127,3 +127,23 @@ pub fn supports_dynamic_mcp(id: HarnessId) -> (bool, &'static str) {
 pub fn supports_dynamic_mcp_bool(id: HarnessId) -> bool {
     supports_dynamic_mcp(id).0
 }
+
+/// True where komet can mediate the agent's NATIVE `mcpServers` config at
+/// launch — applying per-agent overlay enable/disable decisions without
+/// writing the agent's files:
+/// - Claude Code: `--strict-mcp-config` + merged `--mcp-config` document;
+/// - OpenCode: `OPENCODE_CONFIG_CONTENT` disable list;
+/// - Codex: `-c mcp_servers.<name>.enabled=<bool>` per-run overrides.
+///
+/// Returns `(supported, reason)`; `reason` is a human-readable explanation
+/// (French) for UI when unsupported. Agents without a mediation path must
+/// surface read-only extension rows rather than silent no-op toggles.
+pub fn mediates_native_mcp(id: HarnessId) -> (bool, &'static str) {
+    match id {
+        HarnessId::ClaudeCode | HarnessId::Opencode | HarnessId::Codex => (true, ""),
+        _ => (
+            false,
+            "komet ne peut pas modifier la config MCP native de cet agent",
+        ),
+    }
+}

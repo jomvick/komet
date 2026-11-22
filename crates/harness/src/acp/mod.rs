@@ -206,7 +206,8 @@ fn opencode_native_mcp_names(
     cwd: &str,
     extra_env: &[(String, String)],
     explicitly_enabled: &BTreeSet<String>,
-) -> Result<Vec<String>, HarnessError> {
+    overlay_enabled: &BTreeSet<String>,
+) -> Result<(Vec<String>, Vec<String>), HarnessError> {
     let mut paths = BTreeSet::new();
     let custom_config = extra_env
         .iter()
@@ -268,15 +269,48 @@ fn opencode_native_mcp_names(
             collect_opencode_mcp_names(&contents, key, &mut names)?;
         }
     }
-    Ok(opencode_mcp_names_to_disable(names, explicitly_enabled))
+    Ok(opencode_mcp_names_and_enables(
+        names,
+        explicitly_enabled,
+        overlay_enabled,
+    ))
 }
 
-fn opencode_mcp_names_to_disable(
+/// Native MCP names to disable for this launch: everything configured minus
+/// (a) servers komet injects itself (`explicitly_enabled`) and (b) servers the
+/// user explicitly switched on in the komet ext overlay (`overlay_enabled`).
+/// Absence of an overlay entry keeps the historical posture — native configs
+/// stay off unless komet or the user turns them on.
+/// `(disabled, reenabled)`: every configured native is disabled unless
+/// komet injects it or the overlay explicitly enabled it — and an
+/// overlay-enabled name that the user's own config marked `disabled` needs
+/// an explicit `disabled:false` override, since merely leaving it out of the
+/// disable list cannot re-enable it (OpenCode V2 has no `enabled` field).
+fn opencode_mcp_names_and_enables(
     mut configured: BTreeSet<String>,
     explicitly_enabled: &BTreeSet<String>,
-) -> Vec<String> {
-    configured.retain(|name| !explicitly_enabled.contains(name));
-    configured.into_iter().collect()
+    overlay_enabled: &BTreeSet<String>,
+) -> (Vec<String>, Vec<String>) {
+    // Komet-injected names are excluded: komet supplies its own definition
+    // for them, so re-enabling the native entry would only duplicate it.
+    let reenabled = configured
+        .intersection(overlay_enabled)
+        .filter(|name| !explicitly_enabled.contains(*name))
+        .cloned()
+        .collect::<Vec<_>>();
+    configured.retain(|name| !explicitly_enabled.contains(name) && !overlay_enabled.contains(name));
+    (configured.into_iter().collect(), reenabled)
+}
+
+/// MCP server names the user enabled for OpenCode in the komet ext overlay.
+/// The overlay keys on the OpenCode agent even when the consumer is Devin:
+/// the *source* of these configs is opencode's own config files.
+fn opencode_overlay_enabled_mcp() -> BTreeSet<String> {
+    crate::ext::load_overlay().explicitly_enabled(
+        crate::ext::ExtKind::McpServer,
+        crate::ext::Origin::External,
+        HarnessId::Opencode,
+    )
 }
 
 fn collect_opencode_mcp_names(
@@ -1462,8 +1496,16 @@ impl AcpHarness {
                 None => std::env::current_dir().map_err(HarnessError::Io)?,
             };
             let enabled: BTreeSet<String> = enabled_mcp_names.iter().cloned().collect();
-            let disabled = opencode_native_mcp_names(&cwd.to_string_lossy(), extra_env, &enabled)?;
-            if let Some(content) = opencode_perms::opencode_mcp_disable_document(&disabled) {
+            let overlay_enabled = opencode_overlay_enabled_mcp();
+            let (disabled, reenabled) = opencode_native_mcp_names(
+                &cwd.to_string_lossy(),
+                extra_env,
+                &enabled,
+                &overlay_enabled,
+            )?;
+            if let Some(content) =
+                opencode_perms::opencode_mcp_toggle_document(&disabled, &reenabled)
+            {
                 cmd.env("OPENCODE_CONFIG_CONTENT", content);
             }
         }
@@ -1525,7 +1567,16 @@ impl AcpHarness {
             if commands.is_empty() {
                 let cwd = cwd.to_string_lossy();
                 let session = client
-                    .request("session/new", build_acp_session_params(&cwd, None, vec![]))
+                    .request(
+                        "session/new",
+                        build_acp_session_params(
+                            &cwd,
+                            None,
+                            vec![],
+                            self.spec.id,
+                            &crate::ext::load_overlay(),
+                        ),
+                    )
                     .await;
                 if session.is_ok() {
                     // The update usually arrives within milliseconds of the
@@ -1605,7 +1656,16 @@ impl AcpHarness {
                 .map(|h| h.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "/".into());
             let session = client
-                .request("session/new", build_acp_session_params(&cwd, None, vec![]))
+                .request(
+                    "session/new",
+                    build_acp_session_params(
+                        &cwd,
+                        None,
+                        vec![],
+                        self.spec.id,
+                        &crate::ext::load_overlay(),
+                    ),
+                )
                 .await?;
             let mut models = models_from_session(&session, &(self.spec.models)());
             // Sync with the real CLI: the wire list omits the CLI's own
@@ -2308,12 +2368,18 @@ impl Harness for AcpHarness {
             Vec::new()
         };
         let enabled_mcp_set: BTreeSet<String> = enabled_mcp_names.iter().cloned().collect();
-        let disabled_native_mcp = if matches!(self.spec.id, HarnessId::Opencode | HarnessId::Devin)
-        {
-            opencode_native_mcp_names(&request.cwd, &controls.env, &enabled_mcp_set)?
-        } else {
-            Vec::new()
-        };
+        let (disabled_native_mcp, reenabled_native_mcp) =
+            if matches!(self.spec.id, HarnessId::Opencode | HarnessId::Devin) {
+                let overlay_enabled = opencode_overlay_enabled_mcp();
+                opencode_native_mcp_names(
+                    &request.cwd,
+                    &controls.env,
+                    &enabled_mcp_set,
+                    &overlay_enabled,
+                )?
+            } else {
+                (Vec::new(), Vec::new())
+            };
 
         // The per-run overlay preserves OpenCode permissions and disables MCP
         // servers from native configs without changing those files. Devin also
@@ -2330,9 +2396,10 @@ impl Harness for AcpHarness {
                 {
                     let dir = tempfile::tempdir().map_err(HarnessError::Io)?;
                     let path = dir.path().join("opencode.json");
-                    let doc = opencode_perms::opencode_config_document_with_disabled_mcp(
+                    let doc = opencode_perms::opencode_config_document_with_mcp_overlay(
                         perms,
                         &disabled_native_mcp,
+                        &reenabled_native_mcp,
                     );
                     std::fs::write(&path, doc).map_err(HarnessError::Io)?;
                     // C1: opt-in sandbox-runtime — write sandbox.json alongside overlay
@@ -2355,8 +2422,10 @@ impl Harness for AcpHarness {
                     }
                     (Some(dir), Some(path))
                 } else if self.spec.id == HarnessId::Devin
-                    && let Some(doc) =
-                        opencode_perms::opencode_mcp_disable_document(&disabled_native_mcp)
+                    && let Some(doc) = opencode_perms::opencode_mcp_toggle_document(
+                        &disabled_native_mcp,
+                        &reenabled_native_mcp,
+                    )
                 {
                     let dir = tempfile::tempdir().map_err(HarnessError::Io)?;
                     let path = dir.path().join("opencode.json");
@@ -2554,11 +2623,30 @@ fn mcp_servers(injection: Option<&komet_proto::McpInjection>) -> Vec<Value> {
 /// Build `session/new` params merging internal `komet` MCP + external resolved servers.
 /// Transport handling: Http→type http, Sse→type sse, Stdio→name/command/args/env.
 /// Always includes `env: []` for opencode 1.18.25+.
+///
+/// `agent` is the running harness and `overlay` the ext overlay to apply:
+/// komet-managed externals (`Origin::Komet`) the user disabled for that agent
+/// are filtered out here — the overlay is the only place that decision
+/// lives, agent configs are never written. The overlay is a parameter (not
+/// loaded inside) so tests can pass an empty fixture.
 pub fn build_acp_session_params(
     cwd: &str,
     internal: Option<komet_proto::McpInjection>,
     externals: Vec<komet_proto::ResolvedMcpServer>,
+    agent: HarnessId,
+    overlay: &crate::ext::ExtOverlay,
 ) -> Value {
+    let externals = externals
+        .into_iter()
+        .filter(|ext| {
+            overlay.decision(
+                crate::ext::ExtKind::McpServer,
+                crate::ext::Origin::Komet,
+                agent,
+                &ext.config.id,
+            ) != Some(false)
+        })
+        .collect::<Vec<_>>();
     let mut servers = mcp_servers(internal.as_ref());
     for ext in externals {
         match ext.config.transport {
@@ -4050,6 +4138,8 @@ async fn run_session(session: Session) {
             &request.cwd,
             request.mcp.clone(),
             request.mcp_external.clone(),
+            harness,
+            &crate::ext::load_overlay(),
         );
         let (session_id, session_response) = if let Some(resume) = &request.resume {
             let mut load = session_params.clone();
@@ -5708,10 +5798,33 @@ mod tests {
             &mut names,
         )
         .expect("valid legacy config");
-        assert_eq!(
-            opencode_mcp_names_to_disable(names, &BTreeSet::from(["supabase".to_owned()])),
-            vec!["legacy-server".to_owned()]
+        let (disabled, reenabled) = opencode_mcp_names_and_enables(
+            names,
+            &BTreeSet::from(["supabase".to_owned()]),
+            &BTreeSet::new(),
         );
+        assert_eq!(disabled, vec!["legacy-server".to_owned()]);
+        assert!(reenabled.is_empty());
+    }
+
+    #[test]
+    fn opencode_overlay_enabled_native_mcp_survives_disable_list() {
+        let configured = BTreeSet::from([
+            "supabase".to_owned(),
+            "convex".to_owned(),
+            "vercel".to_owned(),
+        ]);
+        // supabase: komet-injected → never disabled. convex: user enabled in
+        // the overlay → survives AND gets an explicit re-enable override (its
+        // native config may mark it disabled). vercel: no overlay entry →
+        // disabled.
+        let (disabled, reenabled) = opencode_mcp_names_and_enables(
+            configured,
+            &BTreeSet::from(["supabase".to_owned()]),
+            &BTreeSet::from(["convex".to_owned()]),
+        );
+        assert_eq!(disabled, vec!["vercel".to_owned()]);
+        assert_eq!(reenabled, vec!["convex".to_owned()]);
     }
 
     #[test]

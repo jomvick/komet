@@ -34,6 +34,7 @@ pub mod archived;
 pub mod browser;
 pub mod composer;
 pub mod devices;
+pub mod extensions;
 pub mod files;
 pub mod general;
 pub mod integrations;
@@ -128,6 +129,14 @@ pub struct UiSettings {
     /// Sidebar session filter: a space id, or `None` for the Project tree.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub space_filter: Option<String>,
+    /// The standing project filter of every workspace the user visited
+    /// (workspace id -> space id). `space_filter` is the live value for the
+    /// ACTIVE workspace; this map is what makes leaving and re-entering a
+    /// workspace restore its own pick instead of the other one's — a filter
+    /// pointing at a project that only exists on another machine would
+    /// otherwise hide every row here.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub space_filters: HashMap<String, String>,
     /// The workspace the sidebar was showing (device id), restored once that
     /// device is paired and reachable again. `None`/`"local"` = this computer.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -271,6 +280,7 @@ impl Default for UiSettings {
             last_session_by_device: HashMap::new(),
             open_tabs: None,
             space_filter: None,
+            space_filters: HashMap::new(),
             active_workspace: None,
             tab_order: std::collections::HashMap::new(),
             space_order: Vec::new(),
@@ -623,6 +633,10 @@ mod tests {
             ]),
             open_tabs: Some(vec!["b".to_string(), "a".to_string()]),
             space_filter: Some("space-1".into()),
+            space_filters: HashMap::from([
+                ("local".to_string(), "space-1".to_string()),
+                ("env-1".to_string(), "space-2".to_string()),
+            ]),
             tab_order: std::collections::HashMap::from([(
                 "space-1".to_string(),
                 vec!["b".to_string(), "a".to_string()],

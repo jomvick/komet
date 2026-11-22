@@ -28,6 +28,7 @@ pub mod local_import;
 pub mod mcp;
 pub mod memory;
 pub mod profile;
+pub mod project_transfer;
 pub mod registry;
 pub mod repos;
 pub mod rpc;
@@ -146,6 +147,9 @@ pub struct EngineCore {
     harness_cli_checker: harness_cli::HarnessCliChecker,
     /// Local→synced profile import (account-scoped runtimes only).
     pub local_import: Option<local_import::LocalImporter>,
+    /// Project-transfer staging (`ProjectTransfer*`): archives and imports land
+    /// under `<data_dir>/transfers/` and never in a project folder directly.
+    pub transfers: Arc<project_transfer::TransferStore>,
     workspace_scope: WorkspaceScope,
     /// Auth service (attached by [`Engine::run`]; a lazy dev-mode instance otherwise).
     auth: std::sync::Mutex<Option<Auth>>,
@@ -478,6 +482,7 @@ impl EngineCore {
             )),
             device_id,
             harness_cli_checker,
+            transfers: Arc::new(project_transfer::TransferStore::open(data_dir)?),
             local_import,
             workspace_scope: profile.scope(),
             auth: std::sync::Mutex::new(None),
@@ -612,6 +617,7 @@ impl EngineCore {
         )
         .with_auth(self.auth())
         .with_mcp(self.mcp_registry.clone(), self.mcp_secrets.clone())
+        .with_transfers(self.transfers.clone())
         .with_environments(self.envs.clone());
         if let Some(links) = self.links() {
             rpc = rpc.with_links(links);
@@ -653,6 +659,7 @@ impl EngineCore {
             self.workspace_scope,
         )
         .with_mcp(self.mcp_registry.clone(), self.mcp_secrets.clone())
+        .with_transfers(self.transfers.clone())
         .with_environment(id);
         if let Some(links) = self.envs.links(id) {
             rpc = rpc.with_links(links);

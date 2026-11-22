@@ -794,7 +794,7 @@ fn nav_settings_sections_are_distinct_entries() {
 
 #[test]
 fn settings_sections_general_first_ten_entries() {
-    assert_eq!(SettingsSection::ALL.len(), 10);
+    assert_eq!(SettingsSection::ALL.len(), 11);
     assert_eq!(SettingsSection::ALL[0], SettingsSection::General);
     assert_eq!(SettingsSection::General.label(), "General");
     assert!(SettingsSection::ALL.contains(&SettingsSection::Providers));
