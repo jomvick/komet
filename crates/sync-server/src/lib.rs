@@ -701,6 +701,39 @@ fn registry_frame(
 /// with a dot, which rules out `.` and `..`. The final check also catches a
 /// Windows drive prefix such as `C:name`, which `join` would treat as a new root.
 fn blob_path(data_dir: &std::path::Path, chat: &str, part: &str) -> Option<PathBuf> {
+    let chat_dir = data_dir.join("blobs").join(chat);
+    blob_name_valid(chat, part)?;
+    let path = chat_dir.join(encode_part(part));
+    path.starts_with(&chat_dir).then_some(path)
+}
+
+/// Legacy layout: blobs written before the encoding was introduced keep the
+/// raw id as the file name. Only read paths fall back to it.
+fn blob_path_legacy(data_dir: &std::path::Path, chat: &str, part: &str) -> Option<PathBuf> {
+    let chat_dir = data_dir.join("blobs").join(chat);
+    blob_name_valid(chat, part)?;
+    let path = chat_dir.join(part);
+    path.starts_with(&chat_dir).then_some(path)
+}
+
+/// Filename-safe spelling of a part id. `:` is illegal in Windows file names
+/// (and `C:name` reads as a drive), so every byte outside a conservative set is
+/// percent-encoded. The URL keeps the raw id; the mapping is reversible.
+fn encode_part(part: &str) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(part.len());
+    for byte in part.bytes() {
+        match byte {
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'.' | b'_' | b'-' => out.push(byte as char),
+            _ => {
+                let _ = write!(out, "%{byte:02X}");
+            }
+        }
+    }
+    out
+}
+
+fn blob_name_valid(chat: &str, part: &str) -> Option<()> {
     let chat_valid = (1..=128).contains(&chat.len())
         && chat
             .bytes()
@@ -710,12 +743,7 @@ fn blob_path(data_dir: &std::path::Path, chat: &str, part: &str) -> Option<PathB
         && part
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"._:#~-".contains(&b));
-    if !(chat_valid && part_valid) {
-        return None;
-    }
-    let chat_dir = data_dir.join("blobs").join(chat);
-    let path = chat_dir.join(part);
-    path.starts_with(&chat_dir).then_some(path)
+    (chat_valid && part_valid).then_some(())
 }
 
 async fn get_blob(
@@ -729,10 +757,17 @@ async fn get_blob(
     let Some(path) = blob_path(&state.data_dir, &chat, &part) else {
         return Err((StatusCode::BAD_REQUEST, "invalid blob path"));
     };
-    match tokio::fs::read(&path).await {
-        Ok(b) => Ok(b.into_response()),
-        Err(_) => Err((StatusCode::NOT_FOUND, "not_found")),
+    if let Ok(b) = tokio::fs::read(&path).await {
+        return Ok(b.into_response());
     }
+    // Blobs stored before the filename encoding existed.
+    if let Some(legacy) = blob_path_legacy(&state.data_dir, &chat, &part)
+        && legacy != path
+        && let Ok(b) = tokio::fs::read(&legacy).await
+    {
+        return Ok(b.into_response());
+    }
+    Err((StatusCode::NOT_FOUND, "not_found"))
 }
 
 async fn put_blob(
@@ -1000,6 +1035,47 @@ mod tests {
             let body = get.into_body().collect().await.unwrap().to_bytes();
             assert_eq!(&body[..], b"output");
         }
+    }
+
+    // Windows rejects `:` in file names, and the client's part ids contain it.
+    #[tokio::test]
+    async fn blob_files_are_filesystem_safe_and_legacy_names_still_read() {
+        let root = tempfile::tempdir().unwrap();
+        let app = router(test_state(root.path()));
+        let chat = "0b7f1c4e-9d2a-4e55-8a61-3c9f0e2d7b11";
+        let part = "toolu_01ABC:call#1";
+        let uri = format!("/blob/{chat}/{}", part.replace('#', "%23"));
+        let put = app
+            .clone()
+            .oneshot(request(Method::PUT, &uri, "output"))
+            .await
+            .unwrap();
+        assert_eq!(put.status(), StatusCode::OK);
+
+        let chat_dir = root.path().join("blobs").join(chat);
+        let names: Vec<String> = std::fs::read_dir(&chat_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["toolu_01ABC%3Acall%231".to_string()]);
+
+        // A blob written under the old raw name keeps serving.
+        let legacy_chat = "1b7f1c4e-9d2a-4e55-8a61-3c9f0e2d7b11";
+        let legacy_dir = root.path().join("blobs").join(legacy_chat);
+        std::fs::create_dir_all(&legacy_dir).unwrap();
+        std::fs::write(legacy_dir.join(part), b"legacy").unwrap();
+        let get = app
+            .clone()
+            .oneshot(request(
+                Method::GET,
+                &format!("/blob/{legacy_chat}/{}", part.replace('#', "%23")),
+                "",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(get.status(), StatusCode::OK);
+        let body = get.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"legacy");
     }
 
     // Finding 2: a server must never start without a real token.
