@@ -455,10 +455,12 @@ async fn production_bootstrap_opens_the_local_profile() {
 
     let mut sync = handle
         .client()
-        .subscribe(methods::SYNC_STATUS, serde_json::json!({}))
+        .subscribe(methods::WATCH_SYNC_CREDENTIALS, serde_json::json!({}))
         .await
         .unwrap();
-    assert_eq!(sync.recv().await.unwrap()["tokenConfigured"], false);
+    // `sync_token` is configured above, so the engine reports the credential
+    // as present from the first frame — reachability is a separate concern.
+    assert_eq!(sync.recv().await.unwrap()["tokenConfigured"], true);
     let harnesses = handle
         .client()
         .call(methods::LIST_HARNESSES, serde_json::json!({}))
@@ -550,6 +552,13 @@ fn chat(id: &str, created_min: i64, last_msg_min: Option<i64>) -> Chat {
         last_seen_at: None,
         room_gen: None,
     }
+}
+
+/// Same fixture with a project folder attached (sidebar grouping/location).
+fn chat_with_cwd(id: &str, created_min: i64, cwd: Option<&str>) -> Chat {
+    let mut row = chat(id, created_min, None);
+    row.cwd = cwd.map(str::to_string);
+    row
 }
 
 fn space(id: &str, device_id: &str, path: &str, created_min: i64) -> Space {
@@ -1793,33 +1802,4 @@ fn chat_location_joins_project_and_branch() {
     assert_eq!(chat_location(&c), None);
     c.branch = None;
     assert_eq!(chat_location(&c), None);
-}
-
-#[test]
-fn org_gate_reducers() {
-    assert!(org_name_valid("Acme"));
-    assert!(org_name_valid("  padded  "));
-    assert!(!org_name_valid(""));
-    assert!(!org_name_valid("   "));
-    assert!(!org_name_valid(&"x".repeat(65)));
-
-    let rows = parse_orgs(&serde_json::json!({ "orgs": [
-        { "id": "m2", "organizationId": "o2", "name": "beta" },
-        { "id": "m1", "organizationId": "o1", "name": "Alpha" },
-        { "id": "m3", "organizationId": "o1", "name": "Alpha" },
-    ]}));
-    assert_eq!(rows.len(), 3);
-    let sorted = sort_memberships(rows);
-    let names: Vec<&str> = sorted.iter().map(|o| o.name.as_str()).collect();
-    assert_eq!(
-        names,
-        ["Alpha", "beta"],
-        "case-insensitive sort + dedupe by org id"
-    );
-    // Bare-array replies parse too; garbage yields empty.
-    assert_eq!(
-        parse_orgs(&serde_json::json!([{ "id": "m", "organizationId": "o", "name": "n" }])).len(),
-        1
-    );
-    assert!(parse_orgs(&serde_json::json!("nope")).is_empty());
 }

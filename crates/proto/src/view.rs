@@ -268,14 +268,9 @@ mod gate_tests {
 
     #[test]
     fn ready_engine_has_no_blocking_setup_gate() {
-        for scope in [
-            None,
-            Some(WorkspaceScope::Local),
-            Some(WorkspaceScope::Synced),
-            Some(WorkspaceScope::Development),
-        ] {
-            assert_eq!(gate_phase(&ConnectionStatus::Ready), GatePhase::Ready);
-        }
+        // The gate is scope-independent since the legacy host auth went away:
+        // a ready link always paints the workspace.
+        assert_eq!(gate_phase(&ConnectionStatus::Ready), GatePhase::Ready);
     }
 }
 
