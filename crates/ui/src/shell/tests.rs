@@ -1,4 +1,5 @@
 use komet_engine::InstanceLock;
+use komet_proto::WorkspaceScope;
 
 use super::*;
 
@@ -283,6 +284,55 @@ fn spaces_only_local_work_still_gets_the_import_offer() {
     assert_eq!(
         local_work_phrase(1, 2).as_deref(),
         Some("the 1 session and 2 projects")
+    );
+}
+
+#[test]
+fn unknown_sync_status_never_opens_the_restart_notice() {
+    // An older daemon (or a frame that has not arrived yet) reports nothing:
+    // that is unknown, not "missing credentials", and must not gate the shell.
+    for flow in [SyncFlow::Idle, SyncFlow::SwitchOffer { notice_open: false }] {
+        assert_eq!(
+            sync_flow_for_status(flow, Some(WorkspaceScope::Synced), None),
+            SyncFlow::Idle,
+        );
+    }
+    assert_eq!(
+        sync_flow_for_status(
+            SyncFlow::RestartPending { notice_open: true },
+            Some(WorkspaceScope::Synced),
+            None,
+        ),
+        SyncFlow::RestartPending { notice_open: true },
+        "an unknown status must not discard a pending notice either"
+    );
+}
+
+#[test]
+fn dismissed_restart_notice_stays_dismissed_but_reachable() {
+    let disabled = komet_proto::SyncStatus {
+        token_configured: false,
+    };
+    let dismissed = SyncFlow::RestartPending { notice_open: false };
+    // "Later" survives the next render: the status is unchanged, so the
+    // notice must not reopen on its own.
+    assert_eq!(
+        sync_flow_for_status(dismissed, Some(WorkspaceScope::Synced), Some(&disabled)),
+        dismissed,
+    );
+    // First entry into the pending state still opens it.
+    assert_eq!(
+        sync_flow_for_status(
+            SyncFlow::Idle,
+            Some(WorkspaceScope::Synced),
+            Some(&disabled)
+        ),
+        SyncFlow::RestartPending { notice_open: true },
+    );
+    // And the account menu keeps the only way back in.
+    assert_eq!(
+        account_menu_action(Some(WorkspaceScope::Synced), dismissed),
+        Some(AccountMenuAction::RestartPending),
     );
 }
 

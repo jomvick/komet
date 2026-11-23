@@ -194,6 +194,9 @@ pub fn account_menu_action(
             // A pending import failure must stay reachable: this is the only
             // surface that can reopen the retry dialog on a synced runtime.
             SyncFlow::ImportFailed { .. } => Some(AccountMenuAction::RestartPending),
+            // Same for the restart notice: dismissing it must not remove the
+            // only way back in ("Finish sync setup").
+            SyncFlow::RestartPending { .. } => Some(AccountMenuAction::RestartPending),
             _ if flow.is_switch_lifecycle() => Some(AccountMenuAction::SyncInProgress),
             _ => None,
         },
@@ -206,19 +209,43 @@ pub fn sync_flow_for_status(
     scope: Option<WorkspaceScope>,
     status: Option<&SyncStatus>,
 ) -> SyncFlow {
-    let configured = status.is_some_and(|status| status.token_configured);
+    // `None` is UNKNOWN, not "no credentials": a daemon that predates the
+    // credential frame must not get a restart modal over a usable workspace.
+    let configured = status.map(|status| status.token_configured);
     match scope {
         Some(WorkspaceScope::Local) if flow.is_switch_lifecycle() => flow,
-        Some(WorkspaceScope::Local) if configured => match flow {
-            SyncFlow::SwitchOffer { .. } | SyncFlow::RestartPending { .. } => flow,
-            _ => SyncFlow::SwitchOffer { notice_open: true },
+        Some(WorkspaceScope::Local) => match configured {
+            Some(true) => match flow {
+                SyncFlow::SwitchOffer { .. } | SyncFlow::RestartPending { .. } => flow,
+                _ => SyncFlow::SwitchOffer { notice_open: true },
+            },
+            // Unknown: keep showing what the shell already has rather than
+            // inventing (or dismissing) a notice from a missing frame.
+            None => match flow {
+                SyncFlow::SwitchOffer { .. } | SyncFlow::RestartPending { .. } => flow,
+                _ => SyncFlow::Idle,
+            },
+            Some(false) => SyncFlow::Idle,
         },
-        Some(WorkspaceScope::Local) => SyncFlow::Idle,
         Some(WorkspaceScope::Synced) if flow.is_switch_lifecycle() => flow,
-        Some(WorkspaceScope::Synced) if !configured => {
-            SyncFlow::RestartPending { notice_open: true }
-        }
-        Some(WorkspaceScope::Synced | WorkspaceScope::Development) => SyncFlow::Idle,
+        Some(WorkspaceScope::Synced) => match configured {
+            Some(false) => match flow {
+                // Dismissed once: keep it dismissed until the condition
+                // changes (the menu's "Finish sync setup" reopens it).
+                SyncFlow::RestartPending { notice_open } => {
+                    SyncFlow::RestartPending { notice_open }
+                }
+                _ => SyncFlow::RestartPending { notice_open: true },
+            },
+            // Unknown: an older daemon without the credential frame, or a
+            // status that has not arrived yet — never a restart modal.
+            None => match flow {
+                SyncFlow::RestartPending { .. } => flow,
+                _ => SyncFlow::Idle,
+            },
+            Some(true) => SyncFlow::Idle,
+        },
+        Some(WorkspaceScope::Development) => SyncFlow::Idle,
         None => flow,
     }
 }
