@@ -267,7 +267,7 @@ mod gate_tests {
     use super::*;
 
     #[test]
-    fn ready_engine_never_requires_legacy_authentication() {
+    fn ready_engine_has_no_blocking_setup_gate() {
         for scope in [
             None,
             Some(WorkspaceScope::Local),

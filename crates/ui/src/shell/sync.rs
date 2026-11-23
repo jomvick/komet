@@ -258,7 +258,7 @@ impl Shell {
     }
 
     /// The wizard's choice step chose a path: stop the local runtime, boot the
-    /// synced one in-place (mirror of the sign-out transition), then let
+    /// synced one in-place, then let
     /// [`Self::drive_sync_switch`] run the import once the runtime is ready.
     /// Failure falls back to the quit-and-reopen dialog — the local profile is
     /// untouched, so the old path is always a safe exit.

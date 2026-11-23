@@ -426,7 +426,7 @@ async fn a_stranger_on_the_ipc_port_does_not_wedge_the_window() {
 }
 
 #[tokio::test]
-async fn production_bootstrap_opens_local_data_without_sign_in() {
+async fn production_bootstrap_opens_the_local_profile() {
     let dir = tempfile::tempdir().unwrap();
     let handle = EngineHandle::bootstrap(EngineBootConfig {
         data_dir: dir.path().to_path_buf(),
@@ -441,8 +441,7 @@ async fn production_bootstrap_opens_local_data_without_sign_in() {
     .await
     .unwrap();
 
-    // Komet is local-first: without a synced backend the boot resolves the
-    // development profile (dev identity, no sign-in gate).
+    // Without a configured sync server, boot resolves the local development profile.
     assert_eq!(
         handle.engine_info().workspace_scope,
         WorkspaceScope::Development

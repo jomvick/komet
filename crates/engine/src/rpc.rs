@@ -29,8 +29,8 @@
 //!   `TerminalScreen`, `ReadTerminalTail {terminalId, lines}` →
 //!   `TerminalTail`, `ReadTerminalDelta {terminalId, sinceSeq}` →
 //!   `TerminalDelta`. Agents list and read every terminal over MCP but never
-//!   write to one (see `crate::terminals` and docs/security.md). M5 is single-user local:
-//!   per-user owner checks land with real multi-account auth in M6.
+//!   write to one (see `crate::terminals` and docs/security.md). Terminal ownership
+//!   remains scoped to the device that hosts the engine.
 //! - Agent accounts (§3.7): `ListAgentAccounts {usageMode?, forceUsage?}` →
 //!   `AgentAccountsSnapshot`, `ActivateAgentAccount`/`ForgetAgentAccount`
 //!   `{harness, accountId}` → snapshot, `StartAgentLogin {harness}` →

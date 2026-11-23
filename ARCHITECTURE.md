@@ -3,8 +3,8 @@
 > Fork of [zeronsh/comet](https://github.com/zeronsh/comet) — MIT, Copyright Wing. See `LICENSE` and `THIRD_PARTY_NOTICES.md`.
 
 A native controller for coding agents (Claude Code, Codex, Cursor, Grok, Hermes, OpenCode, Pi, Cline, Devin, GitHub Copilot, Muse Code, Qoder) —
-Rust engine + gpui UI, single binary. **100% local by default**: no account, no login
-screen, no network calls. Multi-device sync is built (Loro CRDT docs through the self-hosted
+Rust engine + gpui UI, single binary. **100% local by default**: no sync configuration
+or network calls are required. Multi-device sync is built (Loro CRDT docs through the self-hosted
 `komet-sync` server) but **disabled by default** — see "Multi-device sync" in the README.
 
 **Pillars:**
@@ -32,8 +32,8 @@ gpui UI ─ in-proc/localhost RPC ─ engine A ══ device-room relay ══ e
   diff sync, doc hosting. Pure Rust daemon, fully functional headless.
 - **UI = viewport** (was Electron): gpui app rendering engine state. Talks the same typed RPC whether the engine is in-process or a separate daemon. Organized around **spaces** — (device, folder) pairs, local or synced according to the active profile. The sidebar is the data: an attention-sorted Sessions list, filtered by a searchable spaces dropdown ("All spaces" included) that also hosts space management. The horizontal tabs are a **device-local viewport** onto that list (`ui-settings.json` `openTabs`, cross-space): closing a tab is local-only — archiving is an explicit sidebar action — and a sidebar click (re)opens a session as a tab. The new-session canvas carries a space picker (defaulting to the sidebar filter, else the last selected space); new sessions are minted onto the picked space's device via relay-forwardable RPCs.
 - **Sync server (`komet-sync-server`)**: self-hosted Rust service (VPS via Docker or any PC).
-  SQLite per room (frames), blobs on the filesystem, shared-secret Bearer auth
-  (`KOMET_SYNC_TOKEN`). No accounts, no third-party identity provider.
+  SQLite per room (frames), blobs on the filesystem, and the operator-configured
+  shared bearer token (`KOMET_SYNC_TOKEN`).
 
 ### Headed / headless
 Single binary `komet`:
@@ -58,7 +58,7 @@ Workspace selection is an immutable storage boundary captured at engine startup:
 | Sync URL and shared bearer configured | `Development` | Enabled |
 | Explicit compatibility profile (migration/import paths) | `Synced` | Enabled when URL and bearer are available |
 
-Sync access is configured explicitly through `KOMET_EDGE_URL` and `KOMET_SYNC_TOKEN`; there is no account login step.
+Sync transport activates only when `KOMET_EDGE_URL` and `KOMET_SYNC_TOKEN` are configured.
 
 The headed app starts its engine as a detached process using the same binary and inherited runtime
 configuration. It does not install or enable a system service. `komet engine stop` is the explicit
@@ -77,7 +77,7 @@ The resolved profile selects the session snapshots, registry snapshot, run journ
 | `Synced` (legacy) | `{data_dir}/orgs/{org_id}/{user_id}/` | `{data_dir}/orgs/{org_id}/{user_id}/uploads/` |
 | `Development` | `{data_dir}/orgs/{org_id}/{user_id}/` (compatibility path) | `{data_dir}/orgs/{org_id}/{user_id}/uploads/` |
 
-The development store root preserves the historical on-disk layout for upgrade compatibility; Komet no longer associates it with an account. Local identity lives in `{data_dir}/local-profile.json`; its UUID is stable across restarts and is not an account identity.
+The development store root preserves the historical on-disk layout for upgrade compatibility. Local identity lives in `{data_dir}/local-profile.json`; its UUID is stable across restarts and separate from sync credentials.
 
 Older releases wrote synced and development attachments to `{data_dir}/uploads/`, and persisted those absolute paths in transcripts. Existing compatibility readers retain access to the legacy cache while new staging and commits use the active profile's uploads root.
 
@@ -85,7 +85,7 @@ Device identity and machine resources remain device-scoped under the common data
 
 #### Privacy boundary and follow-ups
 
-This first local-first change does not upload, import, link, or delete local sessions when a user signs in. Local attachments remain jailed under the local upload root and are not readable through the synced attachment cache. Returning to local-only mode reopens the same local identity and data.
+Local and synced profiles keep separate data roots. The UI offers an explicit one-time import when switching local work into a configured synced profile; local attachments remain jailed under their profile's upload root.
 
 The following product work is intentionally deferred:
 

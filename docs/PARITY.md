@@ -10,7 +10,7 @@ not built yet).
 | Item | Status | Notes |
 | --- | --- | --- |
 | 1.1 Window shell | partial | gpui window, always-dark theme, external links via OS browser. Deferred: frameless-inset/traffic-light chrome (macOS packaging not executed), single-instance lock, dev-vs-packaged port split (env vars instead). |
-| 1.2 App phases | done | Local-first shell with engine failure state and boot splash with fade-out cap (`ui/src/shell.rs`). The former Komet account and organization gates have been removed. |
+| 1.2 App phases | done | Local-first shell with engine failure state and boot splash with fade-out cap (`ui/src/shell.rs`). |
 | 1.3 Shell layout | done | Collapsible drag-resizable sidebar (208–400), right Changes pane (360–760, 52% cap), header variants, widths persisted to `ui-settings.json`. Titlebar GitHub control (GitHub mark + chevron left of the right-pane toggle, only with a GitHub remote): dropdown with branch (open repo/branch), the branch's PR with checks (opens in browser; "Create pull request" compare link otherwise), recent commits (open their diff tab), and Changes `+/-` (focus the Git diff tab) — `ui/src/shell/github.rs`. |
 | 1.4 Keyboard shortcuts | done | Customizable keymap, click-to-record with conflict detection, per-row reset (`ui/src/settings/shortcuts.rs`); persisted with UI settings. |
 | 1.5 Routes | partial | Native navigation instead of URL routes; settings pages: devices / providers / appearance / files / notifications / shortcuts / archived / sync / security. Profile page (heatmap) is an §8 exclusion. |
@@ -39,7 +39,7 @@ not built yet).
 | LocalDevice | done | `{deviceId}`; IPC-only (never forwarded). |
 | DataRpc watches + QueueCommand | done | — |
 | Mutate ops | done | createChat/renameChat/setChatArchived/deleteChat/renameDevice done; markChatSeen accepted as a no-op (unseen markers UI-local); `SetChatConfig` exposed as a Mutate op dispatching to `set_chat_config` (`engine/src/rpc.rs`). |
-| Sync authentication | done | Self-hosted sync uses the shared bearer configured by the operator. Komet account sign-in, organization selection, and sign-out RPCs are removed. |
+| Sync authentication | done | Self-hosted sync uses the shared bearer configured by the operator. |
 | Wire types | done | `komet-proto`: AgentEvent, ToolCall kinds, models/options, entities, SyncStatus. |
 
 ## §3 Backend engine

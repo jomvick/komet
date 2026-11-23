@@ -49,7 +49,7 @@ are the maintained architecture and status references.
   (registry, rename, presence dot, copy id), agents (accounts), shortcuts, archived (unarchive).
 
 ### 1.6 Sidebar
-- DeviceSwitcher + "New session" button + session list + settings menu. The former Komet account menu was removed.
+- DeviceSwitcher + "New session" button + session list + settings menu.
 - Flat or grouped-by-project (persisted); "Show more" per group.
 - Session rows: title, time, status dot (staleness-checked), context menu Rename/Archive/Delete,
   hover-intent prefetch, optimistic pending chats deduped on sync.
@@ -154,9 +154,6 @@ are the maintained architecture and status references.
 - QueueCommand{chatId,kind,payload}->{commandId}
 - Mutate: CreateChat, SetChatConfig, SetChatArchived, RenameChat, RenameDevice, DeleteChat,
   MarkChatSeen
-### Retired Komet account RPCs
-- Komet account sign-in/out and organization membership RPCs have been removed.
-- The self-hosted sync server uses its own shared bearer token; see `docs/sync.md`.
 ### Wire types
 - AgentEvent: SessionStarted, TextDelta, ReasoningDelta, ToolCall, ToolResult, Usage(kept as event,
   not displayed), Error, InputRequested, InputResolved, Steered, Done
@@ -186,11 +183,11 @@ are the maintained architecture and status references.
   patch incl untracked), 3MiB cap, sha256; publishes DiffSidecar to chat rooms; GitMetadataSync
   watches HEAD -> chat.branch; folder listing in disposable worker w/ 6s timeout.
 - 3.7 Sync: one self-hosted `komet-sync-server`, configured with `KOMET_EDGE_URL` and
-  `KOMET_SYNC_TOKEN`; no Komet account or organization onboarding. Uploads: chunked staging -> durable
+  `KOMET_SYNC_TOKEN`. Uploads: chunked staging -> durable
   file. Agent accounts: claude-swap
   (Keychain "Claude Code-credentials" / ~/.claude/.credentials.json + ~/.claude.json; Codex
   $CODEX_HOME/auth.json); detect live, swap to activate, plan labels, usage probes, OAuth flows.
-  Device-room host: one wss to device DO; serves full ControlRpc via virtual sockets over
+  Device-room host: one WebSocket to the device relay; serves ControlRpc via virtual sockets over
   {s,k,to,from} frames; nudges. Peers dial other device relays with link caching.
 
 ## 4. Harness
@@ -235,7 +232,7 @@ are the maintained architecture and status references.
 
 ## 7. Server boundary
 - One optional self-hosted service owns synchronized rooms and blobs.
-- There is no Komet account, organization onboarding, or hosted authentication service.
+- Sync clients authenticate to the self-hosted server with the configured shared bearer token.
 
 ## 8. EXCLUDED (token usage display)
 - WatchUsage RPC, UsageStats/UsageDay, backend usage aggregation, profile heatmap/hero/stats,

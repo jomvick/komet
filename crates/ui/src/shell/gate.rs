@@ -96,12 +96,12 @@ impl Shell {
     }
 }
 
-/// The sign-in gate's faint grid backdrop (komet styles.css `.bg-grid`):
+/// The connection gate's faint grid backdrop (komet styles.css `.bg-grid`):
 /// 44px hairlines at white 3.5%, with the radial mask approximated by edge
 /// gradients back into the page background (gpui has no mask-image).
 ///
 /// `pub(crate)`: the first-run onboarding reuses it so its pages keep the
-/// gate's visual identity (same bg, same faint grid) instead of a bare fill.
+/// page's visual identity (same bg, same faint grid) instead of a bare fill.
 pub(crate) fn grid_backdrop(theme: &Theme) -> AnyElement {
     let line = crate::theme::hairline(0.035);
     let bg = theme.bg;
