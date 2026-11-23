@@ -249,7 +249,9 @@ impl RegistryClient {
             presence: presence.clone(),
             stats: stats.clone(),
         };
-        let task = tokio::spawn(actor.run(ready_tx));
+        // Aborts the actor if this connect future is dropped before the join
+        // completes (a caller that gave up must not leave a client running).
+        let task = transport::AbortOnDrop::new(tokio::spawn(actor.run(ready_tx)));
 
         match ready_rx.await {
             Ok(Ok(())) => Ok(Self {
@@ -262,16 +264,10 @@ impl RegistryClient {
                 presence_out: presence_tx,
                 presence,
                 stats,
-                task: Some(task),
+                task: Some(task.release()),
             }),
-            Ok(Err(err)) => {
-                task.abort();
-                Err(err)
-            }
-            Err(_) => {
-                task.abort();
-                Err(SyncError::Closed)
-            }
+            Ok(Err(err)) => Err(err),
+            Err(_) => Err(SyncError::Closed),
         }
     }
 
@@ -503,8 +499,9 @@ impl Session<String> for Actor {
                     tracing::warn!("registry: probe unanswered past deadline; redialing");
                     return SessionEnd::Reconnect;
                 }
-                _ = self.shutdown.changed() => {
-                    if *self.shutdown.borrow() {
+                observed = self.shutdown.changed() => {
+                    // A closed channel means the supervisor is gone: stop.
+                    if observed.is_err() || *self.shutdown.borrow() {
                         return SessionEnd::Stop;
                     }
                 }
@@ -543,17 +540,19 @@ impl Actor {
 
     async fn push_pending(&self, pipe: &mut TextPipe) -> bool {
         let batches: Vec<PendingBatch> = lock(&self.doc).take_pushable();
-        for batch in batches {
-            let frame = serde_json::to_string(&ClientFrame::Push {
-                batch: &batch.batch,
-                ops: &batch.ops,
+        let frames: Vec<String> = batches
+            .iter()
+            .map(|batch| {
+                serde_json::to_string(&ClientFrame::Push {
+                    batch: &batch.batch,
+                    ops: &batch.ops,
+                })
+                .expect("push serializes")
             })
-            .expect("push serializes");
-            if pipe.tx.send(frame).await.is_err() {
-                return false;
-            }
-        }
-        true
+            .collect();
+        // Drains replies while a full outbound queue waits: a burst bigger than
+        // the channel must not wedge the pump against the actor.
+        transport::push_all(pipe, frames, |text| self.handle_frame(&text)).await
     }
 
     /// Apply one inbound protocol frame. False = protocol breakdown, redial.

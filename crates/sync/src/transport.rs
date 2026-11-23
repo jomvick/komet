@@ -41,6 +41,13 @@ pub(crate) const BACKOFF_CAP: Duration = Duration::from_secs(30);
 /// Quiet-room probe cadence default (one room per engine — a fixed cadence
 /// costs ~100 DO wakes/day total).
 pub(crate) const PROBE_QUIET_DEFAULT: Duration = Duration::from_secs(900);
+/// Bound on one socket write. A peer that stops reading must not park `pump`
+/// (and with it the silence lease and the keepalive) forever: an expired write
+/// tears the socket down so the session unwinds and redials.
+pub(crate) const WRITE_DEADLINE: Duration = Duration::from_secs(10);
+/// Best-effort close write: short, and a failure is already a lost cause — it
+/// exists so a stalled peer cannot retain the socket after its owner leaves.
+const CLOSE_DEADLINE: Duration = Duration::from_secs(1);
 /// The "no deadline armed" select arm sleeps out a day and is always beaten
 /// by the real timers.
 const DAY: Duration = Duration::from_secs(86_400);
@@ -165,12 +172,18 @@ async fn pump<F: Send + 'static>(
         tokio::select! {
             frame = out_rx.recv() => match frame {
                 Some(frame) => {
-                    if sink.send(to_msg(frame)).await.is_err() {
+                    // Every write is deadline-bound: a stalled `send` would stop
+                    // this loop from ever seeing the silence lease again.
+                    if !send_within(&mut sink, to_msg(frame), WRITE_DEADLINE).await {
                         break;
                     }
                 }
                 None => {
-                    let _ = sink.send(WsMessage::Close(None)).await;
+                    let _ = tokio::time::timeout(
+                        CLOSE_DEADLINE,
+                        sink.send(WsMessage::Close(None)),
+                    )
+                    .await;
                     break;
                 }
             },
@@ -199,7 +212,13 @@ async fn pump<F: Send + 'static>(
                 Some(Err(_)) | None => break,
             },
             _ = ping.tick() => {
-                if sink.send(WsMessage::Text("ping".into())).await.is_err() {
+                if !send_within(
+                    &mut sink,
+                    WsMessage::Text("ping".into()),
+                    WRITE_DEADLINE,
+                )
+                .await
+                {
                     break;
                 }
             }
@@ -209,6 +228,75 @@ async fn pump<F: Send + 'static>(
             }
         }
     }
+}
+
+/// Send one frame, giving up after `deadline`. A timeout (or a sink error)
+/// means the peer stopped reading: the caller drops the socket so the
+/// consumer observes the pipe closing instead of a hung session.
+async fn send_within<S>(sink: &mut S, msg: WsMessage, deadline: Duration) -> bool
+where
+    S: futures::Sink<WsMessage> + Unpin,
+{
+    match tokio::time::timeout(deadline, sink.send(msg)).await {
+        Ok(Ok(())) => true,
+        Ok(Err(_)) => false,
+        Err(_) => {
+            tracing::warn!(
+                deadline_ms = deadline.as_millis(),
+                "socket write stalled; dropping the connection"
+            );
+            false
+        }
+    }
+}
+
+/// Send outbound frames while keeping inbound frames moving.
+///
+/// A burst bigger than the outbound channel must not park the actor: if it
+/// blocks in `pipe.tx.send`, it stops draining `pipe.rx`, and once the pump's
+/// inbound channel fills too, both sides wait on each other — a wedge the
+/// silence lease can never break because neither side is back at its
+/// `select!`. Waiting for outbound capacity therefore drains (and handles)
+/// inbound frames until the frame goes out.
+pub(crate) async fn push_all<F>(
+    pipe: &mut Pipe<F>,
+    frames: Vec<F>,
+    mut on_inbound: impl FnMut(F) -> bool,
+) -> bool
+where
+    F: Send + 'static,
+{
+    for frame in frames {
+        let mut pending = Some(frame);
+        loop {
+            let frame = pending.take().expect("frame is retained until it is sent");
+            match pipe.tx.try_send(frame) {
+                Ok(()) => break,
+                Err(mpsc::error::TrySendError::Closed(_)) => return false,
+                Err(mpsc::error::TrySendError::Full(frame)) => {
+                    pending = Some(frame);
+                    tokio::select! {
+                        permit = pipe.tx.reserve() => match permit {
+                            Ok(permit) => {
+                                permit.send(pending.take().expect("frame is pending"));
+                                break;
+                            }
+                            Err(_) => return false,
+                        },
+                        inbound = pipe.rx.recv() => {
+                            let Some(inbound) = inbound else {
+                                return false;
+                            };
+                            if !on_inbound(inbound) {
+                                return false;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    true
 }
 
 // ── session channels ────────────────────────────────────────────────────────
@@ -350,13 +438,43 @@ pub(crate) trait Session<F>: Send {
 }
 
 /// Wait out one reconnect-backoff step, cut short by a wake or online event.
-/// Returns true when shutdown was observed.
+/// Returns true when shutdown was observed — an explicit `true`, or a closed
+/// shutdown channel (the supervisor handle is gone, which cancels the session
+/// just as a request does; treating closure as "not yet" would spin here).
 async fn sleep_or_shutdown(shutdown: &mut watch::Receiver<bool>, wait: Duration) -> bool {
     tokio::select! {
         // Wake/online events cut the backoff short; an offline-reported
         // path parks the wait instead of burning futile dials.
         _ = crate::wake::reconnect_wait(wait) => false,
-        _ = shutdown.changed() => *shutdown.borrow(),
+        observed = shutdown.changed() => observed.is_err() || *shutdown.borrow(),
+    }
+}
+
+/// Aborts the spawned session task unless the caller takes ownership of it.
+///
+/// The actor is spawned before the initial-join handshake completes: if the
+/// caller abandons the connect future (the engine bounds its join wait), the
+/// actor would otherwise survive with no owner — finishing a backfill, taking
+/// `ready` and looking like an established client forever. Ownership transfers
+/// at [`Self::release`], i.e. exactly when the caller receives a client.
+pub(crate) struct AbortOnDrop(Option<tokio::task::JoinHandle<()>>);
+
+impl AbortOnDrop {
+    pub(crate) fn new(task: tokio::task::JoinHandle<()>) -> Self {
+        Self(Some(task))
+    }
+
+    /// Hand the task to the client; dropping this guard no longer aborts it.
+    pub(crate) fn release(mut self) -> tokio::task::JoinHandle<()> {
+        self.0.take().expect("session task is present once")
+    }
+}
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        if let Some(task) = self.0.take() {
+            task.abort();
+        }
     }
 }
 
@@ -376,7 +494,9 @@ pub(crate) async fn run<F, S>(
     let mut ready = Some(ready);
     let mut backoff = BACKOFF_BASE;
     loop {
-        if *shutdown.borrow() {
+        // A closed shutdown channel (sender dropped) cancels the session just
+        // like a `true`; `has_changed()` is the only sync way to tell them apart.
+        if *shutdown.borrow() || shutdown.has_changed().is_err() {
             return;
         }
         let dial = tokio::time::timeout(CONNECT_TIMEOUT, connector.connect()).await;
@@ -469,5 +589,96 @@ mod tests {
         assert_eq!(live.probe_deadline, Some(deadline));
         live.note_frame();
         assert!(live.probe_deadline.is_none(), "a frame answers the probe");
+    }
+
+    /// A burst larger than the outbound channel must not wedge the actor
+    /// against the pump: inbound frames keep being drained while it waits.
+    #[tokio::test]
+    async fn push_all_drains_inbound_while_the_outbound_queue_is_full() {
+        let (tx, mut out_rx) = mpsc::channel(1);
+        let (in_tx, in_rx) = mpsc::channel(4);
+        let mut pipe = Pipe { tx, rx: in_rx };
+        pipe.tx
+            .try_send("queued".to_string())
+            .expect("seed outbound");
+        in_tx
+            .send("reply-1".to_string())
+            .await
+            .expect("seed inbound");
+
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_from_push = seen.clone();
+        let push = tokio::spawn(async move {
+            push_all(
+                &mut pipe,
+                vec!["f2".to_string(), "f3".to_string()],
+                move |frame| {
+                    seen_from_push.lock().unwrap().push(frame);
+                    true
+                },
+            )
+            .await
+        });
+
+        // The push side is parked on a full queue; the reply must still land.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(*seen.lock().unwrap(), ["reply-1"]);
+
+        // Grow the room from the consumer side: the burst then completes.
+        let mut sent = Vec::new();
+        for _ in 0..3 {
+            sent.push(out_rx.recv().await.expect("frame"));
+        }
+        assert!(push.await.expect("push task"), "the burst must complete");
+        assert_eq!(sent, ["queued", "f2", "f3"]);
+    }
+
+    struct DropFlag(Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// An abandoned connect future must not leave the actor running: the client
+    /// never existed, so nobody else can ever shut it down.
+    #[tokio::test]
+    async fn dropping_the_connect_guard_aborts_the_session_task() {
+        let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let flag = DropFlag(alive.clone());
+        let task = tokio::spawn(async move {
+            let _flag = flag;
+            std::future::pending::<()>().await;
+        });
+
+        let guard = AbortOnDrop::new(task);
+        drop(guard);
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !alive.load(std::sync::atomic::Ordering::SeqCst),
+            "the actor must be aborted with the guard"
+        );
+    }
+
+    /// A caller that received its client owns the task from then on: releasing
+    /// must not abort a live session.
+    #[tokio::test]
+    async fn releasing_the_connect_guard_keeps_the_session_task_alive() {
+        let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let flag = DropFlag(alive.clone());
+        let task = tokio::spawn(async move {
+            let _flag = flag;
+            std::future::pending::<()>().await;
+        });
+
+        let handle = AbortOnDrop::new(task).release();
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(alive.load(std::sync::atomic::Ordering::SeqCst));
+        handle.abort();
     }
 }

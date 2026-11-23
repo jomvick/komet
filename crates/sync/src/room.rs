@@ -44,6 +44,8 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
+use crate::transport;
+
 pub use crate::types::{RoomStatsSnapshot, StaticUrl, SyncError, UrlProvider};
 
 /// Payload bytes per outbound fragment — mirrors the edge's `FRAGMENT_BYTES`
@@ -427,7 +429,9 @@ impl RoomClient {
             events: events.clone(),
             shutdown: shutdown_rx,
         };
-        let task = tokio::spawn(actor.run(ready_tx));
+        // Aborts the actor if this connect future is dropped before the join
+        // completes (a caller that gave up must not leave a client running).
+        let task = transport::AbortOnDrop::new(tokio::spawn(actor.run(ready_tx)));
 
         match ready_rx.await {
             Ok(Ok(())) => Ok(Self {
@@ -438,17 +442,11 @@ impl RoomClient {
                 probe: probe_tx,
                 redial: redial_tx,
                 stats,
-                task: Some(task),
+                task: Some(task.release()),
                 _subs: vec![sub_doc, sub_eph],
             }),
-            Ok(Err(err)) => {
-                task.abort();
-                Err(err)
-            }
-            Err(_) => {
-                task.abort();
-                Err(SyncError::Closed)
-            }
+            Ok(Err(err)) => Err(err),
+            Err(_) => Err(SyncError::Closed),
         }
     }
 
@@ -623,7 +621,11 @@ impl RoomActor {
                 tokio::select! {
                     _ = &mut sleep => break false,
                     _ = wake.recv() => break true,
-                    _ = self.shutdown.changed() => return,
+                    observed = self.shutdown.changed() => {
+                        if observed.is_err() || *self.shutdown.borrow() {
+                            return;
+                        }
+                    }
                     Some(_) = self.local_rx.recv() => {}
                     Some(_) = self.eph_rx.recv() => {}
                     // Probe/redial hints while disconnected: the redial

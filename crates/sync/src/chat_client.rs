@@ -317,7 +317,9 @@ impl ChatClient {
             flags: flags.clone(),
             resumed: false,
         };
-        let task = tokio::spawn(actor.run(ready_tx));
+        // Aborts the actor if this connect future is dropped before the join
+        // completes (the engine bounds its join wait and may give up first).
+        let task = transport::AbortOnDrop::new(tokio::spawn(actor.run(ready_tx)));
 
         match ready_rx.await {
             Ok(Ok(())) => Ok(Self {
@@ -329,16 +331,10 @@ impl ChatClient {
                 redial: redial_tx,
                 presence_out: presence_tx,
                 flags,
-                task: Some(task),
+                task: Some(task.release()),
             }),
-            Ok(Err(err)) => {
-                task.abort();
-                Err(err)
-            }
-            Err(_) => {
-                task.abort();
-                Err(SyncError::Closed)
-            }
+            Ok(Err(err)) => Err(err),
+            Err(_) => Err(SyncError::Closed),
         }
     }
 
@@ -579,6 +575,8 @@ impl Session<Vec<u8>> for Actor {
                 let fetch = self.fetcher.fetch();
                 let fetched = tokio::select! {
                     fetched = tokio::time::timeout(CHECKPOINT_FETCH_DEADLINE, fetch) => fetched,
+                    // Any change — a `true`, or the watch closing because the
+                    // supervisor was dropped — must not leave this waiting.
                     _ = self.shutdown.changed() => return SessionEnd::Stop,
                 };
                 let bytes = match fetched {
@@ -729,8 +727,9 @@ impl Session<Vec<u8>> for Actor {
                     tracing::warn!("chat2: probe unanswered past deadline; redialing");
                     return SessionEnd::Reconnect;
                 }
-                _ = self.shutdown.changed() => {
-                    if *self.shutdown.borrow() {
+                observed = self.shutdown.changed() => {
+                    // A closed channel means the supervisor is gone: stop.
+                    if observed.is_err() || *self.shutdown.borrow() {
                         return SessionEnd::Stop;
                     }
                 }
@@ -799,12 +798,12 @@ impl Actor {
                 )
             })
             .collect();
-        for frame in frames {
-            if pipe.tx.send(frame).await.is_err() {
-                return false;
-            }
-        }
-        true
+        // Drains replies while a full outbound queue waits: a burst bigger than
+        // the channel must not wedge the pump against the actor.
+        transport::push_all(pipe, frames, |bytes| {
+            wire::decode(&bytes).is_some_and(|frame| self.handle_frame(frame))
+        })
+        .await
     }
 
     /// Apply one inbound protocol frame. False = protocol breakdown, redial.
