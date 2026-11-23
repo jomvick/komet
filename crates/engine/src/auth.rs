@@ -7,6 +7,12 @@ pub struct AuthConfig {
     pub dev_user_id: String,
 }
 
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AuthConfig {
     pub fn new() -> Self {
         Self {
