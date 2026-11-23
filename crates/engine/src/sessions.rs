@@ -2595,7 +2595,7 @@ fn render_parts(parts: &[MessagePart]) -> Vec<MessagePart> {
                 // Output summaries, diff stats, and sidecar refs are
                 // deliberately kept: unlike raw tool inputs they are the
                 // transcript's record of what happened, and the strip already
-                // bounded them (docs/chat2-sync.md A1).
+                // bounded them (session document schema).
                 output: output.clone(),
                 diff: diff.clone(),
                 output_ref: output_ref.clone(),
@@ -3550,7 +3550,7 @@ async fn drive_run(
             if pending.is_some() {
                 pending_tokens_after = pending;
             }
-            // R2 sidecar PARKED (2026-08-10, product call): the fold's
+            // full-output sidecar PARKED (2026-08-10, product call): the fold's
             // summary/stats ARE the doc's whole record — no refs stamped, no
             // uploads. Full outputs survive only in the host's local run
             // journal. To reintroduce: `komet_doc::sidecar_payload(&event)`

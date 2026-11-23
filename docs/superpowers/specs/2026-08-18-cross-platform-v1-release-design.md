@@ -55,10 +55,10 @@ existing `DaemonCommand` (Install/Uninstall/Start/Stop/Restart/Status):
 
 Target-dependency: `windows-service` (add under `[target.'cfg(windows)'.dependencies]`).
 
-`apps/komet/src/auth_cli.rs` Windows path (l.273 cfg unix today): read/write the
-Claude credentials via the new `engine` wincred module instead of the file-only
-path (or keep file-first, credential-manager fallback — same precedence as
-macOS).
+Agent credential storage is separate from Komet synchronization identity. The
+Windows credential backend belongs in `crates/engine/src/agent_accounts.rs`,
+with file/credential-manager precedence matched to the provider's existing
+platform behavior.
 
 ### `crates/engine` — credentials, lock, device name
 

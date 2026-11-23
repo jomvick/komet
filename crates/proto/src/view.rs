@@ -12,7 +12,7 @@
 
 use chrono::{DateTime, Utc};
 
-use crate::{AuthState, Chat, ChatIndicator, Session, SessionStatus, Space, WorkspaceScope};
+use crate::{Chat, ChatIndicator, Session, SessionStatus, Space};
 
 // ---------------------------------------------------------------------------
 // Connection + status
@@ -239,25 +239,15 @@ pub enum GatePhase {
     Loading,
     /// Engine unreachable and embedding failed.
     Failed(String),
-    /// Engine up, but signed out — show the sign-in card.
-    SignIn,
-    /// Signed in but no organization selected — "Create your workspace".
-    OrgGate,
+    /// Engine up, but required sync configuration is missing.
+    SyncRequired,
     /// Render the shell.
     Ready,
 }
 
 /// Komet is local-first: once an engine is reachable, the shell is usable.
-///
-/// Authentication is not an application gate. Self-hosted synchronization is
-/// configured separately with a token, and an old daemon that does not report
-/// its scope must remain usable rather than being sent to the retired WorkOS
-/// sign-in flow.
-pub fn gate_phase(
-    connection: &ConnectionStatus,
-    _workspace_scope: Option<WorkspaceScope>,
-    _auth: Option<&AuthState>,
-) -> GatePhase {
+/// Self-hosted synchronization is configured separately with a shared token.
+pub fn gate_phase(connection: &ConnectionStatus) -> GatePhase {
     match connection {
         ConnectionStatus::Connecting => GatePhase::Loading,
         // A bounded auto-retry or a degraded-but-attached engine keeps the
@@ -284,42 +274,8 @@ mod gate_tests {
             Some(WorkspaceScope::Synced),
             Some(WorkspaceScope::Development),
         ] {
-            assert_eq!(
-                gate_phase(&ConnectionStatus::Ready, scope, None),
-                GatePhase::Ready
-            );
+            assert_eq!(gate_phase(&ConnectionStatus::Ready), GatePhase::Ready);
         }
-    }
-}
-
-/// Parse an `AuthStatus` frame tolerantly. The engine currently serializes its
-/// own enum (`{"_tag": "SignedIn", ...}`) while the proto type expects
-/// `{"state": "signedIn", ...}` — accept both so either side can converge
-/// without breaking a viewport.
-pub fn parse_auth_state(value: &serde_json::Value) -> Option<AuthState> {
-    if let Ok(state) = serde_json::from_value::<AuthState>(value.clone()) {
-        return Some(state);
-    }
-    let tag = value.get("_tag").and_then(|t| t.as_str())?;
-    let user = || -> Option<crate::UserProfile> {
-        let u = value.get("user")?;
-        Some(crate::UserProfile {
-            id: u.get("id")?.as_str()?.to_string(),
-            email: u.get("email")?.as_str()?.to_string(),
-            name: u.get("name").and_then(|n| n.as_str()).map(str::to_string),
-        })
-    };
-    match tag {
-        "SignedOut" => Some(AuthState::SignedOut),
-        "NeedsOrganization" => Some(AuthState::NeedsOrganization { user: user()? }),
-        "SignedIn" => Some(AuthState::SignedIn {
-            user: user()?,
-            org_id: value
-                .get("orgId")
-                .and_then(|v| v.as_str())
-                .map(str::to_string),
-        }),
-        _ => None,
     }
 }
 

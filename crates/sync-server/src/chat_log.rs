@@ -1,5 +1,5 @@
 //! chat2 log storage — the dumb-relay data model of the removed
-//! `edge/src/chat-log.ts`, over one sqlite file per chat room.
+//! `shared protocol behavior`, over one sqlite file per chat room.
 //!
 //! The room is an append-only log of opaque Loro update blobs plus one
 //! client-written checkpoint blob. Nothing here interprets the bytes; CRDT
@@ -14,11 +14,11 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use rusqlite::{Connection, OptionalExtension as _, params};
 
-/// Per-row byte cap (the DO's `MAX_ROW_BYTES`). Post-strip updates are
+/// Per-row byte cap (the room service's `MAX_ROW_BYTES`). Post-strip updates are
 /// KB-scale; a full checkpoint travels over HTTP, never as a row.
 pub const MAX_ROW_BYTES: usize = 1024 * 1024;
 
-/// Blob names for the checkpoint payload and its frontier (the DO's names).
+/// Blob names for the checkpoint payload and its frontier (the room service's names).
 pub const CHECKPOINT_BLOB: &str = "checkpoint";
 pub const FRONTIER_BLOB: &str = "checkpoint-frontier";
 

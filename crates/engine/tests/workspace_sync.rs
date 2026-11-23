@@ -117,7 +117,7 @@ fn assemble(dir: &std::path::Path, device_id: &str) -> EngineCore {
     EngineCore::assemble(dir, registry(), HarnessId::Mock, None).expect("engine core assembles")
 }
 
-/// The in-process room: an in-memory registry server speaking the DO's JSON
+/// The in-process room: an in-memory registry server speaking the room service's JSON
 /// WS protocol (what the RegistryRoom DO does over the wire), with both
 /// engines' hosts wired to it via the test seam.
 async fn bridge(
@@ -548,7 +548,7 @@ async fn chat_config_selects_the_run_harness() {
 }
 
 /// Live-edge variant: the same convergence through a real workspace room. Requires
-/// the TS edge (`wrangler dev` in `edge/` with AUTH_MODE=dev):
+/// the self-hosted `komet-sync-server`:
 ///
 /// ```sh
 /// KOMET_EDGE_WS=ws://127.0.0.1:8787 cargo test -p komet-engine -- --ignored
@@ -556,7 +556,7 @@ async fn chat_config_selects_the_run_harness() {
 #[tokio::test]
 #[ignore = "requires a live edge: set KOMET_EDGE_WS (e.g. ws://127.0.0.1:8787)"]
 async fn two_engines_converge_through_a_real_workspace_room() {
-    use komet_engine::doc_host::EdgeConfig;
+    use komet_engine::doc_host::SyncConfig;
 
     let base = std::env::var("KOMET_EDGE_WS")
         .expect("set KOMET_EDGE_WS to the edge origin, e.g. ws://127.0.0.1:8787");
@@ -566,7 +566,7 @@ async fn two_engines_converge_through_a_real_workspace_room() {
         std::fs::create_dir_all(dir).expect("create data dir");
         std::fs::write(dir.join("device-id"), device_id).expect("write device id");
         // Dev-mode bearer `user@org` carries the org claim the workspace route checks.
-        let edge = Some(EdgeConfig::with_static_token(
+        let edge = Some(SyncConfig::with_static_token(
             base.clone(),
             format!("{user}@{org}"),
         ));

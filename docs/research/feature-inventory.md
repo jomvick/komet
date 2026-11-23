@@ -1,19 +1,16 @@
 # Komet — Complete Feature Inventory (parity checklist for the native rewrite)
 
-Source: exploration of ~/github/komet on 2026-07-19. Rewrite keeps ONLY the Loro path; token-usage
-display EXCLUDED. File paths refer to the reference repo.
+Historical feature inventory from the native rewrite. Items below describe the
+source behavior where not superseded; `ARCHITECTURE.md` and `docs/PARITY.md`
+are the maintained architecture and status references.
 
 ## 0. Architecture orientation
-- Backend = engine, UI = viewport. Headless backend runs agents, owns auth, hosts terminals,
-  computes diffs, syncs. Desktop is a thin viewport over localhost WebSocket "IPC" (UiRpc).
-- Two transports, one contract: UI<->backend = IPC (UiRpc); backend<->backend = device-room relay
-  DO on the edge (ControlRpc). WebRTC mesh is GONE (replaced by relay).
-- KEEP (Loro/DO): transcripts = per-chat Loro docs via session-room DO; commands
-  (run/steer/interrupt/respondInput) = durable doc entries executed by the chat's host.
-- DROP: messages sync over Postgres logical replication, device-addressed run RPCs,
-  WatchMessages, WebRTC + signaling.
-- NOTE: chats/sessions/devices/checkout-diffs entity sync is STILL Postgres-based in komet — the rewrite
-  must re-home it (decision: per-org workspace Loro doc, see ARCHITECTURE.md).
+- The Rust engine runs agent sessions and owns local stores, terminals, repositories,
+  project transfers, and sync clients. The GPUI app can embed it or connect over localhost IPC.
+- Optional multi-device sync uses the self-hosted Rust `komet-sync-server`, shared bearer
+  credentials, and Loro documents for sessions, registry, and device relay.
+- Commands are durable entries in session documents and execute on the device hosting each chat.
+- Without a configured sync URL and bearer, the engine makes no sync network connections.
 
 ## 1. Desktop app
 ### 1.1 Window shell
@@ -21,10 +18,11 @@ display EXCLUDED. File paths refer to the reference repo.
 - External links open in OS browser; single-instance lock; dev vs packaged ports (26634/26654) and
   data dirs (.komet-dev/.komet). Fullscreen hides traffic lights -> cluster reflows.
 
-### 1.2 App phases (App.tsx)
-- Three phases with crossfade: Gate (loading/reconnect/login card over bg-grid), OrgGate ("Create
-  your workspace" + existing org memberships + "Use a different account"), app (router).
-- Boot Splash: komet-wave loader, fades out (splash-out) once connected && authReady (15s cap),
+### 1.2 App phases
+- Connection bootstrap and recoverable engine failure lead into the shell; local use needs no
+  remote identity setup.
+- First-run onboarding configures the local app experience. The boot splash fades once the
+  engine and workspace state are ready (15s cap),
   never returns mid-session.
 
 ### 1.3 Shell layout (__root.tsx)
@@ -51,7 +49,7 @@ display EXCLUDED. File paths refer to the reference repo.
   (registry, rename, presence dot, copy id), agents (accounts), shortcuts, archived (unarchive).
 
 ### 1.6 Sidebar
-- DeviceSwitcher + "New session" button + session list + UserMenu (name/email/plan, settings, signout).
+- DeviceSwitcher + "New session" button + session list + settings menu. The former Komet account menu was removed.
 - Flat or grouped-by-project (persisted); "Show more" per group.
 - Session rows: title, time, status dot (staleness-checked), context menu Rename/Archive/Delete,
   hover-intent prefetch, optimistic pending chats deduped on sync.
@@ -134,7 +132,7 @@ display EXCLUDED. File paths refer to the reference repo.
 
 ### 1.13 State & connection
 - Every UI action = RPC to local backend; send path QueueCommand (doc). Chunked uploads 60KB.
-- Subscriptions: AuthStatus, WatchDevices, WatchChats(scoped), WatchSessions, WatchCheckoutDiffs,
+- Subscriptions: SyncStatus, WatchDevices, WatchChats(scoped), WatchSessions, WatchCheckoutDiffs,
   LocalDevice, per-active-chat WatchDocMessages; hover-prefetch; reconnect from scratch on drop.
 
 ## 2. Control plane (RPC surface)
@@ -156,21 +154,21 @@ display EXCLUDED. File paths refer to the reference repo.
 - QueueCommand{chatId,kind,payload}->{commandId}
 - Mutate: CreateChat, SetChatConfig, SetChatArchived, RenameChat, RenameDevice, DeleteChat,
   MarkChatSeen
-### AuthRpc (IPC-only)
-- AuthStatus -> stream (SignedOut|NeedsOrganization{user}|SignedIn{user,orgId?})
-- SignIn->{url}; SignInHeadless->{url}; CompleteSignIn{code}; SignOut; ListOrgs; CreateOrg; SelectOrg
+### Retired Komet account RPCs
+- Komet account sign-in/out and organization membership RPCs have been removed.
+- The self-hosted sync server uses its own shared bearer token; see `docs/sync.md`.
 ### Wire types
 - AgentEvent: SessionStarted, TextDelta, ReasoningDelta, ToolCall, ToolResult, Usage(kept as event,
   not displayed), Error, InputRequested, InputResolved, Steered, Done
 - ToolCall kinds: Exec/ReadFile/WriteFile/EditFile/ApplyPatch/Search/Glob/WebFetch/WebSearch/
   Todo/Mcp/Unknown
 - Model/ModelOption/ModelOptionChoice, RunRequest, Chat/Session/Message/Device/Repo/Worktree/
-  FolderListing/CheckoutDiff, AgentAccount/AgentUsage, AuthState
+  FolderListing/CheckoutDiff, AgentAccount/AgentUsage, SyncStatus
 
 ## 3. Backend engine
 - 3.1 Lifecycle: single-instance lock on data dir; login-shell PATH; crash shield (drain+exit);
   parent-PID watchdog; heartbeat 15s; device registration; stale-session recovery; headless
-  sign-in prompt on TTY; doc command executor (host-only) run/steer(->new-turn fallback)/
+  startup from local configuration; doc command executor (host-only) run/steer(->new-turn fallback)/
   interrupt/respondInput.
 - 3.2 Sessions engine: per-session pub/sub; Subscribe = journal replay (resumable seq) then live;
   persistent steerable sessions (idle reaper, STALL_MS=10min watchdog, steering mailbox delivered
@@ -185,14 +183,15 @@ display EXCLUDED. File paths refer to the reference repo.
   buffers 30min TTL; max 32; SubscribeTerminal replays then tails.
 - 3.5 Repos/diffs: list/add/clone/create; branches; worktrees ~/.komet/worktrees/<repo>/<name>;
   checkoutIdentity; CheckoutDiffSync: fs watchers + 2min repair, git diff (name-status + numstat +
-  patch incl untracked), 3MiB cap, sha256; publishes DiffSidecar to chat DOs; GitMetadataSync
+  patch incl untracked), 3MiB cap, sha256; publishes DiffSidecar to chat rooms; GitMetadataSync
   watches HEAD -> chat.branch; folder listing in disposable worker w/ 6s timeout.
-- 3.7 Auth: WorkOS auth-code + loopback callback; headless paste-code; refresh persisted; org
-  gate; dev mode bearer. Uploads: chunked staging -> durable file. Agent accounts: claude-swap
+- 3.7 Sync: one self-hosted `komet-sync-server`, configured with `KOMET_EDGE_URL` and
+  `KOMET_SYNC_TOKEN`; no Komet account or organization onboarding. Uploads: chunked staging -> durable
+  file. Agent accounts: claude-swap
   (Keychain "Claude Code-credentials" / ~/.claude/.credentials.json + ~/.claude.json; Codex
   $CODEX_HOME/auth.json); detect live, swap to activate, plan labels, usage probes, OAuth flows.
   Device-room host: one wss to device DO; serves full ControlRpc via virtual sockets over
-  {s,k,to,from} frames; nudges. Peers: dials other devices' relay DOs, link caching.
+  {s,k,to,from} frames; nudges. Peers dial other device relays with link caching.
 
 ## 4. Harness
 - HarnessShape: id, name, supportsSteering, steeringMode (step-boundary|turn-boundary),
@@ -227,25 +226,16 @@ display EXCLUDED. File paths refer to the reference repo.
 - Constants: MSG_INLINE_MAX 256KB, RETAIN_DAYS 30, COMPACT_LOG_BYTES 8MB, SOFT_CEILING 25MB,
   STREAM_COMMIT_MS 120, DO_FLUSH_MS 5000, LRU 80MB, TAIL 64, TERMINAL_OUTPUT_BATCH_MS 12.
 
-## 6. Edge (Cloudflare Worker + DOs — stays TypeScript)
-- Worker routes: /health; /session/:chatId/ws (loro room); /tail/:chatId; /stats/:chatId;
-  /diff/:chatId GET/POST; /snapshot/:chatId; /append/:chatId; /seed/:chatId;
-  /device/:deviceId/ws?role=host|client&connId=; /device/:id/sidecar/:name; /device/:id/status;
-  /device/:id/nudge; /attachments/:sha256 PUT/GET/HEAD (content-addressed R2 att/{user}/{sha},
-  32MB, server-side hash verify).
-- Auth: WorkOS JWKS at edge; DOs see only Worker-stamped identity; ownership claim-on-first-join.
-- SessionRoom DO: hibernatable WS, updates log (5s flush), snapshot blob, lazy tail, diff blob,
-  %EPH presence; two-level compaction (log-fold @8MB lossless; history-trim shallow snapshot at
-  daily frontier checkpoints >= RETAIN_DAYS); daily alarm -> checkpoint + trim + R2
-  backup/{chatId}/latest.loro; VV backfill on join; fragment reassembly; stale-peer import ->
-  InvalidUpdate ack -> app re-submit; blobs chunked over DO SQL.
-- DeviceRoom DO: byte-pipe frames uleb128 len ‖ JSON {s,k,to?,from?} ‖ payload; one live host
-  socket; relay control frames; durable nudges (replayed on host join, dedup, cap 256); sidecar
-  slots (repos snapshot); /status /nudge.
+## 6. Self-hosted sync server
+- `komet-sync-server` is a Rust service; SQLite stores per-room frames and filesystem storage holds
+  blobs. Clients use a shared bearer token and connect only when both the server URL and token are
+  configured.
+- Session, registry and device rooms use the current Loro protocol. See `docs/chat2-sync.md`,
+  `docs/registry-sync.md` and `docs/self-hosted-sync.md` for protocol and deployment details.
 
-## 7. Server -> folded into edge for native
-- Keep: WorkOS code exchange/refresh, org list/create (move to edge Worker routes).
-- Drop: entity push/query, Postgres, signaling, Fly deploy of separate server.
+## 7. Server boundary
+- One optional self-hosted service owns synchronized rooms and blobs.
+- There is no Komet account, organization onboarding, or hosted authentication service.
 
 ## 8. EXCLUDED (token usage display)
 - WatchUsage RPC, UsageStats/UsageDay, backend usage aggregation, profile heatmap/hero/stats,

@@ -4,8 +4,8 @@
 //! the current executable with the `KOMET_*` environment captured at install
 //! time, so `KOMET_EDGE_URL=… komet daemon install` bakes that override in.
 //!
-//! Auth is decoupled: without a saved session the service remains up on the
-//! local-only profile. `komet login` and a service restart opt into sync.
+//! Sync is configured explicitly with `KOMET_EDGE_URL` and `KOMET_SYNC_TOKEN`;
+//! those values are captured when the service is installed.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -18,11 +18,7 @@ use anyhow::{Context, bail};
 mod win;
 
 const LAUNCHD_LABEL: &str = "sh.komet.app";
-/// Unit name written by `komet daemon install`. Komet's curl|sh installer
-/// (`edge/src/install.sh`) used to write this same name so the two paths
-/// wouldn't fight over the unit; that installer no longer exists in Komet
-/// (the `edge` crate was dropped), so `komet daemon install` is the sole
-/// owner now.
+/// Unit name written by `komet daemon install`.
 const SYSTEMD_UNIT: &str = "komet.service";
 
 /// Windows service key name (SCM database) and the registry service subkey.
@@ -57,11 +53,9 @@ const CAPTURED_ENV: &[&str] = &[
     "KOMET_DATA_DIR",
     "KOMET_EDGE_URL",
     "KOMET_EDGE_TOKEN",
+    "KOMET_SYNC_TOKEN",
     "KOMET_ORG_ID",
-    "KOMET_WORKOS_CLIENT_ID",
-    "KOMET_WORKOS_API_BASE",
     "KOMET_IPC_PORT",
-    "KOMET_CALLBACK_PORT",
     "KOMET_HARNESS",
     "KOMET_DEVICE_NAME",
     // Captured, not defaulted: a daemon pointed at a plain-HTTP LAN server warns
@@ -115,9 +109,7 @@ pub fn install_with_args(data_dir: &Path, args: &[&str]) -> anyhow::Result<()> {
     } else {
         bail!("komet daemon is only supported on macOS (launchd) and Linux (systemd)");
     }
-    println!(
-        "Without a saved account the engine stays local-only; sign-in and restart are optional for sync."
-    );
+    println!("Sync uses the KOMET_EDGE_URL and KOMET_SYNC_TOKEN captured at install time.");
     println!(
         "Logs: {}",
         if cfg!(target_os = "macos") {
@@ -450,11 +442,13 @@ mod tests {
 
     #[test]
     fn systemd_unit_shape() {
+        assert!(CAPTURED_ENV.contains(&"KOMET_SYNC_TOKEN"));
         let unit = render_systemd_unit(
             Path::new("/usr/local/bin/komet"),
             &[
                 ("PATH".into(), "/usr/bin:/bin".into()),
                 ("KOMET_EDGE_URL".into(), "https://edge.example".into()),
+                ("KOMET_SYNC_TOKEN".into(), "shared-secret".into()),
                 ("RUST_LOG".into(), "info,komet=\"debug\"".into()),
             ],
             &["headless"],
@@ -462,6 +456,7 @@ mod tests {
         assert!(unit.contains("ExecStart=/usr/local/bin/komet headless\n"));
         assert!(unit.contains("Environment=\"PATH=/usr/bin:/bin\"\n"));
         assert!(unit.contains("Environment=\"KOMET_EDGE_URL=https://edge.example\"\n"));
+        assert!(unit.contains("Environment=\"KOMET_SYNC_TOKEN=shared-secret\"\n"));
         // Inner quotes escaped so systemd re-parses the value verbatim.
         assert!(unit.contains("Environment=\"RUST_LOG=info,komet=\\\"debug\\\"\"\n"));
         assert!(unit.contains("StartLimitIntervalSec=60\n"));
@@ -487,13 +482,6 @@ mod tests {
         );
         assert!(plist.contains("<string>serve</string>"));
     }
-
-    // The curl|sh installer (edge/src/install.sh) shipped a duplicate unit
-    // spec that this test cross-checked against `render_systemd_unit`. The
-    // `edge` crate was removed as part of Komet's local-first divergence from
-    // Komet, so the installer no longer exists — `komet daemon install` is
-    // now the only path that writes the unit, and `systemd_unit_shape` above
-    // already covers its shape directly.
 
     #[test]
     fn installed_exe_uses_the_current_symlink() {

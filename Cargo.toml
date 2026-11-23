@@ -40,9 +40,8 @@ komet-term = { path = "crates/term" }
 
 # CRDT
 loro = "1.13"
-# Wire protocol for the SessionRoom DO rooms — official Rust twin of the npm
-# `loro-protocol` package the TS edge speaks (same monorepo, byte-identical
-# frames, cross-checked by its js_snapshots tests).
+# Wire protocol used by Komet's Loro session rooms; frame compatibility is
+# covered by shared protocol snapshots.
 loro-protocol = "0.3"
 
 # gpui — the jomvick/zed fork (branch komet-gpui @ e2ddcc6): upstream f14fea9 + commits on the fork's

@@ -30,7 +30,7 @@ const MIGRATIONS: &[&str] = &[
         command_id   TEXT PRIMARY KEY,
         processed_at INTEGER NOT NULL
      ) STRICT;",
-    // v2 — chat2 room cursor + doc epoch (docs/chat2-sync.md C2). The cursor
+    // v2 — chat2 room cursor + doc epoch (local sync store schema). The cursor
     // is persisted in the SAME transaction as the snapshot bytes, so content
     // and cursor cannot diverge (restored backups / copied devices simply
     // redownload from their honest cursor). `epoch` marks rebuild lineage

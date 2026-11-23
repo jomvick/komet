@@ -1,5 +1,5 @@
 //! chat2 hub (`/chat2/{chatId}/ws` + checkpoint/tail sidecars) — the Rust port
-//! of the removed Cloudflare Durable Object (`edge/src/chat-room.ts`).
+//! implemented by the self-hosted Rust sync server.
 //!
 //! The hub is a dumb authenticated log relay: opaque Loro updates are appended
 //! to a seq-ordered log ([`crate::chat_log`]), live-relayed to the room's other
@@ -14,7 +14,7 @@
 //! it originated, so the sender never sees its own row echoed.
 //!
 //! Quota windows and presence beats are memory-only and reset on restart,
-//! exactly like the DO's in-memory maps: they contain runaway-client loops and
+//! exactly like the room service's in-memory maps: they contain runaway-client loops and
 //! light the stats surface, not honest traffic metering.
 
 use std::collections::HashMap;

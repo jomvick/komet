@@ -1,6 +1,4 @@
-use gpui::{
-    AnyElement, Context, IntoElement, MouseButton, SharedString, Window, div, prelude::*, px,
-};
+use gpui::{AnyElement, Context, IntoElement, MouseButton, SharedString, Window, div, px};
 use komet_engine::environments::LOCAL_ENV_ID;
 use komet_proto::{ChatIndicator, WorkspaceScope};
 
@@ -728,9 +726,9 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let (user, workspace_scope) = {
+        let (sync_status, workspace_scope) = {
             let state = self.state.read(cx);
-            (state.auth_user().cloned(), state.workspace_scope)
+            (state.sync_status.clone(), state.workspace_scope)
         };
 
         // When "All projects" (filter = None) → grouped by project folder.
@@ -813,20 +811,23 @@ impl Shell {
             }
             Some(WorkspaceScope::Development) => (
                 "Development".into(),
-                Some("Local development runtime".into()),
-                "Authentication disabled".into(),
+                Some(
+                    if sync_status
+                        .as_ref()
+                        .is_some_and(|status| status.token_configured)
+                    {
+                        "Self-hosted sync enabled".into()
+                    } else {
+                        "Local development runtime".into()
+                    },
+                ),
+                "Stored on this device".into(),
             ),
-            Some(WorkspaceScope::Synced) | None => {
-                let line: SharedString = user
-                    .as_ref()
-                    .map(|u| u.name.clone().unwrap_or_else(|| u.email.clone()).into())
-                    .unwrap_or_else(|| SharedString::from("Not signed in"));
-                let email = user
-                    .as_ref()
-                    .map(|u| SharedString::from(u.email.clone()))
-                    .unwrap_or_else(|| line.clone());
-                (line, Some("Alpha".into()), email)
-            }
+            Some(WorkspaceScope::Synced) | None => (
+                "Synced workspace".into(),
+                Some("Self-hosted sync".into()),
+                "Stored in the configured workspace".into(),
+            ),
         };
         // In Development mode show a plain Settings button instead of the
         // profile card — there is no real account to display in that scope.

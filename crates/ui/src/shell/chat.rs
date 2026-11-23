@@ -127,42 +127,4 @@ impl Shell {
         );
         cx.notify();
     }
-
-    pub(super) fn start_sign_in(&mut self, cx: &mut Context<Self>) {
-        let scope = self.state.read(cx).workspace_scope;
-        if scope == Some(WorkspaceScope::Development) {
-            return;
-        }
-        self.close_user_menu(cx);
-        if scope == Some(WorkspaceScope::Local) {
-            self.sync_flow = SyncFlow::Enabling;
-        }
-        let Some(engine) = self.state.read(cx).local_engine().cloned() else {
-            return;
-        };
-        self.auth_task = Some(cx.spawn(async move |this, cx| {
-            let result = engine
-                .client()
-                .call(methods::SIGN_IN, serde_json::json!({}))
-                .await;
-            this.update(cx, |shell, cx| match result {
-                Ok(value) => {
-                    if let Some(url) = value.get("url").and_then(|u| u.as_str()) {
-                        cx.open_url(url);
-                    }
-                    cx.notify();
-                }
-                Err(err) => {
-                    if scope == Some(WorkspaceScope::Local) && shell.sync_flow == SyncFlow::Enabling
-                    {
-                        shell.sync_flow = SyncFlow::Idle;
-                    }
-                    shell.sidebar_notice = Some(format!("Sign in failed: {err}").into());
-                    cx.notify();
-                }
-            })
-            .ok();
-        }));
-        cx.notify();
-    }
 }

@@ -61,13 +61,12 @@ const DOC_RESIDENT_FLOOR_BYTES: usize = 512 * 1024;
 /// watcher on a roomless doc that renders once and never updates again.
 const EVICT_MIN_IDLE_MS: i64 = 30_000;
 
-/// Edge connection config. The bearer is a **provider**, never a snapshot:
-/// every room (re)connect and HTTP request re-reads it, so WorkOS access-token
-/// refreshes (~1h expiry) take effect without an engine restart. Dev bearers
-/// (which never expire) ride the same seam as a [`komet_rpc::StaticToken`].
+/// Sync connection config. The bearer is a **provider**, never a snapshot:
+/// every room reconnect and HTTP request reads it from the configured token
+/// source, which keeps transport credential handling in one place.
 #[derive(Clone)]
-pub struct EdgeConfig {
-    /// Edge base URL (`http(s)://…`); rewritten to `ws(s)` for the room socket.
+pub struct SyncConfig {
+    /// Sync server base URL (`http(s)://…`); rewritten to `ws(s)` for room sockets.
     pub url: String,
     /// Fresh-bearer provider (the relay's `TokenSource`), consulted per
     /// connect/request. `None` from the provider = signed out.
@@ -79,16 +78,16 @@ pub struct EdgeConfig {
     pub device_id: String,
 }
 
-impl std::fmt::Debug for EdgeConfig {
+impl std::fmt::Debug for SyncConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("EdgeConfig")
+        f.debug_struct("SyncConfig")
             .field("url", &self.url)
             .field("token", &"<provider>")
             .finish()
     }
 }
 
-impl EdgeConfig {
+impl SyncConfig {
     pub fn new(url: impl Into<String>, token: Arc<dyn komet_rpc::TokenSource>) -> Self {
         Self {
             url: url.into(),
@@ -161,7 +160,7 @@ pub struct DocHostConfig {
     pub default_harness: HarnessId,
     /// When present, each opened chat joins its edge session room. `None` = fully
     /// offline operation (local snapshots only).
-    pub edge: Option<EdgeConfig>,
+    pub edge: Option<SyncConfig>,
 }
 
 struct DocHostInner {
@@ -231,7 +230,7 @@ pub struct ChatDocHandle {
     /// thin lineage exists on disk at all; `save_snapshot` double-checks, so
     /// a doc that was never seeded can't lose its only copy).
     retired: AtomicBool,
-    /// chat2 relay client (docs/chat2-sync.md C3) — populated instead of
+    /// chat2 relay client (chat2 engine integration) — populated instead of
     /// `room` when the registry names roomGen 2 for this chat.
     chat2: Mutex<Option<komet_sync::ChatClient>>,
     /// Local commits made before the relay connects (the dial can take up
@@ -717,7 +716,7 @@ impl DocHost {
     /// Open (or return) the chat's doc handle: load the local snapshot (or init fresh),
     /// start the change-driven task, and join the edge room when configured.
     pub fn open(&self, chat_id: &str) -> Result<Arc<ChatDocHandle>, EngineError> {
-        // The registry names the sync room generation (docs/chat2-sync.md
+        // The registry names the sync room generation (docs/sync.md
         // M2): absent row / absent field = legacy s2. Read it BEFORE the
         // cached-handle check — a cached s2-mode handle for a chat another
         // device has since cut over to chat2 would otherwise serve its frozen
@@ -1013,7 +1012,7 @@ impl DocHost {
     /// The legacy s2 loro-room join loop (extracted verbatim from `open`).
     fn spawn_s2_join(
         &self,
-        edge: &EdgeConfig,
+        edge: &SyncConfig,
         chat_id: &str,
         doc: &Arc<SessionDoc>,
         handle: &Arc<ChatDocHandle>,
@@ -1109,11 +1108,11 @@ impl DocHost {
         }
     }
 
-    /// chat2 relay join (docs/chat2-sync.md C3): supervised like the s2
+    /// chat2 relay join (chat2 engine integration): supervised like the s2
     /// loop — deadline on every dial, capped jittered backoff, wake redial —
     /// but the client resolves only after full catch-up (checkpoint + rows),
     /// so "joined" here means "transcript converged".
-    fn spawn_chat2_join(&self, edge: EdgeConfig, handle: &Arc<ChatDocHandle>, cursor: u64) {
+    fn spawn_chat2_join(&self, edge: SyncConfig, handle: &Arc<ChatDocHandle>, cursor: u64) {
         let chat = handle.chat_id.clone();
         let doc = handle.doc.clone();
         let store = self.inner.store.clone();
@@ -1286,7 +1285,7 @@ impl DocHost {
         });
     }
 
-    /// Host-side chat2 seed (docs/chat2-sync.md M1/M2): rebuild thin, POST
+    /// Host-side chat2 seed (chat2 snapshot format): rebuild thin, POST
     /// the seed checkpoint, persist the thin lineage locally, THEN flip the
     /// registry — each step idempotent, a crash before the flip leaves the
     /// chat on s2 and the next open retries (M5).
@@ -1298,7 +1297,7 @@ impl DocHost {
     /// execute first). Holds only a weak handle: eviction ends the wait.
     fn spawn_chat2_seed_when_quiet(
         &self,
-        edge: EdgeConfig,
+        edge: SyncConfig,
         chat_id: &str,
         handle: &Arc<ChatDocHandle>,
     ) {
@@ -1361,7 +1360,7 @@ impl DocHost {
         });
     }
 
-    fn spawn_chat2_seed(&self, edge: EdgeConfig, chat_id: &str, doc: Arc<SessionDoc>) {
+    fn spawn_chat2_seed(&self, edge: SyncConfig, chat_id: &str, doc: Arc<SessionDoc>) {
         {
             let mut seeding = lock(&self.inner.seeding);
             if !seeding.insert(chat_id.to_string()) {
@@ -1387,7 +1386,7 @@ impl DocHost {
 
     async fn seed_chat2(
         &self,
-        edge: &EdgeConfig,
+        edge: &SyncConfig,
         chat_id: &str,
         doc: Arc<SessionDoc>,
     ) -> Result<(), String> {
@@ -1401,7 +1400,7 @@ impl DocHost {
         // single chat (v0.1.32 DOA).
         drop(doc);
         if !rebuilt.sidecar.is_empty() {
-            // Sidecar PARKED (docs/chat2-sync.md A2): full outputs are not
+            // Sidecar PARKED (full-output retention policy): full outputs are not
             // uploaded; they survive in the rollback snapshot + run journal.
             tracing::info!(chat = %chat_id, payloads = rebuilt.sidecar.len(),
                 "chat2 seed: sidecar parked; outputs stay local");
@@ -1562,7 +1561,7 @@ impl DocHost {
         let raw = loro::LoroDoc::new();
         raw.import(&bytes).map_err(|e| e.to_string())?;
         let fat = SessionDoc::from_doc(raw);
-        // Thin before appending (docs/chat2-sync.md A2): full outputs are
+        // Thin before appending (full-output retention policy): full outputs are
         // parked, exactly like a seed — they survive in the rollback copy
         // saved below and the run journal.
         let rebuilt = komet_doc::rebuild::rebuild_thin_doc(&fat).map_err(|e| e.to_string())?;
@@ -1631,7 +1630,7 @@ impl DocHost {
         fat.export_snapshot().ok()
     }
 
-    /// chat2 host duties on the doc-quiesce tick (docs/chat2-sync.md C3):
+    /// chat2 host duties on the doc-quiesce tick (chat2 engine integration):
     /// - threshold checkpoint: when the room's row log passes 512KB or 200
     ///   rows, post a full checkpoint so cold readers load one compact blob
     ///   instead of replaying the log (the alert-shaped growth bound);
@@ -2127,8 +2126,8 @@ impl DocHost {
         });
     }
 
-    /// Upload a tool result's full output/diff to the R2 sidecar
-    /// (`PUT {edge}/blob/{chatId}/{partId}[.diff]`, docs/chat2-sync.md A2).
+    /// Upload a tool result's full output/diff to the parked sidecar
+    /// (`PUT {edge}/blob/{chatId}/{partId}[.diff]`, full-output retention policy).
     /// Fire-and-forget: the doc already carries the summary, so a lost upload
     /// degrades to "full output unavailable" — it must never block or fail
     /// the run. Offline/edge-less engines skip silently.
@@ -2736,9 +2735,9 @@ pub fn respond_input_prompt(
 }
 
 /// Percent-encode one URL path segment of a sidecar part id. PART_RE's
-/// alphabet includes `#` and `:` — legal in R2 keys and doc refs, but a raw
+/// alphabet includes `#` and `:` — legal in object-store keys and doc refs, but a raw
 /// `#` in a URL is a fragment delimiter (the request would silently hit the
-/// truncated key, colliding parts). The Worker decodes before validating.
+/// truncated key, colliding parts). The sidecar fetcher decodes before validating.
 fn encode_part_segment(part_id: &str) -> String {
     let mut out = String::with_capacity(part_id.len());
     for byte in part_id.bytes() {

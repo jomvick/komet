@@ -40,7 +40,7 @@ const PING: &str = "ping";
 const PONG: &str = "pong";
 
 /// Pending nudges kept per device while its host is offline; overflow drops the
-/// oldest (recency wins, like the DO's `pending_nudges` bound).
+/// oldest (recency wins, like the room service's `pending_nudges` bound).
 const NUDGE_MAX_PENDING: usize = 256;
 
 /// A room with no host, client or queued nudge is dropped after this idle period.
@@ -409,7 +409,7 @@ pub(crate) async fn nudge_handler(
     let Some(chat_id) = body.get("chatId").and_then(|value| value.as_str()) else {
         return bad_chat_id();
     };
-    // Same rule as the DO's CHAT_ID_RE (64, not the 128 a room id allows).
+    // Same rule as the room service's CHAT_ID_RE (64, not the 128 a room id allows).
     if !(1..=64).contains(&chat_id.len())
         || !chat_id
             .bytes()

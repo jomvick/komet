@@ -250,8 +250,8 @@ Use `tempfile::tempdir()` (already a dev-dep of `komet-engine`; verify in `crate
 Discovered while running Task 5's integration test: the Rust sync server only
 **relayed** bytes. It never answered `hello` with `state`, so no engine could join
 a registry room (`protocol: registry handshake failed`) and an environment would
-show an empty sidebar — the feature's whole point. Ported the Durable Object's
-protocol into the server before building `komet serve` on top of it.
+show an empty sidebar — the feature's whole point. Implemented the registry
+room protocol in the server before building `komet serve` on top of it.
 
 **Files:**
 - Create: `crates/sync-server/src/registry.rs`

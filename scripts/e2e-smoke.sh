@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Two-device e2e smoke: the local self-hosted sync server (komet-sync-server, no
-# edge/ worker), two headless engines, and the komet-rpc e2e_driver example
+# self-hosted server), two headless engines, and the komet-rpc e2e_driver example
 # proving the doc-queued cross-device command path:
 #
 #   B queues a Run into the chat doc -> nudge -> A (host) executes via the mock

@@ -1,4 +1,4 @@
-//! chat2 wire frames — Rust twin of `edge/src/chat-frames.ts` (the DO's
+//! chat2 wire frames — Rust twin of `shared protocol behavior` (the room service's
 //! codec). Binary WS frames: `[type u8][headerLen u32 LE][header JSON][payload]`.
 //! Headers are tiny JSON; payloads are opaque bytes (Loro updates, checkpoint
 //! frontiers, presence ephemera). Cross-language contract — the layout tests

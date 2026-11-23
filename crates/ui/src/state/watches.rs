@@ -8,7 +8,7 @@ use serde::de::DeserializeOwned;
 
 use super::{AppState, ConnectionStatus, EngineHandle, WatchOwner, wait_for_deferred_engine};
 
-/// Observe assembly after an early attach (cloud onboarding or another viewport
+/// Observe assembly after an early attach (engine assembly or another viewport
 /// reaching the embedded engine over IPC). Data subscriptions wait on the same
 /// result, but their individual errors are not authoritative: older engines may
 /// legitimately omit a watch method. Only the assembly result may fail the

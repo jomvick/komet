@@ -1,11 +1,11 @@
 //! RegistryClient — WebSocket transport for the workspace registry
-//! (docs/registry-sync.md): hello/cursor handshake, push/ack for pending op
+//! (docs/sync.md): hello/cursor handshake, push/ack for pending op
 //! batches, merged-row broadcasts, presence beats, probe/redial liveness, and
 //! reconnect with exponential backoff.
 //!
 //! The client owns no row semantics: everything applies through the shared
 //! [`komet_doc::RegistryDoc`] under a lock. Wire frames are JSON text —
-//! byte-compatible with `edge/src/registry-room.ts`.
+//! byte-compatible with `shared protocol behavior`.
 //!
 //! Liveness discipline is inherited from `room.rs` and its incidents: the
 //! transport-level text ping elicits a runtime auto-pong that proves NOTHING
@@ -59,7 +59,7 @@ pub enum RegistryEvent {
     Presence,
 }
 
-// ── wire frames (JSON text; mirror edge/src/registry-room.ts) ───────────────
+// ── wire frames (JSON text; mirror shared protocol behavior) ───────────────
 
 #[derive(Serialize)]
 #[serde(tag = "t", rename_all = "lowercase")]

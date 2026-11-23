@@ -10,7 +10,7 @@ not built yet).
 | Item | Status | Notes |
 | --- | --- | --- |
 | 1.1 Window shell | partial | gpui window, always-dark theme, external links via OS browser. Deferred: frameless-inset/traffic-light chrome (macOS packaging not executed), single-instance lock, dev-vs-packaged port split (env vars instead). |
-| 1.2 App phases | done | Gate / OrgGate ("Create your workspace" + memberships) / app with crossfade; boot splash with fade-out cap (`ui/src/shell.rs`). |
+| 1.2 App phases | done | Local-first shell with engine failure state and boot splash with fade-out cap (`ui/src/shell.rs`). The former Komet account and organization gates have been removed. |
 | 1.3 Shell layout | done | Collapsible drag-resizable sidebar (208–400), right Changes pane (360–760, 52% cap), header variants, widths persisted to `ui-settings.json`. Titlebar GitHub control (GitHub mark + chevron left of the right-pane toggle, only with a GitHub remote): dropdown with branch (open repo/branch), the branch's PR with checks (opens in browser; "Create pull request" compare link otherwise), recent commits (open their diff tab), and Changes `+/-` (focus the Git diff tab) — `ui/src/shell/github.rs`. |
 | 1.4 Keyboard shortcuts | done | Customizable keymap, click-to-record with conflict detection, per-row reset (`ui/src/settings/shortcuts.rs`); persisted with UI settings. |
 | 1.5 Routes | partial | Native navigation instead of URL routes; settings pages: devices / providers / appearance / files / notifications / shortcuts / archived / sync / security. Profile page (heatmap) is an §8 exclusion. |
@@ -21,7 +21,7 @@ not built yet).
 | 1.10 Terminal panel | done | Session-scoped tabs, drag-reorder, middle-click close, height drag, replay-then-tail streams, input coalescing, ANSI emulator: grid paint + theme over `komet-term`, the gpui-free shared core (`crates/term/`, `ui/src/terminal/`). |
 | 1.11 Changes viewer | done | Patch → file/hunk/line rows, per-file collapse, ±gutters, time-sliced highlighting, preparing/clean/error states, checkout_id → device+cwd resolution. |
 | 1.12 Motion catalog | partial | Motion kit (cubic-bezier curves, fade-in/quick, splash-out, pulse/gradient spinners, menu/dialog-in, resort glide). Core motion paths honor gpui's reduced-motion flag (loaders, hover fades, scroll and pane tweens); there is no Komet-specific preference control. |
-| 1.13 State & connection | done | All subscriptions (AuthStatus, WatchDevices/Chats/Sessions/CheckoutDiffs, per-chat WatchDocMessages, LocalDevice probe); bounded backoff reconnect (500ms→10s, ±20% jitter, 6 attempts) with `Reconnecting`/`Degraded`/`Failed{retryable}` states, last frame and optimistic echoes kept across the gap, sends fired while down parked in a local outbox, ephemeral `RunPhase` frames naming the live wait. |
+| 1.13 State & connection | done | All subscriptions (SyncStatus, WatchDevices/Chats/Sessions/CheckoutDiffs, per-chat WatchDocMessages, LocalDevice probe); bounded backoff reconnect (500ms→10s, ±20% jitter, 6 attempts) with `Reconnecting`/`Degraded`/`Failed{retryable}` states, last frame and optimistic echoes kept across the gap, sends fired while down parked in a local outbox, ephemeral `RunPhase` frames naming the live wait. |
 | 1.14 Engine lifetime | done | The headed app starts a detached `komet engine` child when no engine is listening; sessions survive window/app close. `komet engine stop` gracefully stops it; startup falls back to embedded mode if the child fails to attach. |
 | 1.15 Agent shell panel | done | Right-panel « Shell agent » (`ui/src/agent_shell.rs`) showing what Claude/Codex report about their own CLI tool calls: `Exec` chip commands + harness progress tails. Read-only transcript projection — no PTY wiring, nothing journaled (see `docs/security.md`). |
 | 1.16 Appearance & wallpaper | done | Light/dark/system theme, accent, terminal chrome. Wallpaper over the whole window or the main panel, imported under `{data_dir}/wallpapers/`. Background effect `None` / `ASCII`: a single choice with no configuration — picking ASCII runs a fixed recipe (120 glyph columns, classic ramp, image colours, 35 % opacity) that turns the image into a glyph grid, rasterised once off the UI thread into one RGBA texture, cached at `{data_dir}/wallpaper-cache/{sha256}.png` per (image, params, 256 px size bucket). ASCII reads PNG/JPEG only; WebP/GIF keep working under `None`. `ui/src/settings/wallpaper/` |
@@ -39,19 +39,19 @@ not built yet).
 | LocalDevice | done | `{deviceId}`; IPC-only (never forwarded). |
 | DataRpc watches + QueueCommand | done | — |
 | Mutate ops | done | createChat/renameChat/setChatArchived/deleteChat/renameDevice done; markChatSeen accepted as a no-op (unseen markers UI-local); `SetChatConfig` exposed as a Mutate op dispatching to `set_chat_config` (`engine/src/rpc.rs`). |
-| AuthRpc | done (changed shape) | Deliberate redesign: local-first auth — dev bearer + self-hosted `komet-sync-server` (`docs/self-hosted-sync.md`). The legacy edge WorkOS stack (JWKS verify, `/auth/*` routes, org list/create at edge) was removed with `edge/` (see `ARCHITECTURE.md`); SignIn/SignOut/ListOrgs surface retained in dev/local shape. |
-| Wire types | done | `komet-proto`: AgentEvent, ToolCall kinds, models/options, entities, AuthState. |
+| Sync authentication | done | Self-hosted sync uses the shared bearer configured by the operator. Komet account sign-in, organization selection, and sign-out RPCs are removed. |
+| Wire types | done | `komet-proto`: AgentEvent, ToolCall kinds, models/options, entities, SyncStatus. |
 
 ## §3 Backend engine
 
 | Item | Status | Notes |
 | --- | --- | --- |
-| 3.1 Lifecycle | partial | Device registration, presence heartbeat (ephemeral, 15s), stale-session recovery, host-only doc executor with steer→new-turn fallback, single-instance data-dir lock, crash shield (process-wide panic hook: logs payload + location, leaves a `last-crash.log` marker reported and cleared at next boot; journal stamping stays with boot-time `recover_stale`). CLI auth decoupled from the daemon: `komet login`/`logout`/`status` work on the persisted session and exit; headless TTY sign-in remains, and off-TTY (systemd/launchd) headless fails fast with "run `komet login` first"; `komet daemon install/start/stop/restart/status/uninstall` manages launchd / systemd `--user` units (install-time PATH captured into the unit for harness CLIs). Gaps: login-shell PATH capture for the headed app, parent-PID watchdog. |
+| 3.1 Lifecycle | partial | Device registration, presence heartbeat (ephemeral, 15s), stale-session recovery, host-only doc executor with steer→new-turn fallback, single-instance data-dir lock, crash shield (process-wide panic hook: logs payload + location, leaves a `last-crash.log` marker reported and cleared at next boot; journal stamping stays with boot-time `recover_stale`). `komet status` reports sync configuration and engine liveness; `komet daemon install/start/stop/restart/status/uninstall` manages launchd / systemd `--user` units (install-time PATH and sync token captured into the unit). Gaps: login-shell PATH capture for the headed app, parent-PID watchdog. |
 | 3.2 Sessions engine | done (one intentional deferral) | Run journal on disk with crash recovery (aborted stamps), steering mailbox at step boundaries, doc hooks at boundaries, streamed part folding at STREAM_COMMIT_MS, idle reaper (parked sessions end clean as `Idle` after 30min, no aborted stamp). Deliberately not ported: per-turn stall watchdog — a live child IS the working signal (`engine/src/sessions.rs`). |
 | 3.3 Session-docs host | done | docs.sqlite snapshots + processed-command ledger, mark-BEFORE-execute, room join per open chat, diff sidecar publish, cold-chat delivery both directions (nudge POST on queue for remote-hosted chats + warm-open on nudge receipt). Gap (minor): no boot-time warm-open of recent chats (14d/30) — cold chats rely on nudges. |
 | 3.4 Terminals | done | PTYs, 1MB bounded replay + `afterSeq` resume, 32 max, exited 30-min TTL, live shells survive detach. Text mirror via `komet-term` on every terminal; agents can list/read any Komet terminal through the MCP `terminal_list`/`terminal_read` tools but cannot write, open, close or run commands (`engine/src/terminals.rs`, `engine/src/mcp/`, rules in `docs/security.md`). |
 | 3.5 Repos/diffs | done | list/add/clone/create, branches, worktrees, checkout identity; CheckoutDiffSync (fs watchers + repair pass, name-status+numstat+patch incl. untracked, 3MiB cap, sha256, sidecar publish); chat.branch upkeep from HEAD watch; folder listing with timeout. |
-| 3.7 Auth / uploads / accounts / device-room | done | Dev-bearer + self-hosted sync auth, org gate, dev mode; chunked uploads; claude/codex credential swap with usage probes and OAuth flows; host relay (virtual sockets over `{s,k,to,from}` frames) + peer link cache. The legacy WorkOS code+loopback / paste-code refresh flows were removed with `edge/` (see `ARCHITECTURE.md`). |
+| 3.7 Sync / uploads / agent accounts / device-room | done | Shared bearer + self-hosted sync; chunked uploads; claude/codex credential swap with usage probes and OAuth flows; host relay (virtual sockets over `{s,k,to,from}` frames) + peer link cache. |
 
 ## §4 Harness
 
@@ -86,11 +86,8 @@ not built yet).
 
 ## §6 Sync (self-hosted)
 
-The legacy `edge/` Cloudflare Worker + Durable Objects + WorkOS + R2 stack has
-been removed (`ARCHITECTURE.md`; `docs/self-hosted-sync.md`). Sync is Loro CRDT
-docs through the self-hosted `komet-sync-server` (SQLite rooms, FS blobs,
-bearer auth). The §6/§7 rows below describe the original inventory surface, not
-the current backend.
+Sync is Loro CRDT docs through the self-hosted `komet-sync-server` (SQLite rooms,
+filesystem blobs, bearer auth; `docs/self-hosted-sync.md`).
 
 | Item | Status | Notes |
 | --- | --- | --- |
@@ -105,7 +102,7 @@ the current backend.
 
 | Item | Status | Notes |
 | --- | --- | --- |
-| WorkOS exchange/refresh, org list/create at edge | dropped | Removed with `edge/`; org gate is local-first now. |
+| Hosted account and organization service | removed | Sync access is configured with the self-hosted server URL and shared bearer. |
 | Postgres/signaling dropped | done | Nothing depends on them. |
 
 ## §8 Exclusions

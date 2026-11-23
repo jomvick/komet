@@ -1,11 +1,10 @@
 use chrono::{DateTime, Utc};
 use komet_doc::{SessionMessageEntry, TranscriptDesync, TranscriptFrame};
-use komet_proto::{AuthState, Chat, Device, Session, Space, WorkspaceScope};
+use komet_proto::{Chat, Device, Session, Space, SyncStatus, WorkspaceScope};
 
 use super::{
     AppState, ConnectionStatus, PENDING_SEND_TTL_MS, PendingSend, QueuedSend, ThreadCompactions,
-    UploadProgress, WorkspaceStatus, access_for_selection, format_ms, parse_auth_state, sort_chats,
-    sort_spaces,
+    UploadProgress, WorkspaceStatus, access_for_selection, format_ms, sort_chats, sort_spaces,
 };
 
 impl AppState {
@@ -267,23 +266,14 @@ impl AppState {
         out
     }
 
-    pub fn apply_auth(&mut self, auth: AuthState) {
-        self.auth = Some(auth);
+    pub fn apply_sync_status(&mut self, status: SyncStatus) {
+        self.sync_status = Some(status);
     }
 
-    /// Tolerant AuthStatus frame reducer (see [`parse_auth_state`]).
-    pub fn apply_auth_value(&mut self, value: serde_json::Value) {
-        match parse_auth_state(&value) {
-            Some(auth) => self.apply_auth(auth),
-            None => tracing::warn!("dropping unrecognized AuthStatus frame"),
-        }
-    }
-
-    /// The signed-in user, if the engine reports one.
-    pub fn auth_user(&self) -> Option<&komet_proto::UserProfile> {
-        match self.auth.as_ref()? {
-            AuthState::SignedIn { user, .. } | AuthState::NeedsOrganization { user } => Some(user),
-            AuthState::SignedOut => None,
+    pub fn apply_sync_status_value(&mut self, value: serde_json::Value) {
+        match serde_json::from_value(value) {
+            Ok(status) => self.apply_sync_status(status),
+            Err(error) => tracing::warn!(%error, "dropping invalid SyncStatus frame"),
         }
     }
 

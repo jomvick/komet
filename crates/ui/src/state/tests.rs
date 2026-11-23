@@ -6,7 +6,7 @@ use komet_engine::{EngineCore, default_registry};
 // `SessionStatus` is only needed to build the fixtures below — the module
 // itself derives everything through `komet_proto::view`.
 use crate::state::engine::{DeferredEngineState, query_engine_info};
-use komet_proto::{EngineInfo, HarnessId, SessionStatus, UserProfile};
+use komet_proto::{EngineInfo, HarnessId, SessionStatus};
 use komet_rpc::{RpcError, RpcReply, RpcService, connect_ws, memory_client};
 
 /// A localhost port that was just free (bind :0, read, drop).
@@ -66,14 +66,7 @@ async fn legacy_daemon_identity_remains_usable() {
 
     assert_eq!(info.device_id, "legacy-device");
     assert_eq!(info.workspace_scope, WorkspaceScope::Synced);
-    assert_eq!(
-        gate_phase(
-            &ConnectionStatus::Ready,
-            Some(info.workspace_scope),
-            Some(&AuthState::SignedOut),
-        ),
-        GatePhase::Ready
-    );
+    assert_eq!(gate_phase(&ConnectionStatus::Ready), GatePhase::Ready);
 }
 
 /// Publish an engine token for a test server the way `serve_ipc` does, so
@@ -461,15 +454,12 @@ async fn production_bootstrap_opens_local_data_without_sign_in() {
         .unwrap();
     assert_eq!(info, *handle.engine_info());
 
-    let mut auth = handle
+    let mut sync = handle
         .client()
-        .subscribe(methods::AUTH_STATUS, serde_json::json!({}))
+        .subscribe(methods::SYNC_STATUS, serde_json::json!({}))
         .await
         .unwrap();
-    assert!(matches!(
-        parse_auth_state(&auth.recv().await.unwrap()),
-        Some(AuthState::SignedIn { .. })
-    ));
+    assert_eq!(sync.recv().await.unwrap()["tokenConfigured"], false);
     let harnesses = handle
         .client()
         .call(methods::LIST_HARNESSES, serde_json::json!({}))
@@ -1556,48 +1546,20 @@ fn active_plan_clears_when_its_entry_is_truncated() {
 #[test]
 fn gate_phases() {
     assert_eq!(
-        gate_phase(&ConnectionStatus::Connecting, None, None),
+        gate_phase(&ConnectionStatus::Connecting),
         GatePhase::Loading
     );
     assert_eq!(
-        gate_phase(
-            &ConnectionStatus::Failed {
-                message: "boom".into(),
-                retryable: false
-            },
-            None,
-            None
-        ),
+        gate_phase(&ConnectionStatus::Failed {
+            message: "boom".into(),
+            retryable: false
+        }),
         GatePhase::Failed("boom".into())
     );
-    assert_eq!(
-        gate_phase(
-            &ConnectionStatus::Ready,
-            Some(WorkspaceScope::Local),
-            Some(&AuthState::SignedOut),
-        ),
-        GatePhase::Ready
-    );
-    assert_eq!(
-        gate_phase(
-            &ConnectionStatus::Ready,
-            Some(WorkspaceScope::Synced),
-            Some(&AuthState::SignedOut),
-        ),
-        GatePhase::Ready
-    );
-    assert_eq!(
-        gate_phase(&ConnectionStatus::Ready, Some(WorkspaceScope::Synced), None),
-        GatePhase::Ready
-    );
-    assert_eq!(
-        gate_phase(
-            &ConnectionStatus::Ready,
-            Some(WorkspaceScope::Synced),
-            Some(&AuthState::SignedOut)
-        ),
-        GatePhase::Ready
-    );
+    assert_eq!(gate_phase(&ConnectionStatus::Ready), GatePhase::Ready);
+    assert_eq!(gate_phase(&ConnectionStatus::Ready), GatePhase::Ready);
+    assert_eq!(gate_phase(&ConnectionStatus::Ready), GatePhase::Ready);
+    assert_eq!(gate_phase(&ConnectionStatus::Ready), GatePhase::Ready);
 }
 
 #[test]
@@ -1644,7 +1606,7 @@ fn connection_backoff_is_bounded_and_visible() {
     state.reconnect_deadline = Some(Utc::now() + chrono::Duration::milliseconds(2_000));
     assert_eq!(state.reconnect_attempt, 3);
     assert!(state.reconnect_deadline.is_some());
-    assert_eq!(gate_phase(&state.connection, None, None), GatePhase::Ready);
+    assert_eq!(gate_phase(&state.connection), GatePhase::Ready);
 
     // Ceiling reached: the chain hands the Retry button to the user, and
     // `retryable: true` is what keeps that button from being a lie.
@@ -1704,7 +1666,7 @@ fn reconnect_keeps_the_last_frame_and_the_echoes() {
         retry_in_ms: 500,
         reason: "engine connection lost".into(),
     };
-    assert_eq!(gate_phase(&state.connection, None, None), GatePhase::Ready);
+    assert_eq!(gate_phase(&state.connection), GatePhase::Ready);
 }
 
 #[test]
@@ -1763,72 +1725,6 @@ fn paired_environment_reconnect_uses_the_same_states() {
     ));
     state.connection = ConnectionStatus::Ready;
     assert_eq!(state.link_status(), ConnectionStatus::Ready);
-}
-
-#[test]
-fn auth_changes_do_not_change_a_local_runtime_scope_or_watches() {
-    let mut state = AppState::new();
-    state.workspace_scope = Some(WorkspaceScope::Local);
-    state.watch_tasks.push(Task::ready(()));
-
-    state.apply_auth(AuthState::NeedsOrganization {
-        user: UserProfile {
-            id: "u".into(),
-            email: "w@example.com".into(),
-            name: None,
-        },
-    });
-    assert_eq!(state.workspace_scope, Some(WorkspaceScope::Local));
-    assert_eq!(state.watch_tasks.len(), 1);
-
-    state.apply_auth(AuthState::SignedIn {
-        user: UserProfile {
-            id: "u".into(),
-            email: "w@example.com".into(),
-            name: None,
-        },
-        org_id: Some("org-1".into()),
-    });
-    assert_eq!(state.workspace_scope, Some(WorkspaceScope::Local));
-    assert_eq!(state.watch_tasks.len(), 1);
-}
-
-#[test]
-fn auth_frames_parse_both_wire_shapes() {
-    // Proto shape.
-    let proto = serde_json::json!({ "state": "signedOut" });
-    assert_eq!(parse_auth_state(&proto), Some(AuthState::SignedOut));
-    // Engine shape (`_tag`, PascalCase, orgId).
-    let engine = serde_json::json!({
-        "_tag": "SignedIn",
-        "user": { "id": "u1", "email": "w@example.com" },
-        "orgId": "org-1",
-    });
-    let Some(AuthState::SignedIn { user, org_id }) = parse_auth_state(&engine) else {
-        panic!("expected SignedIn");
-    };
-    assert_eq!(user.email, "w@example.com");
-    assert_eq!(org_id.as_deref(), Some("org-1"));
-    let needs = serde_json::json!({
-        "_tag": "NeedsOrganization",
-        "user": { "id": "u1", "email": "w@example.com", "name": "W" },
-    });
-    assert!(matches!(
-        parse_auth_state(&needs),
-        Some(AuthState::NeedsOrganization { .. })
-    ));
-    // Garbage → None (frame dropped, not a crash).
-    assert_eq!(
-        parse_auth_state(&serde_json::json!({ "_tag": "Wat" })),
-        None
-    );
-    assert_eq!(parse_auth_state(&serde_json::json!(42)), None);
-}
-
-fn chat_with_cwd(id: &str, created_min: i64, cwd: Option<&str>) -> Chat {
-    let mut c = chat(id, created_min, None);
-    c.cwd = cwd.map(str::to_string);
-    c
 }
 
 #[test]

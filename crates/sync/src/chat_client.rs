@@ -1,4 +1,4 @@
-//! ChatClient — WebSocket transport for chat2 rooms (docs/chat2-sync.md C1):
+//! ChatClient — WebSocket transport for chat2 rooms (current chat2 protocol):
 //! hello/state handshake with client-side checkpoint precision, cursor-based
 //! row backfill, push/ack with a pending-unacked queue, opaque presence
 //! relay, probe/redial liveness, and reconnect with exponential backoff.
@@ -7,7 +7,7 @@
 //! [`ChatDocSink`] the engine implements over its `ChatDocHandle` (import +
 //! persist doc AND cursor in one transaction — the C2 rule). Wire frames are
 //! the binary chat2 codec ([`crate::chat_frames`]), byte-compatible with
-//! `edge/src/chat-frames.ts`.
+//! `shared protocol behavior`.
 //!
 //! Liveness discipline is inherited from `registry.rs` and its incidents:
 //! transport pings prove nothing about the DO; room health is judged only by
@@ -37,7 +37,7 @@ const CHECKPOINT_FETCH_DEADLINE: Duration = Duration::from_secs(120);
 /// Re-push cadence after a `quota` rejection (server window is 60 s; pending
 /// batches must not wait for the next enqueue/probe to retry).
 const QUOTA_RETRY: Duration = Duration::from_secs(5);
-/// Client-side push cap: the DO's per-row cap (`chat-log.ts MAX_ROW_BYTES`,
+/// Client-side push cap: the room service's per-row cap (`chat-log.ts MAX_ROW_BYTES`,
 /// 1 MiB) minus frame-overhead headroom. The headroom matters: the runtime
 /// closes WS messages at 1 MiB BEFORE the DO runs, so a payload within a
 /// frame-header's width of the row cap would die with no error frame (and no

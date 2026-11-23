@@ -152,8 +152,8 @@ export default function Topology() {
           </div>
 
           <p className="mt-4 font-mono text-[10px] leading-relaxed text-muted-foreground/50">
-            Sync stays off until you point it at your own relay — a VPS or a
-            Cloudflare Worker is enough.
+            Sync stays off until you point it at a VPS running the self-hosted
+            sync server.
           </p>
         </motion.div>
       </div>

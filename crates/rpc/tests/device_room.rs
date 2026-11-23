@@ -1,6 +1,6 @@
 //! HostRelay + ClientLink end-to-end over an in-memory fake device room.
 //!
-//! The fake implements the `DeviceRoom` DO's relay semantics (edge/src/device-room.ts):
+//! The fake implements the `DeviceRoom` room service's relay semantics (shared protocol behavior):
 //! route client frames to the single host socket with `from` stamped; route host frames
 //! by `to` (bounce `client_gone` when the target left); host supersede (a new host join
 //! closes the predecessor); `client_closed` on client disconnect; `host_closed` broadcast
@@ -90,7 +90,7 @@ impl FakeRelay {
         wait_until(|| self.host_connected()).await;
     }
 
-    /// Deliver a nudge frame to the connected host (the DO's /nudge live path).
+    /// Deliver a nudge frame to the connected host (the room service's /nudge live path).
     fn nudge(&self, chat_id: &str) {
         let header = DeviceFrameHeader::new(chat_id, NUDGE_KIND);
         let payload = serde_json::json!({ "chatId": chat_id }).to_string();

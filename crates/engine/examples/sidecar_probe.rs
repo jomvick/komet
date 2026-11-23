@@ -3,7 +3,7 @@
 //! zero-blobs-in-prod mystery (refs stamped, uploads absent, no warns).
 use std::sync::Arc;
 
-use komet_engine::doc_host::{DocHost, DocHostConfig, EdgeConfig};
+use komet_engine::doc_host::{DocHost, DocHostConfig, SyncConfig};
 use komet_sync::DocsStore;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -36,7 +36,7 @@ async fn main() {
         DocHostConfig {
             device_id: "probe-dev".into(),
             default_harness: komet_proto::HarnessId::ClaudeCode,
-            edge: Some(EdgeConfig::with_static_token(
+            edge: Some(SyncConfig::with_static_token(
                 format!("http://{addr}"),
                 "probe-user",
             )),

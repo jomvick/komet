@@ -25,7 +25,7 @@ use gpui::{
 };
 
 use komet_engine::harness_cli::HarnessCliStatus;
-use komet_proto::{AuthState, HarnessId, WorkspaceScope};
+use komet_proto::HarnessId;
 use komet_rpc::methods;
 
 use crate::changes::{Changes, ChangesEvent};
@@ -110,7 +110,6 @@ pub use navigation::{
 };
 
 pub(crate) mod gate;
-use gate::{OrgGateUi, grid_backdrop};
 
 mod sync;
 pub use sync::*;
@@ -443,13 +442,11 @@ pub struct Shell {
     /// How this binary was installed — decides the strip's click behavior.
     /// Cached: `detect_install` stats `current_exe` and this renders per frame.
     install: komet_update::InstallKind,
-    org: Option<OrgGateUi>,
     /// First-run tour; `Some` renders it instead of the ready page. Cleared on
     /// its `Finish`, which persists `settings.onboarding_completed` first.
     onboarding: Option<Entity<Onboarding>>,
     sync_flow: SyncFlow,
     mutate_task: Option<Task<()>>,
-    auth_task: Option<Task<()>>,
     runtime_change_task: Option<Task<()>>,
     runtime_change_error: Option<SharedString>,
     /// The one-time local→synced import stream (switch wizard progress step).
@@ -685,12 +682,10 @@ impl Shell {
         // More capture knobs of the same kind: `KOMET_OPEN_DIALOG=rename|delete`
         // opens that dialog for the first chat once chats land; `=model` pops
         // the combined harness/model menu once the shell is Ready;
-        // `KOMET_FORCE_GATE=signin|org|failed` renders that gate regardless of
-        // real auth state (display-only — for styling passes).
+        // `KOMET_FORCE_GATE=failed|sync` renders a diagnostic gate for styling.
         let debug_dialog = std::env::var("KOMET_OPEN_DIALOG").ok();
         let debug_gate = match std::env::var("KOMET_FORCE_GATE").ok().as_deref() {
-            Some("signin") => Some(GatePhase::SignIn),
-            Some("org") => Some(GatePhase::OrgGate),
+            Some("sync") => Some(GatePhase::SyncRequired),
             Some("failed") => Some(GatePhase::Failed(
                 "Could not reach the komet engine on port 27901".into(),
             )),
@@ -830,11 +825,9 @@ impl Shell {
             cli_updates_dismissed: false,
             cli_update_rows: HashMap::new(),
             install: komet_update::detect_install(),
-            org: None,
             onboarding,
             sync_flow: SyncFlow::Idle,
             mutate_task: None,
-            auth_task: None,
             runtime_change_task: None,
             runtime_change_error: None,
             import_task: None,
@@ -908,31 +901,18 @@ impl Shell {
         }
         let next_sync_flow = {
             let state = state.read(cx);
-            sync_flow_after_auth(self.sync_flow, state.workspace_scope, state.auth.as_ref())
+            sync_flow_for_status(
+                self.sync_flow,
+                state.workspace_scope,
+                state.sync_status.as_ref(),
+            )
         };
         if next_sync_flow != self.sync_flow {
             self.sync_flow = next_sync_flow;
-            if matches!(
-                self.sync_flow,
-                SyncFlow::RestartPending { .. } | SyncFlow::SwitchOffer { .. }
-            ) {
-                self.org = None;
-            }
         }
         // The in-place local→synced switch: once the replacement runtime is
         // attached and Ready, kick the import (or finish) from here.
         self.drive_sync_switch(cx);
-        let signed_out_synced = {
-            let state = state.read(cx);
-            state.workspace_scope == Some(WorkspaceScope::Synced)
-                && matches!(state.auth, Some(AuthState::SignedOut))
-        };
-        // AuthStatus is shared by every viewport. Whichever viewport owns the
-        // embedded runtime drains it; remote viewports request daemon shutdown
-        // and all of them independently reattach to the new local runtime.
-        if signed_out_synced && self.runtime_change_task.is_none() {
-            self.start_local_runtime_transition(false, cx);
-        }
         // Capture knob: pop the requested dialog once chats have landed.
         if let Some(which) = self.debug_dialog.clone()
             && let Some(first) = state.read(cx).chats.first().map(|c| c.id.clone())
@@ -1501,7 +1481,6 @@ impl Shell {
     ) -> gpui::Stateful<gpui::Div> {
         let theme = Theme::of(cx);
         let (shell_surface, text, font) = (theme.surface, theme.text, theme.font_sans.clone());
-        let restart_required = self.sync_flow == SyncFlow::SignedOutRestartRequired;
         let gate = self
             .debug_gate
             .clone()
@@ -1540,8 +1519,7 @@ impl Shell {
                 }
             }));
         }
-        if !restart_required
-            && matches!(gate, GatePhase::Ready)
+        if matches!(gate, GatePhase::Ready)
             && self.onboarding.is_none()
             && matches!(self.route, Route::Chat)
             && window.focused(cx).is_none()
@@ -1666,9 +1644,7 @@ impl Shell {
             root
         };
 
-        let render_gate = if restart_required {
-            GatePhase::Loading
-        } else if matches!(&gate, GatePhase::Loading) {
+        let render_gate = if matches!(&gate, GatePhase::Loading) {
             // Connecting paints the normal frame: the window opens straight
             // into the shell and rows fill in as the engine attaches, instead
             // of a boot splash covering an empty window.
@@ -1682,25 +1658,12 @@ impl Shell {
                 Some(onboarding) => root.child(onboarding),
                 None => self.render_ready_page(root, window, cx),
             },
-            // Only the sign-out restart lands here; a normal Connecting boot
-            // renders the Ready page above.
             GatePhase::Loading => root,
-            GatePhase::OrgGate => {
-                let card = self.render_org_gate(window, cx);
-                root.child(card)
-            }
-            phase @ (GatePhase::Failed(_) | GatePhase::SignIn) => {
+            phase @ (GatePhase::Failed(_) | GatePhase::SyncRequired) => {
                 let card = self.render_gate_card(phase, cx);
                 root.child(card)
             }
         };
-        let root = if restart_required {
-            let restart = self.render_signed_out_restart(cx);
-            root.child(restart)
-        } else {
-            root
-        };
-
         // Manual tweens and hover fades share this root's vsync cadence;
         // looping loaders run on the slower pulse ticker (`motion`).
         if self.motion_active.get() | motion::hover_frame(cx.entity_id(), cx) {
@@ -1708,25 +1671,24 @@ impl Shell {
         }
 
         // Caption controls are shell-level chrome, not Ready-page content:
-        // keep them above every auth/org/error gate as well as the full
+        // keep them above the error gate as well as the full
         // application. Gate pages also need a native drag surface
         // because they do not render the unified tabs/settings titlebar.
-        let root =
-            if (!restart_required && matches!(gate, GatePhase::Ready) && self.onboarding.is_none())
-                || !cfg!(target_os = "windows")
-            {
-                root
-            } else {
-                root.child(
-                    div()
-                        .absolute()
-                        .top_0()
-                        .left_0()
-                        .right_0()
-                        .h(px(Theme::TITLEBAR_HEIGHT))
-                        .window_control_area(WindowControlArea::Drag),
-                )
-            };
+        let root = if (matches!(gate, GatePhase::Ready) && self.onboarding.is_none())
+            || !cfg!(target_os = "windows")
+        {
+            root
+        } else {
+            root.child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .right_0()
+                    .h(px(Theme::TITLEBAR_HEIGHT))
+                    .window_control_area(WindowControlArea::Drag),
+            )
+        };
         root.children(self.render_windows_caption_controls(window, cx))
             .children(self.render_linux_caption_controls(window, cx))
     }
@@ -1954,11 +1916,12 @@ impl Render for Shell {
             self.window_close_pending = false;
             window.defer(cx, |window, _| window.remove_window());
         }
-        let (workspace_scope, auth) = {
+        let (workspace_scope, sync_status) = {
             let state = self.state.read(cx);
-            (state.workspace_scope, state.auth.clone())
+            (state.workspace_scope, state.sync_status.clone())
         };
-        self.sync_flow = sync_flow_after_auth(self.sync_flow, workspace_scope, auth.as_ref());
+        self.sync_flow =
+            sync_flow_for_status(self.sync_flow, workspace_scope, sync_status.as_ref());
         let root = self.render_root(window, cx);
 
         if cfg!(target_os = "linux")

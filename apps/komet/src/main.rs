@@ -1,11 +1,10 @@
-//! komet — headed by default; `komet headless` runs the engine alone. Both start
-//! local-only without credentials. `komet login` and `komet logout` select the
-//! profile used by the next engine start without mutating a live runtime.
+//! komet — headed by default; `komet headless` runs the engine alone. Sync is
+//! configured explicitly with `KOMET_EDGE_URL` and `KOMET_SYNC_TOKEN`.
 
-mod auth_cli;
 mod daemon;
 mod models_cli;
 mod serve;
+mod status_cli;
 mod update_cli;
 
 use clap::{Parser, Subcommand};
@@ -61,11 +60,7 @@ enum Command {
         #[command(subcommand)]
         command: Option<EngineCommand>,
     },
-    /// Sign in and enable sync on the next engine start.
-    Login,
-    /// Remove the saved session and return to local-only on the next start.
-    Logout,
-    /// Show workspace mode, optional auth, and engine status.
+    /// Show sync configuration and engine status.
     Status,
     /// Live sync introspection from the running engine: per-room connection
     /// state, last pushed-frame/ack ages, rejoin/probe/resync counters.
@@ -149,17 +144,13 @@ enum DaemonCommand {
     Status,
 }
 
-/// Production edge URL used when sync is enabled — overridden by `KOMET_EDGE_URL`
-/// (local dev / self-hosting). Unused while the app runs local-only.
-const DEFAULT_EDGE_URL: &str = "https://edge.komet.sh";
-
+/// Self-hosted sync server URL. An unset value keeps the runtime local-only.
 fn edge_url_from_env() -> String {
-    let url = std::env::var("KOMET_EDGE_URL")
+    std::env::var("KOMET_EDGE_URL")
         .ok()
         .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| DEFAULT_EDGE_URL.into());
-    komet_sync_server::warn_if_insecure_sync_url(&url);
-    url
+        .inspect(|url| komet_sync_server::warn_if_insecure_sync_url(url))
+        .unwrap_or_default()
 }
 
 /// mimalloc: system malloc (macOS libmalloc especially) never returns the
@@ -310,17 +301,9 @@ fn main() -> anyhow::Result<()> {
             let runtime = tokio::runtime::Runtime::new()?;
             runtime.block_on(stop_engine(engine_config_from_env().ipc_port))
         }
-        Some(Command::Login) => {
-            let runtime = tokio::runtime::Runtime::new()?;
-            runtime.block_on(auth_cli::login(engine_config_from_env()))
-        }
-        Some(Command::Logout) => {
-            let runtime = tokio::runtime::Runtime::new()?;
-            runtime.block_on(auth_cli::logout(engine_config_from_env()))
-        }
         Some(Command::Status) => {
             let runtime = tokio::runtime::Runtime::new()?;
-            runtime.block_on(auth_cli::status(engine_config_from_env()))
+            runtime.block_on(status_cli::status(engine_config_from_env()))
         }
         Some(Command::Sync { command }) => {
             let runtime = tokio::runtime::Runtime::new()?;
@@ -385,9 +368,7 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
-/// The env-resolved engine configuration shared by `headless`, `login`,
-/// `logout`, and `status` — one resolution so the CLI auth commands always
-/// operate on the exact session the daemon will load.
+/// Resolve the engine configuration from the current process environment.
 fn engine_config_from_env() -> komet_engine::EngineConfig {
     komet_engine::EngineConfig {
         data_dir: std::env::var_os("KOMET_DATA_DIR")

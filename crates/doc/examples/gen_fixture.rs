@@ -1,5 +1,5 @@
 //! Generates a session-doc snapshot fixture for the cross-language compat check
-//! (`edge/scripts/compat-check.mjs`). Usage: `cargo run -p komet-doc --example gen_fixture -- <out>`
+//! (shared protocol fixture validation). Usage: `cargo run -p komet-doc --example gen_fixture -- <out>`
 
 use komet_doc::{
     MessagePart, MessageRole, MessageStatus, SegmentWriter, SessionCommandEntry,

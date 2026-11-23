@@ -3,7 +3,7 @@
 //! full RPC surface through the relay), and the **client link** (dialing another device's
 //! relay and speaking ordinary [`RpcClient`] RPC over it).
 //!
-//! Frame encoding (must stay byte-identical to `edge/src/device-room.ts`):
+//! Frame encoding (must stay byte-identical to `shared protocol behavior`):
 //! `uleb128(header_len) ‖ UTF-8 JSON header ‖ payload`, header `{s, k, to?, from?}`.
 //! - client → DO: the DO stamps `from = connId` and forwards to the host socket;
 //! - host → DO: must carry `to = connId`; the DO strips routing keys and delivers;
@@ -26,7 +26,7 @@ use tokio::sync::{mpsc, watch};
 
 use crate::{RpcClient, RpcError, RpcService, serve_connection};
 
-/// Relay-emitted control frames. MUST byte-match the DO's `RELAY_KIND` (yes, it has a
+/// Relay-emitted control frames. MUST byte-match the room service's `RELAY_KIND` (yes, it has a
 /// leading space — clients compare with equality; a mismatch makes host_offline invisible).
 pub const RELAY_KIND: &str = " relay";
 /// Durable command nudge frames (§7 cold-chat delivery): payload `{chatId}`.
@@ -45,7 +45,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 /// The shared transport pump sends a text `"ping"` every 15s — answered by
-/// the DO's hibernation-safe auto-response pair (`edge/src/device-room.ts`)
+/// the room service's hibernation-safe auto-response pair (`shared protocol behavior`)
 /// without waking it. 15s, not 30: a laptop's uplink (corporate proxy, VPN
 /// split-tunnel extension, consumer NAT) can reap an idle flow well inside a
 /// minute, and a keepalive that races the reaper loses. The frame is 4 bytes
@@ -56,7 +56,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 /// couple of intervals plus grace = dead socket (half-open TCP after NAT
 /// timeout or sleep/wake) — drop it and reconnect instead of waiting on a TCP
 /// write error. Must stay well under the relay's own host-liveness window
-/// (`HOST_LIVENESS_MS`, edge/src/device-room.ts) so a host replaces its dead
+/// (`HOST_LIVENESS_MS`, shared protocol behavior) so a host replaces its dead
 /// socket before the relay gives up on the device.
 const SILENCE_LEASE: Duration = Duration::from_secs(40);
 
@@ -344,7 +344,7 @@ const HOST_REJOIN_MIN: Duration = Duration::from_millis(250);
 const DIAL_ATTEMPTS: u32 = 3;
 const DIAL_RETRY_SPACING: Duration = Duration::from_millis(1500);
 /// A session that lasted at least this long counts as healthy: its end is the
-/// DO's lifecycle, not our failure, so the rejoin does not escalate.
+/// room service's lifecycle, not our failure, so the rejoin does not escalate.
 const HOST_HEALTHY_SESSION: Duration = Duration::from_secs(30);
 
 fn jitter() -> Duration {
@@ -876,7 +876,7 @@ impl LinkCache {
 }
 
 // ---------------------------------------------------------------------------
-// Codec tests — vectors ported from edge/src/device-frame.test.ts
+// Codec tests — vectors ported from shared protocol behavior
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]

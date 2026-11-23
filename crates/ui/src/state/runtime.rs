@@ -130,7 +130,7 @@ impl AppState {
             s.reconnect_pending = false;
             s.reconnect_deadline = None;
             s.workspace_scope = None;
-            s.auth = None;
+            s.sync_status = None;
             s.data_dir = Some(data_dir.clone());
             s.new_chat_access =
                 crate::settings::security::SecurityDefaults::load(&data_dir).default_sandbox;
@@ -189,8 +189,8 @@ impl AppState {
                 cx,
                 handle.client_arc(),
                 WatchOwner::Engine,
-                methods::AUTH_STATUS,
-                AppState::apply_auth_value,
+                methods::SYNC_STATUS,
+                AppState::apply_sync_status_value,
             ),
             spawn_watch(
                 cx,

@@ -2,6 +2,11 @@
 
 **Branche cible :** `sync`. Le merge de `main` est maintenant intégré dans `048090d`.
 
+> **Plan révisé le 2026-11-22 après revue du dépôt et décision produit :** finir
+> le chantier sync d'abord, rétablir l'accès à Import project dans l'UI, puis
+> retirer l'ancien système d'auth/sync propre à Komet et seulement ensuite
+> réorganiser les modules si les mesures montrent un gain.
+
 **But :** intégrer les fonctions workspaces/import déjà livrées sur `main`, finir les écarts du plan workspaces, puis clôturer la migration et la simplification de sync. Le travail sera découpé en changements révisables, validés et poussés sur `sync`.
 
 ## État constaté le 2026-11-22
@@ -103,3 +108,68 @@ Chaque étape est un commit/PR relisible sur `sync`. Ne pas annoncer la suppress
 - Navigation : `crates/ui/src/state/workspaces.rs`, `crates/ui/src/state/engine.rs`, état de filtre dans `crates/ui/src/settings.rs` et `crates/ui/src/shell/spaces/menu.rs`.
 - Import : `crates/engine/src/project_transfer.rs`, `crates/engine/src/rpc.rs`, `crates/ui/src/shell/spaces/import.rs`, `crates/rpc/src/lib.rs` (après merge de `main`).
 - Sync : `crates/sync/src/{room,transport,registry,chat_client,wake,types}.rs`, `crates/sync-server/src/{lib,chat_room}.rs`, `crates/engine/src/doc_host.rs`, `apps/komet/src/main.rs`.
+
+## Ordre révisé après revue d'architecture
+
+### A — Clore le chantier sync sans perdre les anciennes sessions
+
+1. Valider le contrat réel des profils et des variables de sync (`KOMET_EDGE_URL`,
+   `KOMET_SYNC_TOKEN`, `KOMET_EDGE_TOKEN`) : le code active maintenant le transport
+   avec URL + token sync, et conserve `KOMET_EDGE_TOKEN` comme identité dev.
+2. Rendre Import project accessible depuis le sélecteur par défaut « All
+   projects » ; la ligne existante après « New project… » est maintenant
+   rattachée au menu de l'en-tête et s'affiche aussi dans ce mode.
+3. Compléter la validation des transferts local↔VPS et VPS↔VPS, puis la CI
+   multiplateforme et l'audit ACL Windows.
+4. Exécuter/valider la migration s2, documenter les sessions irrécupérables et
+   maintenir la période de grâce avant toute suppression de lecteur s2.
+5. Unifier le guide de sync et les documents de référence après stabilisation.
+
+**Barrière de sécurité des données :** ne pas supprimer le code s2 qui peut
+encore lire ou migrer des conversations tant que la période de grâce n'est pas
+terminée et que les stores connus sont migrés ou explicitement archivés.
+
+### B — Retirer l'ancien système Komet
+
+Après la clôture sync, retirer les flux d'authentification/organisations Komet,
+les RPC et écrans de connexion sans effet, les commandes CLI devenues vides,
+les variables de déploiement retirées et les références au service hébergé
+précédent. Aligner README, AGENTS, ARCHITECTURE, PARITY, plans actifs, site,
+scripts, exemples et tests sur le serveur self-hosted actuel.
+
+Ne pas supprimer les formats/données de session nécessaires à la migration.
+Les mots `edge` utilisés pour EdgeFade, Microsoft Edge, ou l'URL de serveur
+encore configurée par `KOMET_EDGE_URL` ne sont pas à effacer mécaniquement ;
+décider séparément si cette variable publique est renommée et fournir une
+migration explicite si elle l'est.
+
+### C — Séparer UI et moteur sans réarchitecture globale
+
+Déplacer l'assemblage/démarrage du moteur hors de `komet-ui` et faire dépendre
+l'interface d'un client RPC injecté. Garder le même protocole pour le mode
+embarqué et le moteur distant. Le gain attendu concerne surtout les builds
+ciblés de l'UI ; le build complet compile encore les deux côtés et devra être
+mesuré avant/après.
+
+### D — Réorganiser les gros modules et optimiser sur mesures
+
+Découper par responsabilité `composer.rs`, `transcript.rs`,
+`agent_accounts.rs`, `sessions.rs` et les handlers RPC. Commencer par des
+modules internes, créer une crate seulement si elle isole une dépendance et
+améliore un build ciblé. Traiter en priorité la reprojection O(n) du transcript
+déjà identifiée dans ARCHITECTURE. Comparer compilation froide/chaude, démarrage
+avec données existantes et `scripts/frame-budget.sh`; un découpage de fichiers
+seul ne compte pas comme gain de performance.
+
+### État de l'exécution après la revue
+
+- [x] Contrat de sync/profils aligné dans le démarrage : URL + bearer non vide requis, bearer vide ignoré, token capturé par `komet daemon install` pour les services Linux, macOS et Windows. Reste à valider par une exécution à deux appareils.
+- [x] Import project rattaché au sélecteur en mode « All projects » ; UI compilée, validation interactive de l'import encore à faire.
+- [x] Commandes CLI `login`/`logout` sans effet supprimées ; `komet status` décrit maintenant la configuration sync et l'état IPC sans modèle de compte.
+- [ ] Transferts local↔VPS et VPS↔VPS vérifiés.
+- [ ] Migration s2 et période de grâce clôturées avant retrait.
+- [x] Guide courant `docs/sync.md` créé ; les repères chat2/registre décrivent maintenant le protocole et son implémentation Rust actuels.
+- [ ] Audit Windows des ACL pour `environments.json` et `server-identity.json` ; le contrôle runtime Windows reste nécessaire.
+- [x] Ancien compte Komet retiré du code actif : CLI login/logout, écrans de connexion/organisation, RPC mutation, types utilisateur/organisation et état d’auth du shell supprimés ; seul le bearer self-hosted (`SyncStatus`) reste. Les données historiques gardent leurs chemins de profil compatibles.
+- [ ] Mesures compilation/démarrage/frame capturées avant toute réorganisation.
+- [ ] UI découplée d'engine et fichiers réorganisés seulement avec bénéfice mesuré.

@@ -1,4 +1,4 @@
-//! komet-sync — Loro room client (loro-protocol over WebSocket against the TS edge),
+//! komet-sync — Loro room client (loro-protocol over WebSocket to komet-sync-server),
 //! ephemeral presence, and the local `DocsStore` (SQLite snapshots + processed-command ledger).
 //!
 //! - [`RoomClient`]: joins a SessionRoom DO room (`wss://…/session/{chatId}/ws?token=`),
