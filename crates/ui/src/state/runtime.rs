@@ -189,7 +189,7 @@ impl AppState {
                 cx,
                 handle.client_arc(),
                 WatchOwner::Engine,
-                methods::SYNC_STATUS,
+                methods::WATCH_SYNC_CREDENTIALS,
                 AppState::apply_sync_status_value,
             ),
             spawn_watch(

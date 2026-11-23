@@ -98,6 +98,12 @@ pub mod methods {
     /// counters for the workspace room and every open chat doc. No params;
     /// IPC-only.
     pub const SYNC_STATUS: &str = "SyncStatus";
+    /// Credential readiness (`tokenConfigured`) as a live watch. Deliberately
+    /// a different method from [`Self::SYNC_STATUS`]: that one is a unary
+    /// room-stats read (`komet sync status`), while this one never sends
+    /// `done` — a client that took the stream for a reply would hang forever.
+    /// No params; IPC-only. The first frame arrives immediately.
+    pub const WATCH_SYNC_CREDENTIALS: &str = "WatchSyncCredentials";
     /// s2→chat2 migration inventory (`komet sync status --legacy` /
     /// `komet sync migrate --dry-run`): registry chats still on roomGen < 2,
     /// with per-chat host/local-doc flags. Params: none; IPC-only.

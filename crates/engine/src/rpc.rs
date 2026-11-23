@@ -1859,8 +1859,10 @@ fn doc_messages_stream(
     .boxed()
 }
 
-/// Local sync identity status used during engine bootstrap. Keeping it separate
-/// from [`EngineRpc`] lets the shell connect before profile stores open.
+/// Local sync credential status used during engine bootstrap. Keeping it
+/// separate from [`EngineRpc`] lets the shell connect before profile stores
+/// open; it owns [`methods::WATCH_SYNC_CREDENTIALS`] only, so the unary
+/// room-stats read on [`methods::SYNC_STATUS`] still reaches [`EngineRpc`].
 #[derive(Clone)]
 pub struct SyncStatusRpc {
     auth: Auth,
@@ -1872,7 +1874,7 @@ impl SyncStatusRpc {
     }
 
     pub fn handles(method: &str) -> bool {
-        method == methods::SYNC_STATUS
+        method == methods::WATCH_SYNC_CREDENTIALS
     }
 }
 
@@ -1880,7 +1882,9 @@ impl SyncStatusRpc {
 impl RpcService for SyncStatusRpc {
     async fn handle(&self, method: &str, _params: serde_json::Value) -> Result<RpcReply, RpcError> {
         match method {
-            methods::SYNC_STATUS => Ok(RpcReply::Stream(watch_stream(self.auth.watch_status()))),
+            methods::WATCH_SYNC_CREDENTIALS => {
+                Ok(RpcReply::Stream(watch_stream(self.auth.watch_status())))
+            }
             _ => Err(RpcError::UnknownMethod(method.to_string())),
         }
     }

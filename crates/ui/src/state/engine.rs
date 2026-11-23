@@ -477,7 +477,7 @@ impl EngineHandle {
         // Serve the same service on the IPC port so a terminal viewport can
         // attach to this window's engine with no setup. Deliberately the
         // *deferred* service, not the assembled one: a viewport that connects
-        // during engine assembly gets EngineInfo and SyncStatus immediately, and
+        // during engine assembly gets EngineInfo and the sync credential watch, and
         // its data subscriptions wait exactly as this window's do.
         //
         // Best-effort — losing the bind race with another engine costs other
