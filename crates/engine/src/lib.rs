@@ -177,7 +177,9 @@ impl EngineCore {
     ) -> Result<Self, EngineError> {
         let org_id = env_or("KOMET_ORG_ID", DEFAULT_ORG_ID);
         let user_id = env_or("KOMET_USER_ID", DEFAULT_USER_ID);
-        let profile = EngineProfile::development(data_dir, &org_id, &user_id);
+        let profile = crate::profile::adopt_legacy_store(EngineProfile::development(
+            data_dir, &org_id, &user_id,
+        ));
         Self::assemble_with_profile(profile, registry, default_harness, edge)
     }
 
@@ -870,10 +872,10 @@ impl Engine {
                     .or(config.org_id.clone())
                     .unwrap_or_else(|| env_or("KOMET_ORG_ID", DEFAULT_ORG_ID));
                 let user_id = auth.user_id();
-                Ok(Some(EngineProfile::development(
-                    &config.data_dir,
-                    &org_id,
-                    &user_id,
+                // Upgrade path: keep a pre-hosted-auth store reachable instead
+                // of opening an empty workspace beside it.
+                Ok(Some(crate::profile::adopt_legacy_store(
+                    EngineProfile::development(&config.data_dir, &org_id, &user_id),
                 )))
             }
             WorkspaceScope::Synced => {
