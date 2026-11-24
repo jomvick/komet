@@ -25,6 +25,8 @@ not built yet).
 | 1.14 Engine lifetime | done | The headed app starts a detached `komet engine` child when no engine is listening; sessions survive window/app close. `komet engine stop` gracefully stops it; startup falls back to embedded mode if the child fails to attach. |
 | 1.15 Agent shell panel | done | Right-panel « Shell agent » (`ui/src/agent_shell.rs`) showing what Claude/Codex report about their own CLI tool calls: `Exec` chip commands + harness progress tails. Read-only transcript projection — no PTY wiring, nothing journaled (see `docs/security.md`). |
 | 1.16 Appearance & wallpaper | done | Light/dark/system theme, accent, terminal chrome. Wallpaper over the whole window or the main panel, imported under `{data_dir}/wallpapers/`. Background effect `None` / `ASCII`: a single choice with no configuration — picking ASCII runs a fixed recipe (120 glyph columns, classic ramp, image colours, 35 % opacity) that turns the image into a glyph grid, rasterised once off the UI thread into one RGBA texture, cached at `{data_dir}/wallpaper-cache/{sha256}.png` per (image, params, 256 px size bucket). ASCII reads PNG/JPEG only; WebP/GIF keep working under `None`. `ui/src/settings/wallpaper/` |
+| 1.17 Built-in browser | done (human surface) | Right-panel Browser tab on a system Chromium-family binary (`ui/src/browser/`): discovery order `CHROME_PATH` / `KOMET_BROWSER_BIN`, then PATH (`google-chrome-stable`, `google-chrome`, `chromium-browser`, `chromium`, `brave-browser`, `microsoft-edge-stable`, `obscura`), then per-OS paths. Launched headless (`--headless=new --ozone-platform=headless --remote-debugging-port=0`, `--allow-insecure-localhost`, real-version UA) with a persistent per-panel profile under `{data_dir}/komet/browser-profiles/{sha256(panel_key)}`. Chromium is pooled per profile and refcounted; a keeper thread owns the child and `PR_SET_PDEATHSIG` kills it with Komet. Rendering is `Page.startScreencast` + per-frame `Page.screencastFrameAck` (flow control), not polling; the viewport follows the panel size via `Emulation.setDeviceMetricsOverride` (device scale included). Address bar (URL + search, history suggestions, localhost/private IP on `http://`, `:PORT` shorthand), back/forward/reload/stop, find-in-page (JS highlight, match count), zoom, device/touch emulation presets, screenshot to `capture_dir` (default Downloads), element-select mode with labelled `CSS.highlights` and “Add to chat”, Console drawer (`Runtime.consoleAPICalled` / `Runtime.exceptionThrown`, level filters, `Runtime.evaluate` REPL), History, Favorites, **Downloads** (CDP `Browser.setDownloadBehavior` + `downloadWillBegin`/`downloadProgress` — progress bar, Open/Reveal via gpui, configurable folder) and **Network** tabs (`Network.enable`: request/response/error rows; canceled ≠ failed; `ERR_CERT_*` flagged; local host / http / https labeled), clear-browsing-data dialog (`Storage.clearDataForOrigin`, `Network.clearBrowserCookies`, `Network.clearBrowserCache`). Gaps: no request/response bodies view, no tab restore across restarts, no agent control of the surface. |
+| 1.18 Browser settings | done | Settings → Browser (`ui/src/settings/browser.rs`, persisted in `ui-settings.json` as `BrowserPrefs`): search preset or custom `{q}` template, home page, history on/off + retention (30/90/365 days/forever), default zoom, remember zoom per host, screenshot directory, downloads directory (`Browser.setDownloadBehavior` re-applied live via `SetDownloadDir`), default emulation preset, Clear history / Clear browsing data. The default search is Google; at load time an exact legacy DuckDuckGo default migrates to Google while any explicit choice is kept (`BrowserPrefs::migrate`, tested). `KOMET_SEARCH_URL` overrides both. |
 
 ## §2 Control plane
 
@@ -51,6 +53,7 @@ not built yet).
 | 3.3 Session-docs host | done | docs.sqlite snapshots + processed-command ledger, mark-BEFORE-execute, room join per open chat, diff sidecar publish, cold-chat delivery both directions (nudge POST on queue for remote-hosted chats + warm-open on nudge receipt). Gap (minor): no boot-time warm-open of recent chats (14d/30) — cold chats rely on nudges. |
 | 3.4 Terminals | done | PTYs, 1MB bounded replay + `afterSeq` resume, 32 max, exited 30-min TTL, live shells survive detach. Text mirror via `komet-term` on every terminal; agents can list/read any Komet terminal through the MCP `terminal_list`/`terminal_read` tools but cannot write, open, close or run commands (`engine/src/terminals.rs`, `engine/src/mcp/`, rules in `docs/security.md`). |
 | 3.5 Repos/diffs | done | list/add/clone/create, branches, worktrees, checkout identity; CheckoutDiffSync (fs watchers + repair pass, name-status+numstat+patch incl. untracked, 3MiB cap, sha256, sidecar publish); chat.branch upkeep from HEAD watch; folder listing with timeout. |
+| 3.6 Browser tools for agents | deferred | The Browser is a UI surface only (`crates/ui/src/browser*`); no engine/MCP tool reaches it today, so an agent cannot drive the tab the user sees. `chrome-devtools-mcp` with `--headless --isolated` (spec 2026-10-12) remains an optional separate path, not this surface. Phase 3 of the browser plan: typed engine/MCP tools (navigate/snapshot/click/fill/key/wait/screenshot/console, then network + annotations) scoped to the calling session and the active surface, with an agent-only profile rather than the user's persistent one. |
 | 3.7 Sync / uploads / agent accounts / device-room | done | Shared bearer + self-hosted sync; chunked uploads; claude/codex credential swap with usage probes and OAuth flows; host relay (virtual sockets over `{s,k,to,from}` frames) + peer link cache. |
 
 ## §4 Harness
@@ -117,12 +120,17 @@ filesystem blobs, bearer auth; `docs/self-hosted-sync.md`).
 - **E2EE** — transport is TLS + sync bearer tokens; end-to-end encryption of doc
   contents not designed.
 - **macOS packaging execution** — config + steps in `dist/` only (needs a Mac).
+- **Browser: agent control, request/response bodies, tab restore, annotations** — the visible
+  Browser is human-driven; agent tools, a bodies view and tab persistence are planned
+  (rows 1.17/3.6).
 - **Engine hardening**: parent-PID watchdog, idle reaper / stall watchdog, boot warm-open of recent chats.
   (Single-instance data-dir lock and crash shield are done — see 3.1; per-turn
   stall watchdog is deliberately not ported — see 3.2.)
 
 ## Summary
 
-Table rows above: **42 done · 4 partial**, plus the cross-cutting deferrals
-(mobile, E2EE, macOS packaging execution, engine hardening) — the last
-overlaps the named gaps in the partial rows.
+Table rows above: **60 done · 4 partial**, 1 removed, 1 deferred (browser tools
+for agents), plus the cross-cutting deferrals (mobile, E2EE, macOS packaging
+execution, browser agent control/downloads/network, engine hardening) — the last
+overlaps the named gaps in the partial rows. The "done" bucket includes the
+qualified variants ("done (human surface)", "done, one intentional deferral", …).
