@@ -182,6 +182,9 @@ pub mod methods {
     pub const WATCH_CHECKOUT_DIFFS: &str = "WatchCheckoutDiffs";
     pub const GET_CHECKOUT_DIFF: &str = "GetCheckoutDiff";
     pub const GET_CHECKOUT_FILE_DIFF_TEXT: &str = "GetCheckoutFileDiffText";
+    /// Explicit repository state for a checkout (branch, dirty counts, or the
+    /// typed reason Git could not answer). Relay-forwarded to the owner.
+    pub const GET_GIT_CHECKOUT_STATE: &str = "GetGitCheckoutState";
     // Agent accounts (ControlRpc, relay-forwardable — CLI logins are per-device).
     pub const LIST_AGENT_ACCOUNTS: &str = "ListAgentAccounts";
     /// Settings › Usage (issue #53): selected agents' provider quotas joined

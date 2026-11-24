@@ -609,6 +609,7 @@ mod tests {
             installed,
             enabled: None,
             surface: Default::default(),
+            capabilities: Default::default(),
         }
     }
 

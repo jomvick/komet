@@ -13,7 +13,7 @@ or network calls are required. Multi-device sync is built (Loro CRDT docs throug
 - Optional sync uses Loro CRDT docs (loro-mirror model) through the self-hosted `komet-sync`
   server (`crates/sync-server`: Rust + SQLite rooms + FS blobs, bearer-token auth).
 - Everything device-side is Rust; no TypeScript services remain.
-- Token-usage display is excluded (poor fit for CRDTs).
+- Token-usage display inside the CRDT chat doc is excluded (`WatchUsage`, per-message token columns, profile heatmap). Settings → Usage keeps provider quota and CLI-log-derived tokens locally, clearly sourced and never synced into chat docs.
 - Frontend is **gpui** (pinned Zed rev). Virtualization + markdown techniques ported from
   **mugen + pretext** (`docs/research/mugen-pretext.md`).
 - One binary, **headed or headless**. Smooth transitions/animations
@@ -240,7 +240,10 @@ feature spec `docs/research/feature-inventory.md` §1.
 Direct ports of komet behaviors (spec: feature-inventory §3):
 - **Sessions engine**: per-session broadcast hub; on-disk run journal (resumable `seq` replay,
   crash auto-resume); persistent steerable sessions (steering mailbox at step/turn boundary; idle
-  reaper; 10min stall watchdog); recovery stamps `aborted`.
+  reaper; turn-quiesce watchdog that only parks a silent turn already showing completed output);
+  recovery stamps `aborted`. There is no hard per-turn stall timeout: agents may legitimately be
+  quiet for minutes, and terminal `RunOutcome` plus the 45 s freshness gate distinguish a failure
+  from a slow turn. A silent turn is parked only after quiescence, never failed by a timeout.
 - **Doc host**: per-chat handle (join room, VV backfill, write user entries + stream assistant
   segments at 120ms commits, drain commands host-only with processed-ledger idempotence, publish
   diff sidecar, presence); warm-open recent chats (14d/cap 30); nudge-driven cold open; SQLite
@@ -256,7 +259,16 @@ Direct ports of komet behaviors (spec: feature-inventory §3):
 - **Repos/diffs**: git2 or `git` subprocess (subprocess — matches komet, avoids libgit2 edge
   cases); worktrees under `~/.komet/worktrees`; fs watchers (`notify`) + 2min repair; diff
   capture (patch + numstat + untracked, 3MiB cap, sha256) → workspace registry summary + diff
-  sidecar.
+  sidecar. `GetGitCheckoutState` returns a typed checkout (`ready` with branch/root/dirty
+  totals, `notRepository`, or `error`), so a failed probe never renders as a clean repo.
+- **Files preview**: text, supported raster images (PNG/JPEG/GIF/WebP/BMP), and explicit
+  binary/unsupported/too-large states. Images reuse the conversation decoder, are capped at
+  8 MiB, and render read-only with name, dimensions, size and fit-to-window.
+- **Memory handoff**: project memory is local per device. On a fresh session or agent switch,
+  the engine appends a delimited briefing to the run prompt (never to the user's transcript)
+  and records a provenance-only `ContextHandoff` on the switch marker: source labels and
+  sizes, memory-on/off, transcript replay, and preparation failures. The raw briefing and
+  secrets stay out of the synced doc; an empty memory falls back to transcript replay.
 - **Agent accounts**: credential-slot swap (macOS Keychain via `security-framework`, files
   elsewhere), plan labels, usage probes, paste-code/browser-poll OAuth flows.
 - **Auth**: bearer shared secret (`KOMET_SYNC_TOKEN`) against the self-hosted `komet-sync`
@@ -335,11 +347,47 @@ live evidence for it (Gate B). Until then every ACP agent keeps
 affordance it cannot honour — a harness that cannot answer a question renders
 the question as a visible notice, never a reply field that goes nowhere.
 
+### Accounts, identity and real usage
+
+The Phase-0 capability matrix in `capabilities::capabilities(HarnessId)` is the
+single source of truth for the three independent questions the reliability plan
+asks. `HarnessDescriptor.capabilities`, Settings → Providers and Settings → Usage
+project it; `crates/harness/tests/capabilities.rs` fails on a missing or drifted
+row. `AccountMode` is about what **Komet** can keep and switch, not what the
+provider allows. Each usage surface is separate: provider quota is never inferred
+from Komet-measured turns, and a missing value is never rendered as zero.
+
+| Harness | Accounts | Identity (source actually read) | Usage (real source) | Known limit / fallback |
+| --- | --- | --- | --- | --- |
+| Claude Code | Multi | Detectable: Claude config `oauthAccount` + Keychain credentials | Provider quota: Anthropic OAuth usage endpoint | Locked Keychain → identity `Error`; API-key login → `NotReported`, empty OAuth response → `RetrievalError` |
+| Codex | Multi | Detectable: `auth.json` account claims | Provider quota: ChatGPT usage endpoint | API-key login has no ChatGPT quota → `NotReported` |
+| Cursor | Multi | Detectable: `auth.json` + `state.vscdb` profile | Provider quota: Cursor usage endpoint | Offline → last persisted sample with its date; unreadable store → identity `Error` |
+| Devin | Multi | Detectable: Devin CLI credential store | Komet-measured turns only | No quota endpoint and no readable counter |
+| Grok | Multi | Detectable: Grok CLI auth store | Local logs: Grok CLI usage log | Log missing/partial → `NotReported` with reason |
+| Hermes | Multi | Detectable: Hermes CLI auth store | Komet-measured turns only | No quota endpoint and no readable counter |
+| Pi | Mono | Not exposed: `auth.json` carries a provider label, not a person | Local logs: Pi usage log | Adding a login replaces the active provider login |
+| OpenCode | Mono | Detectable: OpenCode SQLite credential table | Local logs: OpenCode usage log | CLI-managed single credential; an unreadable SQLite store → identity `Error` |
+| Cline | Multi | Detectable: Cline CLI credential store | Komet-measured turns only | No quota endpoint and no readable counter |
+| Qoder | Multi | Not exposed: opaque credential file; slots are Komet labels | Komet-measured turns only | Can keep/switch slots, cannot name the person |
+| Copilot | Mono | Detectable: GitHub Copilot token / user endpoint | Provider quota: GitHub Copilot quota endpoint | Replace-only: a new login replaces the single token slot |
+| Antigravity | Multi | Detectable: keyring + Google userinfo, opaque fallback | Provider quota: Antigravity quota endpoint | Opaque key → identity `NotExposed`, never a fake email |
+| Muse | Multi | Detectable: Muse CLI auth store | Local logs: Muse usage log | Counters absent → `NotReported`; attribution uses activation timeline |
+| Mock | Mono | Not exposed: test double | Komet-measured turns only | Test harness, never advertised as real |
+
+**Fallbacks.** A read failure yields `AgentIdentityStatus::Error` (retryable), never
+`NotConnected`; an agent whose CLI exposes no identity yields `NotExposed` with a
+message. Usage has exactly three states: `Available` (source + collection date),
+`NotReported` (reason: no endpoint, no account, not collected, no token counter)
+and `RetrievalError` (message + retry). A persisted last-known sample may be shown
+during an error, but it keeps its collection date and is never rewritten to zero. Credentials stay in the local account store; RPC and UI carry only ids and
+status.
+
 ## 7. Parity exclusions & deliberate changes
 
-- **Excluded**: token-usage display (profile heatmap, lifetime stats, per-message token columns,
-  `WatchUsage`). Rate-limit meters on agent accounts are *kept* (separate concern; probed from
-  CLIs, not CRDT-synced).
+- **Excluded from the CRDT doc**: token-usage display (profile heatmap, lifetime stats,
+  per-message token columns, `WatchUsage`). Rate-limit meters and the Settings → Usage view are
+  *kept* as local, source-labeled data (provider quota, CLI logs, Komet-measured turns); they are
+  not synced and never masquerade as provider billing.
 - **Changed**: Postgres entity sync/server → workspace registry + self-hosted sync server; Electron/React/mugen → gpui with
   ported techniques; Node harness SDKs → ACP adapter protocols; WebRTC → device-room relay.
 - **Kept verbatim**: session-doc schema shape + constants, command ledger rules, room design,

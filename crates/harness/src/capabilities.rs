@@ -1,6 +1,7 @@
 use komet_proto::{
-    CompactionSurface, HarnessId, HarnessInteractionSurface, PlanSurface, ProgressSurface,
-    QuestionSurface, SubagentSurface,
+    AccountMode, CompactionSurface, HarnessCapabilities, HarnessId, HarnessInteractionSurface,
+    IdentityCapability, IdentityDetection, PlanSurface, ProgressSurface, QuestionSurface,
+    SubagentSurface, UsageCapability, UsageSurface,
 };
 
 /// The one ACP-shaped declaration, parameterised by the subagent case (the only
@@ -94,6 +95,195 @@ pub fn interaction_surface(id: HarnessId) -> HarnessInteractionSurface {
             tool_progress: ProgressSurface::Streaming,
         },
     }
+}
+
+/// Account, identity and real-usage decisions for every agent, as the
+/// integrations actually stand. This is the Phase-0 matrix from
+/// `fiabiliser les agents Komet`, and the single source of truth: the
+/// descriptor, Settings and Usage read it instead of keeping parallel lists.
+///
+/// `accounts` is about Komet's ability to keep and switch logins, not about a
+/// provider allowing several sessions. `identity.source` names the store/API
+/// actually read. `usage.source` names the quota endpoint, local log or
+/// measurement actually used; a source that is not declared here must not be
+/// advertised by a surface.
+pub fn capabilities(id: HarnessId) -> HarnessCapabilities {
+    match id {
+        HarnessId::ClaudeCode => HarnessCapabilities {
+            accounts: AccountMode::MultiAccount,
+            identity: IdentityCapability {
+                detection: IdentityDetection::Detectable,
+                source: "Claude config oauthAccount + Keychain credentials".into(),
+            },
+            usage: UsageCapability {
+                surface: UsageSurface::ProviderQuota,
+                source: "Anthropic OAuth usage endpoint".into(),
+            },
+        },
+        HarnessId::Codex => HarnessCapabilities {
+            accounts: AccountMode::MultiAccount,
+            identity: IdentityCapability {
+                detection: IdentityDetection::Detectable,
+                source: "Codex auth.json account claims".into(),
+            },
+            usage: UsageCapability {
+                surface: UsageSurface::ProviderQuota,
+                source: "ChatGPT usage endpoint".into(),
+            },
+        },
+        HarnessId::Cursor => HarnessCapabilities {
+            accounts: AccountMode::MultiAccount,
+            identity: IdentityCapability {
+                detection: IdentityDetection::Detectable,
+                source: "Cursor auth.json + state.vscdb profile".into(),
+            },
+            usage: UsageCapability {
+                surface: UsageSurface::ProviderQuota,
+                source: "Cursor usage endpoint".into(),
+            },
+        },
+        HarnessId::Devin => HarnessCapabilities {
+            accounts: AccountMode::MultiAccount,
+            identity: IdentityCapability {
+                detection: IdentityDetection::Detectable,
+                source: "Devin CLI credential store".into(),
+            },
+            usage: UsageCapability {
+                surface: UsageSurface::MeasuredOnly,
+                source: "Komet-measured turns (no quota endpoint, no counter)".into(),
+            },
+        },
+        HarnessId::Grok => HarnessCapabilities {
+            accounts: AccountMode::MultiAccount,
+            identity: IdentityCapability {
+                detection: IdentityDetection::Detectable,
+                source: "Grok CLI auth store".into(),
+            },
+            usage: UsageCapability {
+                surface: UsageSurface::LocalLogs,
+                source: "Grok CLI local usage log".into(),
+            },
+        },
+        HarnessId::Hermes => HarnessCapabilities {
+            accounts: AccountMode::MultiAccount,
+            identity: IdentityCapability {
+                detection: IdentityDetection::Detectable,
+                source: "Hermes CLI auth store".into(),
+            },
+            usage: UsageCapability {
+                surface: UsageSurface::MeasuredOnly,
+                source: "Komet-measured turns (no quota endpoint, no counter)".into(),
+            },
+        },
+        HarnessId::Pi => HarnessCapabilities {
+            // One provider login at a time; Komet has no switch path.
+            accounts: AccountMode::MonoAccount,
+            identity: IdentityCapability {
+                detection: IdentityDetection::NotExposed,
+                source: "Pi auth.json provider label (no account identity)".into(),
+            },
+            usage: UsageCapability {
+                surface: UsageSurface::LocalLogs,
+                source: "Pi local usage log".into(),
+            },
+        },
+        HarnessId::Opencode => HarnessCapabilities {
+            // CLI-managed single credential; adding replaces the active login.
+            accounts: AccountMode::MonoAccount,
+            identity: IdentityCapability {
+                detection: IdentityDetection::Detectable,
+                source: "OpenCode SQLite credential table".into(),
+            },
+            usage: UsageCapability {
+                surface: UsageSurface::LocalLogs,
+                source: "OpenCode local usage log".into(),
+            },
+        },
+        HarnessId::Cline => HarnessCapabilities {
+            accounts: AccountMode::MultiAccount,
+            identity: IdentityCapability {
+                detection: IdentityDetection::Detectable,
+                source: "Cline CLI credential store".into(),
+            },
+            usage: UsageCapability {
+                surface: UsageSurface::MeasuredOnly,
+                source: "Komet-measured turns (no quota endpoint, no counter)".into(),
+            },
+        },
+        HarnessId::Qoder => HarnessCapabilities {
+            accounts: AccountMode::MultiAccount,
+            identity: IdentityCapability {
+                // The login file is opaque bytes: Komet can hold and switch
+                // several slots, but cannot name the person behind one.
+                detection: IdentityDetection::NotExposed,
+                source: "Qoder opaque credential file (no account identity)".into(),
+            },
+            usage: UsageCapability {
+                surface: UsageSurface::MeasuredOnly,
+                source: "Komet-measured turns (no quota endpoint, no counter)".into(),
+            },
+        },
+        HarnessId::Copilot => HarnessCapabilities {
+            // GitHub login is a single token slot: a new login replaces it.
+            accounts: AccountMode::MonoAccount,
+            identity: IdentityCapability {
+                detection: IdentityDetection::Detectable,
+                source: "GitHub Copilot token / user endpoint".into(),
+            },
+            usage: UsageCapability {
+                surface: UsageSurface::ProviderQuota,
+                source: "GitHub Copilot quota endpoint".into(),
+            },
+        },
+        HarnessId::Antigravity => HarnessCapabilities {
+            accounts: AccountMode::MultiAccount,
+            identity: IdentityCapability {
+                detection: IdentityDetection::Detectable,
+                source: "Antigravity keyring + Google userinfo (opaque fallback)".into(),
+            },
+            usage: UsageCapability {
+                surface: UsageSurface::ProviderQuota,
+                source: "Antigravity quota endpoint".into(),
+            },
+        },
+        HarnessId::Muse => HarnessCapabilities {
+            accounts: AccountMode::MultiAccount,
+            identity: IdentityCapability {
+                detection: IdentityDetection::Detectable,
+                source: "Muse CLI auth store".into(),
+            },
+            usage: UsageCapability {
+                surface: UsageSurface::LocalLogs,
+                source: "Muse local usage log".into(),
+            },
+        },
+        HarnessId::Mock => HarnessCapabilities {
+            accounts: AccountMode::MonoAccount,
+            identity: IdentityCapability {
+                detection: IdentityDetection::NotExposed,
+                source: "test double".into(),
+            },
+            usage: UsageCapability {
+                surface: UsageSurface::MeasuredOnly,
+                source: "test double".into(),
+            },
+        },
+    }
+}
+
+/// Quota-capable agents, derived from the matrix (never a second list).
+pub fn reports_provider_quota(id: HarnessId) -> bool {
+    capabilities(id).usage.surface == UsageSurface::ProviderQuota
+}
+
+/// Agents whose usage comes from a readable CLI log.
+pub fn has_local_usage_log(id: HarnessId) -> bool {
+    capabilities(id).usage.surface == UsageSurface::LocalLogs
+}
+
+/// Agents Komet can switch between saved logins.
+pub fn supports_account_switching(id: HarnessId) -> bool {
+    capabilities(id).accounts == AccountMode::MultiAccount
 }
 
 /// Returns `(supports, reason)`. `reason` is empty when supported, otherwise a

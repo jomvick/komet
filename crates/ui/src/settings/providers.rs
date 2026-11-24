@@ -19,8 +19,8 @@ use std::time::{Duration, Instant};
 use komet_engine::harness_cli::HarnessCliStatus;
 use komet_engine::registry::{HarnessDescriptor, descriptor_enabled};
 use komet_proto::{
-    AgentAccount, AgentAccountsSnapshot, AgentLoginMode, AgentLoginPoll, AgentLoginStart,
-    AgentLoginStatus, HarnessId, SteeringMode,
+    AccountMode, AgentAccount, AgentAccountsSnapshot, AgentIdentityReport, AgentIdentityStatus,
+    AgentLoginMode, AgentLoginPoll, AgentLoginStart, AgentLoginStatus, HarnessId, SteeringMode,
 };
 use komet_rpc::methods;
 
@@ -206,6 +206,7 @@ fn placeholder_descriptors() -> Vec<HarnessDescriptor> {
             installed: true,
             enabled: None,
             surface: Default::default(),
+            capabilities: Default::default(),
         })
         .collect()
 }
@@ -250,6 +251,66 @@ fn account_summary(accounts: &[&AgentAccount]) -> SharedString {
         }
         None => SharedString::from(format!("{} {noun} · Not connected", accounts.len())),
     }
+}
+
+/// The engine's typed detection state for one provider, when this snapshot
+/// predates the field it is absent and the caller falls back to the account list.
+fn identity_report(
+    snapshot: &AgentAccountsSnapshot,
+    harness: HarnessId,
+) -> Option<&AgentIdentityReport> {
+    snapshot
+        .statuses
+        .iter()
+        .find(|report| report.harness == harness)
+}
+
+/// The account line for a provider card. A detection ERROR is never rendered
+/// as "not connected"; an agent that never exposes an identity says so.
+fn identity_summary(
+    snapshot: &AgentAccountsSnapshot,
+    harness: HarnessId,
+    accounts: &[&AgentAccount],
+) -> (SharedString, bool) {
+    match identity_report(snapshot, harness).map(|report| &report.status) {
+        Some(AgentIdentityStatus::Detected { identity, .. }) => {
+            if accounts.is_empty() {
+                (
+                    SharedString::from(identity.clone().unwrap_or_else(|| "Connected".into())),
+                    false,
+                )
+            } else {
+                (account_summary(accounts), false)
+            }
+        }
+        Some(AgentIdentityStatus::NotConnected) => (SharedString::from("Not connected"), false),
+        Some(AgentIdentityStatus::NotExposed { message }) => {
+            (SharedString::from(message.clone()), false)
+        }
+        Some(AgentIdentityStatus::Error { message, .. }) => (
+            SharedString::from(format!("Account status unavailable: {message}")),
+            true,
+        ),
+        None => (account_summary(accounts), false),
+    }
+}
+
+/// Mono-account providers replace the active login; the button must say so
+/// before the user acts, not after the previous account is gone.
+fn add_account_label(harness: HarnessId, has_accounts: bool) -> &'static str {
+    if has_accounts
+        && komet_harness::capabilities::capabilities(harness).accounts == AccountMode::MonoAccount
+    {
+        "Replace account"
+    } else {
+        "Add account"
+    }
+}
+
+fn mono_account_note(harness: HarnessId, has_account: bool) -> Option<&'static str> {
+    (has_account
+        && komet_harness::capabilities::capabilities(harness).accounts == AccountMode::MonoAccount)
+        .then_some("This provider keeps one login: signing in replaces the current account.")
 }
 
 /// The last enabled agent cannot be switched off — the composer needs
@@ -1183,12 +1244,18 @@ impl ProvidersPage {
                 let managing = self.managing_cli == Some(harness);
                 let (icon_path, tint) = crate::pickers::harness_brand_icon(harness);
 
-                let accounts: Vec<&AgentAccount> = self
-                    .accounts
-                    .ready()
+                let snapshot = self.accounts.ready();
+                let accounts: Vec<&AgentAccount> = snapshot
                     .map(|snapshot| provider_accounts(snapshot, harness))
                     .unwrap_or_default();
-                let summary = account_summary(&accounts);
+                let identity = snapshot.and_then(|snapshot| identity_report(snapshot, harness));
+                let identity_error = matches!(
+                    identity.map(|report| &report.status),
+                    Some(AgentIdentityStatus::Error { .. })
+                );
+                let (summary, summary_warning) = snapshot
+                    .map(|snapshot| identity_summary(snapshot, harness, &accounts))
+                    .unwrap_or_default();
 
                 let mut meta: Vec<AnyElement> = vec![
                     div()
@@ -1283,8 +1350,20 @@ impl ProvidersPage {
                 if !summary.is_empty() {
                     meta.push(
                         div()
-                            .text_color(theme.text_muted.opacity(0.75))
+                            .text_color(if summary_warning {
+                                theme.warning_muted.opacity(0.9)
+                            } else {
+                                theme.text_muted.opacity(0.75)
+                            })
                             .child(summary)
+                            .into_any_element(),
+                    );
+                }
+                if let Some(note) = mono_account_note(harness, !accounts.is_empty()) {
+                    meta.push(
+                        div()
+                            .text_color(theme.text_muted.opacity(0.6))
+                            .child(SharedString::from(note))
                             .into_any_element(),
                     );
                 }
@@ -1352,7 +1431,7 @@ impl ProvidersPage {
                     }
                 }
                 let accounts_known = matches!(self.accounts, Loadable::Ready(_));
-                if accounts_known && accounts.is_empty() {
+                if accounts_known && accounts.is_empty() && !identity_error {
                     let copy = if cli_login_command(harness).is_some() {
                         format!("{name} sign-in is managed by its own CLI.")
                     } else if supports_in_app_login(harness) {
@@ -1421,7 +1500,10 @@ impl ProvidersPage {
                                             .size(px(16.0))
                                             .text_color(theme.text_muted),
                                     )
-                                    .child(SharedString::from("Add account")),
+                                    .child(SharedString::from(add_account_label(
+                                        harness,
+                                        !accounts.is_empty(),
+                                    ))),
                             ),
                     );
                 } else if let Some(command) = cli_login_command(harness) {
@@ -2267,7 +2349,12 @@ impl ProvidersPage {
                                     if submitting {
                                         "Verifying…"
                                     } else {
-                                        "Add account"
+                                        add_account_label(
+                                            *harness,
+                                            self.accounts.ready().is_some_and(|snapshot| {
+                                                !provider_accounts(snapshot, *harness).is_empty()
+                                            }),
+                                        )
                                     },
                                 )
                                 .id("login-submit-code")
@@ -2795,6 +2882,7 @@ mod tests {
         let empty = AgentAccountsSnapshot {
             accounts: vec![],
             warnings: vec![],
+            statuses: vec![],
         };
         assert!(!completed_browser_login_has_account(
             Some(&copilot_login(true, HashMap::new())),
@@ -2803,6 +2891,7 @@ mod tests {
         let saved = AgentAccountsSnapshot {
             accounts: vec![account.clone()],
             warnings: vec![],
+            statuses: vec![],
         };
         assert!(!completed_browser_login_has_account(
             Some(&copilot_login(false, HashMap::new())),
@@ -2818,6 +2907,7 @@ mod tests {
                 },
             ],
             warnings: vec![],
+            statuses: vec![],
         };
         assert!(completed_browser_login_has_account(
             Some(&copilot_login(true, prior)),
@@ -2848,6 +2938,7 @@ mod tests {
         let snapshot = AgentAccountsSnapshot {
             accounts: vec![existing],
             warnings: vec![],
+            statuses: vec![],
         };
         let login = LoginFlow::Browser {
             harness: HarnessId::Copilot,
@@ -2910,6 +3001,7 @@ mod tests {
         let pre_existing = AgentAccountsSnapshot {
             accounts: vec![codex_account("codex-1", Some(1000))],
             warnings: vec![],
+            statuses: vec![],
         };
         assert!(!completed_browser_login_has_account(
             Some(&login(HashMap::from([("codex-1".to_string(), Some(1000))]))),
@@ -2920,6 +3012,7 @@ mod tests {
         let updated = AgentAccountsSnapshot {
             accounts: vec![codex_account("codex-1", Some(2000))],
             warnings: vec![],
+            statuses: vec![],
         };
         assert!(completed_browser_login_has_account(
             Some(&login(HashMap::from([("codex-1".to_string(), Some(1000))]))),
@@ -2932,6 +3025,7 @@ mod tests {
                 codex_account("codex-2", Some(3000)),
             ],
             warnings: vec![],
+            statuses: vec![],
         };
         assert!(completed_browser_login_has_account(
             Some(&login(HashMap::from([("codex-1".to_string(), Some(1000))]))),
@@ -2978,6 +3072,7 @@ mod tests {
                 account("c2", HarnessId::ClaudeCode, true),
             ],
             warnings: vec![],
+            statuses: vec![],
         };
         let claude = provider_accounts(&snapshot, HarnessId::ClaudeCode);
         let ids: Vec<&str> = claude.iter().map(|a| a.id.as_str()).collect();
@@ -3081,6 +3176,7 @@ mod tests {
         let baseline = AgentAccountsSnapshot {
             accounts: vec![account("old", true), account("selected", false)],
             warnings: vec![],
+            statuses: vec![],
         };
         let flags = |s: &AgentAccountsSnapshot| -> Vec<bool> {
             s.accounts.iter().map(|a| a.active).collect()
@@ -3102,5 +3198,61 @@ mod tests {
         // Foreign harness: matches no account either, flags stay put.
         select_active_account(&mut snapshot, HarnessId::ClaudeCode, "selected");
         assert_eq!(flags(&snapshot), flags(&baseline));
+    }
+
+    fn status_snapshot(harness: HarnessId, status: AgentIdentityStatus) -> AgentAccountsSnapshot {
+        AgentAccountsSnapshot {
+            accounts: Vec::new(),
+            warnings: Vec::new(),
+            statuses: vec![AgentIdentityReport { harness, status }],
+        }
+    }
+
+    #[test]
+    fn identity_error_is_never_rendered_as_not_connected() {
+        let snapshot = status_snapshot(
+            HarnessId::ClaudeCode,
+            AgentIdentityStatus::Error {
+                message: "Keychain is locked".into(),
+                retryable: true,
+            },
+        );
+        let (summary, warning) = identity_summary(&snapshot, HarnessId::ClaudeCode, &[]);
+        assert!(summary.contains("Keychain is locked"), "{summary}");
+        assert!(summary.contains("unavailable"), "{summary}");
+        assert!(
+            !summary.to_lowercase().contains("not connected"),
+            "{summary}"
+        );
+        assert!(warning);
+    }
+
+    #[test]
+    fn not_exposed_identity_explains_what_the_cli_reports() {
+        let snapshot = status_snapshot(
+            HarnessId::Pi,
+            AgentIdentityStatus::NotExposed {
+                message: "Pi exposes only the provider".into(),
+            },
+        );
+        let (summary, warning) = identity_summary(&snapshot, HarnessId::Pi, &[]);
+        assert_eq!(summary.as_ref(), "Pi exposes only the provider");
+        assert!(!warning);
+    }
+
+    #[test]
+    fn mono_provider_labels_the_action_as_replace() {
+        assert_eq!(
+            add_account_label(HarnessId::Copilot, true),
+            "Replace account"
+        );
+        assert_eq!(add_account_label(HarnessId::Copilot, false), "Add account");
+        assert_eq!(
+            add_account_label(HarnessId::ClaudeCode, true),
+            "Add account"
+        );
+        assert!(mono_account_note(HarnessId::Opencode, true).is_some());
+        assert!(mono_account_note(HarnessId::Opencode, false).is_none());
+        assert!(mono_account_note(HarnessId::ClaudeCode, true).is_none());
     }
 }

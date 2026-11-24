@@ -1252,9 +1252,10 @@ impl BrowserSurface {
         &mut self,
         uid: u32,
         text: &str,
+        snapshot: Option<u64>,
         _cx: &mut Context<Self>,
     ) -> Result<(), String> {
-        let el = self.agent_element(uid)?;
+        let el = self.agent_element(uid, snapshot)?;
         self.commands
             .send(BrowserCommand::Evaluate(cdp::fill_element_script(
                 &el.selector,

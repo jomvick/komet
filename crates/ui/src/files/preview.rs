@@ -2121,6 +2121,69 @@ impl FilesSurface {
         if let DocumentPhase::Error(error) = &document.phase {
             return centered_state(error.clone(), theme.danger_muted);
         }
+        if let Some(image) = document.image.clone() {
+            let name = path.rsplit('/').next().unwrap_or(path);
+            let dimensions = document
+                .image_dimensions
+                .map(|(width, height)| format!("{width} × {height} px"))
+                .unwrap_or_else(|| "Dimensions unavailable".to_string());
+            let size = document
+                .file
+                .as_ref()
+                .map(|file| human_bytes(file.size))
+                .unwrap_or_default();
+            return div()
+                .id("files-image-preview")
+                .flex_1()
+                .min_w_0()
+                .min_h_0()
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .h(px(28.0))
+                        .flex_none()
+                        .px(px(Theme::SPACE_MD))
+                        .flex()
+                        .items_center()
+                        .gap(px(6.0))
+                        .border_b_1()
+                        .border_color(theme.border)
+                        .text_size(px(10.5))
+                        .text_color(theme.text_muted)
+                        .child(div().min_w_0().truncate().child(SharedString::from(name)))
+                        .child(div().text_color(theme.text_faint).child("·"))
+                        .child(SharedString::from(dimensions))
+                        .when(!size.is_empty(), |el| {
+                            el.child(div().text_color(theme.text_faint).child("·"))
+                                .child(SharedString::from(size))
+                        })
+                        .child(div().flex_1())
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_color(theme.text_faint)
+                                .child(SharedString::from("Read-only")),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_hidden()
+                        .p(px(Theme::SPACE_LG))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            gpui::img(image)
+                                .max_w_full()
+                                .max_h_full()
+                                .object_fit(gpui::ObjectFit::Contain),
+                        ),
+                )
+                .into_any_element();
+        }
         if let Some(editor) = editor {
             editor.update(cx, |state, _| {
                 state.set_editor_style(super::editor_adapter::editor_style(theme));
@@ -2714,11 +2777,24 @@ fn centered_state(message: impl Into<SharedString>, color: gpui::Hsla) -> AnyEle
         .into_any_element()
 }
 
+fn human_bytes(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else if bytes >= 1024 {
+        format!("{:.0} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
 fn read_only_message(reason: Option<WorkspaceReadOnlyReason>) -> SharedString {
     match reason {
         Some(WorkspaceReadOnlyReason::Binary) => "Binary files cannot be previewed.",
         Some(WorkspaceReadOnlyReason::UnsupportedEncoding) => {
             "This file encoding is not supported."
+        }
+        Some(WorkspaceReadOnlyReason::UnsupportedImage) => {
+            "This image format is not supported for preview."
         }
         Some(WorkspaceReadOnlyReason::Symlink) => "Symlink targets are read-only.",
         Some(WorkspaceReadOnlyReason::PermissionDenied) => "Permission denied.",
@@ -2752,6 +2828,9 @@ mod tests {
         assert!(
             read_only_message(Some(WorkspaceReadOnlyReason::UnsupportedEncoding))
                 .contains("encoding")
+        );
+        assert!(
+            read_only_message(Some(WorkspaceReadOnlyReason::UnsupportedImage)).contains("image")
         );
     }
 

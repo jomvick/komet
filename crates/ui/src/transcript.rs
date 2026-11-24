@@ -528,6 +528,8 @@ pub struct SwitchTransition {
     pub to: Option<komet_proto::HarnessId>,
     pub from_label: SharedString,
     pub to_label: SharedString,
+    /// Provenance/size record of what Komet sent to the receiving agent.
+    pub context: Option<komet_proto::ContextHandoff>,
 }
 
 #[derive(Clone)]
@@ -593,7 +595,14 @@ pub enum RowKind {
         kind: komet_proto::ErrorKind,
         detail: Option<String>,
         retryable: bool,
+        /// Structured terminal cause (RunOutcome); `None` on documentation
+        /// written before the field, so old chips render unchanged.
+        cause: Option<komet_proto::RunCause>,
+        exit_code: Option<i32>,
     },
+    /// A settled non-completion note. Persisted message status drives it, so
+    /// "Interrompu" survives a restart even when no Error chip exists.
+    Interrupted { label: SharedString },
     /// A mid-chat model switch, recorded by the engine as a `System` entry
     /// the moment `setChatConfig` lands (zcode's permanent "Model switched
     /// A → B" divider — visible from the switch, not deferred to the next
@@ -844,6 +853,7 @@ fn row_kind_tag(kind: &RowKind) -> &'static str {
         RowKind::QuestionRow { .. } => "question",
         RowKind::PermissionRow { .. } => "permission",
         RowKind::ErrorChip { .. } => "error",
+        RowKind::Interrupted { .. } => "interrupted",
         RowKind::AgentSwitch { .. } => "agent_switch",
         RowKind::ModelSwitch { .. } => "model_switch",
         RowKind::Compaction { .. } => "compaction",
@@ -1096,6 +1106,7 @@ pub fn rows_for_entry(
                     to,
                     from_harness,
                     to_harness,
+                    context,
                     ..
                 } => {
                     switch = Some(SwitchTransition {
@@ -1107,6 +1118,7 @@ pub fn rows_for_entry(
                             .and_then(komet_proto::HarnessId::from_slug),
                         from_label: from.as_str().into(),
                         to_label: to.as_str().into(),
+                        context: context.clone(),
                     });
                     None
                 }
@@ -1348,6 +1360,8 @@ pub fn rows_for_entry(
                         kind,
                         detail,
                         retryable,
+                        cause,
+                        exit_code,
                     } => {
                         // Version covers the typed fields: a kind/detail
                         // arriving late (re-fold) re-renders the chip.
@@ -1355,6 +1369,12 @@ pub fn rows_for_entry(
                         version = version.wrapping_mul(31).wrapping_add(*retryable as u64);
                         if let Some(detail) = detail {
                             version = version.wrapping_mul(31).wrapping_add(detail.len() as u64);
+                        }
+                        if let Some(cause) = cause {
+                            version = version.wrapping_mul(31).wrapping_add(*cause as u64 + 1);
+                        }
+                        if let Some(code) = exit_code {
+                            version = version.wrapping_mul(31).wrapping_add(*code as u64);
                         }
                         rows.push(Row {
                             id: format!("{}#{}", entry.id, part_id).into(),
@@ -1366,6 +1386,8 @@ pub fn rows_for_entry(
                                 kind: *kind,
                                 detail: detail.clone(),
                                 retryable: *retryable,
+                                cause: *cause,
+                                exit_code: *exit_code,
                             },
                             entry_id: entry_id.clone(),
                             timestamp: None,
@@ -1429,6 +1451,7 @@ pub fn rows_for_entry(
                         to_model,
                         from_harness,
                         to_harness,
+                        ..
                     } if entry.role == MessageRole::System => {
                         let from_harness_id = from_harness
                             .as_deref()
@@ -1455,6 +1478,7 @@ pub fn rows_for_entry(
                                         to: to_harness_id,
                                         from_label: from.as_str().into(),
                                         to_label: to.as_str().into(),
+                                        context: None,
                                     },
                                 },
                                 entry_id: entry_id.clone(),
@@ -1491,6 +1515,21 @@ pub fn rows_for_entry(
         &mut group_ix,
         group_last_part_ix,
     );
+
+    // The final state stays visible after reload: message status is persisted
+    // in the doc, so an interrupted turn does not silently look complete.
+    if entry.status == Some(MessageStatus::Aborted) {
+        rows.push(Row {
+            id: format!("{}#interrupted", entry.id).into(),
+            version: 1,
+            turn_start: false,
+            kind: RowKind::Interrupted {
+                label: "Interrompu".into(),
+            },
+            entry_id: entry_id.clone(),
+            timestamp: None,
+        });
+    }
 
     if let Some(first) = rows.first_mut() {
         first.turn_start = true;
@@ -4526,17 +4565,75 @@ impl Transcript {
                 )))
                 .into_any_element(),
         };
-        div()
+        let mut column = div().w_full().flex().flex_col().gap(px(4.0)).child(
+            div()
+                .w_full()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(10.0))
+                .py(px(4.0))
+                .child(div().flex_1().h(px(1.0)).bg(crate::theme::hairline(0.10)))
+                .child(content)
+                .child(div().flex_1().h(px(1.0)).bg(crate::theme::hairline(0.10))),
+        );
+        if let Some(context) = switch.context.as_ref() {
+            column = column.child(Self::context_handoff_line(context, theme));
+        }
+        column.into_any_element()
+    }
+
+    /// What Komet prepared for the receiving agent: source labels and sizes,
+    /// never the raw prompt, files or secret values.
+    fn context_handoff_line(context: &komet_proto::ContextHandoff, theme: &Theme) -> AnyElement {
+        let mut line = div()
             .w_full()
             .flex()
             .flex_row()
+            .flex_wrap()
             .items_center()
-            .gap(px(10.0))
-            .py(px(4.0))
-            .child(div().flex_1().h(px(1.0)).bg(crate::theme::hairline(0.10)))
-            .child(content)
-            .child(div().flex_1().h(px(1.0)).bg(crate::theme::hairline(0.10)))
-            .into_any_element()
+            .gap(px(6.0))
+            .px(px(2.0))
+            .text_size(px(10.0))
+            .text_color(theme.text_faint)
+            .child(
+                crate::icons::icon(crate::icons::INFO_CIRCLE)
+                    .size(px(10.0))
+                    .text_color(theme.text_faint),
+            )
+            .child(SharedString::from("Context sent"));
+        for source in &context.sources {
+            line = line.child(
+                div()
+                    .px(px(5.0))
+                    .py(px(1.0))
+                    .rounded(px(4.0))
+                    .bg(crate::theme::wash(0.06))
+                    .text_color(theme.text_muted)
+                    .child(SharedString::from(match &source.detail {
+                        Some(detail) => format!("{} · {detail}", source.label),
+                        None => source.label.clone(),
+                    })),
+            );
+        }
+        if context.memory_chars == 0
+            && context
+                .sources
+                .iter()
+                .all(|source| source.kind != komet_proto::ContextSourceKind::Memory)
+        {
+            line = line.child(SharedString::from(
+                "no project-memory match — transcript fallback",
+            ));
+        }
+        if let Some(warning) = context.warning.as_ref() {
+            line = line.child(
+                div()
+                    .text_color(theme.danger_muted)
+                    .child(SharedString::from(warning.clone())),
+            );
+        }
+        line.into_any_element()
     }
 
     /// The permanent "⇄ Model switched A → B" divider (zcode): hairlines
@@ -4839,7 +4936,22 @@ impl Transcript {
                 kind,
                 detail,
                 retryable,
-            } => self.render_error_chip(&row.id, message, kind, detail, *retryable, &theme, cx),
+                cause,
+                exit_code,
+            } => self.render_error_chip(
+                &row.id, message, kind, detail, *retryable, *cause, *exit_code, &theme, cx,
+            ),
+            RowKind::Interrupted { label } => div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(6.0))
+                .px(px(10.0))
+                .py(px(4.0))
+                .text_size(px(12.0))
+                .text_color(theme.text_muted)
+                .child(label.clone())
+                .into_any_element(),
             RowKind::AgentSwitch { switch } => Self::switch_line(switch, &theme),
             RowKind::ModelSwitch {
                 from_model,
@@ -5947,6 +6059,27 @@ fn error_action(
 }
 
 impl Transcript {
+    /// Human label for a structured terminal cause. French, matching the error
+    /// chip's other actions; the raw enum stays available to logs and tests.
+    fn run_cause_label(cause: komet_proto::RunCause) -> &'static str {
+        use komet_proto::RunCause;
+        match cause {
+            RunCause::Auth => "Authentification",
+            RunCause::Billing => "Facturation",
+            RunCause::RateLimit => "Limite de débit",
+            RunCause::Overloaded => "Service surchargé",
+            RunCause::ModelUnavailable => "Modèle indisponible",
+            RunCause::Network => "Réseau",
+            RunCause::Config => "Configuration",
+            RunCause::Protocol => "Protocole",
+            RunCause::Process => "Processus",
+            RunCause::Crash => "Crash",
+            RunCause::Timeout => "Délai dépassé",
+            RunCause::Cancelled => "Annulé",
+            RunCause::EngineRestart => "Redémarrage du moteur",
+            RunCause::Unknown => "Inconnue",
+        }
+    }
     /// Error chip with a « Détails » toggle (raw CLI text) and the kind's
     /// action button. Navigation/retry actions dispatch window actions the
     /// shell handles (it owns settings, composer, and pickers); copy runs
@@ -5959,6 +6092,8 @@ impl Transcript {
         kind: &komet_proto::ErrorKind,
         detail: &Option<String>,
         retryable: bool,
+        cause: Option<komet_proto::RunCause>,
+        exit_code: Option<i32>,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -5971,7 +6106,7 @@ impl Transcript {
             .w_full()
             .child(error_chip(message.clone(), theme));
 
-        if detail_text.is_some() || action.is_some() {
+        if detail_text.is_some() || action.is_some() || cause.is_some() || exit_code.is_some() {
             let mut bar = div()
                 .flex()
                 .flex_row()
@@ -5979,6 +6114,25 @@ impl Transcript {
                 .gap(px(12.0))
                 .px(px(10.0))
                 .pt(px(4.0));
+            if cause.is_some() || exit_code.is_some() {
+                let mut label = String::new();
+                if let Some(cause) = cause {
+                    label.push_str("Cause : ");
+                    label.push_str(Self::run_cause_label(cause));
+                }
+                if let Some(code) = exit_code {
+                    if !label.is_empty() {
+                        label.push_str(" · ");
+                    }
+                    label.push_str(&format!("code {code}"));
+                }
+                bar = bar.child(
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(theme.text_muted)
+                        .child(SharedString::from(label)),
+                );
+            }
             if detail_text.is_some() {
                 let key = row_id.clone();
                 let label: SharedString = (if expanded { "Masquer" } else { "Détails" }).into();
@@ -7156,6 +7310,7 @@ mod tests {
                     to_harness: Some("muse".into()),
                     from_model: None,
                     to_model: None,
+                    context: None,
                 },
             ],
             created_at: 0,
@@ -7191,6 +7346,7 @@ mod tests {
             to_harness: None,
             from_model: None,
             to_model: None,
+            context: None,
         }];
         let rows = rows_for_entry(&legacy, false, &mut parse);
         let RowKind::User { switch, .. } = &rows[0].kind else {
@@ -7214,6 +7370,7 @@ mod tests {
                 to_harness: Some("claude-code".into()),
                 from_model: Some("claude-opus".into()),
                 to_model: Some("glm-5.3-flash".into()),
+                context: None,
             }],
             created_at: 0,
             device_id: "dev".into(),
@@ -7247,6 +7404,7 @@ mod tests {
             to_harness: Some("muse".into()),
             from_model: None,
             to_model: None,
+            context: None,
         }];
         let rows = rows_for_entry(&agent_only, false, &mut parse);
         assert_eq!(rows.len(), 1);
@@ -7266,6 +7424,7 @@ mod tests {
             to_harness: Some("muse".into()),
             from_model: Some("claude-opus".into()),
             to_model: Some("glm-5.3-flash".into()),
+            context: None,
         }];
         let rows = rows_for_entry(&combined, false, &mut parse);
         assert_eq!(rows.len(), 2);
@@ -7283,6 +7442,7 @@ mod tests {
             to_harness: Some("claude-code".into()),
             from_model: None,
             to_model: None,
+            context: None,
         }];
         assert!(rows_for_entry(&noop, false, &mut parse).is_empty());
     }

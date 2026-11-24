@@ -32,6 +32,26 @@ pub enum HarnessId {
 }
 
 impl HarnessId {
+    /// Every production integration plus the test double, in display order.
+    /// Exhaustive matrices (capabilities, golden tests) iterate this so a new
+    /// variant cannot silently skip its explicit decision.
+    pub const ALL: [HarnessId; 14] = [
+        HarnessId::ClaudeCode,
+        HarnessId::Codex,
+        HarnessId::Cursor,
+        HarnessId::Devin,
+        HarnessId::Grok,
+        HarnessId::Hermes,
+        HarnessId::Pi,
+        HarnessId::Opencode,
+        HarnessId::Cline,
+        HarnessId::Qoder,
+        HarnessId::Antigravity,
+        HarnessId::Muse,
+        HarnessId::Copilot,
+        HarnessId::Mock,
+    ];
+
     pub fn as_str(&self) -> &'static str {
         match self {
             HarnessId::ClaudeCode => "claude-code",
@@ -188,6 +208,94 @@ impl HarnessInteractionSurface {
 impl Default for HarnessInteractionSurface {
     fn default() -> Self {
         Self::none()
+    }
+}
+
+/// How many accounts Komet can actually keep side by side for one agent.
+///
+/// Declared per agent from the real CLI + integration behavior, never guessed:
+/// `MultiAccount` means the credentials Komet swaps are sufficient to return to
+/// a previous login; `MonoAccount` means a new connection REPLACES the current
+/// one (the UI must say so before the action).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AccountMode {
+    MultiAccount,
+    MonoAccount,
+}
+
+/// Whether the agent exposes an identity Komet can read (account email, user id).
+/// Runtime failures are a separate status ([crate::AgentIdentityStatus]) — a
+/// detection error must never read as "not connected".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum IdentityDetection {
+    Detectable,
+    NotExposed,
+}
+
+/// Best source an agent can offer for real usage, independent of whether a
+/// sample exists right now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum UsageSurface {
+    /// The provider exposes a quota endpoint Komet can query.
+    ProviderQuota,
+    /// No quota endpoint, but the CLI writes token counters Komet can read.
+    LocalLogs,
+    /// No provider quota and no readable CLI counter: only Komet-measured turns.
+    MeasuredOnly,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IdentityCapability {
+    pub detection: IdentityDetection,
+    /// The store/API actually read, stated for the Provider panel and docs.
+    pub source: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageCapability {
+    pub surface: UsageSurface,
+    /// The quota endpoint / local log / measurement actually used.
+    pub source: String,
+}
+
+/// The three independent capabilities the reliability plan freezes per agent.
+/// Exhaustive by construction: `capabilities(id)` has a match arm for every
+/// `HarnessId`, and the golden test fails if a new id is added without one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HarnessCapabilities {
+    pub accounts: AccountMode,
+    pub identity: IdentityCapability,
+    pub usage: UsageCapability,
+}
+
+impl HarnessCapabilities {
+    /// The conservative fallback for a harness with no explicit decision:
+    /// mono-account, no identity, Komet-measured only. A new agent is therefore
+    /// never advertised as supported until its row is filled in.
+    pub fn unknown() -> Self {
+        Self {
+            accounts: AccountMode::MonoAccount,
+            identity: IdentityCapability {
+                detection: IdentityDetection::NotExposed,
+                source: "no identity source declared".into(),
+            },
+            usage: UsageCapability {
+                surface: UsageSurface::MeasuredOnly,
+                source: "Komet-measured turns only".into(),
+            },
+        }
+    }
+}
+
+impl Default for HarnessCapabilities {
+    fn default() -> Self {
+        Self::unknown()
     }
 }
 
@@ -1790,6 +1898,104 @@ pub enum DoneReason {
     ChildExit,
 }
 
+/// What Komet transmitted to a newly selected agent, recorded on the
+/// transcript's switch marker. It names sources and sizes only: raw prompts,
+/// files and secret values never ride this record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextHandoff {
+    /// First non-empty line of the request, capped — the objective the agent
+    /// received, already visible in the user bubble.
+    pub objective: String,
+    /// Characters of the delimited project-memory briefing appended to the run
+    /// prompt. `0` means the transcript is the fallback.
+    pub memory_chars: usize,
+    /// Whether the previous transcript was replayed into the prompt.
+    pub transcript_replayed: bool,
+    pub sources: Vec<ContextSource>,
+    /// Preparation/injection failure surfaced to the user (memory store
+    /// unavailable, unreadable project, …). Never contains a secret value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
+    /// Wall-clock preparation time (epoch ms).
+    pub prepared_at: i64,
+}
+
+/// One provenance entry of a [`ContextHandoff`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextSource {
+    pub kind: ContextSourceKind,
+    /// Human label shown in the handoff card.
+    pub label: String,
+    /// Optional count/size detail ("12 earlier messages", "3.2 KB").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ContextSourceKind {
+    Request,
+    Transcript,
+    Memory,
+    Agent,
+}
+
+/// Structured cause of a non-clean run termination, carried by
+/// [`AgentEvent::RunOutcome`] and the terminal error part's Details view.
+///
+/// Deliberately richer than [`ErrorKind`]: a process that died, a protocol
+/// stream that ended without a terminator and a user cancellation are three
+/// different facts, and only one of them is a failure.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RunCause {
+    Auth,
+    Billing,
+    RateLimit,
+    Overloaded,
+    ModelUnavailable,
+    Network,
+    Config,
+    /// The agent's wire ended or answered in a way the protocol does not allow.
+    Protocol,
+    /// The child could not be spawned or was reaped without a prompt result.
+    Process,
+    /// The child crashed after starting (non-zero exit, signal, stderr crash).
+    Crash,
+    Timeout,
+    /// The user (or a shutdown acting for them) stopped the run.
+    Cancelled,
+    /// Boot recovery closed a run whose engine process died mid-flight.
+    EngineRestart,
+    #[default]
+    Unknown,
+}
+
+impl RunCause {
+    pub fn from_error_kind(kind: ErrorKind) -> Self {
+        match kind {
+            ErrorKind::Auth => Self::Auth,
+            ErrorKind::Billing => Self::Billing,
+            ErrorKind::RateLimit => Self::RateLimit,
+            ErrorKind::Overloaded => Self::Overloaded,
+            ErrorKind::ModelUnavailable => Self::ModelUnavailable,
+            ErrorKind::Network => Self::Network,
+            ErrorKind::Config => Self::Config,
+            ErrorKind::CliCrash => Self::Crash,
+            ErrorKind::Timeout => Self::Timeout,
+            ErrorKind::Truncated => Self::Protocol,
+            ErrorKind::Refusal | ErrorKind::Unknown => Self::Unknown,
+        }
+    }
+
+    /// Whether the run ended as a FAILURE rather than a clean or requested stop.
+    pub fn is_failure(self) -> bool {
+        !matches!(self, Self::Cancelled | Self::EngineRestart)
+    }
+}
+
 /// Machine-readable class of a CLI-side failure, carried on
 /// [`AgentEvent::Error`] and on the doc's `MessagePart::Error` alongside the
 /// raw CLI text. Decided by the harness `classify_error` helper; `Unknown`
@@ -2048,6 +2254,28 @@ pub enum AgentEvent {
         /// Optional classification of why the producer closed the run.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<DoneReason>,
+    },
+    /// Additive terminal metadata for a run that did NOT complete cleanly.
+    ///
+    /// `Done` stays the single lifecycle terminal (journals, stale detection and
+    /// old peers keep working); this frame carries what the plan needs to make a
+    /// failure visible and diagnosable: structured cause, human message, capped
+    /// raw detail and the child's exit code. The harness emits `Error` before
+    /// `Done` today, so the engine synthesizes this frame from a failed `Done`
+    /// when the producer did not. It is published BEFORE `Done`, never after, so
+    /// "last journal event is Done" remains true.
+    #[serde(rename_all = "camelCase")]
+    RunOutcome {
+        result: DoneStatus,
+        cause: RunCause,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+        /// Raw provider/stderr tail, already capped and sanitized by the producer.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+        /// Child exit code when the producer observed one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exit_code: Option<i32>,
     },
     /// A USER-role message injected into a running session — today only seen
     /// wrapped in [`AgentEvent::Subagent`]: the PARENT agent steering its
@@ -2355,6 +2583,45 @@ mod tests {
         assert_eq!(ReasoningLevel::from_thinking_id(""), None);
     }
 
+    #[test]
+    fn run_outcome_round_trips_before_done() {
+        let outcome = AgentEvent::RunOutcome {
+            result: DoneStatus::Errored,
+            cause: RunCause::Crash,
+            message: Some("process exited with code 1".into()),
+            detail: Some("stderr tail".into()),
+            exit_code: Some(1),
+        };
+        let json = serde_json::to_string(&outcome).unwrap();
+        assert_eq!(serde_json::from_str::<AgentEvent>(&json).unwrap(), outcome);
+        // The cause survives as a stable slug, not a debug string.
+        assert!(json.contains("\"cause\":\"crash\""), "{json}");
+    }
+
+    #[test]
+    fn run_cause_defaults_to_unknown_and_maps_the_typed_error_kinds() {
+        assert_eq!(RunCause::default(), RunCause::Unknown);
+        assert_eq!(RunCause::from_error_kind(ErrorKind::Auth), RunCause::Auth);
+        assert_eq!(
+            RunCause::from_error_kind(ErrorKind::CliCrash),
+            RunCause::Crash
+        );
+        assert_eq!(
+            RunCause::from_error_kind(ErrorKind::Timeout),
+            RunCause::Timeout
+        );
+        assert_eq!(
+            RunCause::from_error_kind(ErrorKind::Truncated),
+            RunCause::Protocol
+        );
+        assert_eq!(
+            RunCause::from_error_kind(ErrorKind::Unknown),
+            RunCause::Unknown
+        );
+        assert!(!RunCause::Cancelled.is_failure());
+        assert!(!RunCause::EngineRestart.is_failure());
+        assert!(RunCause::Crash.is_failure());
+    }
     #[test]
     fn agent_event_round_trips() {
         let ev = AgentEvent::ToolCall {
