@@ -127,6 +127,13 @@ struct DocPartJson {
     /// Retry flag for error parts (additive; absent on old rows).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     error_retryable: Option<bool>,
+    /// Structured terminal cause (additive; absent on old rows and on an
+    /// engine that could not classify the ending).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    error_cause: Option<komet_proto::RunCause>,
+    /// Child exit code observed at the terminal event (additive).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    error_exit_code: Option<i32>,
     /// Answers recorded against an input part, as a doc-resident list so two
     /// devices answering the same question both keep their answer (additive;
     /// absent on old rows).
@@ -175,6 +182,10 @@ struct DocPartJson {
     from_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     to_model: Option<String>,
+    /// Handoff record on an agent-switch marker (additive; absent on model
+    /// switches and on every pre-handoff row).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    context: Option<komet_proto::ContextHandoff>,
 }
 
 /// App parts → doc part json (mirror of `toDocParts`).
@@ -251,6 +262,7 @@ fn to_doc_part(part: &MessagePart) -> Result<DocPartJson, DocError> {
             to_harness,
             from_model,
             to_model,
+            context,
         } => DocPartJson {
             id: id.clone(),
             kind: "switch".into(),
@@ -259,6 +271,7 @@ fn to_doc_part(part: &MessagePart) -> Result<DocPartJson, DocError> {
             questions: Some(serde_json::to_value((from, to, from_harness, to_harness))?),
             from_model: from_model.clone(),
             to_model: to_model.clone(),
+            context: context.clone(),
             ..Default::default()
         },
         MessagePart::Error {
@@ -267,6 +280,8 @@ fn to_doc_part(part: &MessagePart) -> Result<DocPartJson, DocError> {
             kind,
             detail,
             retryable,
+            cause,
+            exit_code,
         } => DocPartJson {
             id: id.clone(),
             kind: "error".into(),
@@ -274,6 +289,8 @@ fn to_doc_part(part: &MessagePart) -> Result<DocPartJson, DocError> {
             error_kind: (!kind.is_unknown()).then_some(*kind),
             error_detail: detail.clone(),
             error_retryable: (*retryable).then_some(true),
+            error_cause: *cause,
+            error_exit_code: *exit_code,
             ..Default::default()
         },
         MessagePart::Permission {
@@ -391,6 +408,7 @@ fn from_doc_part(p: DocPartJson) -> MessagePart {
                     to_harness,
                     from_model: p.from_model,
                     to_model: p.to_model,
+                    context: p.context,
                 },
                 None => MessagePart::Text {
                     id: p.id,
@@ -404,6 +422,8 @@ fn from_doc_part(p: DocPartJson) -> MessagePart {
             kind: p.error_kind.unwrap_or_default(),
             detail: p.error_detail,
             retryable: p.error_retryable.unwrap_or(false),
+            cause: p.error_cause,
+            exit_code: p.error_exit_code,
         },
         "permission" => {
             // Read request_id directly from the dedicated column first
@@ -813,6 +833,8 @@ impl SessionDoc {
                     kind: komet_proto::ErrorKind::Unknown,
                     detail: None,
                     retryable: false,
+                    cause: None,
+                    exit_code: None,
                 },
             )?;
             self.doc.commit();
@@ -1665,6 +1687,8 @@ fn salvage_part(part: &serde_json::Value, entry_id: &str, ix: usize) -> Option<M
             kind: komet_proto::ErrorKind::Unknown,
             detail: None,
             retryable: false,
+            cause: None,
+            exit_code: None,
         });
     }
     None
@@ -1951,6 +1975,12 @@ fn write_switch_fields(map: &LoroMap, doc_part: &DocPartJson) -> Result<(), DocE
     }
     if let Some(to_model) = &doc_part.to_model {
         map.insert("toModel", to_model.as_str())?;
+    }
+    if let Some(context) = &doc_part.context {
+        map.insert(
+            "context",
+            loro_value_from_json(&serde_json::to_value(context)?),
+        )?;
     }
     Ok(())
 }
@@ -2896,6 +2926,18 @@ mod tests {
             to_harness: Some("devin".into()),
             from_model: None,
             to_model: None,
+            context: Some(komet_proto::ContextHandoff {
+                objective: "hello".into(),
+                memory_chars: 42,
+                transcript_replayed: true,
+                sources: vec![komet_proto::ContextSource {
+                    kind: komet_proto::ContextSourceKind::Memory,
+                    label: "Project memory".into(),
+                    detail: Some("42 chars".into()),
+                }],
+                warning: None,
+                prepared_at: 7,
+            }),
         };
         assert!(doc.append_switch_part("m1", &marker).unwrap());
         assert!(doc.append_switch_part("m1", &marker).unwrap());
@@ -2934,6 +2976,7 @@ mod tests {
             to_harness: Some("claude-code".into()),
             from_model: Some("claude-opus".into()),
             to_model: Some("glm-5.3-flash".into()),
+            context: None,
         };
         doc.record_switch_part(&marker, "dev-a", 42).unwrap();
         // Idempotent: the same marker never stacks a second entry.

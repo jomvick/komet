@@ -61,8 +61,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use komet_proto::{
-    AgentAccount, AgentAccountWarning, AgentAccountsSnapshot, AgentAuthKind, AgentLoginMode,
-    AgentLoginPoll, AgentLoginStart, AgentLoginStatus, AgentUsageWindow, HarnessId,
+    AgentAccount, AgentAccountWarning, AgentAccountsSnapshot, AgentAuthKind, AgentIdentityReport,
+    AgentIdentityStatus, AgentLoginMode, AgentLoginPoll, AgentLoginStart, AgentLoginStatus,
+    AgentUsageWindow, HarnessId,
 };
 
 use crate::repos::home_dir;
@@ -1003,6 +1004,10 @@ struct Inner {
     /// 30 s manual-refresh cooldown (issue #53): a second click inside it is
     /// answered from the cache instead of hammering the provider.
     fresh_probes: Mutex<HashMap<String, Instant>>,
+    /// `"{harness}:{accountId}"` → last failed live quota probe. Lets the
+    /// Usage report say "retrieval failed, showing the last known sample"
+    /// instead of presenting a persisted sample as fresh.
+    usage_probe_failures: Mutex<HashMap<String, i64>>,
     /// Local usage-history sink + this device's id (wired at engine assembly).
     usage_sink: Mutex<Option<(Arc<crate::usage::UsageStore>, String)>>,
     /// Per-agent active-account history behind Settings › Usage attribution
@@ -1339,6 +1344,7 @@ impl AgentAccounts {
                 http,
                 flows: Mutex::new(HashMap::new()),
                 usage_cache: Mutex::new(HashMap::new()),
+                usage_probe_failures: Mutex::new(HashMap::new()),
                 inflight_refreshes: Mutex::new(std::collections::HashSet::new()),
                 antigravity_profile_cache: Mutex::new(antigravity_profile_cache),
                 fresh_probes: Mutex::new(HashMap::new()),
@@ -1504,15 +1510,29 @@ impl AgentAccounts {
             active_keys.insert(HarnessId::Antigravity, detected.account_key.clone());
             self.snapshot_detected(HarnessId::Antigravity, &detected)?;
         }
-        if let Some(detected) = self.detect_cursor() {
-            active_keys.insert(HarnessId::Cursor, detected.account_key.clone());
-            self.snapshot_detected(HarnessId::Cursor, &detected)?;
+        match self.detect_cursor() {
+            Ok(Some(detected)) => {
+                active_keys.insert(HarnessId::Cursor, detected.account_key.clone());
+                self.snapshot_detected(HarnessId::Cursor, &detected)?;
+            }
+            Ok(None) => {}
+            Err(message) => warnings.push(AgentAccountWarning {
+                harness: HarnessId::Cursor,
+                message,
+            }),
         }
         // CLI-owned accounts with no Komet sign-in: mirror whatever the CLI
         // itself is logged into so the card is never blank.
-        if let Some(detected) = self.detect_opencode() {
-            active_keys.insert(HarnessId::Opencode, detected.account_key.clone());
-            self.snapshot_detected(HarnessId::Opencode, &detected)?;
+        match self.detect_opencode() {
+            Ok(Some(detected)) => {
+                active_keys.insert(HarnessId::Opencode, detected.account_key.clone());
+                self.snapshot_detected(HarnessId::Opencode, &detected)?;
+            }
+            Ok(None) => {}
+            Err(message) => warnings.push(AgentAccountWarning {
+                harness: HarnessId::Opencode,
+                message,
+            }),
         }
         if let Some(detected) = self.detect_pi() {
             active_keys.insert(HarnessId::Pi, detected.account_key.clone());
@@ -1678,7 +1698,115 @@ impl AgentAccounts {
                 });
             }
         }
-        Ok(AgentAccountsSnapshot { accounts, warnings })
+        let statuses = [
+            HarnessId::ClaudeCode,
+            HarnessId::Codex,
+            HarnessId::Cursor,
+            HarnessId::Devin,
+            HarnessId::Grok,
+            HarnessId::Hermes,
+            HarnessId::Pi,
+            HarnessId::Opencode,
+            HarnessId::Cline,
+            HarnessId::Qoder,
+            HarnessId::Copilot,
+            HarnessId::Antigravity,
+            HarnessId::Muse,
+        ]
+        .into_iter()
+        .map(|harness| {
+            let account = accounts.iter().find(|a| a.harness == harness && a.active);
+            let warning = warnings.iter().find(|w| w.harness == harness);
+            let unreadable_store = self.unreadable_live_store(harness);
+            let status = match (account, warning) {
+                // Pi signs in but never exposes an account identity; its slot
+                // label is the provider, not a person.
+                (Some(account), _) if harness == HarnessId::Pi => AgentIdentityStatus::NotExposed {
+                    message: format!(
+                        "Signed in; Pi exposes only the provider ({}), not an account identity",
+                        account.email.as_deref().unwrap_or("unknown")
+                    ),
+                },
+                // Qoder authenticates with one opaque file: a slot exists,
+                // but its label is Komet's ("Qoder account 2"), not a person.
+                (Some(_), _) if harness == HarnessId::Qoder => AgentIdentityStatus::NotExposed {
+                    message:
+                        "Signed in; Qoder exposes an opaque login file, not an account identity"
+                            .into(),
+                },
+                (Some(account), _)
+                    if harness == HarnessId::Antigravity
+                        && account
+                            .email
+                            .as_deref()
+                            .is_some_and(is_opaque_antigravity_email) =>
+                {
+                    AgentIdentityStatus::NotExposed {
+                        message:
+                            "Signed in with an opaque Antigravity key; identity is not readable"
+                                .into(),
+                    }
+                }
+                // A keychain read can fail while `oauthAccount` still yields a
+                // detected profile; the credentials are missing, so this is a
+                // detection error, not a usable login.
+                (Some(_), Some(warning)) if harness == HarnessId::ClaudeCode => {
+                    AgentIdentityStatus::Error {
+                        message: warning.message.clone(),
+                        retryable: true,
+                    }
+                }
+                (Some(account), _) => AgentIdentityStatus::Detected {
+                    account_id: account.id.clone(),
+                    identity: account.email.clone(),
+                    switchable: account.switchable,
+                },
+                // The store/CLI exists but reading it failed: never "not connected".
+                (None, Some(warning)) => AgentIdentityStatus::Error {
+                    message: warning.message.clone(),
+                    retryable: true,
+                },
+                (None, None) => match unreadable_store {
+                    Some(message) => AgentIdentityStatus::Error {
+                        message,
+                        retryable: true,
+                    },
+                    None => AgentIdentityStatus::NotConnected,
+                },
+            };
+            AgentIdentityReport { harness, status }
+        })
+        .collect();
+        Ok(AgentAccountsSnapshot {
+            accounts,
+            warnings,
+            statuses,
+        })
+    }
+
+    /// Why a credential store that EXISTS could not produce an account.
+    /// `None` covers both "no store" (genuinely signed out) and readable stores.
+    /// Opaque/binary stores (Qoder file, OpenCode DB, Devin TOML) are excluded:
+    /// `read_json` cannot judge them, and a false error would be worse than
+    /// their typed `NotExposed`/`NotConnected` state.
+    fn unreadable_live_store(&self, harness: HarnessId) -> Option<String> {
+        let path = match harness {
+            HarnessId::ClaudeCode => self.inner.config.claude_config_file.clone(),
+            HarnessId::Codex => self.inner.config.codex_home.join("auth.json"),
+            HarnessId::Cursor => self.inner.config.cursor_auth_file.clone(),
+            HarnessId::Antigravity => self.inner.config.antigravity_home.join("auth.json"),
+            HarnessId::Pi => self.inner.config.pi_auth.clone(),
+            HarnessId::Grok | HarnessId::Muse | HarnessId::Cline | HarnessId::Hermes => {
+                self.inner.config.cli_auth_file(harness)?.to_path_buf()
+            }
+            _ => return None,
+        };
+        if !path.exists() {
+            return None;
+        }
+        read_json(&path)
+            .is_none()
+            .then(|| format!("{} exists but could not be read or parsed", path.display()))
     }
 
     /// Resolved `gh` binary: the configured name goes through
@@ -1978,6 +2106,16 @@ impl AgentAccounts {
             .into_iter()
             .find(|slot| slot.id == active_id)
             .map(|slot| slot.account_key)
+    }
+
+    /// When the last live quota probe for `account_id` failed, if it did.
+    /// `None` means the latest probe (or cached probe) succeeded; the Usage
+    /// report turns `Some` into `RetrievalError`, keeping the last known
+    /// sample visibly dated instead of presenting it as fresh.
+    pub fn usage_probe_failed_at(&self, harness: HarnessId, account_id: &str) -> Option<i64> {
+        lock(&self.inner.usage_probe_failures)
+            .get(&format!("{}:{}", harness_slug(harness), account_id))
+            .copied()
     }
 
     /// Token for the selected Komet Copilot account. Returned only for the
@@ -4631,43 +4769,75 @@ impl AgentAccounts {
         read_json(&self.inner.config.codex_auth_file()).and_then(parse_codex_auth)
     }
 
-    fn detect_cursor(&self) -> Option<Detected> {
+    fn detect_cursor(&self) -> Result<Option<Detected>, String> {
         if let Some(detected) =
             read_json(&self.inner.config.cursor_auth_file()).and_then(parse_cursor_auth)
         {
-            return Some(detected);
+            return Ok(Some(detected));
         }
         // Fallback: Cursor's own Electron/VSCode store — `state.vscdb`
         // (SQLite, `ItemTable`) holds the Workos session token even when no
         // SDK `auth.json` exists. Read-only, never panics on SQLITE_BUSY.
+        let mut read_error = None;
         for db in cursor_state_db_paths() {
-            if let Some(token) = read_cursor_sqlite_token(&db)
-                && let Some(detected) = parse_cursor_session_token(&token)
-            {
-                return Some(detected);
+            if !db.exists() {
+                continue;
+            }
+            match read_cursor_sqlite_token_checked(&db) {
+                Ok(Some(token)) => {
+                    if let Some(detected) = parse_cursor_session_token(&token) {
+                        return Ok(Some(detected));
+                    }
+                }
+                Ok(None) => {}
+                Err(message) => {
+                    read_error.get_or_insert(message);
+                }
             }
         }
-        None
+        match read_error {
+            Some(message) => Err(message),
+            None => Ok(None),
+        }
     }
 
     /// OpenCode keeps its console login inside its own SQLite store: the
     /// `credential` table's OAuth blob carries `metadata.email`/`accountID`.
     /// Read-only and busy-tolerant, same contract as the Cursor `state.vscdb`
     /// probe — the CLI owns the file, Komet only mirrors the identity.
-    fn detect_opencode(&self) -> Option<Detected> {
+    fn detect_opencode(&self) -> Result<Option<Detected>, String> {
         let db = self.inner.config.opencode_db.clone();
         if !db.exists() {
-            return None;
+            return Ok(None);
         }
         use rusqlite::OpenFlags;
         let conn = rusqlite::Connection::open_with_flags(
             &db,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
-        .ok()?;
-        conn.busy_timeout(Duration::from_millis(0)).ok()?;
-        let mut stmt = conn.prepare("SELECT value FROM credential").ok()?;
-        let rows = stmt.query_map([], |row| row.get::<_, String>(0)).ok()?;
+        .map_err(|err| format!("{} exists but could not be opened: {err}", db.display()))?;
+        conn.busy_timeout(Duration::from_millis(0))
+            .map_err(|err| format!("{} could not set a read timeout: {err}", db.display()))?;
+        let mut stmt = match conn.prepare("SELECT value FROM credential") {
+            Ok(stmt) => stmt,
+            // An empty/other SQLite database is not a credential store: that
+            // is genuinely signed out, not a read failure.
+            Err(err) if err.to_string().contains("no such table") => return Ok(None),
+            Err(err) => {
+                return Err(format!(
+                    "{} exists but its credentials could not be read: {err}",
+                    db.display()
+                ));
+            }
+        };
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|err| {
+                format!(
+                    "{} exists but its credentials could not be read: {err}",
+                    db.display()
+                )
+            })?;
         let mut fallback = None;
         for value in rows.flatten() {
             let Ok(credential) = serde_json::from_str::<serde_json::Value>(&value) else {
@@ -4712,11 +4882,11 @@ impl AgentAccounts {
                 claude_config: None,
             };
             if server.contains("opencode") {
-                return Some(detected);
+                return Ok(Some(detected));
             }
             fallback.get_or_insert(detected);
         }
-        fallback
+        Ok(fallback)
     }
 
     /// Pi's `~/.pi/agent/auth.json` maps provider id → credentials; its
@@ -5084,7 +5254,15 @@ impl AgentAccounts {
         // re-served that stale miss instead of retrying.
         if let Some(windows) = &usage {
             lock(&self.inner.usage_cache).insert(key, (usage.clone(), Instant::now()));
+            lock(&self.inner.usage_probe_failures).remove(&format!(
+                "{}:{}",
+                harness_slug(harness),
+                slot.id
+            ));
             self.record_quota_sample(harness, slot, windows);
+        } else if mode.probes() {
+            lock(&self.inner.usage_probe_failures)
+                .insert(format!("{}:{}", harness_slug(harness), slot.id), now_ms());
         }
         usage
     }
@@ -6180,30 +6358,41 @@ fn cursor_state_db_paths() -> Vec<PathBuf> {
 /// Read the Workos session token from a `state.vscdb` copy/live file.
 ///
 /// Opens `SQLITE_OPEN_READ_ONLY` with a zero busy-timeout and one short retry:
-/// Cursor is usually running (WAL) while we read. `SQLITE_BUSY`/missing
-/// table/key all map to `None`.
+/// Cursor is usually running (WAL) while we read. A missing table/key is
+/// `Ok(None)`; `SQLITE_BUSY`/corruption is an error so identity detection can
+/// say "could not read" instead of "not connected".
 fn read_cursor_sqlite_token(db: &Path) -> Option<String> {
-    use rusqlite::OpenFlags;
-    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-    let mut attempt = 0;
-    loop {
-        match read_cursor_sqlite_token_once(db, flags) {
-            Some(token) => return Some(token),
-            None => {
-                attempt += 1;
-                if attempt >= 2 {
-                    return None;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-        }
-    }
+    read_cursor_sqlite_token_checked(db).ok().flatten()
 }
 
-fn read_cursor_sqlite_token_once(db: &Path, flags: rusqlite::OpenFlags) -> Option<String> {
-    let conn = rusqlite::Connection::open_with_flags(db, flags).ok()?;
+fn read_cursor_sqlite_token_checked(db: &Path) -> Result<Option<String>, String> {
+    use rusqlite::OpenFlags;
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let mut last_error = None;
+    for attempt in 0..2 {
+        match read_cursor_sqlite_token_once(db, flags) {
+            Ok(token) => return Ok(token),
+            Err(err) => last_error = Some(err),
+        }
+        if attempt == 0 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+    Err(format!(
+        "{} exists but could not be read: {}",
+        db.display(),
+        last_error.unwrap_or_else(|| "unknown SQLite error".into())
+    ))
+}
+
+fn read_cursor_sqlite_token_once(
+    db: &Path,
+    flags: rusqlite::OpenFlags,
+) -> Result<Option<String>, String> {
+    let conn = rusqlite::Connection::open_with_flags(db, flags)
+        .map_err(|err| format!("could not open: {err}"))?;
     conn.busy_timeout(std::time::Duration::from_millis(0))
-        .ok()?;
+        .map_err(|err| format!("could not set a read timeout: {err}"))?;
     // Exact keys first (cheap, index-friendly), then a LIKE sweep for
     // build-variant spellings (`WorkosCursorSessionToken`, …).
     for key in [
@@ -6216,15 +6405,31 @@ fn read_cursor_sqlite_token_once(db: &Path, flags: rusqlite::OpenFlags) -> Optio
             rusqlite::params![key],
             |row| row.get::<_, String>(0),
         ) {
-            Ok(v) if !v.trim().is_empty() => return Some(v),
-            _ => {}
+            Ok(v) if !v.trim().is_empty() => return Ok(Some(v)),
+            Ok(_) => {}
+            Err(rusqlite::Error::QueryReturnedNoRows) => {}
+            Err(rusqlite::Error::SqliteFailure(_, Some(message)))
+                if message.contains("no such table") => {}
+            Err(err) => return Err(format!("query failed: {err}")),
         }
     }
-    let mut stmt = conn
-        .prepare("SELECT value FROM ItemTable WHERE key LIKE '%SessionToken%' LIMIT 5")
-        .ok()?;
-    let rows = stmt.query_map([], |row| row.get::<_, String>(0)).ok()?;
-    rows.flatten().find(|value| !value.trim().is_empty())
+    let mut stmt =
+        match conn.prepare("SELECT value FROM ItemTable WHERE key LIKE '%SessionToken%' LIMIT 5") {
+            Ok(stmt) => stmt,
+            Err(err) if err.to_string().contains("no such table") => return Ok(None),
+            Err(err) => return Err(format!("could not query the session table: {err}")),
+        };
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|err| format!("could not read the session table: {err}"))?;
+    for row in rows {
+        match row {
+            Ok(value) if !value.trim().is_empty() => return Ok(Some(value)),
+            Ok(_) => {}
+            Err(err) => return Err(format!("could not read a session row: {err}")),
+        }
+    }
+    Ok(None)
 }
 
 /// Build a [`Detected`] from a raw Workos session JWT (identity mined from
@@ -6403,19 +6608,9 @@ fn pi_provider_label(provider: &str) -> String {
 /// The CLI-managed sign-in providers keep one login in their own home, so
 /// their rows are shown active but never switchable.
 fn supports_switching(harness: HarnessId) -> bool {
-    matches!(
-        harness,
-        HarnessId::ClaudeCode
-            | HarnessId::Codex
-            | HarnessId::Antigravity
-            | HarnessId::Cursor
-            | HarnessId::Qoder
-            | HarnessId::Devin
-            | HarnessId::Grok
-            | HarnessId::Muse
-            | HarnessId::Cline
-            | HarnessId::Hermes
-    )
+    // Single source: the capability matrix. A row declared MonoAccount cannot
+    // grow a Switch button by accident here.
+    komet_harness::capabilities::supports_account_switching(harness)
 }
 
 fn read_json(file: &Path) -> Option<serde_json::Value> {
@@ -8094,6 +8289,69 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// B1: a credential store that EXISTS but cannot be parsed is a detection
+    /// error, never "not connected" — and a readable store reports Detected.
+    #[tokio::test]
+    async fn unreadable_store_is_an_identity_error_not_signed_out() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let config = cursor_test_config(root.path());
+        let accounts = AgentAccounts::new(config.clone());
+        let status = |snapshot: &AgentAccountsSnapshot, harness| {
+            snapshot
+                .statuses
+                .iter()
+                .find(|report| report.harness == harness)
+                .map(|report| report.status.clone())
+                .expect("one status per harness")
+        };
+
+        // No live store: genuinely signed out.
+        let snapshot = accounts.list(UsageMode::Offline).await.expect("list");
+        assert_eq!(
+            status(&snapshot, HarnessId::Grok),
+            AgentIdentityStatus::NotConnected
+        );
+
+        // Present but corrupt: unreadable, not signed out.
+        let grok = config.cli_files.grok_auth.clone();
+        std::fs::create_dir_all(grok.parent().unwrap()).unwrap();
+        std::fs::write(&grok, b"{ not json").unwrap();
+        let snapshot = accounts.list(UsageMode::Offline).await.expect("list");
+        match status(&snapshot, HarnessId::Grok) {
+            AgentIdentityStatus::Error { message, retryable } => {
+                assert!(message.contains("could not be read"), "{message}");
+                assert!(retryable);
+            }
+            other => panic!("a broken store must not look signed out: {other:?}"),
+        }
+
+        // Readable again: the error clears.
+        std::fs::write(
+            &grok,
+            br#"{"https://auth.x.ai::c":{"email":"g@rok.dev","user_id":"grok-user"}}"#,
+        )
+        .unwrap();
+        let snapshot = accounts.list(UsageMode::Offline).await.expect("list");
+        assert!(matches!(
+            status(&snapshot, HarnessId::Grok),
+            AgentIdentityStatus::Detected { .. }
+        ));
+
+        // OpenCode keeps the login in SQLite. A corrupt/busy file is a read
+        // failure, not a signed-out CLI.
+        let opencode = config.opencode_db.clone();
+        std::fs::create_dir_all(opencode.parent().unwrap()).unwrap();
+        std::fs::write(&opencode, b"not a sqlite database").unwrap();
+        let snapshot = accounts.list(UsageMode::Offline).await.expect("list");
+        match status(&snapshot, HarnessId::Opencode) {
+            AgentIdentityStatus::Error { message, retryable } => {
+                assert!(message.contains("opencode.db"), "{message}");
+                assert!(retryable);
+            }
+            other => panic!("a broken OpenCode store must not look signed out: {other:?}"),
+        }
+    }
+
     /// Issue #77: CLI-file providers keep restorable slots — add (external
     /// store appears), switch (slot bytes land back in the live store), and
     /// forget. A store whose identity matches no slot becomes a NEW account
@@ -8544,6 +8802,14 @@ mod tests {
         assert!(pi[0].active);
         assert!(!pi[0].switchable);
         assert_eq!(pi[0].email.as_deref(), Some("GitHub Copilot"));
+        assert!(matches!(
+            snapshot
+                .statuses
+                .iter()
+                .find(|report| report.harness == HarnessId::Pi)
+                .map(|report| &report.status),
+            Some(AgentIdentityStatus::NotExposed { .. })
+        ));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -8563,6 +8829,32 @@ mod tests {
         }
     }
 
+    #[test]
+    fn quota_probe_failure_is_scoped_to_harness_and_account() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let accounts = AgentAccounts::new(cursor_test_config(root.path()));
+        assert!(
+            accounts
+                .usage_probe_failed_at(HarnessId::ClaudeCode, "acct")
+                .is_none()
+        );
+
+        lock(&accounts.inner.usage_probe_failures).insert("claude-code:acct".into(), 42);
+        assert_eq!(
+            accounts.usage_probe_failed_at(HarnessId::ClaudeCode, "acct"),
+            Some(42)
+        );
+        assert!(
+            accounts
+                .usage_probe_failed_at(HarnessId::ClaudeCode, "other")
+                .is_none()
+        );
+        assert!(
+            accounts
+                .usage_probe_failed_at(HarnessId::Codex, "acct")
+                .is_none()
+        );
+    }
     fn insert_cursor_flow(
         accounts: &AgentAccounts,
         login_id: &str,
@@ -9090,6 +9382,12 @@ mod tests {
         assert_eq!(read_cursor_sqlite_token(&empty), None);
         // Missing file → unavailable, no panic.
         assert_eq!(read_cursor_sqlite_token(&dir.join("nope.vscdb")), None);
+        // Corrupt file → a typed read error, not "signed out".
+        let corrupt = dir.join("corrupt.vscdb");
+        std::fs::write(&corrupt, b"not a sqlite database").unwrap();
+        let err = read_cursor_sqlite_token_checked(&corrupt)
+            .expect_err("a corrupt state.vscdb must be an error");
+        assert!(err.contains("could not be read"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

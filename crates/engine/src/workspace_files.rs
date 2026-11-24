@@ -10,11 +10,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
+use base64::Engine as _;
 use komet_proto::{
     ListWorkspaceDirectoryRequest, ReadWorkspaceFileRequest, SearchWorkspaceFilesRequest,
     WatchWorkspaceFilesRequest, WorkspaceDirectoryPage, WorkspaceEntry, WorkspaceEntryKind,
     WorkspaceFileChange, WorkspaceFileChangeKind, WorkspaceFileChanges,
-    WorkspaceFileConflictReason, WorkspaceFileSearchMatch, WorkspaceFileText,
+    WorkspaceFileConflictReason, WorkspaceFileImage, WorkspaceFileSearchMatch, WorkspaceFileText,
     WorkspaceFileWriteResult, WorkspaceLineEnding, WorkspaceReadOnlyReason, WorkspaceTarget,
     WorkspaceTextEncoding, WorkspaceWritableEncoding, WorkspaceWritableLineEnding,
     WriteWorkspaceFileOutcome, WriteWorkspaceFileRequest,
@@ -1184,6 +1185,7 @@ fn read_file_blocking(
             line_ending: None,
             read_only_reason: Some(WorkspaceReadOnlyReason::TooLarge),
             truncated: true,
+            image: None,
         });
     }
 
@@ -1269,6 +1271,42 @@ fn non_text_file(
         line_ending: None,
         read_only_reason: Some(reason),
         truncated: false,
+        image: None,
+    }
+}
+
+/// MIME for a raster image whose extension AND magic agree. SVG/TIFF are
+/// deliberately excluded: the preview decoder supports the conversation
+/// formats, and an unrecognized image must fall back to the binary state.
+fn looks_like_image_extension(path: &str) -> bool {
+    matches!(
+        std::path::Path::new(path)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "svg" | "tif" | "tiff" | "ico")
+    )
+}
+
+fn image_mime(path: &str, bytes: &[u8]) -> Option<&'static str> {
+    let extension = Path::new(path)
+        .extension()
+        .and_then(|extension| extension.to_str())?
+        .to_ascii_lowercase();
+    match extension.as_str() {
+        "png" if bytes.starts_with(b"\x89PNG\r\n\x1a\n") => Some("image/png"),
+        "jpg" | "jpeg" if bytes.starts_with(b"\xff\xd8\xff") => Some("image/jpeg"),
+        "gif" if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") => Some("image/gif"),
+        "webp"
+            if bytes.len() >= 12
+                && bytes.starts_with(b"RIFF")
+                && bytes.get(8..12) == Some(b"WEBP") =>
+        {
+            Some("image/webp")
+        }
+        "bmp" if bytes.starts_with(b"BM") && bytes.len() >= 14 => Some("image/bmp"),
+        _ => None,
     }
 }
 
@@ -1280,6 +1318,38 @@ fn classify_file_text(
     let content_hash = Some(hash_bytes(&bytes));
     let size = bytes.len() as u64;
     let modified_at = metadata.modified().ok().map(chrono::DateTime::from);
+    if let Some(mime) = image_mime(&path, &bytes) {
+        return WorkspaceFileText {
+            path,
+            text: None,
+            content_hash,
+            size,
+            modified_at,
+            encoding: WorkspaceTextEncoding::Image,
+            line_ending: None,
+            read_only_reason: None,
+            truncated: false,
+            image: Some(WorkspaceFileImage {
+                mime: mime.to_string(),
+                bytes_base64: base64::engine::general_purpose::STANDARD.encode(&bytes),
+                size,
+            }),
+        };
+    }
+    if looks_like_image_extension(&path) {
+        return WorkspaceFileText {
+            path,
+            text: None,
+            content_hash,
+            size,
+            modified_at,
+            encoding: WorkspaceTextEncoding::Unsupported,
+            line_ending: None,
+            read_only_reason: Some(WorkspaceReadOnlyReason::UnsupportedImage),
+            truncated: false,
+            image: None,
+        };
+    }
     if bytes.contains(&0) {
         return WorkspaceFileText {
             path,
@@ -1291,6 +1361,7 @@ fn classify_file_text(
             line_ending: None,
             read_only_reason: Some(WorkspaceReadOnlyReason::Binary),
             truncated: false,
+            image: None,
         };
     }
 
@@ -1310,6 +1381,7 @@ fn classify_file_text(
             line_ending: None,
             read_only_reason: Some(WorkspaceReadOnlyReason::UnsupportedEncoding),
             truncated: false,
+            image: None,
         };
     };
     let line_ending = detect_line_ending(source.as_bytes());
@@ -1334,6 +1406,7 @@ fn classify_file_text(
         line_ending: Some(line_ending),
         read_only_reason,
         truncated: false,
+        image: None,
     }
 }
 
@@ -2039,15 +2112,50 @@ mod tests {
     }
 
     fn read_fixture(bytes: &[u8]) -> WorkspaceFileText {
+        read_named_fixture("file.txt", bytes)
+    }
+
+    fn read_named_fixture(name: &str, bytes: &[u8]) -> WorkspaceFileText {
         let root = tempfile::tempdir().unwrap();
-        std::fs::write(root.path().join("file.txt"), bytes).unwrap();
+        std::fs::write(root.path().join(name), bytes).unwrap();
         let canonical = std::fs::canonicalize(root.path()).unwrap();
         read_file_blocking(
             &canonical,
-            &WorkspaceRelativePath::file("file.txt").unwrap(),
+            &WorkspaceRelativePath::file(name).unwrap(),
             &no_cancel(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn read_classifies_supported_images_and_keeps_binary_fallback() {
+        let mut png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+        png.extend_from_slice(&16u32.to_be_bytes());
+        png.extend_from_slice(&8u32.to_be_bytes());
+        png.extend_from_slice(&[8, 6, 0, 0, 0]);
+        let image = read_named_fixture("photo.png", &png);
+        assert_eq!(image.encoding, WorkspaceTextEncoding::Image);
+        assert!(image.text.is_none());
+        assert!(image.read_only_reason.is_none());
+        let payload = image.image.expect("PNG payload");
+        assert_eq!(payload.mime, "image/png");
+        assert_eq!(payload.size, png.len() as u64);
+
+        // A supported extension with the wrong magic is not silently decoded
+        // as text or called clean: it gets an explicit unsupported-image state.
+        let spoofed = read_named_fixture("photo.png", b"not a png\0");
+        assert_eq!(spoofed.encoding, WorkspaceTextEncoding::Unsupported);
+        assert_eq!(
+            spoofed.read_only_reason,
+            Some(WorkspaceReadOnlyReason::UnsupportedImage)
+        );
+        assert!(spoofed.image.is_none());
+
+        let tiff = read_named_fixture("scan.tiff", b"II*\0");
+        assert_eq!(
+            tiff.read_only_reason,
+            Some(WorkspaceReadOnlyReason::UnsupportedImage)
+        );
     }
 
     #[test]

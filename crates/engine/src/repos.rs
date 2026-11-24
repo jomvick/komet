@@ -20,8 +20,9 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use komet_proto::{
-    FileSearchMatch, FolderEntry, FolderListing, GitHistoryCommit, GitHistoryPage, GitHistoryRef,
-    GitHistoryRefKind, GitHubChecks, GitHubPullRequest, GitHubStatus, Repo, RepoRef, Worktree,
+    FileSearchMatch, FolderEntry, FolderListing, GitCheckoutState, GitHistoryCommit,
+    GitHistoryPage, GitHistoryRef, GitHistoryRefKind, GitHubChecks, GitHubPullRequest,
+    GitHubStatus, Repo, RepoRef, Worktree,
 };
 
 use crate::EngineError;
@@ -237,6 +238,9 @@ impl Repos {
     async fn git(&self, args: &[&str], cwd: Option<&Path>) -> Result<String, EngineError> {
         let mut cmd = tokio::process::Command::new("git");
         cmd.no_console();
+        // Keep parseable messages locale-independent: error classification and
+        // the not-a-repository state must not depend on the user's locale.
+        cmd.env("LC_ALL", "C").env("LANG", "C");
         cmd.args(args);
         if let Some(cwd) = cwd {
             cmd.current_dir(cwd);
@@ -579,6 +583,65 @@ impl Repos {
 
     /// Resolve the first configured GitHub remote to a credential-free HTTPS
     /// repository URL. `origin` wins when several remotes point to GitHub.
+    /// Typed repository state for a checkout. "Not a repository" and "Git
+    /// failed" are distinct from a clean work tree; the UI never has to turn a
+    /// missing diff into an empty repository.
+    pub async fn checkout_state(&self, cwd: &Path) -> GitCheckoutState {
+        let display = cwd.to_string_lossy().into_owned();
+        let inside = self
+            .git(&["rev-parse", "--is-inside-work-tree"], Some(cwd))
+            .await;
+        if let Err(error) = inside {
+            let message = error.to_string();
+            // A failed work-tree probe is "not a repository" for every Git
+            // diagnostic (including a bare repo); only Komet's own spawn or
+            // timeout failures are operational errors. `LC_ALL=C` keeps the
+            // message stable across locales.
+            if message.contains("git spawn failed") || message.contains("timed out") {
+                return GitCheckoutState::Error {
+                    cwd: display,
+                    message,
+                };
+            }
+            return GitCheckoutState::NotRepository { cwd: display };
+        }
+        let root = match self.git(&["rev-parse", "--show-toplevel"], Some(cwd)).await {
+            Ok(root) => root,
+            Err(error) => {
+                return GitCheckoutState::Error {
+                    cwd: display,
+                    message: error.to_string(),
+                };
+            }
+        };
+        let branch = self
+            .git(&["branch", "--show-current"], Some(cwd))
+            .await
+            .unwrap_or_default();
+        let detached = branch.is_empty();
+        let status = self
+            .git(&["status", "--porcelain"], Some(cwd))
+            .await
+            .unwrap_or_default();
+        let changed_files = status.lines().filter(|line| !line.is_empty()).count() as u32;
+        let (insertions, deletions) = self
+            .git(&["diff", "--shortstat", "HEAD"], Some(cwd))
+            .await
+            .map(|out| parse_shortstat(&out))
+            .unwrap_or_default();
+        let github_url = self.github_repo_url(cwd).await.ok().flatten();
+        GitCheckoutState::Ready {
+            cwd: display,
+            root,
+            branch: if detached { "HEAD".to_string() } else { branch },
+            detached,
+            changed_files,
+            insertions,
+            deletions,
+            github_url,
+        }
+    }
+
     pub async fn github_repo_url(&self, repo_path: &Path) -> Result<Option<String>, EngineError> {
         let remotes = self.git(&["remote"], Some(repo_path)).await?;
         let mut names: Vec<&str> = remotes.lines().filter(|name| !name.is_empty()).collect();
@@ -1750,6 +1813,84 @@ mod tests {
         assert!(matches!(
             serde_json::from_str::<ProjectOpenTarget>("\"files\""),
             Ok(ProjectOpenTarget::Files)
+        ));
+    }
+
+    async fn init_test_repo(path: &Path) {
+        std::fs::create_dir_all(path).unwrap();
+        let init = tokio::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(path)
+            .output()
+            .await
+            .unwrap();
+        assert!(init.status.success(), "git init failed");
+        std::fs::write(path.join("file.txt"), b"one\n").unwrap();
+        let add = tokio::process::Command::new("git")
+            .args(["add", "file.txt"])
+            .current_dir(path)
+            .output()
+            .await
+            .unwrap();
+        assert!(add.status.success());
+        let commit = tokio::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-qm",
+                "initial",
+            ])
+            .current_dir(path)
+            .output()
+            .await
+            .unwrap();
+        assert!(commit.status.success());
+    }
+
+    #[tokio::test]
+    async fn checkout_state_distinguishes_clean_dirty_and_non_repo() {
+        let data = tempfile::tempdir().unwrap();
+        let repos = Repos::new(data.path(), "device");
+        let repo = data.path().join("repo");
+        init_test_repo(&repo).await;
+
+        let clean = repos.checkout_state(&repo).await;
+        assert!(
+            matches!(
+                &clean,
+                GitCheckoutState::Ready {
+                    changed_files: 0,
+                    branch,
+                    detached: false,
+                    ..
+                } if !branch.is_empty() && branch != "HEAD"
+            ),
+            "{clean:?}"
+        );
+
+        std::fs::write(repo.join("file.txt"), b"two\n").unwrap();
+        let dirty = repos.checkout_state(&repo).await;
+        assert!(
+            matches!(
+                &dirty,
+                GitCheckoutState::Ready {
+                    changed_files: 1,
+                    insertions,
+                    deletions,
+                    ..
+                } if *insertions > 0 && *deletions > 0
+            ),
+            "{dirty:?}"
+        );
+
+        let outside = data.path().join("plain");
+        std::fs::create_dir_all(&outside).unwrap();
+        assert!(matches!(
+            repos.checkout_state(&outside).await,
+            GitCheckoutState::NotRepository { .. }
         ));
     }
 

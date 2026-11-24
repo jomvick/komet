@@ -254,6 +254,10 @@ pub enum MessagePart {
         from_model: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         to_model: Option<String>,
+        /// What Komet prepared for the receiving agent. Additive: absent on
+        /// every pre-handoff switch marker and on model-only switches.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        context: Option<komet_proto::ContextHandoff>,
     },
     Error {
         id: String,
@@ -272,6 +276,13 @@ pub enum MessagePart {
         /// Whether the UI offers a retry action.
         #[serde(default)]
         retryable: bool,
+        /// Structured terminal cause, when the engine classified the end of
+        /// the run. Additive: old docs decode it as unknown.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cause: Option<komet_proto::RunCause>,
+        /// Child exit code observed at the terminal event, when any.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exit_code: Option<i32>,
     },
     #[serde(rename_all = "camelCase")]
     Permission {
@@ -430,6 +441,28 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
     fold_event_into_parts_with(out, event, CompactionSummaryPolicy::default());
 }
 
+/// The chip kind a structured cause implies. Kept beside the fold so a new
+/// `RunCause` is a compile error here, not a silently generic chip.
+fn outcome_error_kind(cause: komet_proto::RunCause) -> ErrorKind {
+    use komet_proto::RunCause;
+    match cause {
+        RunCause::Auth => ErrorKind::Auth,
+        RunCause::Billing => ErrorKind::Billing,
+        RunCause::RateLimit => ErrorKind::RateLimit,
+        RunCause::Overloaded => ErrorKind::Overloaded,
+        RunCause::ModelUnavailable => ErrorKind::ModelUnavailable,
+        RunCause::Network => ErrorKind::Network,
+        RunCause::Config => ErrorKind::Config,
+        RunCause::Crash => ErrorKind::CliCrash,
+        RunCause::Timeout => ErrorKind::Timeout,
+        RunCause::Protocol
+        | RunCause::Process
+        | RunCause::Cancelled
+        | RunCause::EngineRestart
+        | RunCause::Unknown => ErrorKind::Unknown,
+    }
+}
+
 /// Fold one agent event into a parts accumulator, with an explicit compaction
 /// summary policy.
 pub fn fold_event_into_parts_with(
@@ -585,7 +618,83 @@ pub fn fold_event_into_parts_with(
                 kind: *kind,
                 detail: detail.clone(),
                 retryable: *retryable,
+                cause: None,
+                exit_code: None,
             });
+        }
+        // Terminal metadata companion. It either enriches the Error chip the
+        // harness already emitted (same message) or CREATES one for a run that
+        // died before any Error event — the case the plan says must never
+        // disappear. Interrupted is not an error: the message status already
+        // says Aborted, and no false chip is added.
+        AgentEvent::RunOutcome {
+            result,
+            cause,
+            message,
+            detail,
+            exit_code,
+        } => {
+            if matches!(*result, komet_proto::DoneStatus::Errored) {
+                let message = message
+                    .clone()
+                    .unwrap_or_else(|| "run ended without a message".to_string());
+                if let Some(MessagePart::Error {
+                    kind,
+                    detail: existing,
+                    cause: existing_cause,
+                    exit_code: existing_code,
+                    ..
+                }) = out
+                    .iter_mut()
+                    .rev()
+                    .find(|p| matches!(p, MessagePart::Error { message: m, .. } if m == &message))
+                {
+                    if existing.is_none() {
+                        *existing = detail.clone();
+                    }
+                    if existing_cause.is_none() {
+                        *existing_cause = Some(*cause);
+                    }
+                    if existing_code.is_none() {
+                        *existing_code = *exit_code;
+                    }
+                    // Keep the harness's specific kind (Auth/Timeout/…); a
+                    // generic Unknown is upgraded when the cause is precise.
+                    if matches!(*kind, ErrorKind::Unknown) {
+                        *kind = outcome_error_kind(*cause);
+                    }
+                } else {
+                    let id = format!("e{}", out.len());
+                    out.push(MessagePart::Error {
+                        id,
+                        message,
+                        kind: outcome_error_kind(*cause),
+                        detail: detail.clone(),
+                        retryable: *cause == komet_proto::RunCause::Timeout
+                            || *cause == komet_proto::RunCause::Network,
+                        cause: Some(*cause),
+                        exit_code: *exit_code,
+                    });
+                }
+            } else if matches!(*result, komet_proto::DoneStatus::Interrupted)
+                && *cause == komet_proto::RunCause::EngineRestart
+            {
+                // A restart is not a user Stop: keep it visible so the
+                // transcript can say why the turn ended, while a plain
+                // cancellation stays just the Aborted status (no fake error).
+                let message = message
+                    .clone()
+                    .unwrap_or_else(|| "Run interrupted by engine restart".to_string());
+                out.push(MessagePart::Error {
+                    id: format!("e{}", out.len()),
+                    message,
+                    kind: ErrorKind::Unknown,
+                    detail: detail.clone(),
+                    retryable: true,
+                    cause: Some(*cause),
+                    exit_code: *exit_code,
+                });
+            }
         }
         AgentEvent::Done { error, .. } => {
             if let Some(message) = error {
@@ -593,7 +702,13 @@ pub fn fold_event_into_parts_with(
                 // before the Done (same message, kind + stderr detail); the
                 // Done then adds nothing — skip it so the transcript shows a
                 // single detailed part instead of two chips.
-                let dup = matches!(out.last(), Some(MessagePart::Error { message: m, .. }) if m == message);
+                // Match anywhere in the turn: a tool/progress part may have
+                // landed after the Error, and the RunOutcome already enriched
+                // that same chip. A second chip would be the same failure twice.
+                let dup = out
+                    .iter()
+                    .rev()
+                    .any(|p| matches!(p, MessagePart::Error { message: m, .. } if m == message));
                 if !dup {
                     let id = format!("e{}", out.len());
                     out.push(MessagePart::Error {
@@ -602,6 +717,8 @@ pub fn fold_event_into_parts_with(
                         kind: ErrorKind::Unknown,
                         detail: None,
                         retryable: false,
+                        cause: None,
+                        exit_code: None,
                     });
                 }
             }
@@ -1078,6 +1195,168 @@ mod tests {
         );
     }
 
+    #[test]
+    fn run_outcome_enriches_the_typed_error_instead_of_duplicating_it() {
+        let mut out = Vec::new();
+        fold_event_into_parts(
+            &mut out,
+            &AgentEvent::Error {
+                message: "chat died".into(),
+                kind: ErrorKind::Unknown,
+                detail: None,
+                retryable: false,
+            },
+        );
+        fold_event_into_parts(
+            &mut out,
+            &AgentEvent::RunOutcome {
+                result: komet_proto::DoneStatus::Errored,
+                cause: komet_proto::RunCause::Crash,
+                message: Some("chat died".into()),
+                detail: Some("signal 9".into()),
+                exit_code: Some(137),
+            },
+        );
+        assert_eq!(out.len(), 1, "one chip, enriched: {out:?}");
+        assert!(matches!(
+            &out[0],
+            MessagePart::Error {
+                cause: Some(komet_proto::RunCause::Crash),
+                detail: Some(detail),
+                exit_code: Some(137),
+                kind: ErrorKind::CliCrash,
+                ..
+            } if detail == "signal 9"
+        ));
+    }
+
+    #[test]
+    fn done_does_not_duplicate_an_enriched_error_that_is_not_last() {
+        let mut out = Vec::new();
+        fold_event_into_parts(
+            &mut out,
+            &AgentEvent::Error {
+                message: "chat died".into(),
+                kind: ErrorKind::Unknown,
+                detail: None,
+                retryable: false,
+            },
+        );
+        fold_event_into_parts(&mut out, &text_delta("partial answer"));
+        fold_event_into_parts(
+            &mut out,
+            &AgentEvent::RunOutcome {
+                result: komet_proto::DoneStatus::Errored,
+                cause: komet_proto::RunCause::Crash,
+                message: Some("chat died".into()),
+                detail: Some("signal 9".into()),
+                exit_code: Some(137),
+            },
+        );
+        fold_event_into_parts(
+            &mut out,
+            &AgentEvent::Done {
+                status: komet_proto::DoneStatus::Errored,
+                result: None,
+                error: Some("chat died".into()),
+                session_id: None,
+                reason: None,
+            },
+        );
+        let errors: Vec<_> = out
+            .iter()
+            .filter(|part| matches!(part, MessagePart::Error { .. }))
+            .collect();
+        assert_eq!(errors.len(), 1, "one chip, not a second Done copy: {out:?}");
+        assert!(matches!(
+            errors[0],
+            MessagePart::Error {
+                detail: Some(detail),
+                exit_code: Some(137),
+                ..
+            } if detail == "signal 9"
+        ));
+    }
+    #[test]
+    fn run_outcome_without_a_prior_error_adds_one() {
+        let mut out = Vec::new();
+        fold_event_into_parts(
+            &mut out,
+            &AgentEvent::RunOutcome {
+                result: komet_proto::DoneStatus::Errored,
+                cause: komet_proto::RunCause::Timeout,
+                message: Some("no answer within 30s".into()),
+                detail: None,
+                exit_code: None,
+            },
+        );
+        assert!(matches!(
+            out.as_slice(),
+            [MessagePart::Error { message, cause: Some(komet_proto::RunCause::Timeout), retryable: true, .. }]
+            if message == "no answer within 30s"
+        ));
+    }
+
+    #[test]
+    fn engine_restart_interruption_stays_visible_but_user_stop_does_not() {
+        let mut restart = Vec::new();
+        fold_event_into_parts(
+            &mut restart,
+            &AgentEvent::RunOutcome {
+                result: komet_proto::DoneStatus::Interrupted,
+                cause: komet_proto::RunCause::EngineRestart,
+                message: Some("Run interrupted by engine restart".into()),
+                detail: None,
+                exit_code: None,
+            },
+        );
+        assert!(matches!(
+            restart.as_slice(),
+            [MessagePart::Error {
+                cause: Some(komet_proto::RunCause::EngineRestart),
+                ..
+            }]
+        ));
+
+        let mut cancelled = Vec::new();
+        fold_event_into_parts(
+            &mut cancelled,
+            &AgentEvent::RunOutcome {
+                result: komet_proto::DoneStatus::Interrupted,
+                cause: komet_proto::RunCause::Cancelled,
+                message: None,
+                detail: None,
+                exit_code: None,
+            },
+        );
+        assert!(cancelled.is_empty(), "user Stop is not an error chip");
+    }
+    #[test]
+    fn clean_and_interrupted_run_outcomes_add_no_error_chip() {
+        for (result, cause) in [
+            (
+                komet_proto::DoneStatus::Completed,
+                komet_proto::RunCause::Unknown,
+            ),
+            (
+                komet_proto::DoneStatus::Interrupted,
+                komet_proto::RunCause::Cancelled,
+            ),
+        ] {
+            let mut out = Vec::new();
+            fold_event_into_parts(
+                &mut out,
+                &AgentEvent::RunOutcome {
+                    result,
+                    cause,
+                    message: None,
+                    detail: None,
+                    exit_code: None,
+                },
+            );
+            assert!(out.is_empty(), "{result:?} must not add an error chip");
+        }
+    }
     fn text_delta(s: &str) -> AgentEvent {
         AgentEvent::TextDelta { text: s.into() }
     }

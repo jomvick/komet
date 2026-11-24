@@ -32,7 +32,7 @@ use gpui::{
     SharedString, Subscription, Task, Window, div, font, list, prelude::*, px,
 };
 
-use komet_proto::{Chat, CheckoutDiff, GitHistoryCommit};
+use komet_proto::{Chat, CheckoutDiff, GitCheckoutState, GitHistoryCommit};
 use komet_rpc::methods;
 
 use crate::composer::{ComposerInput, ComposerInputEvent};
@@ -989,6 +989,13 @@ pub struct Changes {
     /// `device:cwd` the branch list was fetched for.
     branches_for: Option<String>,
     branches_task: Option<Task<()>>,
+    /// Typed repository state for the selected checkout. `None` while the
+    /// first probe runs; `NotRepository`/`Error` are rendered explicitly,
+    /// never as an empty or clean diff.
+    git_state: Option<GitCheckoutState>,
+    /// `device:cwd` the repository probe was issued for.
+    git_state_for: Option<String>,
+    git_state_task: Option<Task<()>>,
     /// One-shot scoped capture (Branch / Latest turn) + its fetch key.
     scoped: Option<CheckoutDiff>,
     scoped_for: Option<String>,
@@ -1040,6 +1047,9 @@ impl Changes {
             branches: Vec::new(),
             branches_for: None,
             branches_task: None,
+            git_state: None,
+            git_state_for: None,
+            git_state_task: None,
             scoped: None,
             scoped_for: None,
             scoped_error: None,
@@ -1240,6 +1250,62 @@ impl Changes {
             diff.checksum,
             self.scope_key()
         )
+    }
+
+    /// Probe the selected checkout's repository exactly once per
+    /// `device:cwd`. This is the pane's explicit "repo detected / not a repo /
+    /// Git error" state: it never infers either from an absent diff.
+    fn ensure_git_state(&mut self, cx: &mut Context<Self>) {
+        let Some(cwd) = self.scoped_cwd(cx) else {
+            if self.git_state_for.take().is_some() {
+                self.git_state = None;
+                self.git_state_task = None;
+            }
+            return;
+        };
+        let target = self.desired_target(cx);
+        let key = format!("{}:{}", target.as_deref().unwrap_or("local"), cwd);
+        if self.git_state_for.as_deref() == Some(key.as_str()) {
+            return;
+        }
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        self.git_state_for = Some(key.clone());
+        self.git_state = None;
+        self.git_state_task = Some(cx.spawn(async move |this, cx| {
+            let mut params = serde_json::Map::new();
+            params.insert("repoPath".into(), serde_json::Value::String(cwd.clone()));
+            if let Some(target) = target {
+                params.insert("targetDeviceId".into(), serde_json::Value::String(target));
+            }
+            let result = engine
+                .client()
+                .call(
+                    methods::GET_GIT_CHECKOUT_STATE,
+                    serde_json::Value::Object(params),
+                )
+                .await;
+            this.update(cx, |changes, cx| {
+                if changes.git_state_for.as_deref() != Some(key.as_str()) {
+                    return; // superseded by a chat/device/cwd switch
+                }
+                changes.git_state =
+                    Some(match result {
+                        Ok(value) => serde_json::from_value::<GitCheckoutState>(value)
+                            .unwrap_or_else(|error| GitCheckoutState::Error {
+                                cwd: cwd.clone(),
+                                message: error.to_string(),
+                            }),
+                        Err(error) => GitCheckoutState::Error {
+                            cwd: cwd.clone(),
+                            message: error.to_string(),
+                        },
+                    });
+                cx.notify();
+            })
+            .ok();
+        }));
     }
 
     /// Fetch the branch list for the selected chat's checkout (idempotent per
@@ -1501,6 +1567,7 @@ impl Changes {
         // The watch follows the selected chat's host device (idempotent when
         // the target is unchanged); a boot-deferred attempt retries here too.
         self.ensure_watch(cx);
+        self.ensure_git_state(cx);
         if self.scope == DiffScope::History {
             self.history_pane(cx)
                 .update(cx, |history, cx| history.ensure_loaded(cx));
@@ -2596,6 +2663,186 @@ impl Changes {
             .into_any_element()
     }
 
+    /// Compact repository strip above the diff: repo name, active branch and
+    /// dirty totals when Git answered. Hidden for blocked states, which get
+    /// the content area instead.
+    fn render_git_strip(&self, theme: &Theme) -> Option<AnyElement> {
+        if self.git_state.is_none() {
+            self.git_state_for.as_ref()?;
+            return Some(
+                div()
+                    .flex_none()
+                    .h(px(30.0))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(6.0))
+                    .px(px(Theme::SPACE_LG))
+                    .border_b_1()
+                    .border_color(crate::theme::hairline(0.06))
+                    .text_size(px(11.0))
+                    .text_color(theme.text_faint)
+                    .child(
+                        crate::icons::icon(crate::icons::GIT_BRANCH)
+                            .size(px(11.0))
+                            .text_color(theme.text_faint),
+                    )
+                    .child(SharedString::from("Checking Git repository…"))
+                    .into_any_element(),
+            );
+        }
+        let GitCheckoutState::Ready {
+            root,
+            branch,
+            detached,
+            changed_files,
+            insertions,
+            deletions,
+            ..
+        } = self.git_state.as_ref()?
+        else {
+            return None;
+        };
+        let name = root
+            .trim_end_matches(['/', '\\'])
+            .rsplit(['/', '\\'])
+            .next()
+            .filter(|name| !name.is_empty())
+            .unwrap_or(root);
+        let dirty = if *changed_files == 0 {
+            SharedString::from("clean")
+        } else if *insertions == 0 && *deletions == 0 {
+            SharedString::from(format!("{changed_files} changed"))
+        } else {
+            SharedString::from(format!(
+                "{changed_files} changed  +{insertions}  -{deletions}"
+            ))
+        };
+        Some(
+            div()
+                .flex_none()
+                .h(px(30.0))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(6.0))
+                .px(px(Theme::SPACE_LG))
+                .border_b_1()
+                .border_color(crate::theme::hairline(0.06))
+                .text_size(px(11.0))
+                .text_color(theme.text_muted)
+                .child(
+                    crate::icons::icon(crate::icons::GIT_BRANCH)
+                        .size(px(11.0))
+                        .text_color(theme.text_faint),
+                )
+                .child(
+                    div()
+                        .min_w_0()
+                        .max_w(px(150.0))
+                        .truncate()
+                        .child(SharedString::from(name.to_string())),
+                )
+                .child(div().text_color(theme.text_faint).child("/"))
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .text_color(if *detached { theme.warning } else { theme.text })
+                        .child(if *detached {
+                            SharedString::from("detached HEAD")
+                        } else {
+                            SharedString::from(branch.clone())
+                        }),
+                )
+                .child(div().flex_1())
+                .child(
+                    div()
+                        .flex_none()
+                        .text_color(if *changed_files == 0 {
+                            theme.text_faint
+                        } else {
+                            theme.text_muted
+                        })
+                        .child(dirty),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// The explicit blocked state: not a repository, or Git failed. Both
+    /// replace the diff body so a read failure can never masquerade as a
+    /// clean/empty checkout.
+    fn render_git_blocked(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (title, detail, warning) = match self.git_state.as_ref()? {
+            GitCheckoutState::NotRepository { cwd } => (
+                "Not a Git repository",
+                format!(
+                    "{cwd} is outside a Git work tree. Diff, branch and history views need a repository."
+                ),
+                false,
+            ),
+            GitCheckoutState::Error { cwd, message } => (
+                "Git unavailable",
+                format!("Could not read the repository at {cwd}: {message}"),
+                true,
+            ),
+            GitCheckoutState::Ready { .. } => return None,
+        };
+        Some(
+            div()
+                .flex_1()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap(px(6.0))
+                .px(px(Theme::SPACE_LG))
+                .child(
+                    div()
+                        .text_size(px(12.0))
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(if warning {
+                            theme.warning
+                        } else {
+                            theme.text_muted
+                        })
+                        .child(SharedString::from(title)),
+                )
+                .child(
+                    div()
+                        .max_w(px(340.0))
+                        .text_center()
+                        .text_size(px(11.0))
+                        .text_color(theme.text_faint)
+                        .child(SharedString::from(detail)),
+                )
+                .when(warning, |el| {
+                    el.child(
+                        div()
+                            .id("changes-git-retry")
+                            .mt(px(4.0))
+                            .px(px(8.0))
+                            .py(px(3.0))
+                            .rounded(px(5.0))
+                            .border_1()
+                            .border_color(theme.border)
+                            .text_size(px(11.0))
+                            .text_color(theme.text_muted)
+                            .cursor_pointer()
+                            .hover(|style| style.bg(theme.element_hover))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.git_state_for = None;
+                                this.sync(cx);
+                                cx.notify();
+                            }))
+                            .child(SharedString::from("Retry")),
+                    )
+                })
+                .into_any_element(),
+        )
+    }
+
     fn render_header_strip(&self, theme: &Theme) -> Option<AnyElement> {
         let parsed = self.parsed.as_ref()?;
         Some(
@@ -2962,7 +3209,10 @@ impl Render for Changes {
                 }
             });
 
-        let content: AnyElement = if let Some((message, warn)) = scoped_notice {
+        let git_strip = self.render_git_strip(&theme);
+        let content: AnyElement = if let Some(blocked) = self.render_git_blocked(&theme, cx) {
+            blocked
+        } else if let Some((message, warn)) = scoped_notice {
             div()
                 .flex_1()
                 .flex()
@@ -3062,6 +3312,7 @@ impl Render for Changes {
                         .child(message),
                 )
             })
+            .when_some(git_strip, |el, strip| el.child(strip))
             .child(content)
             .into_any_element()
     }

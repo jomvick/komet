@@ -1102,6 +1102,7 @@ impl EngineRpc {
             } else {
                 None
             },
+            context: None,
         };
         let result = self.doc_host.open(chat_id).and_then(|handle| {
             handle
@@ -1457,6 +1458,7 @@ fn forwardable(method: &str) -> bool {
             | methods::WATCH_CHECKOUT_DIFFS
             | methods::GET_CHECKOUT_DIFF
             | methods::GET_CHECKOUT_FILE_DIFF_TEXT
+            | methods::GET_GIT_CHECKOUT_STATE
             // Terminals live on the chat's host device.
             | methods::OPEN_TERMINAL
             | methods::SUBSCRIBE_TERMINAL
@@ -2983,6 +2985,14 @@ impl RpcService for EngineRpc {
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&branches)
             }
+            methods::GET_GIT_CHECKOUT_STATE => {
+                let p: RepoPathParams = parse_params(params)?;
+                let state = self
+                    .repos
+                    .checkout_state(std::path::Path::new(&p.repo_path))
+                    .await;
+                RpcReply::value(&state)
+            }
             methods::LIST_REFS => {
                 let p: RepoPathParams = parse_params(params)?;
                 let refs = self
@@ -3563,6 +3573,105 @@ impl RpcService for EngineRpc {
                                 now,
                             )
                         });
+                        let capability = komet_harness::capabilities::capabilities(harness);
+                        let probe_failed = account.as_ref().is_some_and(|account| {
+                            self.agent_accounts
+                                .usage_probe_failed_at(harness, &account.id)
+                                .is_some()
+                        });
+                        let usage_status = match capability.usage.surface {
+                            komet_proto::UsageSurface::ProviderQuota => {
+                                match account.as_ref() {
+                                    None => komet_proto::AgentUsageStatus::NotReported {
+                                        reason: komet_proto::UsageNotReportedReason::NoAccount,
+                                        message: "No active account detected, so there is no quota to query"
+                                            .into(),
+                                    },
+                                    Some(account)
+                                        if probe_failed && mode != crate::agent_accounts::UsageMode::Offline =>
+                                    {
+                                        komet_proto::AgentUsageStatus::RetrievalError {
+                                            message: if account.usage_windows.is_empty() {
+                                                "Live quota refresh failed and no earlier sample is available"
+                                                    .into()
+                                            } else {
+                                                "Live quota refresh failed; showing the last known sample"
+                                                    .into()
+                                            },
+                                            retryable: true,
+                                        }
+                                    }
+                                    Some(account) if !account.usage_windows.is_empty() => {
+                                        komet_proto::AgentUsageStatus::Available {
+                                            source: komet_proto::UsageSampleSource::ProviderQuota,
+                                            collected_at: samples
+                                                .first()
+                                                .map(|(at, _)| *at)
+                                                .or(Some(now)),
+                                        }
+                                    }
+                                    Some(account)
+                                        if account.auth_kind
+                                            == Some(komet_proto::AgentAuthKind::ApiKey) =>
+                                    {
+                                        komet_proto::AgentUsageStatus::NotReported {
+                                            reason: komet_proto::UsageNotReportedReason::NoProviderEndpoint,
+                                            message: "An API-key sign-in exposes no quota endpoint"
+                                                .into(),
+                                        }
+                                    }
+                                    Some(_) if mode == crate::agent_accounts::UsageMode::Offline => {
+                                        komet_proto::AgentUsageStatus::NotReported {
+                                            reason: komet_proto::UsageNotReportedReason::NotCollected,
+                                            message: "Opened offline: no live quota probe was attempted"
+                                                .into(),
+                                        }
+                                    }
+                                    Some(_) => komet_proto::AgentUsageStatus::RetrievalError {
+                                        message: "The provider returned no quota data for the active account"
+                                            .into(),
+                                        retryable: true,
+                                    },
+                                }
+                            }
+                            komet_proto::UsageSurface::LocalLogs => match local_usage.as_ref() {
+                                Some(local) if local.coverage != komet_proto::UsageCoverage::Unavailable => {
+                                    komet_proto::AgentUsageStatus::Available {
+                                        source: komet_proto::UsageSampleSource::LocalLog,
+                                        collected_at: Some(now),
+                                    }
+                                }
+                                Some(local) => komet_proto::AgentUsageStatus::NotReported {
+                                    reason: komet_proto::UsageNotReportedReason::NoTokenCounter,
+                                    message: local.reason.clone().unwrap_or_else(|| {
+                                        "The agent's local logs carry no readable token counter".into()
+                                    }),
+                                },
+                                None => komet_proto::AgentUsageStatus::NotReported {
+                                    reason: komet_proto::UsageNotReportedReason::NoTokenCounter,
+                                    message: "No local usage log found for this agent".into(),
+                                },
+                            },
+                            komet_proto::UsageSurface::MeasuredOnly => {
+                                let runs = month
+                                    .totals
+                                    .get(&harness)
+                                    .map(|totals| totals.runs)
+                                    .unwrap_or(0);
+                                if runs > 0 {
+                                    komet_proto::AgentUsageStatus::Available {
+                                        source: komet_proto::UsageSampleSource::MeasuredTurns,
+                                        collected_at: Some(now),
+                                    }
+                                } else {
+                                    komet_proto::AgentUsageStatus::NotReported {
+                                        reason: komet_proto::UsageNotReportedReason::NoProviderEndpoint,
+                                        message: "No provider quota endpoint and no token counter; no Komet-measured turn yet"
+                                            .into(),
+                                    }
+                                }
+                            }
+                        };
                         komet_proto::AgentUsageReport {
                             harness,
                             account,
@@ -3597,6 +3706,7 @@ impl RpcService for EngineRpc {
                                     .as_ref()
                                     .and_then(|counts| counts.get(&harness).copied()),
                             },
+                            usage_status,
                             day_cost: day
                                 .details
                                 .get(&harness)

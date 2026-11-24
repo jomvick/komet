@@ -21,6 +21,7 @@ pub mod client;
 pub mod document;
 pub mod editor;
 pub mod editor_adapter;
+pub mod image;
 pub mod model;
 pub mod preview;
 pub mod search;

@@ -800,6 +800,13 @@ impl SubagentPanel {
                 tool_call_id.as_deref(),
                 theme,
             ),
+            RowKind::Interrupted { label } => div()
+                .w_full()
+                .py(px(4.0))
+                .text_size(px(11.0))
+                .text_color(theme.text_muted)
+                .child(label.clone())
+                .into_any_element(),
             RowKind::ErrorChip { message, .. } => error_chip(message.clone(), theme),
             RowKind::AgentSwitch { switch } => div()
                 .w_full()

@@ -4542,6 +4542,7 @@ mod tests {
             installed: true,
             enabled: None,
             surface: komet_proto::HarnessInteractionSurface::default(),
+            capabilities: Default::default(),
         };
         let mixed = vec![
             descriptor(HarnessId::Mock, "Mock"),
@@ -4569,6 +4570,7 @@ mod tests {
             installed: true,
             enabled,
             surface: komet_proto::HarnessInteractionSurface::default(),
+            capabilities: Default::default(),
         };
         let catalog = |claude: Option<bool>, codex: Option<bool>, grok: Option<bool>| {
             vec![
