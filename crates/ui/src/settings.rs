@@ -247,6 +247,9 @@ pub struct BrowserPrefs {
     pub remember_zoom: bool,
     /// Dossier des captures d'écran ; `None` = dossier Téléchargements.
     pub capture_dir: Option<String>,
+    /// Dossier des téléchargements ; `None` = dossier Téléchargements de
+    /// l'OS. Appliqué à la session CDP via `Browser.setDownloadBehavior`.
+    pub download_dir: Option<String>,
     /// Preset d'émulation par défaut (`None` = responsive désactivé).
     pub emulation_preset: Option<String>,
 }
@@ -255,13 +258,25 @@ impl Default for BrowserPrefs {
     fn default() -> Self {
         Self {
             home_url: None,
-            search_url: "https://duckduckgo.com/?q={q}".into(),
+            search_url: crate::browser::DEFAULT_SEARCH_URL.into(),
             history_enabled: true,
             history_retention_days: Some(90),
             zoom_default: 1.0,
             remember_zoom: false,
             capture_dir: None,
+            download_dir: None,
             emulation_preset: None,
+        }
+    }
+}
+
+impl BrowserPrefs {
+    /// Migration à la lecture (en mémoire, à chaque boot) : le défaut
+    /// DuckDuckGo d'avant la PR devient Google ; tout autre choix explicite
+    /// (preset ou modèle custom) est conservé tel quel.
+    pub fn migrate(&mut self) {
+        if self.search_url.trim() == crate::browser::LEGACY_DEFAULT_SEARCH_URL {
+            self.search_url = crate::browser::DEFAULT_SEARCH_URL.to_string();
         }
     }
 }
@@ -504,6 +519,13 @@ pub fn display_combo(combo: &str) -> String {
 
 impl UiSettings {
     /// Clamp widths into their legal ranges (also heals NaN to defaults).
+    /// Migrations one-shot entre versions de `ui-settings.json`. Appliquées
+    /// uniquement à la lecture : tant que la version courante n'a pas
+    /// sauvegardé, le fichier reste tel quel.
+    pub fn migrate(&mut self) {
+        self.browser.migrate();
+    }
+
     pub fn clamped(mut self) -> Self {
         self.sidebar_width = clamp_or(
             self.sidebar_width,
@@ -559,6 +581,7 @@ impl UiSettings {
             Ok(text) => match serde_json::from_str::<UiSettings>(&text) {
                 Ok(mut settings) => {
                     settings.onboarding_key_absent = settings.onboarding_completed.is_none();
+                    settings.migrate();
                     settings.clamped()
                 }
                 Err(err) => {
@@ -674,6 +697,7 @@ mod tests {
                 zoom_default: 1.25,
                 remember_zoom: true,
                 capture_dir: Some("/tmp/shots".into()),
+                download_dir: Some("/tmp/dl".into()),
                 emulation_preset: Some("iphone-se".into()),
             },
             onboarding_completed: Some(true),
@@ -702,6 +726,33 @@ mod tests {
         let loaded = UiSettings::load(dir.path());
         assert_eq!(loaded.wallpaper_path, None);
         assert_eq!(loaded.sidebar_width, 300.0);
+    }
+
+    #[test]
+    fn legacy_duckduckgo_search_default_migrates_to_google() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            UiSettings::path(dir.path()),
+            r#"{"browser": {"searchUrl": "https://duckduckgo.com/?q={q}"}}"#,
+        )
+        .unwrap();
+
+        // Le défaut de l'époque est migré vers Google…
+        assert_eq!(
+            UiSettings::load(dir.path()).browser.search_url,
+            crate::browser::DEFAULT_SEARCH_URL
+        );
+
+        // …mais un choix explicite (autre preset ou custom) est conservé.
+        std::fs::write(
+            UiSettings::path(dir.path()),
+            r#"{"browser": {"searchUrl": "https://search.brave.com/search?q={q}"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            UiSettings::load(dir.path()).browser.search_url,
+            "https://search.brave.com/search?q={q}"
+        );
     }
 
     #[test]

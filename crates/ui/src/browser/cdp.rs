@@ -64,6 +64,27 @@ pub fn runtime_enable(id: u64) -> String {
     make_request(id, "Runtime.enable", json!({}))
 }
 
+/// Active les événements Network (requêtes/réponses/erreurs) pour la page.
+/// Léger : pas de corps de requête capturé.
+pub fn network_enable(id: u64) -> String {
+    make_request(id, "Network.enable", json!({}))
+}
+
+/// Téléchargements : comportement « allow » (nom d'origine) + dossier Komet,
+/// avec événements de progression. Envoyé sur la session de page — Chrome
+/// l'applique au navigateur entier du profil.
+pub fn set_download_behavior(id: u64, download_path: &str) -> String {
+    make_request(
+        id,
+        "Browser.setDownloadBehavior",
+        json!({
+            "behavior": "allow",
+            "downloadPath": download_path,
+            "eventsEnabled": true
+        }),
+    )
+}
+
 pub fn page_navigate(id: u64, url: &str) -> String {
     make_request(id, "Page.navigate", json!({ "url": url }))
 }

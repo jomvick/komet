@@ -1,8 +1,10 @@
 mod cdp;
 mod clear;
+mod downloads;
 mod element;
 mod history;
 mod menu;
+mod network;
 mod process;
 
 pub use clear::ClearSelection;
@@ -12,7 +14,7 @@ pub use menu::{BrowserAction, MenuItem, MenuStates, action_shipped};
 
 use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -351,6 +353,9 @@ pub enum BrowserCommand {
     CaptureScreenshot,
     ToggleOverlay,
     Evaluate(String),
+    /// Réglage du dossier de téléchargements (Settings → Browser) : le
+    /// ré-applique sur la session ouverte.
+    SetDownloadDir(String),
     /// Le panneau browser s'affiche / se cache : caché, la session CDP se
     /// gare (stopScreencast, attente bloquante — zéro réveil CPU).
     SetVisible(bool),
@@ -387,6 +392,43 @@ pub enum BrowserEvent {
         index: i64,
     },
     Screenshot(Vec<u8>),
+    /// `Browser.downloadWillBegin` : un téléchargement démarre.
+    DownloadStart {
+        id: String,
+        filename: String,
+        url: String,
+    },
+    /// Progression (`receivedBytes`/`totalBytes`) ; `total` = `None` si la
+    /// taille est inconnue (`-1` CDP).
+    DownloadProgress {
+        id: String,
+        received: u64,
+        total: Option<u64>,
+    },
+    /// État terminal : `ok` = fichier écrit, sinon annulé ; `path` est le
+    /// chemin final quand il est connu.
+    DownloadDone {
+        id: String,
+        ok: bool,
+        path: Option<String>,
+    },
+    /// Une requête réseau démarre (`Network.requestWillBeSent`).
+    NetworkStart {
+        id: String,
+        url: String,
+        method: String,
+    },
+    /// Réponse reçue (`Network.responseReceived`).
+    NetworkResponded {
+        id: String,
+        status: u16,
+    },
+    /// Échec réseau (`Network.loadingFailed`) ; `canceled` = abort côté page.
+    NetworkFailed {
+        id: String,
+        error: String,
+        canceled: bool,
+    },
     Failed(String),
     /// Dégradation signalée à l'utilisateur (ex. repli --no-sandbox).
     Warning(String),
@@ -428,11 +470,13 @@ impl Render for ConsoleDragGhost {
     }
 }
 
-/// Onglet du panneau History/Favorites.
+/// Onglet du panneau History/Favorites/Downloads/Network.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PanelTab {
     History,
     Favorites,
+    Downloads,
+    Network,
 }
 
 /// Case à cocher du dialogue « Clear Storage ».
@@ -505,6 +549,10 @@ pub struct BrowserSurface {
     history: Option<BrowserHistory>,
     /// Panneau History/Favorites affiché à la place de la page.
     panel: Option<HistoryPanel>,
+    /// Téléchargements suivis (GUID CDP → item), du début à l'ouverture.
+    downloads: Vec<downloads::DownloadItem>,
+    /// Journal réseau (requêtes/réponses/erreurs, plafonné).
+    network: network::NetworkLog,
     /// Suggestions de la barre d'adresse (lignes historique + « Search … »).
     suggestions: Vec<history::Suggestion>,
     /// Ligne surlignée (0 = première) pour ↑/↓ + Entrée.
@@ -630,6 +678,7 @@ impl BrowserSurface {
         let (event_tx, event_rx) = mpsc::sync_channel(8);
         let (wake_tx, wake_rx): (WakeTx, WakeRx) = futures::channel::mpsc::unbounded();
         let initial_url = url.clone();
+        let initial_download_dir = downloads::resolve_download_dir(prefs.download_dir.as_deref());
         {
             let startup_events = event_tx.clone();
             let spawn_wake = wake_tx.clone();
@@ -643,6 +692,7 @@ impl BrowserSurface {
                         wake_read,
                         initial_url,
                         profile_key,
+                        initial_download_dir,
                     )
                 })
             {
@@ -760,6 +810,8 @@ impl BrowserSurface {
                 store
             }),
             panel: None,
+            downloads: Vec::new(),
+            network: network::NetworkLog::default(),
             suggestions: Vec::new(),
             suggestion_sel: 0,
             prefs,
@@ -818,6 +870,13 @@ impl BrowserSurface {
     /// Recherche/captures/page d'accueil sont lus à l'usage via `prefs` ;
     /// la rétention et le zoom par défaut sont reappliqués tout de suite.
     pub fn update_prefs(&mut self, prefs: BrowserPrefs, cx: &mut Context<Self>) {
+        // Dossier de téléchargements modifié : ré-appliqué sur la session
+        // ouverte (`Browser.setDownloadBehavior`), pas seulement au prochain
+        // démarrage de session.
+        let dir = downloads::resolve_download_dir(prefs.download_dir.as_deref());
+        self.commands.send(BrowserCommand::SetDownloadDir(
+            dir.to_string_lossy().into_owned(),
+        ));
         if let Some(history) = self.history.as_mut() {
             history.set_retention_days(prefs.history_retention_days);
         }
@@ -1254,6 +1313,12 @@ impl BrowserSurface {
     }
 
     /// Panneau History/Favorites : même onglet → fermeture, autre → switch.
+    /// Vrai si le panneau est ouvert sur l'onglet donné (réseau : re-rendu
+    /// conditionnel à l'arrivée des événements).
+    fn panel_visible_with(&self, tab: PanelTab) -> bool {
+        self.panel.as_ref().is_some_and(|panel| panel.tab == tab)
+    }
+
     fn toggle_panel(&mut self, tab: PanelTab, cx: &mut Context<Self>) {
         if self.panel.as_ref().is_some_and(|p| p.tab == tab) {
             self.panel = None;
@@ -1776,6 +1841,93 @@ impl BrowserSurface {
                     }
                     changed = true;
                 }
+                Ok(BrowserEvent::DownloadStart { id, filename, url }) => {
+                    downloads::apply_event(
+                        &mut self.downloads,
+                        &id,
+                        &filename,
+                        &url,
+                        None,
+                        None,
+                        None,
+                        None,
+                    );
+                    self.flash_status(format!("Downloading {filename}…"), cx);
+                    changed = true;
+                }
+                Ok(BrowserEvent::DownloadProgress {
+                    id,
+                    received,
+                    total,
+                }) => {
+                    downloads::apply_event(
+                        &mut self.downloads,
+                        &id,
+                        "",
+                        "",
+                        None,
+                        Some(received),
+                        total,
+                        None,
+                    );
+                    changed = true;
+                }
+                Ok(BrowserEvent::DownloadDone { id, ok, path }) => {
+                    let state = if ok {
+                        downloads::DownloadState::Completed
+                    } else {
+                        downloads::DownloadState::Canceled
+                    };
+                    downloads::apply_event(
+                        &mut self.downloads,
+                        &id,
+                        "",
+                        "",
+                        Some(state),
+                        None,
+                        None,
+                        path.as_deref().map(Path::new),
+                    );
+                    let name = self
+                        .downloads
+                        .iter()
+                        .find(|item| item.id == id)
+                        .map(|item| item.filename.clone())
+                        .unwrap_or_default();
+                    self.flash_status(
+                        if ok {
+                            format!("Download complete: {name}")
+                        } else {
+                            format!("Download canceled: {name}")
+                        },
+                        cx,
+                    );
+                    changed = true;
+                }
+                Ok(BrowserEvent::NetworkStart { id, url, method }) => {
+                    self.network.started(&id, &url, &method);
+                    // Re-rendu seulement si le panneau Réseau est visible :
+                    // chaque requête ne doit pas réveiller toute la surface.
+                    if self.panel_visible_with(PanelTab::Network) {
+                        changed = true;
+                    }
+                }
+                Ok(BrowserEvent::NetworkResponded { id, status }) => {
+                    self.network.responded(&id, status);
+                    if self.panel_visible_with(PanelTab::Network) {
+                        changed = true;
+                    }
+                }
+                Ok(BrowserEvent::NetworkFailed {
+                    id,
+                    error,
+                    canceled,
+                }) => {
+                    self.network.failed(&id, &error, canceled);
+                    if self.panel_visible_with(PanelTab::Network) {
+                        changed = true;
+                    }
+                }
                 Ok(BrowserEvent::Failed(error)) => {
                     self.error = Some(error);
                     changed = true;
@@ -2124,12 +2276,33 @@ impl BrowserSurface {
                     }
                 }
             }
+            PanelTab::Downloads => {
+                if self.downloads.is_empty() {
+                    body = body.child(self.panel_empty(theme, "No downloads yet"));
+                } else {
+                    for (ix, item) in self.downloads.iter().enumerate().rev() {
+                        body = body.child(self.panel_download_row(theme, ix, item, cx));
+                    }
+                }
+            }
+            PanelTab::Network => {
+                if self.network.is_empty() {
+                    body = body.child(self.panel_empty(theme, "No requests yet"));
+                } else {
+                    for (ix, entry) in self.network.entries().iter().enumerate().rev() {
+                        body = body.child(self.panel_network_row(theme, ix, entry, cx));
+                    }
+                }
+            }
         }
 
         let tab_history_active = panel.tab == PanelTab::History;
         let tab_fav_active = panel.tab == PanelTab::Favorites;
-        let clear_open = panel.clear_open;
+        let tab_dl_active = panel.tab == PanelTab::Downloads;
+        let tab_net_active = panel.tab == PanelTab::Network;
         let search = panel.search.clone();
+        let history_like = tab_history_active || tab_fav_active;
+        let clear_open = panel.clear_open;
 
         Some(
             div()
@@ -2166,21 +2339,41 @@ impl BrowserSurface {
                                 this.toggle_panel(PanelTab::Favorites, cx);
                             }),
                         ))
+                        .child(self.panel_tab_button(
+                            theme,
+                            "browser-panel-tab-downloads",
+                            "Downloads",
+                            tab_dl_active,
+                            cx.listener(|this, _, _, cx| {
+                                this.toggle_panel(PanelTab::Downloads, cx);
+                            }),
+                        ))
+                        .child(self.panel_tab_button(
+                            theme,
+                            "browser-panel-tab-network",
+                            "Network",
+                            tab_net_active,
+                            cx.listener(|this, _, _, cx| {
+                                this.toggle_panel(PanelTab::Network, cx);
+                            }),
+                        ))
                         .child(div().flex_1())
-                        .child(
-                            div()
-                                .id("browser-panel-search")
-                                .w(px(200.0))
-                                .h(px(24.0))
-                                .rounded(px(6.0))
-                                .border_1()
-                                .border_color(theme.border)
-                                .bg(crate::theme::ink(0.04))
-                                .px(px(6.0))
-                                .flex()
-                                .items_center()
-                                .child(search),
-                        )
+                        .when(history_like, |el| {
+                            el.child(
+                                div()
+                                    .id("browser-panel-search")
+                                    .w(px(200.0))
+                                    .h(px(24.0))
+                                    .rounded(px(6.0))
+                                    .border_1()
+                                    .border_color(theme.border)
+                                    .bg(crate::theme::ink(0.04))
+                                    .px(px(6.0))
+                                    .flex()
+                                    .items_center()
+                                    .child(search),
+                            )
+                        })
                         .when(panel.tab == PanelTab::History, |el| {
                             el.child(
                                 div()
@@ -2241,11 +2434,277 @@ impl BrowserSurface {
                                         )
                                     }),
                             )
+                        })
+                        .when(panel.tab == PanelTab::Network, |el| {
+                            el.child(
+                                div()
+                                    .id("browser-panel-clear-network")
+                                    .h(px(24.0))
+                                    .px(px(8.0))
+                                    .flex()
+                                    .items_center()
+                                    .rounded(px(6.0))
+                                    .cursor_pointer()
+                                    .text_size(px(12.0))
+                                    .text_color(theme.text_muted)
+                                    .hover(|s| s.bg(crate::theme::ink(0.06)))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.network.clear();
+                                        cx.notify();
+                                    }))
+                                    .child("Clear"),
+                            )
+                        })
+                        .when(panel.tab == PanelTab::Downloads, |el| {
+                            el.child(
+                                div()
+                                    .id("browser-panel-clear-downloads")
+                                    .h(px(24.0))
+                                    .px(px(8.0))
+                                    .flex()
+                                    .items_center()
+                                    .rounded(px(6.0))
+                                    .cursor_pointer()
+                                    .text_size(px(12.0))
+                                    .text_color(theme.text_muted)
+                                    .hover(|s| s.bg(crate::theme::ink(0.06)))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        // Les items en cours restent suivis ;
+                                        // on purge seulement l'historique.
+                                        this.downloads.retain(|item| !item.is_terminal());
+                                        cx.notify();
+                                    }))
+                                    .child("Clear finished"),
+                            )
                         }),
                 )
                 .child(body)
                 .into_any_element(),
         )
+    }
+
+    /// Ligne du panneau Downloads : nom, progression (barre + %), état ;
+    /// terminé → « Open » (application par défaut) et « Reveal » (dossier).
+    fn panel_download_row(
+        &self,
+        theme: &crate::theme::Theme,
+        ix: usize,
+        item: &downloads::DownloadItem,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        use downloads::DownloadState;
+        let state_label = match item.state {
+            DownloadState::InProgress => "Downloading…".to_string(),
+            DownloadState::Completed => "Completed".to_string(),
+            DownloadState::Canceled => "Canceled".to_string(),
+        };
+        let percent = item
+            .progress()
+            .map(|p| format!("{:.0}%", p * 100.0))
+            .unwrap_or_default();
+        let from = host_of(&item.url).unwrap_or_default();
+        let open_path = item.path.clone();
+        let reveal_path = item.path.clone();
+        div()
+            .id(("browser-panel-download", ix))
+            .h(px(44.0))
+            .w_full()
+            .px(px(12.0))
+            .py(px(6.0))
+            .flex()
+            .flex_col()
+            .justify_center()
+            .gap(px(3.0))
+            .border_b_1()
+            .border_color(theme.border)
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_size(px(12.5))
+                            .text_color(theme.text)
+                            .child(item.filename.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(px(11.0))
+                            .text_color(theme.text_muted)
+                            .child(if percent.is_empty() {
+                                state_label.clone()
+                            } else {
+                                format!("{state_label} · {percent}")
+                            }),
+                    ),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(
+                        // barre de progression (0 quand la taille est inconnue)
+                        div()
+                            .flex_1()
+                            .h(px(3.0))
+                            .rounded(px(2.0))
+                            .bg(crate::theme::ink(0.08))
+                            .child(
+                                div()
+                                    .h_full()
+                                    .w(gpui::relative(
+                                        item.progress().unwrap_or(0.0).clamp(0.0, 1.0),
+                                    ))
+                                    .rounded(px(2.0))
+                                    .bg(theme.accent),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .max_w(px(160.0))
+                            .overflow_hidden()
+                            .text_size(px(10.5))
+                            .text_color(theme.text_muted)
+                            .child(from),
+                    )
+                    .when(item.state == DownloadState::Completed, |el| {
+                        el.child(
+                            div()
+                                .id(("browser-panel-download-open", ix))
+                                .flex_none()
+                                .px(px(6.0))
+                                .h(px(18.0))
+                                .flex()
+                                .items_center()
+                                .rounded(px(4.0))
+                                .cursor_pointer()
+                                .text_size(px(11.0))
+                                .text_color(theme.text)
+                                .hover(|s| s.bg(crate::theme::ink(0.10)))
+                                .on_click(cx.listener(move |_, _, _, cx| {
+                                    if let Some(path) = &open_path {
+                                        cx.open_with_system(path);
+                                    }
+                                }))
+                                .child("Open"),
+                        )
+                        .child(
+                            div()
+                                .id(("browser-panel-download-reveal", ix))
+                                .flex_none()
+                                .px(px(6.0))
+                                .h(px(18.0))
+                                .flex()
+                                .items_center()
+                                .rounded(px(4.0))
+                                .cursor_pointer()
+                                .text_size(px(11.0))
+                                .text_color(theme.text_muted)
+                                .hover(|s| s.bg(crate::theme::ink(0.10)))
+                                .on_click(cx.listener(move |_, _, _, cx| {
+                                    // gpui révèle le fichier dans le
+                                    // gestionnaire de fichiers de l'OS
+                                    if let Some(path) = reveal_path.as_ref() {
+                                        cx.reveal_path(path);
+                                    }
+                                }))
+                                .child("Reveal"),
+                        )
+                    }),
+            )
+    }
+
+    /// Ligne du panneau Network : méthode, URL, statut/erreur. Erreurs en
+    /// rouge, certificats signalés, hôte local marqué, HTTP non chiffré
+    /// distingué d'HTTPS.
+    fn panel_network_row(
+        &self,
+        theme: &crate::theme::Theme,
+        ix: usize,
+        entry: &network::NetworkEntry,
+        _cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let scheme_https = entry.url.starts_with("https://");
+        let local = network::is_local_host(&entry.url);
+        let cert = entry.cert_error();
+        let status_color = if cert || entry.failed() {
+            theme.danger
+        } else {
+            theme.text_muted
+        };
+        let scheme_label = if local {
+            "local".to_string()
+        } else if scheme_https {
+            "https".to_string()
+        } else if entry.url.starts_with("http://") {
+            "http".to_string()
+        } else {
+            String::new()
+        };
+        let scheme_color = if cert || entry.failed() {
+            theme.danger
+        } else if local || scheme_https {
+            theme.success
+        } else {
+            theme.warning
+        };
+        div()
+            .id(("browser-panel-network", ix))
+            .h(px(30.0))
+            .w_full()
+            .px(px(12.0))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.0))
+            .border_b_1()
+            .border_color(theme.border)
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(44.0))
+                    .text_size(px(10.5))
+                    .text_color(theme.text_muted)
+                    .child(entry.method.clone()),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .text_size(px(11.5))
+                    .text_color(theme.text)
+                    .child(entry.url.clone()),
+            )
+            .when(!scheme_label.is_empty(), |el| {
+                el.child(
+                    div()
+                        .flex_none()
+                        .text_size(px(10.5))
+                        .text_color(scheme_color)
+                        .child(scheme_label),
+                )
+            })
+            .child(
+                div()
+                    .flex_none()
+                    .max_w(px(170.0))
+                    .overflow_hidden()
+                    .text_size(px(10.5))
+                    .text_color(status_color)
+                    .child(entry.status_label()),
+            )
     }
 
     fn panel_empty(&self, theme: &crate::theme::Theme, label: &'static str) -> gpui::Div {
@@ -4385,9 +4844,14 @@ fn gpui_render_image(image: RgbaImage) -> Arc<RenderImage> {
     Arc::new(RenderImage::new(vec![Frame::new(image)]))
 }
 
-/// Modèle de recherche par défaut (DuckDuckGo) — `KOMET_SEARCH_URL` et le
+/// Modèle de recherche par défaut (Google) — `KOMET_SEARCH_URL` et le
 /// réglage Settings → Browser le remplacent.
-pub const DEFAULT_SEARCH_URL: &str = "https://duckduckgo.com/?q={q}";
+pub const DEFAULT_SEARCH_URL: &str = "https://www.google.com/search?q={q}";
+
+/// Ancien défaut (DuckDuckGo) : à la lecture des réglages, une valeur
+/// sauvegardée exactement égale à celle-ci est migrée vers le nouveau défaut.
+/// Toute autre valeur (preset choisi ou modèle custom) est conservée.
+pub const LEGACY_DEFAULT_SEARCH_URL: &str = "https://duckduckgo.com/?q={q}";
 
 /// `KOMET_SEARCH_URL` prime sur le réglage (compat scripts/dev), puis le
 /// `BrowserPrefs.search_url` de la surface, sinon le défaut.
@@ -4623,6 +5087,7 @@ fn run_client(
     wake_read: Option<i32>,
     initial_url: String,
     profile_key: String,
+    download_dir: PathBuf,
 ) {
     let mut current_url = initial_url;
     loop {
@@ -4640,6 +5105,7 @@ fn run_client(
                     wake_read,
                     &mut current_url,
                     &page_ws,
+                    &download_dir,
                 )
             }
             Err(error) => Err(error),
@@ -4675,6 +5141,7 @@ fn run_session(
     wake_read: Option<i32>,
     current_url: &mut String,
     page_ws_url: &str,
+    download_dir: &Path,
 ) -> Result<SessionResult, String> {
     let (mut socket, _response) = ws_connect(page_ws_url).map_err(|e| e.to_string())?;
     // id de la cible CDP (pour Target.closeTarget à la fermeture de la surface)
@@ -4690,6 +5157,22 @@ fn run_session(
 
     socket
         .send(Message::Text(cdp::runtime_enable(next_id)))
+        .map_err(|e| e.to_string())?;
+    next_id += 1;
+
+    // Réseau + téléchargements : avant la première navigation, pour ne rien
+    // rater. setDownloadBehavior s'applique au navigateur entier ; le dossier
+    // existe (resolve_download_dir), sinon Chrome refuse le comportement.
+    socket
+        .send(Message::Text(cdp::network_enable(next_id)))
+        .map_err(|e| e.to_string())?;
+    next_id += 1;
+    let download_path = download_dir.to_string_lossy().into_owned();
+    socket
+        .send(Message::Text(cdp::set_download_behavior(
+            next_id,
+            &download_path,
+        )))
         .map_err(|e| e.to_string())?;
     next_id += 1;
 
@@ -4748,6 +5231,9 @@ fn run_session(
     let mut describe_id: Option<u64> = None;
     let mut find_id: Option<u64> = None;
     let mut url_tracker = UrlTracker::default();
+    // Progression de téléchargement : au plus un événement par guid toutes
+    // les 250 ms (les états terminaux passent toujours).
+    let mut download_progress_last: HashMap<String, Instant> = HashMap::new();
 
     // Set non-blocking on the underlying TCP stream so we can multiplex commands and frames
     set_socket_nonblocking(&mut socket, true)?;
@@ -5100,6 +5586,10 @@ fn run_session(
                         .map_err(|e| e.to_string())?;
                     next_id += 1;
                 }
+                BrowserCommand::SetDownloadDir(path) => {
+                    let _ = socket.send(Message::Text(cdp::set_download_behavior(next_id, &path)));
+                    next_id += 1;
+                }
             }
         }
 
@@ -5297,6 +5787,143 @@ fn run_session(
                                         level: "error".into(),
                                         text: desc,
                                     }),
+                                );
+                            }
+                        }
+                        "Browser.downloadWillBegin" => {
+                            if let Some(params) = val.get("params")
+                                && let Some(id) = params.get("guid").and_then(Value::as_str)
+                            {
+                                let filename = params
+                                    .get("suggestedFilename")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("");
+                                let url = params.get("url").and_then(Value::as_str).unwrap_or("");
+                                push_event(
+                                    events,
+                                    wake,
+                                    BrowserEvent::DownloadStart {
+                                        id: id.to_owned(),
+                                        filename: filename.to_owned(),
+                                        url: url.to_owned(),
+                                    },
+                                );
+                            }
+                        }
+                        "Browser.downloadProgress" => {
+                            if let Some(params) = val.get("params")
+                                && let Some(id) = params.get("guid").and_then(Value::as_str)
+                            {
+                                let received = params
+                                    .get("receivedBytes")
+                                    .and_then(Value::as_u64)
+                                    .unwrap_or(0);
+                                let total = params
+                                    .get("totalBytes")
+                                    .and_then(Value::as_i64)
+                                    .filter(|t| *t >= 0)
+                                    .map(|t| t as u64);
+                                let state = params
+                                    .get("state")
+                                    .and_then(Value::as_str)
+                                    .and_then(downloads::DownloadState::from_cdp);
+                                match state {
+                                    Some(downloads::DownloadState::InProgress) => {
+                                        // progression throttlée par guid
+                                        let now = Instant::now();
+                                        let send =
+                                            download_progress_last.get(id).is_none_or(|last| {
+                                                now.duration_since(*last)
+                                                    > Duration::from_millis(250)
+                                            });
+                                        if send {
+                                            download_progress_last.insert(id.to_owned(), now);
+                                            push_event_lossy(
+                                                events,
+                                                wake,
+                                                BrowserEvent::DownloadProgress {
+                                                    id: id.to_owned(),
+                                                    received,
+                                                    total,
+                                                },
+                                            );
+                                        }
+                                    }
+                                    Some(state) => {
+                                        download_progress_last.remove(id);
+                                        let path = params
+                                            .get("filePath")
+                                            .and_then(Value::as_str)
+                                            .map(str::to_owned);
+                                        push_event(
+                                            events,
+                                            wake,
+                                            BrowserEvent::DownloadDone {
+                                                id: id.to_owned(),
+                                                ok: state == downloads::DownloadState::Completed,
+                                                path,
+                                            },
+                                        );
+                                    }
+                                    None => {}
+                                }
+                            }
+                        }
+                        "Network.requestWillBeSent" => {
+                            if let Some(params) = val.get("params")
+                                && let Some(id) = params.get("requestId").and_then(Value::as_str)
+                                && let Some(request) = params.get("request")
+                            {
+                                let url = request.get("url").and_then(Value::as_str).unwrap_or("");
+                                let method =
+                                    request.get("method").and_then(Value::as_str).unwrap_or("");
+                                push_event_lossy(
+                                    events,
+                                    wake,
+                                    BrowserEvent::NetworkStart {
+                                        id: id.to_owned(),
+                                        url: url.to_owned(),
+                                        method: method.to_owned(),
+                                    },
+                                );
+                            }
+                        }
+                        "Network.responseReceived" => {
+                            if let Some(params) = val.get("params")
+                                && let Some(id) = params.get("requestId").and_then(Value::as_str)
+                                && let Some(status) =
+                                    params.pointer("/response/status").and_then(Value::as_u64)
+                            {
+                                push_event_lossy(
+                                    events,
+                                    wake,
+                                    BrowserEvent::NetworkResponded {
+                                        id: id.to_owned(),
+                                        status: status as u16,
+                                    },
+                                );
+                            }
+                        }
+                        "Network.loadingFailed" => {
+                            if let Some(params) = val.get("params")
+                                && let Some(id) = params.get("requestId").and_then(Value::as_str)
+                            {
+                                let error = params
+                                    .get("errorText")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("network error");
+                                let canceled = params
+                                    .get("canceled")
+                                    .and_then(Value::as_bool)
+                                    .unwrap_or(false);
+                                push_event_lossy(
+                                    events,
+                                    wake,
+                                    BrowserEvent::NetworkFailed {
+                                        id: id.to_owned(),
+                                        error: error.to_owned(),
+                                        canceled,
+                                    },
                                 );
                             }
                         }
@@ -5599,7 +6226,7 @@ mod tests {
         );
         assert_eq!(
             normalize_url("komet browser").unwrap(),
-            "https://duckduckgo.com/?q=komet%20browser"
+            "https://www.google.com/search?q=komet%20browser"
         );
         assert_eq!(normalize_url("about:blank").unwrap(), "about:blank");
     }
@@ -5740,7 +6367,7 @@ mod tests {
         }
         assert_eq!(
             normalize_url("komet browser").unwrap(),
-            "https://duckduckgo.com/?q=komet%20browser"
+            "https://www.google.com/search?q=komet%20browser"
         );
     }
 
