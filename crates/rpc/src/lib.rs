@@ -302,6 +302,14 @@ pub mod methods {
     pub const GET_MEMORY_PROJECT_GRAPH: &str = "GetMemoryProjectGraph";
     /// `{projectId, limit?}` — per-agent project activity timeline.
     pub const GET_MEMORY_ACTIVITY: &str = "GetMemoryActivity";
+    /// Browser visible → agent (spec 2026-11-24, IPC-only, jamais relay-forwarded) :
+    /// `{max?}` → `{jobs: [BrowserJob]}` — draine la file de jobs d'outils
+    /// `browser_*` destinés à la surface visible. Seul l'exécuteur UI local
+    /// (l'app qui affiche le Browser) doit appeler.
+    pub const POLL_BROWSER_JOBS: &str = "PollBrowserJobs";
+    /// `{jobId, ok, value}` — résultat d'exécution d'un job browser ; complète
+    /// le handler MCP en attente (voir `engine/src/browser_bridge.rs`).
+    pub const BROWSER_JOB_RESULT: &str = "BrowserJobResult";
 }
 
 #[derive(Debug, thiserror::Error)]

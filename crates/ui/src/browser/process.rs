@@ -577,6 +577,38 @@ fn resolve_page_ws_url(browser_ws: &str, port: u16) -> Result<String, String> {
     Err("Could not resolve page target from browser WebSocket".into())
 }
 
+/// Genre de profil Chromium : humain (clé de panneau, persistant — cookies,
+/// stockage de l'utilisateur) ou agent (sessions d'automatisation). Une
+/// session d'agent ne doit jamais réutiliser le profil humain sans choix
+/// explicite : ses clés vivent dans l'espace de noms `agent:`.
+#[allow(dead_code)] // contrat de la Phase 3 (outils agent) — utilisé par son wiring à venir
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProfileKind {
+    Human,
+    Agent,
+}
+
+/// Clé de profil pour une session d'agent — espace de noms dédié, disjoint
+/// des clés de panneau (`space-canvas:*`, IDs de chat). La Phase 3 (outils
+/// agent) s'appuie dessus : un agent reçoit toujours
+/// `agent_profile_key(session)` et non le profil du panneau visible.
+#[allow(dead_code)] // idem — consommé quand la Phase 3 créera des surfaces agent
+pub fn agent_profile_key(agent_session: &str) -> String {
+    format!("agent:{agent_session}")
+}
+
+/// Classe une clé de profil. Les clés de panneau (chats UUID,
+/// `space-canvas:*`) ne peuvent pas entrer en collision : le préfixe `agent:`
+/// est réservé.
+#[allow(dead_code)]
+pub fn profile_kind(profile_key: &str) -> ProfileKind {
+    if profile_key.starts_with("agent:") {
+        ProfileKind::Agent
+    } else {
+        ProfileKind::Human
+    }
+}
+
 pub fn browser_profile_path(profile_key: &str) -> PathBuf {
     let digest = Sha256::digest(profile_key.as_bytes());
     let name = digest
@@ -637,6 +669,28 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::path::Path;
+
+    #[test]
+    fn agent_profiles_are_namespaced_and_disjoint_from_human_panels() {
+        // les clés humaines connues ne peuvent pas entrer dans l'espace agent
+        for human in ["space-canvas:", "0f0e7d9a-chat"] {
+            assert_eq!(profile_kind(human), ProfileKind::Human);
+        }
+        // l'espace agent est disjoint et reproductible
+        let key = agent_profile_key("run-42");
+        assert_eq!(key, "agent:run-42");
+        assert_eq!(profile_kind(&key), ProfileKind::Agent);
+        // deux sessions d'agent → deux profils isolés (cookies jamais
+        // partagés entre agents ni avec l'humain)
+        assert_ne!(
+            browser_profile_path(&agent_profile_key("a")),
+            browser_profile_path(&agent_profile_key("b"))
+        );
+        assert_ne!(
+            browser_profile_path(&agent_profile_key("a")),
+            browser_profile_path("space-canvas:demo")
+        );
+    }
 
     #[test]
     fn pool_refcount_kills_only_on_last_release() {

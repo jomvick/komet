@@ -218,9 +218,14 @@ impl Shell {
             let profile_key = key.clone();
             let data_dir = self.state.read(cx).data_dir.clone();
             let prefs = self.settings.browser.clone();
-            // Page d'accueil (Settings → Browser) : vide = état « Open
-            // Address… » ; sinon la première surface charge directement.
-            let initial_url = prefs.home_url.clone().unwrap_or_default();
+            // URL initiale : page d'accueil (Settings → Browser) si choisie,
+            // sinon la dernière page visitée (persistance d'onglets), sinon
+            // l'état « Open Address… ».
+            let initial_url = prefs
+                .home_url
+                .clone()
+                .or_else(|| self.settings.browser_urls.first().cloned())
+                .unwrap_or_default();
             let browser = cx.new(|cx| {
                 crate::browser::BrowserSurface::new(initial_url, profile_key, data_dir, prefs, cx)
             });
@@ -252,6 +257,16 @@ impl Shell {
                             // surfaces) sans toucher aux surfaces ouvertes.
                             BrowserSurfaceEvent::EmulationChanged(slug) => {
                                 this.settings.browser.emulation_preset = slug.clone();
+                                this.schedule_save(cx);
+                            }
+                            // Persistance d'onglets : URL mémorisée (les plus
+                            // récentes d'abord) — à la réouverture du panneau,
+                            // la dernière page revient si pas de page d'accueil.
+                            BrowserSurfaceEvent::UrlChanged(url) => {
+                                crate::settings::remember_browser_url(
+                                    &mut this.settings.browser_urls,
+                                    url,
+                                );
                                 this.schedule_save(cx);
                             }
                             // « Clear Storage » avec History coché : le

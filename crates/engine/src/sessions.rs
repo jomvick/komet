@@ -457,6 +457,9 @@ struct Inner {
     /// through this back-edge for the `terminal_list` / `terminal_read` tools
     /// (the agent gate itself lives in `crate::terminals`).
     terminals: OnceLock<Terminals>,
+    /// Set-once: the agent→visible-Browser job bridge (MCP `browser_*` tools
+    /// wait on it; the UI executor drains it over IPC).
+    browser_bridge: OnceLock<Arc<crate::browser_bridge::BrowserBridge>>,
     /// Set-once (first wins), cleared on runtime retirement: sessions and
     /// doc-host reference each other through Arcs, so this back-edge must be
     /// severable for a replaced engine graph to drop.
@@ -537,6 +540,7 @@ impl SessionsEngine {
                 mcp_secrets,
                 agent_accounts: OnceLock::new(),
                 terminals: OnceLock::new(),
+                browser_bridge: OnceLock::new(),
                 doc_host: Mutex::new(None),
                 runs: Mutex::new(HashMap::new()),
                 hubs: Mutex::new(HashMap::new()),
@@ -614,6 +618,20 @@ impl SessionsEngine {
     /// The device's terminals, when wired (`None` in bare test runtimes).
     pub fn terminals(&self) -> Option<Terminals> {
         self.inner.terminals.get().cloned()
+    }
+
+    /// Wire the browser bridge so the internal MCP catalog can answer the
+    /// `browser_*` tools and the RPC surface can serve the UI executor
+    /// (once per engine graph).
+    pub fn set_browser_bridge(&self, bridge: Arc<crate::browser_bridge::BrowserBridge>) {
+        if self.inner.browser_bridge.set(bridge).is_err() {
+            tracing::warn!("browser bridge was already wired to sessions");
+        }
+    }
+
+    /// The browser bridge, when wired (`None` in bare test runtimes).
+    pub fn browser_bridge(&self) -> Option<Arc<crate::browser_bridge::BrowserBridge>> {
+        self.inner.browser_bridge.get().cloned()
     }
 
     /// Test-only constructor with ephemeral MCP stores.

@@ -106,4 +106,16 @@ impl McpHost for EngineMcpHost {
         }
         .map_err(|error| error.to_string())
     }
+
+    async fn browser_tool(
+        &self,
+        tool: &str,
+        args: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let bridge = self
+            .sessions
+            .browser_bridge()
+            .ok_or_else(|| "No visible Browser surface is wired to this engine".to_string())?;
+        bridge.call(tool, args).await
+    }
 }

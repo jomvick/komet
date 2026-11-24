@@ -123,6 +123,7 @@ pub use sidebar::*;
 mod content;
 pub use content::*;
 
+mod browser_agent;
 mod right_pane;
 
 mod terminal;
@@ -628,6 +629,10 @@ impl Shell {
                 }
             }
         });
+        // Pont agent → Browser visible (spec 2026-11-24) : un seul poller
+        // par shell, actif seulement pendant qu'une surface Browser est
+        // ouverte.
+        browser_agent::start_bridge(cx);
         let data_dir = boot.data_dir.clone();
         let settings = UiSettings::load(&data_dir);
         // Bind the customizable shortcuts from the persisted keymap.

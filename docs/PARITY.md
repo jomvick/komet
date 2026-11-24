@@ -53,7 +53,7 @@ not built yet).
 | 3.3 Session-docs host | done | docs.sqlite snapshots + processed-command ledger, mark-BEFORE-execute, room join per open chat, diff sidecar publish, cold-chat delivery both directions (nudge POST on queue for remote-hosted chats + warm-open on nudge receipt). Gap (minor): no boot-time warm-open of recent chats (14d/30) — cold chats rely on nudges. |
 | 3.4 Terminals | done | PTYs, 1MB bounded replay + `afterSeq` resume, 32 max, exited 30-min TTL, live shells survive detach. Text mirror via `komet-term` on every terminal; agents can list/read any Komet terminal through the MCP `terminal_list`/`terminal_read` tools but cannot write, open, close or run commands (`engine/src/terminals.rs`, `engine/src/mcp/`, rules in `docs/security.md`). |
 | 3.5 Repos/diffs | done | list/add/clone/create, branches, worktrees, checkout identity; CheckoutDiffSync (fs watchers + repair pass, name-status+numstat+patch incl. untracked, 3MiB cap, sha256, sidecar publish); chat.branch upkeep from HEAD watch; folder listing with timeout. |
-| 3.6 Browser tools for agents | deferred | The Browser is a UI surface only (`crates/ui/src/browser*`); no engine/MCP tool reaches it today, so an agent cannot drive the tab the user sees. `chrome-devtools-mcp` with `--headless --isolated` (spec 2026-10-12) remains an optional separate path, not this surface. Phase 3 of the browser plan: typed engine/MCP tools (navigate/snapshot/click/fill/key/wait/screenshot/console, then network + annotations) scoped to the calling session and the active surface, with an agent-only profile rather than the user's persistent one. |
+| 3.6 Browser tools for agents | done (v1) | Typed MCP tools drive the **visible** Browser surface (spec `2026-11-24-browser-agent-tools-design.md`): `browser_navigate/snapshot/click/fill/press_key/wait/screenshot/console` on the internal `komet` server, routed through a job bridge in the engine (`browser_bridge.rs`, awaited with a 30 s timeout) to the UI executor (`shell/browser_agent.rs`, polls `PollBrowserJobs` only while a surface is open, posts `BrowserJobResult`). Snapshot uids are valid for one generation (`elements_seq`); clicks use real CDP mouse events at the element box; `fill` runs a JSON-escaped focus+value+events script. Writes are gated by the existing MCP policy (`Decision::Ask`); no surface → explicit error, never a spawned browser; `PollBrowserJobs`/`BrowserJobResult` are IPC-only `LOCAL_ONLY` and never relay-forwarded; the `agent:` profile namespace (`process::agent_profile_key`) is reserved for agent-only sessions. Deferred (Phase 4): page annotations, request/response bodies over the tools. |
 | 3.7 Sync / uploads / agent accounts / device-room | done | Shared bearer + self-hosted sync; chunked uploads; claude/codex credential swap with usage probes and OAuth flows; host relay (virtual sockets over `{s,k,to,from}` frames) + peer link cache. |
 
 ## §4 Harness
@@ -120,17 +120,15 @@ filesystem blobs, bearer auth; `docs/self-hosted-sync.md`).
 - **E2EE** — transport is TLS + sync bearer tokens; end-to-end encryption of doc
   contents not designed.
 - **macOS packaging execution** — config + steps in `dist/` only (needs a Mac).
-- **Browser: agent control, request/response bodies, tab restore, annotations** — the visible
-  Browser is human-driven; agent tools, a bodies view and tab persistence are planned
-  (rows 1.17/3.6).
+- **Browser: annotations, request/response bodies** — agent tools drive the visible
+  surface (3.6); visual annotations and network bodies over the tools remain (Phase 4).
 - **Engine hardening**: parent-PID watchdog, idle reaper / stall watchdog, boot warm-open of recent chats.
   (Single-instance data-dir lock and crash shield are done — see 3.1; per-turn
   stall watchdog is deliberately not ported — see 3.2.)
 
 ## Summary
 
-Table rows above: **60 done · 4 partial**, 1 removed, 1 deferred (browser tools
-for agents), plus the cross-cutting deferrals (mobile, E2EE, macOS packaging
-execution, browser agent control/downloads/network, engine hardening) — the last
+Table rows above: **61 done · 4 partial**, 1 removed, plus the cross-cutting deferrals (mobile,
+E2EE, macOS packaging execution, browser annotations/network bodies, engine hardening) — the last
 overlaps the named gaps in the partial rows. The "done" bucket includes the
 qualified variants ("done (human surface)", "done, one intentional deferral", …).

@@ -135,9 +135,9 @@ Au lieu d'un protocole WebSocket ad-hoc propriétaire (`ego.*`), Komet s'aligne 
 4. **Jalon 4 (Capture & Overlay, Console)** — *livré pour la capture, l'overlay d'éléments, la
    console/REPL, les téléchargements et l'onglet Network (erreurs + liste des requêtes).*
    **Reste :** vue des corps requête/réponse.
-5. **Jalon 5 (Bridge Agent CLI)** — *non commencé.* La surface n'est pas pilotable par un agent ;
-   les outils prévus (`browser_navigate/snapshot/click/fill/screenshot`) doivent vivre dans le
-   moteur/MCP, pas dans les structures UI.
+5. **Jalon 5 (Bridge Agent CLI)** — *livré (v1).* Outils MCP sur la surface visible via le pont
+   moteur (spec `2026-11-24-browser-agent-tools-design.md`, rows 3.6 de `docs/PARITY.md`) ;
+   l'utilisateur voit chaque action et reprend la main en fermant/reprenant la surface.
 
 ## 7. Écarts restants au 2026-11-24
 
@@ -153,11 +153,16 @@ Le plan de travail consolidé (phases 0–4) est repris dans `docs/PARITY.md` :
 - **Inspection réseau (erreurs + liste requêtes)** — *livré.* `Network.enable` → onglet Network
   (méthode, URL, statut/erreur, annulations ≠ erreurs, `ERR_CERT_*` signalé, hôte local / http /
   https distingués, plafond 300 entrées, Clear). Reste : voir les corps requête/réponse.
-- **Onglets et profils** — persistance des onglets au redémarrage ; et séparation explicite entre
-  profil humain (persistant par panneau) et profil réservé aux sessions agent (aucun partage
-  implicite des cookies personnels).
-- **Outils agent** — surface typée dans le moteur/MCP, identifiants d'éléments valides pour un
-  seul snapshot, résultats d'action explicites, confirmation avant action sensible, CDP jamais
-  exposé hors de l'interface locale.
+- **Onglets et profils** — *livré.* Les URLs des surfaces Browser sont mémorisées
+  (`UiSettings.browserUrls`, les plus récentes d'abord, 10 max via
+  `BrowserSurfaceEvent::UrlChanged`) : à la réouverture du panneau sans page d'accueil, la
+  dernière page est restaurée. L'espace de noms `agent:` (`process::agent_profile_key`, testé)
+  réserve les profils aux sessions d'agent, sans cookies de l'utilisateur.
+- **Outils agent** — *livré (v1).* Outils MCP typés vers la surface visible via le pont moteur
+  (`browser_bridge.rs`) et l'exécuteur UI (`shell/browser_agent.rs`) : navigate/snapshot/
+  click/fill/press_key/wait/screenshot/console ; uids valides pour un seul snapshot ; erreurs
+  explicites sans surface ouverte ; écritures passées par la politique d'approbation MCP ;
+  `PollBrowserJobs`/`BrowserJobResult` IPC-only et jamais relay-forwarded. Voir la spec du
+  2026-11-24.
 - **Annotations** — l'utilisateur annote un élément dans la page, l'agent reçoit l'annotation
-  avec capture et contexte DOM.
+  avec capture et contexte DOM (Phase 4, non commencé).

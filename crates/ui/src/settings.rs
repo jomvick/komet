@@ -217,6 +217,11 @@ pub struct UiSettings {
     /// the explicit "Show onboarding" replay.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub onboarding_completed: Option<bool>,
+    /// URLs récentes des surfaces Browser (les plus récentes d'abord, 10
+    /// max) : à la réouverture du panneau sans page d'accueil configurée,
+    /// la dernière page visitée est restaurée.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub browser_urls: Vec<String>,
     /// Set by [`UiSettings::load`] when the file parsed but carried no
     /// `onboardingCompleted` key. Never persisted, never serialized: only the
     /// debug-build replay reads it so `cargo run` shows the tour on a
@@ -281,6 +286,18 @@ impl BrowserPrefs {
     }
 }
 
+/// Mémorise une URL de surface Browser : les plus récentes d'abord, sans
+/// doublon, 10 max (plafond volontaire — ce n'est pas un historique).
+pub fn remember_browser_url(urls: &mut Vec<String>, url: &str) {
+    let url = url.trim();
+    if url.is_empty() || url.starts_with("about:") {
+        return;
+    }
+    urls.retain(|u| u != url);
+    urls.insert(0, url.to_owned());
+    urls.truncate(10);
+}
+
 fn default_usage_agents() -> Vec<String> {
     vec!["claude-code".into(), "codex".into()]
 }
@@ -321,6 +338,7 @@ impl Default for UiSettings {
             files_show_all: false,
             usage_agents: default_usage_agents(),
             browser: BrowserPrefs::default(),
+            browser_urls: Vec::new(),
             onboarding_completed: None,
             onboarding_key_absent: false,
         }
@@ -700,6 +718,7 @@ mod tests {
                 download_dir: Some("/tmp/dl".into()),
                 emulation_preset: Some("iphone-se".into()),
             },
+            browser_urls: vec!["https://example.com".into()],
             onboarding_completed: Some(true),
             onboarding_key_absent: false,
         };
@@ -726,6 +745,25 @@ mod tests {
         let loaded = UiSettings::load(dir.path());
         assert_eq!(loaded.wallpaper_path, None);
         assert_eq!(loaded.sidebar_width, 300.0);
+    }
+
+    #[test]
+    fn browser_urls_keep_most_recent_first_without_duplicates() {
+        let mut urls = Vec::new();
+        remember_browser_url(&mut urls, "https://a.example");
+        remember_browser_url(&mut urls, "https://b.example");
+        remember_browser_url(&mut urls, "https://a.example");
+        assert_eq!(urls, vec!["https://a.example", "https://b.example"]);
+        // pages internes et vides jamais mémorisées
+        remember_browser_url(&mut urls, "about:blank");
+        remember_browser_url(&mut urls, "   ");
+        assert_eq!(urls.len(), 2);
+        // plafond 10
+        for i in 0..15 {
+            remember_browser_url(&mut urls, &format!("https://h{i}.example"));
+        }
+        assert_eq!(urls.len(), 10);
+        assert_eq!(urls[0], "https://h14.example");
     }
 
     #[test]

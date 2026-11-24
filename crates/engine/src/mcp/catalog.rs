@@ -169,6 +169,17 @@ pub trait McpHost: Send + Sync {
         terminal_id: &str,
         angle: &TerminalAngle,
     ) -> Result<TerminalRead, String>;
+    /// Run one `browser_*` tool through the visible-Browser bridge
+    /// (spec 2026-11-24). `Err(message)` reaches the agent verbatim —
+    /// explicit unavailability, never a silent no-op.
+    async fn browser_tool(
+        &self,
+        tool: &str,
+        args: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let _ = (tool, args);
+        Err("browser tools are not wired on this engine".into())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -256,6 +267,79 @@ impl McpCatalog {
                         "sinceSeq": {"type": "number"},
                     },
                     "required": ["terminalId", "angle"],
+                    "additionalProperties": false,
+                }),
+                readonly: true,
+                composio_slug: None,
+            },
+            ToolDef {
+                name: "browser_navigate".into(),
+                title: "Browser: navigate".into(),
+                description: "Navigate the visible Komet Browser (the tab the user sees) to a URL. Requires an open Browser surface; the user watches every action and can take over at any time.".into(),
+                input_schema: obj_schema(&[("url", "string")], &["url"]),
+                readonly: false,
+                composio_slug: None,
+            },
+            ToolDef {
+                name: "browser_snapshot".into(),
+                title: "Browser: snapshot".into(),
+                description: "Extract the visible Browser page's interactive elements (uid, role, text, tag, selector, viewport box). UIDs are valid for THIS snapshot only — after navigation or a significant DOM change, take a new snapshot.".into(),
+                input_schema: obj_schema(&[], &[]),
+                readonly: true,
+                composio_slug: None,
+            },
+            ToolDef {
+                name: "browser_click".into(),
+                title: "Browser: click".into(),
+                description: "Click an element by its snapshot uid (center of its box, real mouse events). Refuses with a stale-snapshot error if the page changed — take a new snapshot.".into(),
+                input_schema: obj_schema(&[("uid", "number")], &["uid"]),
+                readonly: false,
+                composio_slug: None,
+            },
+            ToolDef {
+                name: "browser_fill".into(),
+                title: "Browser: fill".into(),
+                description: "Set an input's value by its snapshot uid (focus + value + input/change events). Does not submit; submitting is your responsibility (and a human-approval gate applies).".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {"uid": {"type": "number"}, "text": {"type": "string"}},
+                    "required": ["uid", "text"],
+                    "additionalProperties": false,
+                }),
+                readonly: false,
+                composio_slug: None,
+            },
+            ToolDef {
+                name: "browser_press_key".into(),
+                title: "Browser: press key".into(),
+                description: "Press one key in the visible Browser page (e.g. \"Enter\", \"Escape\"). Note: Enter can submit forms — treat as a sensitive action.".into(),
+                input_schema: obj_schema(&[("key", "string")], &["key"]),
+                readonly: false,
+                composio_slug: None,
+            },
+            ToolDef {
+                name: "browser_wait".into(),
+                title: "Browser: wait".into(),
+                description: "Wait up to 10000 ms for the page to settle (navigation, render). Use after navigate or before a snapshot.".into(),
+                input_schema: obj_schema(&[("ms", "number")], &["ms"]),
+                readonly: true,
+                composio_slug: None,
+            },
+            ToolDef {
+                name: "browser_screenshot".into(),
+                title: "Browser: screenshot".into(),
+                description: "Capture the visible Browser viewport to a PNG file in the downloads folder and return its path. Pixels stay on this machine.".into(),
+                input_schema: obj_schema(&[], &[]),
+                readonly: false,
+                composio_slug: None,
+            },
+            ToolDef {
+                name: "browser_console".into(),
+                title: "Browser: console".into(),
+                description: "Read the visible Browser's console journal (logs, warnings, errors, network failures, JS exceptions). Optional `level` filter (error/warning/log).".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {"level": {"type": "string", "enum": ["error", "warning", "log"]}},
                     "additionalProperties": false,
                 }),
                 readonly: true,
@@ -351,6 +435,14 @@ impl McpCatalog {
             .tools
             .get(name)
             .ok_or_else(|| CatalogError::Unknown(name.into()))?;
+        // Outils browser : un seul chemin — le pont vers la surface visible.
+        if tool.name.starts_with("browser_") {
+            return self
+                .host
+                .browser_tool(name, input)
+                .await
+                .map_err(CatalogError::ExecutionFailed);
+        }
         match tool.name.as_str() {
             "memory.search" | "memory.recent" | "memory.related" | "memory.why" | "memory.note"
             | "memory.claim" | "memory.claims" => {
@@ -1010,6 +1102,16 @@ mod tests {
                 "list_spaces".to_string(),
                 "terminal_list".to_string(),
                 "terminal_read".to_string(),
+                // Browser visible (spec 2026-11-24) — écritures demandées par
+                // la politique MCP, erreurs explicites sans surface ouverte.
+                "browser_navigate".to_string(),
+                "browser_snapshot".to_string(),
+                "browser_click".to_string(),
+                "browser_fill".to_string(),
+                "browser_press_key".to_string(),
+                "browser_wait".to_string(),
+                "browser_screenshot".to_string(),
+                "browser_console".to_string(),
             ]
         );
         let v = catalog
@@ -1028,12 +1130,18 @@ mod tests {
         );
     }
 
-    /// Agents read terminals but never write: every tool is read-only and no
-    /// tool can open, close, type into or run anything in a terminal.
+    /// Agents read terminals but never write: every terminal tool is read-only
+    /// and no tool can open, close, type into or run anything in a terminal.
+    /// (Browser tools are deliberate writes to the visible surface — gated by
+    /// the MCP policy — and are not part of this guard.)
     #[tokio::test]
     async fn catalog_has_no_terminal_write_tools() {
         let catalog = McpCatalog::komet_default(Arc::new(FakeHost));
-        for tool in catalog.list() {
+        for tool in catalog
+            .list()
+            .into_iter()
+            .filter(|t| t.name.starts_with("terminal_"))
+        {
             assert!(tool.readonly, "{} must be read-only", tool.name);
             for forbidden in ["open", "close", "send", "input", "run", "set", "grant"] {
                 assert!(
@@ -1054,6 +1162,28 @@ mod tests {
             .execute("terminal_run", serde_json::json!({"command": "ls"}))
             .await;
         assert!(err.is_err(), "terminal_run must not exist");
+    }
+
+    /// Browser tools route through the bridge; without an executor they fail
+    /// explicitly (never a silent success, never a spawned browser).
+    #[tokio::test]
+    async fn browser_tools_fail_explicitly_without_a_surface() {
+        let catalog = McpCatalog::komet_default(Arc::new(FakeHost));
+        for tool in [
+            "browser_navigate",
+            "browser_snapshot",
+            "browser_click",
+            "browser_console",
+        ] {
+            let err = catalog
+                .execute(tool, serde_json::json!({}))
+                .await
+                .expect_err("no visible surface — must fail explicitly");
+            assert!(
+                err.to_string().contains("browser"),
+                "{tool} error must say why: {err}"
+            );
+        }
     }
 
     #[tokio::test]

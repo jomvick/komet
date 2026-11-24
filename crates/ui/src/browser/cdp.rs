@@ -285,6 +285,20 @@ pub fn set_auto_attach(id: u64) -> String {
     )
 }
 
+/// Script `fill` agent : focus + value + événements input/change sur le
+/// sélecteur du snapshot. Chaînes sérialisées JSON (sélecteur/texte non
+/// fiables — jamais interpolés dans du code JS).
+pub fn fill_element_script(selector: &str, text: &str) -> String {
+    let selector = serde_json::to_string(selector).unwrap_or_else(|_| "\"\"".into());
+    let text = serde_json::to_string(text).unwrap_or_else(|_| "\"\"".into());
+    format!(
+        "(() => {{ const el = document.querySelector({selector}); if (!el) return false; \
+         el.focus(); el.value = {text}; \
+         el.dispatchEvent(new Event('input', {{ bubbles: true }})); \
+         el.dispatchEvent(new Event('change', {{ bubbles: true }})); return true; }})()"
+    )
+}
+
 pub fn evaluate(id: u64, expression: &str) -> String {
     make_request(
         id,

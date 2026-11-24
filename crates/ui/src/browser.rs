@@ -226,6 +226,9 @@ pub enum BrowserSurfaceEvent {
     /// Le preset d'émulation a changé dans la barre device — le shell le
     /// persiste dans `BrowserPrefs.emulation_preset` (`None` = off).
     EmulationChanged(Option<String>),
+    /// La surface a navigué vers une vraie page (non `about:`) : le shell
+    /// mémorise l'URL pour restaurer l'onglet à la réouverture du panneau.
+    UrlChanged(String),
     /// « Clear Storage » confirmé avec « History » coché : le journal est
     /// partagé entre surfaces (même data_dir), le shell purge la mémoire
     /// de TOUTES les surfaces — les favoris survivent.
@@ -313,6 +316,13 @@ pub struct BrowserSurface {
     can_forward: bool,
     error: Option<String>,
     elements: Vec<OverlayElement>,
+    /// Génération des éléments : +1 à chaque extraction — les uids agent ne
+    /// sont valides que pour la génération du snapshot qui les a donnés.
+    elements_seq: u64,
+    /// Génération des captures : +1 à chaque `BrowserEvent::Screenshot`.
+    screenshot_seq: u64,
+    /// Chemin de la dernière capture enregistrée (agent + bouton manuel).
+    last_screenshot_path: Option<PathBuf>,
     show_overlay: bool,
     /// Mode « Add element » : le clic ne part plus dans la page, le survol
     /// affiche contour + pastille, Échap quitte (touche N = badges numérotés).
@@ -582,6 +592,9 @@ impl BrowserSurface {
             can_forward: false,
             error: None,
             elements: Vec::new(),
+            elements_seq: 0,
+            screenshot_seq: 0,
+            last_screenshot_path: None,
             show_overlay: false,
             select_mode: false,
             select_hover: None,
@@ -1107,9 +1120,152 @@ impl BrowserSurface {
         history.record(&self.url.clone(), &self.title.clone(), now);
     }
 
-    /// Panneau History/Favorites : même onglet → fermeture, autre → switch.
-    /// Vrai si le panneau est ouvert sur l'onglet donné (réseau : re-rendu
-    /// conditionnel à l'arrivée des événements).
+    // ---- Pont agent (Phase 3, spec 2026-11-24) --------------------------
+    // L'exécuteur UI (shell/browser_agent.rs) appelle ces méthodes pour
+    // servir les outils MCP `browser_*` sur CETTE surface visible.
+
+    pub(crate) fn agent_elements_seq(&self) -> u64 {
+        self.elements_seq
+    }
+
+    pub(crate) fn agent_elements(&self) -> Vec<OverlayElement> {
+        self.elements.clone()
+    }
+
+    pub(crate) fn agent_request_elements(&mut self, _cx: &mut Context<Self>) {
+        if self.has_page() {
+            self.commands.send(BrowserCommand::ToggleOverlay);
+        }
+    }
+
+    pub(crate) fn agent_request_screenshot(&mut self, _cx: &mut Context<Self>) {
+        if self.has_page() {
+            self.commands.send(BrowserCommand::CaptureScreenshot);
+        }
+    }
+
+    pub(crate) fn agent_screenshot_seq(&self) -> u64 {
+        self.screenshot_seq
+    }
+
+    pub(crate) fn agent_screenshot_path(&self) -> Option<PathBuf> {
+        self.last_screenshot_path.clone()
+    }
+
+    pub(crate) fn agent_url(&self) -> String {
+        self.url.clone()
+    }
+
+    pub(crate) fn agent_title(&self) -> String {
+        self.title.clone()
+    }
+
+    pub(crate) fn agent_has_page(&self) -> bool {
+        self.has_page()
+    }
+
+    /// Navigation agent : même normalisation que la barre d'adresse
+    /// (localhost en http, ports conservés, recherche si terme nu).
+    pub(crate) fn agent_navigate(
+        &mut self,
+        url: &str,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let target = normalize_url(url)?;
+        self.navigate_to(target, cx);
+        Ok(())
+    }
+
+    /// Élément par uid de la génération courante ; `Err` = snapshot périmé
+    /// ou absent — l'agent doit reprendre un snapshot.
+    pub(crate) fn agent_element(&self, uid: u32) -> Result<OverlayElement, String> {
+        self.elements
+            .iter()
+            .find(|el| el.uid == uid)
+            .cloned()
+            .ok_or_else(|| {
+                if self.elements.is_empty() {
+                    "no snapshot — call browser_snapshot first".to_string()
+                } else {
+                    format!("stale snapshot: uid {uid} is gone — call browser_snapshot again")
+                }
+            })
+    }
+
+    pub(crate) fn agent_click(&mut self, uid: u32, _cx: &mut Context<Self>) -> Result<(), String> {
+        let el = self.agent_element(uid)?;
+        let (x, y) = (el.x + el.width / 2.0, el.y + el.height / 2.0);
+        self.commands.send(BrowserCommand::MousePress {
+            x,
+            y,
+            button: "left",
+            count: 1,
+        });
+        self.commands.send(BrowserCommand::MouseRelease {
+            x,
+            y,
+            button: "left",
+            count: 1,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn agent_fill(
+        &mut self,
+        uid: u32,
+        text: &str,
+        _cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let el = self.agent_element(uid)?;
+        self.commands
+            .send(BrowserCommand::Evaluate(cdp::fill_element_script(
+                &el.selector,
+                text,
+            )));
+        Ok(())
+    }
+
+    /// Touche clavier par nom CDP ("Enter", "Escape", "Tab"…) — les mêmes
+    /// que la carte du clavier humain, en minuscules.
+    pub(crate) fn agent_press_key(
+        &mut self,
+        key: &str,
+        _cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let (key, code, vk) = gpui_key_to_cdp(&key.to_ascii_lowercase()).ok_or_else(|| {
+            format!(
+                "unsupported key {key:?} — use Enter, Escape, Tab, Backspace, Delete, ArrowLeft/Right/Up/Down, Home or End"
+            )
+        })?;
+        self.commands.send(BrowserCommand::KeyPress {
+            key,
+            code,
+            vk: Some(vk),
+            modifiers: cdp::cdp_modifiers(false, false, false, false),
+        });
+        self.commands.send(BrowserCommand::KeyRelease {
+            key,
+            code,
+            modifiers: cdp::cdp_modifiers(false, false, false, false),
+        });
+        Ok(())
+    }
+
+    /// Journal console filtré (dernier 100, le plus récent en dernier).
+    pub(crate) fn agent_console(&self, level: Option<&str>) -> Vec<(String, String)> {
+        let wanted = |entry_level: &str| match level {
+            Some("error") => entry_level == "error",
+            Some("warning") => matches!(entry_level, "warning" | "warn"),
+            Some("log") => !matches!(entry_level, "error" | "warning" | "warn"),
+            _ => true,
+        };
+        self.console_logs
+            .iter()
+            .filter(|entry| wanted(&entry.level))
+            .map(|entry| (entry.level.clone(), entry.text.clone()))
+            .collect()
+    }
+
     fn panel_visible_with(&self, tab: PanelTab) -> bool {
         self.panel.as_ref().is_some_and(|panel| panel.tab == tab)
     }
@@ -1540,6 +1696,11 @@ impl BrowserSurface {
                     if url_changed && self.find_open && !self.find_query.is_empty() {
                         self.run_find(0, cx);
                     }
+                    // Vraie page (pas `about:`, pas vide) → le shell mémorise
+                    // l'URL pour la persistance d'onglets.
+                    if url_changed && is_web_url(&self.url) {
+                        cx.emit(BrowserSurfaceEvent::UrlChanged(self.url.clone()));
+                    }
                     if self.address.read(cx).text() == previous_url {
                         let address = self.url.clone();
                         self.address
@@ -1584,6 +1745,7 @@ impl BrowserSurface {
                 }
                 Ok(BrowserEvent::Elements(elements)) => {
                     self.elements = elements;
+                    self.elements_seq += 1;
                     changed = true;
                 }
                 Ok(BrowserEvent::Console(log)) => {
@@ -1627,6 +1789,7 @@ impl BrowserSurface {
                         .unwrap_or_else(|| PathBuf::from("."));
                     let path = dir.join(&file_name);
                     if let Ok(()) = std::fs::write(&path, &bytes) {
+                        self.last_screenshot_path = Some(path.clone());
                         self.flash_status(format!("Saved: {}", path.display()), cx);
                     } else {
                         self.flash_status(
@@ -1634,6 +1797,7 @@ impl BrowserSurface {
                             cx,
                         );
                     }
+                    self.screenshot_seq += 1;
                     changed = true;
                 }
                 Ok(BrowserEvent::DownloadStart { id, filename, url }) => {
