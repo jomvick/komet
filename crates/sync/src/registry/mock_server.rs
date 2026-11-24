@@ -1,5 +1,5 @@
 //! In-process registry server speaking the same JSON WS protocol as
-//! `edge/src/registry-room.ts`, built on the SAME merge fn the client uses
+//! `shared protocol behavior`, built on the SAME merge fn the client uses
 //! (`komet_doc::apply_op`). Test infrastructure only (`mock-server` feature):
 //! komet-sync's client tests and komet-engine's two-engine integration tests
 //! run against this; TS↔Rust interop is proven separately against a real DO

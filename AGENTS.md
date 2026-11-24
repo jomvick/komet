@@ -43,7 +43,7 @@ the crate table in `ARCHITECTURE.md` §3 is authoritative.
 ## Known traps
 
 - `scripts/e2e-smoke.sh` runs the two-device smoke against the local self-hosted
-  `komet-sync-server` (no `edge/` worker: `edge/` was removed in commit `26dfda1`). It builds
+  `komet-sync-server`. It builds
   `komet`, `komet-sync-server` and the `komet-rpc` `e2e_driver` example, so expect a warm target;
   prebuilt binaries can be supplied with `KOMET_E2E_KOMET_BIN` / `KOMET_E2E_DRIVER_BIN` /
   `KOMET_E2E_SYNC_BIN`. For an offline UI demo without sync, use `scripts/dev-demo.sh`.

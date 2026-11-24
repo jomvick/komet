@@ -15,12 +15,12 @@ use crate::constants::{COMPACTION_SUMMARY_MAX_BYTES, CompactionSummaryPolicy, MS
 /// Char cap for the tool-output SUMMARY persisted into the doc: first
 /// non-empty line, nothing more. The per-part 4KB cap (c951c3e) bounded each
 /// part but not the session — chat 1b65e93d measured 917KB (85%) of a 1MB doc
-/// in capped outputs across 426 tool parts (docs/chat2-sync.md). Full outputs
-/// live in the R2 sidecar behind `output_ref`; t3code ships an 84-char
+/// in capped outputs across 426 tool parts (docs/sync.md). Full outputs
+/// live in the optional output sidecar behind `output_ref`; t3code ships an 84-char
 /// summary, so 160 is generous.
 pub const TOOL_OUTPUT_SUMMARY_MAX: usize = 160;
 
-/// The doc-resident form of a tool output (docs/chat2-sync.md A1; the R2
+/// The doc-resident form of a tool output (session document schema; the R2
 /// sidecar is PARKED as of 2026-08-10, so this IS the whole record in the
 /// doc — the full text survives only in the host's local run journal):
 ///
@@ -514,8 +514,8 @@ pub fn fold_event_into_parts_with(
                     *resolved = true;
                     // Tool OUTPUTS never enter the doc (2026-08-10 product
                     // call: chips are one-liners — name + call info — like
-                    // pre-output builds; the R2 sidecar is parked with them,
-                    // docs/chat2-sync.md A2). Full text lives only in the
+                    // pre-output builds; the optional output sidecar is parked with them,
+                    // full-output retention policy). Full text lives only in the
                     // host's run journal. Inline diffs die the same way:
                     // stats only, never text. `is_error` still folds so
                     // failed chips read as failed.
@@ -1347,7 +1347,7 @@ mod tests {
         assert_eq!(continuation_id("m1", 1), "m1#c1");
     }
 
-    // ── A1 strip (docs/chat2-sync.md) ───────────────────────────────────────
+    // ── A1 strip (docs/sync.md) ───────────────────────────────────────
 
     #[test]
     fn summarize_inlines_small_outputs_and_marks_big_cuts() {

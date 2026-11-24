@@ -16,7 +16,7 @@ use komet_proto::{
 use komet_rpc::{LinkCache, LinkCacheConfig, StaticToken};
 use tokio::sync::watch;
 
-use crate::doc_host::EdgeConfig;
+use crate::doc_host::SyncConfig;
 use crate::environments::{AddOutcome, EnvStoreError, EnvironmentStore, LOCAL_ENV_ID};
 use crate::workspace_runtime::WorkspaceRuntime;
 
@@ -358,7 +358,7 @@ impl EnvHosts {
             .namespace
             .clone()
             .ok_or_else(|| EnvAddError::Runtime("environment has no namespace".into()))?;
-        let edge = EdgeConfig::with_static_token(env.url.clone(), env.token.clone())
+        let edge = SyncConfig::with_static_token(env.url.clone(), env.token.clone())
             .with_device(self.device_id.clone());
         let runtime = WorkspaceRuntime::open(
             &self.data_dir.join("environments").join(&env.id),

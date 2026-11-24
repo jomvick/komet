@@ -3,8 +3,8 @@
 > Fork of [zeronsh/comet](https://github.com/zeronsh/comet) — MIT, Copyright Wing. See `LICENSE` and `THIRD_PARTY_NOTICES.md`.
 
 A native controller for coding agents (Claude Code, Codex, Cursor, Grok, Hermes, OpenCode, Pi, Cline, Devin, GitHub Copilot, Muse Code, Qoder) —
-Rust engine + gpui UI, single binary. **100% local by default**: no account, no login
-screen, no network calls. Multi-device sync is built (Loro CRDT docs through the self-hosted
+Rust engine + gpui UI, single binary. **100% local by default**: no sync configuration
+or network calls are required. Multi-device sync is built (Loro CRDT docs through the self-hosted
 `komet-sync` server) but **disabled by default** — see "Multi-device sync" in the README.
 
 **Pillars:**
@@ -12,7 +12,6 @@ screen, no network calls. Multi-device sync is built (Loro CRDT docs through the
   Loro CRDT docs persist locally when sync is disabled.
 - Optional sync uses Loro CRDT docs (loro-mirror model) through the self-hosted `komet-sync`
   server (`crates/sync-server`: Rust + SQLite rooms + FS blobs, bearer-token auth).
-  The legacy `edge/` Cloudflare Worker + WorkOS stack has been removed.
 - Everything device-side is Rust; no TypeScript services remain.
 - Token-usage display is excluded (poor fit for CRDTs).
 - Frontend is **gpui** (pinned Zed rev). Virtualization + markdown techniques ported from
@@ -29,12 +28,12 @@ gpui UI ─ in-proc/localhost RPC ─ engine A ══ device-room relay ══ e
                                            └─ Workspace registry room ─────────────┘
 ```
 
-- **Engine = backend** (was `@komet/backend`): runs agents, owns auth, terminals, repos/worktrees,
+- **Engine = backend** (was `@komet/backend`): runs agents, owns sync credentials, terminals, repos/worktrees,
   diff sync, doc hosting. Pure Rust daemon, fully functional headless.
 - **UI = viewport** (was Electron): gpui app rendering engine state. Talks the same typed RPC whether the engine is in-process or a separate daemon. Organized around **spaces** — (device, folder) pairs, local or synced according to the active profile. The sidebar is the data: an attention-sorted Sessions list, filtered by a searchable spaces dropdown ("All spaces" included) that also hosts space management. The horizontal tabs are a **device-local viewport** onto that list (`ui-settings.json` `openTabs`, cross-space): closing a tab is local-only — archiving is an explicit sidebar action — and a sidebar click (re)opens a session as a tab. The new-session canvas carries a space picker (defaulting to the sidebar filter, else the last selected space); new sessions are minted onto the picked space's device via relay-forwardable RPCs.
 - **Sync server (`komet-sync-server`)**: self-hosted Rust service (VPS via Docker or any PC).
-  SQLite per room (frames), blobs on the filesystem, shared-secret Bearer auth
-  (`KOMET_SYNC_TOKEN`). No accounts, no third-party identity provider.
+  SQLite per room (frames), blobs on the filesystem, and the operator-configured
+  shared bearer token (`KOMET_SYNC_TOKEN`).
 
 ### Headed / headless
 Single binary `komet`:
@@ -44,53 +43,49 @@ Single binary `komet`:
   requests a graceful shutdown. If the child cannot start or become ready, fall back to an engine
   **in-process** (RPC over an in-memory duplex — same protocol, zero serialization shortcuts, so
   the boundary stays honest) and serve that engine on the IPC port. Binding remains best-effort.
-- `komet headless` — engine only. A clean installation immediately serves its local profile over localhost IPC; when a saved account selects the synced profile at startup and a bearer is available, it also hosts its DeviceRoom for remote control. A VPS can run this while a laptop's UI drives it.
+- `komet headless` — engine only. It serves the local profile over localhost IPC. When `KOMET_EDGE_URL` and `KOMET_SYNC_TOKEN` are configured, it also joins the self-hosted sync server and hosts its DeviceRoom for remote control. A VPS can run this while a laptop's UI drives it.
 
 ### Local-first workspace profiles
 
-Authentication and workspace selection are deliberately separate state machines:
+Workspace selection is an immutable storage boundary captured at engine startup:
 
-- `AuthState` is live credential state: `SignedOut`, `NeedsOrganization`, or `SignedIn`. It may change after login, refresh, revocation, or logout.
-- `WorkspaceScope` is the immutable storage and transport boundary captured once at engine startup: `Local`, `Synced`, or explicit `Development`.
-
-The engine never re-resolves an open store because `AuthState` changed. This prevents a sign-in, token refresh, or revocation from silently swapping databases or attaching online transports to a runtime that started local-only.
+- `WorkspaceScope` is the immutable storage boundary captured once at engine startup: `Local`, `Synced`, or `Development`.
+- Sync transport requires both a server URL and the shared bearer token. A token alone does not enable network access.
 
 | Startup condition | `WorkspaceScope` | Online transports |
 | --- | --- | --- |
-| Sync server configured, no parseable saved `session.json` | `Local` | Disabled |
-| Parseable saved session | `Synced` | Enabled when a bearer is available |
-| No sync server configured and no dev bearer | `Development` | Disabled |
-| Explicit non-empty dev bearer | `Development` | Enabled |
+| No sync URL or shared bearer configured | `Development` | Disabled |
+| Sync URL and shared bearer configured | `Development` | Enabled |
+| Explicit compatibility profile (migration/import paths) | `Synced` | Enabled when URL and bearer are available |
 
-`komet login` and `komet logout` operate on `session.json` while the engine is stopped. Login selects `Synced` for the next start; logout selects `Local` for the next start. The UI may update live authentication status, but the active `WorkspaceScope` still changes only after restart.
+Sync transport activates only when `KOMET_EDGE_URL` and `KOMET_SYNC_TOKEN` are configured.
 
 The headed app starts its engine as a detached process using the same binary and inherited runtime
 configuration. It does not install or enable a system service. `komet engine stop` is the explicit
 graceful stop for that engine; service-managed deployments continue to use `komet daemon`.
 
-**Current default (local-only):** no sync server ships preconfigured (`KOMET_EDGE_URL` unset →
-`None`), so every start resolves to the "Development" row —
-scope, no account, no login screen, zero network calls. To enable the synced profile later:
-deploy `komet-sync-server` (see `docs/self-hosted-sync.md`), then set `KOMET_EDGE_URL`
-and `KOMET_SYNC_TOKEN` on each device; the startup table above applies as written.
+**Current default (local-only):** no sync server ships preconfigured (`KOMET_EDGE_URL` unset),
+so every start resolves to the local-development profile with online transports disabled. To enable
+sync, deploy `komet-sync-server` (see `docs/self-hosted-sync.md`) and set `KOMET_EDGE_URL` and
+`KOMET_SYNC_TOKEN` on each device.
 
 The resolved profile selects the session snapshots, registry snapshot, run journals, and attachment cache that may contain workspace data:
 
 | Scope | Store and journals | Uploads |
 | --- | --- | --- |
 | `Local` | `{data_dir}/profiles/local/` | `{data_dir}/profiles/local/uploads/` |
-| `Synced` | `{data_dir}/orgs/{org_id}/{user_id}/` | `{data_dir}/orgs/{org_id}/{user_id}/uploads/` |
-| `Development` | `{data_dir}/orgs/{org_id}/{user_id}/` | `{data_dir}/orgs/{org_id}/{user_id}/uploads/` |
+| `Synced` (legacy) | `{data_dir}/orgs/{org_id}/{user_id}/` | `{data_dir}/orgs/{org_id}/{user_id}/uploads/` |
+| `Development` | `{data_dir}/orgs/{org_id}/{user_id}/` (compatibility path) | `{data_dir}/orgs/{org_id}/{user_id}/uploads/` |
 
-The synced and development store roots preserve the historical cloud layout while their attachment caches are account-scoped. Local identity lives in `{data_dir}/local-profile.json`; its UUID is stable across restarts and is not an account or development identity.
+The development store root preserves the historical on-disk layout for upgrade compatibility. Local identity lives in `{data_dir}/local-profile.json`; its UUID is stable across restarts and separate from sync credentials.
 
-Older releases wrote every synced and development attachment to `{data_dir}/uploads/`, and persisted those absolute paths in transcripts. On upgrade, the first synced or development account that opens this legacy cache claims it in `{data_dir}/legacy-uploads-owner.json`. That account may read the cache as a compatibility fallback, but all new staging and commits use its account-scoped uploads root; other accounts cannot read or write the legacy cache.
+Older releases wrote synced and development attachments to `{data_dir}/uploads/`, and persisted those absolute paths in transcripts. Existing compatibility readers retain access to the legacy cache while new staging and commits use the active profile's uploads root.
 
 Device identity and machine resources remain device-scoped under the common data directory: `device-id`, repository registration, managed worktrees, agent credentials/accounts, and UI settings. They are available across profiles, but they do not contain or expose another profile's transcripts or attachments.
 
 #### Privacy boundary and follow-ups
 
-This first local-first change does not upload, import, link, or delete local sessions when a user signs in. Local attachments remain jailed under the local upload root and are not readable through the synced attachment cache. Returning to local-only mode reopens the same local identity and data.
+Local and synced profiles keep separate data roots. The UI offers an explicit one-time import when switching local work into a configured synced profile; local attachments remain jailed under their profile's upload root.
 
 The following product work is intentionally deferred:
 
@@ -154,7 +149,7 @@ komet/
                                  # watchdog), doc host + command executor, repos/worktrees,
                                  # checkout-diff sync, terminals (portable-pty; text mirror
                                  # via komet-term on every terminal), uploads,
-                                 # agent accounts (cred swap), auth (bearer via sync server),
+                                 # agent accounts (cred swap), sync bearer credentials,
                                  # device-room host/peers, identity, single-instance lock,
                                  # local project-memory integration and internal MCP tools
     memory/       komet-memory   # per-device SQLite activity/fact store, privacy filters,
@@ -359,7 +354,7 @@ Status legend: ✅ shipped · 🟡 shipped with named gaps (see `docs/PARITY.md`
 - ✅ **M1 Doc + sync core** — `komet-doc` mirror over loro 1.13; room client syncs with the
   self-hosted sync server; Rust⇄server⇄Rust convergence test (M1 exit: two Rust peers converge
   through a real session room, tail endpoint serves).
-- ✅ **M2 Engine core** — Claude harness end-to-end headless: `komet headless` + dev auth runs a
+- ✅ **M2 Engine core** — Claude harness end-to-end headless: `komet headless` with local
   turn, journal + doc writes, recovery test.
 - ✅ **M3 UI core** — shell (sidebar/panes/header), transcript (virtualized, markdown, streaming,
   stick-to-bottom), composer (send/steer/stop, question panel); local chat fully usable headed.
@@ -370,8 +365,7 @@ Status legend: ✅ shipped · 🟡 shipped with named gaps (see `docs/PARITY.md`
 - 🟡 **M5 Full surface** — terminals, diff pane, repo/branch/folder pickers + worktrees,
   agent accounts UI, settings (devices/shortcuts/archived), Codex + Cursor + Grok + Hermes +
   OpenCode + Pi + Cline harnesses. Gaps: composer attachment UI (engine upload RPCs exist).
-- 🟡 **M6 Polish** — wire reconciliation (proto AuthState on the wire, `LocalDevice`),
-  two-device e2e smoke, keyboard map, clippy/fmt sweep, Linux packaging
+- 🟡 **M6 Polish** — two-device e2e smoke, keyboard map, clippy/fmt sweep, Linux packaging
   (`scripts/package-linux.sh` + release profile), macOS bundling config (`dist/macos/`,
   not executed — needs a Mac). Gaps: Windows packaging —
   the workspace already cross-compiles for `x86_64-pc-windows-gnu`
@@ -379,7 +373,7 @@ Status legend: ✅ shipped · 🟡 shipped with named gaps (see `docs/PARITY.md`
 
 ## 9. Open questions (tracked, non-blocking)
 
-1. ~~loro-protocol Rust client ⇄ TS edge interop~~ — resolved by the Rust sync server
+1. ~~loro-protocol Rust client/server interoperability~~ — resolved by the Rust sync server
    (the frame protocol is small and we control both ends).
 2. `lorosurgeon` fit for the mirror write path vs hand-rolled reconcile.
 3. Cursor harness (komet has it; CLI surface for Rust TBD) — parity item, scheduled after Codex.

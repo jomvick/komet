@@ -1,6 +1,8 @@
 # Self-hosted sync (v1)
 
-Remplace Cloudflare Durable Objects + WorkOS + R2.
+Komet peut synchroniser ses documents entre appareils via un serveur `komet-sync` auto-hébergé.
+Pour le diagnostic, les commandes de migration et la sauvegarde, voir aussi
+[`sync.md`](sync.md).
 
 ## Principe
 Par défaut Komet est 100% local. Le user qui veut sync déploie lui-même `komet-sync` (VPS ou PC).
@@ -94,6 +96,9 @@ elle, et ses agents se règlent dans Settings → Providers.
 - `KOMET_SYNC_PORT` : port of the container image binary (default 8787).
 - `KOMET_SYNC_ALLOW_INSECURE_HTTP` : set to `1` to silence the plain-HTTP warning on a trusted LAN. Never set this for traffic over the internet. `komet daemon install` captures it into the service, so the opt-in survives the restart.
 
+`komet daemon install` captures `KOMET_EDGE_URL` and `KOMET_SYNC_TOKEN` too,
+so the installed engine uses the same sync server and bearer as the installing shell.
+
 ## Upgrading an existing Docker deployment
 The image now runs as the unprivileged user `komet` (uid 10001). Give it the existing data directory once (new deployments do this in the steps above):
 ```bash
@@ -103,6 +108,3 @@ sudo chown -R 10001:10001 ./data-sync
 ## Stockage
 - `data/rooms/*.db` : SQLite par room (frames)
 - `data/blobs/` : blobs FS
-
-## Historique
-L'ancien backend Cloudflare (Worker + Durable Objects + WorkOS + R2) a été supprimé.

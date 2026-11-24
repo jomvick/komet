@@ -30,7 +30,7 @@ use komet_doc::{DeletedSpace, REGISTRY_DOC_ID, RegistryDoc, WorkspaceDoc};
 use komet_proto::{Chat, ChatConfig, Device, Session, Space};
 use komet_sync::{DocsStore, RegistryClient, RegistryTuning};
 
-use crate::doc_host::EdgeConfig;
+use crate::doc_host::SyncConfig;
 use crate::{EngineError, now_ms};
 
 /// Legacy Loro workspace snapshot row — now only read once, as the migration
@@ -136,7 +136,7 @@ pub struct WorkspaceHostConfig {
     pub user_id: String,
     /// When present, the host joins `/registry/{orgId}/ws`. `None` = fully offline
     /// (local snapshots only; the registry still drives everything device-side).
-    pub edge: Option<EdgeConfig>,
+    pub edge: Option<SyncConfig>,
     /// Upsert this device's row at boot. True for the workspace on this machine;
     /// false for a remote environment, where the laptop is a controller only and
     /// must not appear in that environment's device list.
@@ -329,7 +329,7 @@ impl WorkspaceHost {
     }
 
     /// Test seam: join a registry room at a fixed WebSocket URL without an
-    /// `EdgeConfig` — integration tests wire hosts to an in-process mock
+    /// `SyncConfig` — integration tests wire hosts to an in-process mock
     /// server through this. Production always goes through [`Self::join_room`].
     #[doc(hidden)]
     pub fn connect_registry_url(&self, url: &str) {
@@ -944,7 +944,7 @@ impl WorkspaceHost {
         Ok(self.mutate(|doc| doc.upsert_space(space))?)
     }
 
-    /// Flip the chat's sync room generation (docs/chat2-sync.md M2) — the
+    /// Flip the chat's sync room generation (sync room generation) — the
     /// host calls this in the same breath as seeding the chat2 checkpoint.
     pub fn set_chat_room_gen(&self, chat_id: &str, room_gen: u32) -> Result<bool, EngineError> {
         Ok(self.mutate(|doc| doc.set_chat_room_gen(chat_id, room_gen))?)

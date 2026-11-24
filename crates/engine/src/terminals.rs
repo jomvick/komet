@@ -8,9 +8,8 @@
 //!   running process, kept until its tab is explicitly closed or the engine exits.
 //!   Only EXITED sessions expire (30min TTL on their inert replay buffers), and
 //!   [`MAX_TERMINALS`] bounds leakage from renderers that lost their tab state.
-//! - Ownership: M5 is single-user local — every IPC/relay caller is the device
-//!   owner, so the per-user owner re-checks from komet's Router land with real
-//!   multi-account auth in M6.
+//! - Ownership: every IPC/relay caller is authorized by the host device's RPC
+//!   boundary. Terminal state stays local to the engine that opened it.
 //! - **Text mirror** (always on, every terminal): the same bytes that ride the
 //!   replay window are folded into a `komet_term::TerminalMirror`, so the engine
 //!   knows what the terminal *displays* and not only what it printed: the

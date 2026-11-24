@@ -5,7 +5,7 @@ use async_trait::async_trait;
 
 use komet_engine::{
     Engine, EngineConfig, EngineCore, EngineRuntime, InstanceLock, environments::LOCAL_ENV_ID,
-    rpc::AuthRpc,
+    rpc::SyncStatusRpc,
 };
 use komet_proto::{Device, EngineInfo, HarnessId, WorkspaceScope};
 use komet_rpc::{
@@ -20,13 +20,13 @@ pub struct EngineBootConfig {
     pub data_dir: PathBuf,
     /// Localhost IPC port to probe / serve.
     pub ipc_port: u16,
-    /// Edge base URL for the embedded engine.
+    /// Self-hosted sync server URL for the embedded engine.
     pub edge_url: String,
-    /// Bearer for edge room joins; `None` runs offline.
+    /// Development identity override; this is not the sync bearer.
     pub edge_token: Option<String>,
-    /// Workspace org override for explicit dev-mode runs.
+    /// Workspace namespace override for explicit development runs.
     pub org_id: Option<String>,
-    /// WorkOS client id for production authentication.
+    /// Shared bearer for the self-hosted sync server.
     pub sync_token: Option<String>,
     /// Harness for doc-command runs until per-chat config lands (M4).
     pub default_harness: HarnessId,
@@ -161,7 +161,6 @@ struct InProcessEngine {
     /// are built from it, so an unset cell means "still assembling".
     core: Arc<tokio::sync::OnceCell<Arc<EngineCore>>>,
     boot_task: tokio::task::JoinHandle<()>,
-    refresh_task: tokio::task::JoinHandle<()>,
     /// Serves this engine to other viewports over the IPC port. `None` when the
     /// port was already taken — the window still works over its own transport.
     ipc_task: Option<tokio::task::JoinHandle<()>>,
@@ -198,7 +197,6 @@ impl EngineBackend for InProcessEngine {
         if let Some(runtime) = self.runtime.lock().await.take() {
             runtime.shutdown().await;
         }
-        self.refresh_task.abort();
     }
 }
 
@@ -209,11 +207,11 @@ pub(crate) enum DeferredEngineState {
     Failed(String),
 }
 
-/// Serves engine identity and AuthRpc immediately, then holds data calls only
-/// while a captured synced profile still needs organization onboarding.
+/// Serves engine identity and SyncStatusRpc immediately, then holds data calls only
+/// while the profile stores are assembled.
 /// Existing subscriptions attach to the assembled service without reconnecting.
 struct DeferredEngineRpc {
-    auth: AuthRpc,
+    auth: SyncStatusRpc,
     engine_info: EngineInfo,
     state: tokio::sync::watch::Receiver<DeferredEngineState>,
     service: Arc<tokio::sync::OnceCell<Arc<dyn RpcService>>>,
@@ -232,7 +230,7 @@ impl RpcService for DeferredEngineRpc {
                 Err(message) => Err(RpcError::Failed(message)),
             };
         }
-        if AuthRpc::handles(method) {
+        if SyncStatusRpc::handles(method) {
             return self.auth.handle(method, params).await;
         }
 
@@ -275,7 +273,7 @@ pub(crate) async fn wait_for_deferred_engine(
 
 /// Routes the embedded engine's IPC connections per `?env=`. The local workspace
 /// keeps answering from the deferred service — a viewport that connects during
-/// cloud onboarding still gets EngineInfo and auth immediately — while an
+/// startup still gets EngineInfo and sync status immediately — while an
 /// environment connection waits for assembly and gets that environment's service.
 struct DeferredEngineRouter {
     state: tokio::sync::watch::Receiver<DeferredEngineState>,
@@ -460,17 +458,16 @@ impl EngineHandle {
         };
 
         let auth = Engine::build_auth(&engine_config).await;
-        let workspace_scope = Engine::initial_workspace_scope(&auth);
+        let workspace_scope = Engine::initial_workspace_scope();
         let initial_profile = Engine::resolve_profile(&engine_config, &auth, workspace_scope)?;
-        let profile_is_resolved = initial_profile.is_some();
+        let profile_is_resolved = true;
         let engine_info = Engine::engine_info(&engine_config, workspace_scope)?;
-        let refresh_task = auth.spawn_refresh_loop();
         let (state_tx, mut state_rx) = tokio::sync::watch::channel(DeferredEngineState::Waiting);
         let assembled_service = Arc::new(tokio::sync::OnceCell::new());
         let assembled_core: Arc<tokio::sync::OnceCell<Arc<EngineCore>>> =
             Arc::new(tokio::sync::OnceCell::new());
         let service: Arc<dyn RpcService> = Arc::new(DeferredEngineRpc {
-            auth: AuthRpc::new(auth.clone()),
+            auth: SyncStatusRpc::new(auth.clone()),
             engine_info: engine_info.clone(),
             state: state_rx.clone(),
             service: assembled_service.clone(),
@@ -480,7 +477,7 @@ impl EngineHandle {
         // Serve the same service on the IPC port so a terminal viewport can
         // attach to this window's engine with no setup. Deliberately the
         // *deferred* service, not the assembled one: a viewport that connects
-        // during cloud onboarding gets EngineInfo and AuthRpc immediately, and
+        // during engine assembly gets EngineInfo and the sync credential watch, and
         // its data subscriptions wait exactly as this window's do.
         //
         // Best-effort — losing the bind race with another engine costs other
@@ -509,35 +506,15 @@ impl EngineHandle {
         let runtime_for_boot = runtime.clone();
         let service_for_boot = assembled_service.clone();
         let core_for_boot = assembled_core.clone();
-        // The instance lock rides into the boot task and is consumed by
-        // assembly — held through sign-in onboarding too, because this process
-        // owns the data dir from the moment it decided to embed.
+        // The instance lock rides into the boot task and is consumed by assembly.
         let boot_task = tokio::spawn(async move {
             let profile = match initial_profile {
                 Some(profile) => profile,
                 None => {
-                    let mut auth_state = auth.watch_state();
-                    while !auth_state.borrow().is_signed_in() {
-                        if auth_state.changed().await.is_err() {
-                            state_tx.send_replace(DeferredEngineState::Failed(
-                                "authentication state closed before workspace onboarding".into(),
-                            ));
-                            return;
-                        }
-                    }
-                    match Engine::resolve_profile(&engine_config, &auth, workspace_scope) {
-                        Ok(Some(profile)) => profile,
-                        Ok(None) => {
-                            state_tx.send_replace(DeferredEngineState::Failed(
-                                "workspace onboarding completed without an organization".into(),
-                            ));
-                            return;
-                        }
-                        Err(err) => {
-                            state_tx.send_replace(DeferredEngineState::Failed(err.to_string()));
-                            return;
-                        }
-                    }
+                    state_tx.send_replace(DeferredEngineState::Failed(
+                        "engine profile resolution returned no store".into(),
+                    ));
+                    return;
                 }
             };
 
@@ -567,7 +544,6 @@ impl EngineHandle {
                 runtime,
                 core: assembled_core,
                 boot_task,
-                refresh_task,
                 ipc_task,
                 client,
                 runtime_handle: tokio::runtime::Handle::current(),

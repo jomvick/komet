@@ -184,7 +184,7 @@ impl AppState {
     }
 
     pub fn gate(&self) -> GatePhase {
-        gate_phase(&self.connection, self.workspace_scope, self.auth.as_ref())
+        gate_phase(&self.connection)
     }
 
     /// The connection the views must use: the displayed workspace's, which is the
@@ -309,7 +309,7 @@ impl AppState {
         self.clear_workspaces();
         self.connection = ConnectionStatus::Connecting;
         self.workspace_scope = None;
-        self.auth = None;
+        self.sync_status = None;
         self.devices.clear();
         self.spaces.clear();
         self.chats.clear();

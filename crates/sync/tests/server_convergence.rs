@@ -1,15 +1,14 @@
-//! Live-edge integration test (M1 exit criterion): two Rust `RoomClient`s
-//! converge through a real SessionRoom Durable Object.
+//! Live-server integration test (M1 exit criterion): two Rust RoomClients
+//! converge through the self-hosted Komet sync server.
 //!
-//! Ignored by default — requires the TS edge running (e.g. `wrangler dev` in
-//! `edge/` with AUTH_MODE=dev). Run with:
+//! Ignored by default; run against a local server with:
 //!
 //! ```sh
-//! KOMET_EDGE_WS=ws://127.0.0.1:8787 cargo test -p komet-sync -- --ignored
+//! KOMET_EDGE_WS=ws://127.0.0.1:8787 cargo test -p komet-sync --test server_convergence -- --ignored
 //! ```
 //!
-//! `KOMET_EDGE_TOKEN` overrides the dev bearer (defaults to `sync-it-user`;
-//! both clients must share it — chat rooms are claim-on-first-join owned).
+//! `KOMET_EDGE_TOKEN` overrides the development bearer (defaults to
+//! `sync-it-user`; both clients must share it).
 
 use std::time::Duration;
 

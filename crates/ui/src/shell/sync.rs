@@ -1,13 +1,12 @@
 use std::time::Duration;
 
-use gpui::{AnyElement, Context, IntoElement, Pixels, SharedString, Window, div, prelude::*, px};
+use gpui::{AnyElement, Context, IntoElement, Pixels, SharedString, Window, div, px};
 use gpui_tokio::Tokio;
 use komet_engine::InstanceLock;
-use komet_proto::{AuthState, WorkspaceScope};
+use komet_proto::{SyncStatus, WorkspaceScope};
 use komet_rpc::methods;
 
 use super::*;
-use crate::motion;
 use crate::popover;
 use crate::theme::Theme;
 
@@ -18,8 +17,6 @@ use crate::theme::Theme;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncFlow {
     Idle,
-    Enabling,
-    Canceling,
     /// Signed in on a local runtime: the wizard's choice step (bring local
     /// work / start fresh / later). `notice_open: false` = postponed, badge
     /// in the account menu.
@@ -53,9 +50,6 @@ pub enum SyncFlow {
     RestartPending {
         notice_open: bool,
     },
-    SignOutConfirm,
-    SigningOut,
-    SignedOutRestartRequired,
 }
 
 impl SyncFlow {
@@ -77,7 +71,6 @@ pub enum AccountMenuAction {
     SyncInProgress,
     /// Postponed switch wizard (or legacy restart fallback) — reopen it.
     RestartPending,
-    SignOut,
 }
 
 pub const RUNTIME_CHANGE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -189,7 +182,6 @@ pub fn account_menu_action(
     match scope {
         Some(WorkspaceScope::Local) => match flow {
             SyncFlow::Idle => None,
-            SyncFlow::Enabling | SyncFlow::Canceling => Some(AccountMenuAction::SyncInProgress),
             SyncFlow::SwitchOffer { .. } | SyncFlow::RestartPending { .. } => {
                 Some(AccountMenuAction::RestartPending)
             }
@@ -197,55 +189,61 @@ pub fn account_menu_action(
             SyncFlow::Switching { .. }
             | SyncFlow::Importing { .. }
             | SyncFlow::ImportDone { .. } => Some(AccountMenuAction::SyncInProgress),
-            SyncFlow::SignOutConfirm
-            | SyncFlow::SigningOut
-            | SyncFlow::SignedOutRestartRequired => None,
         },
         Some(WorkspaceScope::Synced) => match flow {
-            SyncFlow::SignedOutRestartRequired => None,
             // A pending import failure must stay reachable: this is the only
             // surface that can reopen the retry dialog on a synced runtime.
             SyncFlow::ImportFailed { .. } => Some(AccountMenuAction::RestartPending),
+            // Same for the restart notice: dismissing it must not remove the
+            // only way back in ("Finish sync setup").
+            SyncFlow::RestartPending { .. } => Some(AccountMenuAction::RestartPending),
             _ if flow.is_switch_lifecycle() => Some(AccountMenuAction::SyncInProgress),
-            _ => Some(AccountMenuAction::SignOut),
+            _ => None,
         },
         Some(WorkspaceScope::Development) | None => None,
     }
 }
 
-pub fn sync_flow_after_auth(
+pub fn sync_flow_for_status(
     flow: SyncFlow,
     scope: Option<WorkspaceScope>,
-    auth: Option<&AuthState>,
+    status: Option<&SyncStatus>,
 ) -> SyncFlow {
+    // `None` is UNKNOWN, not "no credentials": a daemon that predates the
+    // credential frame must not get a restart modal over a usable workspace.
+    let configured = status.map(|status| status.token_configured);
     match scope {
-        Some(WorkspaceScope::Local) => match (flow, auth) {
-            // The in-place switch owns its own lifecycle once started.
-            (flow, _) if flow.is_switch_lifecycle() => flow,
-            // AuthStatus belongs to the runtime, not to the Shell that opened
-            // the browser. Every attached viewport must advertise the pending
-            // profile switch once any of them completes sign-in.
-            (SyncFlow::SwitchOffer { .. }, Some(AuthState::SignedOut)) => SyncFlow::Idle,
-            (SyncFlow::RestartPending { .. }, Some(AuthState::SignedOut)) => SyncFlow::Idle,
-            (SyncFlow::Canceling, Some(AuthState::SignedIn { .. })) => flow,
-            (SyncFlow::SwitchOffer { .. }, Some(AuthState::SignedIn { .. })) => flow,
-            (SyncFlow::RestartPending { .. }, Some(AuthState::SignedIn { .. })) => flow,
-            (_, Some(AuthState::SignedIn { .. })) => SyncFlow::SwitchOffer { notice_open: true },
-            _ => flow,
-        },
-        Some(WorkspaceScope::Synced) => match auth {
-            // AuthStatus is shared by every viewport attached to the runtime.
-            // Once a synced store loses its credentials, every Shell must stop:
-            // letting another viewport sign in would authenticate a new account
-            // while the engine still serves the previous account's fixed store.
-            Some(AuthState::SignedOut) => SyncFlow::SignedOutRestartRequired,
-            _ => match flow {
-                SyncFlow::SignOutConfirm
-                | SyncFlow::SigningOut
-                | SyncFlow::SignedOutRestartRequired => flow,
-                flow if flow.is_switch_lifecycle() => flow,
+        Some(WorkspaceScope::Local) if flow.is_switch_lifecycle() => flow,
+        Some(WorkspaceScope::Local) => match configured {
+            Some(true) => match flow {
+                SyncFlow::SwitchOffer { .. } | SyncFlow::RestartPending { .. } => flow,
+                _ => SyncFlow::SwitchOffer { notice_open: true },
+            },
+            // Unknown: keep showing what the shell already has rather than
+            // inventing (or dismissing) a notice from a missing frame.
+            None => match flow {
+                SyncFlow::SwitchOffer { .. } | SyncFlow::RestartPending { .. } => flow,
                 _ => SyncFlow::Idle,
             },
+            Some(false) => SyncFlow::Idle,
+        },
+        Some(WorkspaceScope::Synced) if flow.is_switch_lifecycle() => flow,
+        Some(WorkspaceScope::Synced) => match configured {
+            Some(false) => match flow {
+                // Dismissed once: keep it dismissed until the condition
+                // changes (the menu's "Finish sync setup" reopens it).
+                SyncFlow::RestartPending { notice_open } => {
+                    SyncFlow::RestartPending { notice_open }
+                }
+                _ => SyncFlow::RestartPending { notice_open: true },
+            },
+            // Unknown: an older daemon without the credential frame, or a
+            // status that has not arrived yet — never a restart modal.
+            None => match flow {
+                SyncFlow::RestartPending { .. } => flow,
+                _ => SyncFlow::Idle,
+            },
+            Some(true) => SyncFlow::Idle,
         },
         Some(WorkspaceScope::Development) => SyncFlow::Idle,
         None => flow,
@@ -253,126 +251,6 @@ pub fn sync_flow_after_auth(
 }
 
 impl Shell {
-    pub(super) fn cancel_auth_setup(&mut self, cx: &mut Context<Self>) {
-        let local = self.state.read(cx).workspace_scope == Some(WorkspaceScope::Local);
-        let Some(engine) = self.state.read(cx).local_engine().cloned() else {
-            return;
-        };
-        let pending_auth = self.auth_task.take();
-        let pending_org = self.org.as_mut().and_then(|org| org.task.take());
-        if local {
-            self.sync_flow = SyncFlow::Canceling;
-        }
-        self.auth_task = Some(cx.spawn(async move |this, cx| {
-            // Do not race SignOut against an exchange or organization write
-            // that can still persist a session after credentials were cleared.
-            if let Some(task) = pending_auth {
-                task.await;
-            }
-            if let Some(task) = pending_org {
-                task.await;
-            }
-            let result = engine
-                .client()
-                .call(methods::SIGN_OUT, serde_json::json!({}))
-                .await;
-            this.update(cx, |shell, cx| {
-                match result {
-                    Ok(_) => {
-                        shell.org = None;
-                        if local {
-                            shell.sync_flow = SyncFlow::Idle;
-                        }
-                    }
-                    Err(err) => {
-                        if local {
-                            shell.sync_flow = SyncFlow::Enabling;
-                        }
-                        shell.sidebar_notice =
-                            Some(format!("Could not cancel sign-in: {err}").into());
-                    }
-                }
-                cx.notify();
-            })
-            .ok();
-        }));
-        cx.notify();
-    }
-
-    pub(super) fn request_sign_out(&mut self, cx: &mut Context<Self>) {
-        self.close_user_menu(cx);
-        if self.state.read(cx).workspace_scope != Some(WorkspaceScope::Synced) {
-            return;
-        }
-        self.sync_flow = SyncFlow::SignOutConfirm;
-        cx.notify();
-    }
-
-    pub(super) fn confirm_sign_out(&mut self, cx: &mut Context<Self>) {
-        self.start_local_runtime_transition(true, cx);
-    }
-
-    pub(super) fn start_local_runtime_transition(
-        &mut self,
-        sign_out: bool,
-        cx: &mut Context<Self>,
-    ) {
-        if self.runtime_change_task.is_some() {
-            return;
-        }
-        let Some(engine) = self.state.read(cx).local_engine().cloned() else {
-            self.runtime_change_error = Some("Engine not connected".into());
-            self.sync_flow = SyncFlow::SignedOutRestartRequired;
-            cx.notify();
-            return;
-        };
-        self.sync_flow = SyncFlow::SigningOut;
-        self.runtime_change_error = None;
-        let ipc_port = self.boot.ipc_port;
-        let data_dir = self.data_dir.clone();
-        let shutdown_dir = data_dir.clone();
-        let transition = Tokio::spawn(cx, async move {
-            if sign_out {
-                engine
-                    .client()
-                    .call(methods::SIGN_OUT, serde_json::json!({}))
-                    .await
-                    .map_err(|error| format!("Sign out failed: {error}"))?;
-            }
-            stop_synced_runtime(engine, ipc_port, &shutdown_dir).await
-        });
-        let state = self.state.clone();
-        let boot = self.boot.clone();
-        self.runtime_change_task = Some(cx.spawn(async move |this, cx| {
-            let result = match transition.await {
-                Ok(result) => result,
-                Err(error) => Err(error.to_string()),
-            };
-            this.update(cx, |shell, cx| {
-                shell.runtime_change_task = None;
-                match result {
-                    Ok(()) => {
-                        shell.sync_flow = SyncFlow::Idle;
-                        shell.runtime_change_error = None;
-                        shell.org = None;
-                        shell.route = Route::Chat;
-                        shell.space_boot_applied = false;
-                        shell.workspace_boot_applied = false;
-                        state.update(cx, |state, cx| state.prepare_runtime_replacement(cx));
-                        AppState::bootstrap(state.clone(), boot, cx);
-                    }
-                    Err(error) => {
-                        shell.sync_flow = SyncFlow::SignedOutRestartRequired;
-                        shell.runtime_change_error = Some(error.into());
-                        cx.notify();
-                    }
-                }
-            })
-            .ok();
-        }));
-        cx.notify();
-    }
-
     pub(super) fn postpone_sync_restart(&mut self, cx: &mut Context<Self>) {
         match self.sync_flow {
             SyncFlow::RestartPending { .. } => {
@@ -407,7 +285,7 @@ impl Shell {
     }
 
     /// The wizard's choice step chose a path: stop the local runtime, boot the
-    /// synced one in-place (mirror of the sign-out transition), then let
+    /// synced one in-place, then let
     /// [`Self::drive_sync_switch`] run the import once the runtime is ready.
     /// Failure falls back to the quit-and-reopen dialog — the local profile is
     /// untouched, so the old path is always a safe exit.
@@ -443,7 +321,6 @@ impl Shell {
                         // Keep `Switching { import }`: the state observer sees
                         // the replacement runtime reach Ready and advances the
                         // wizard from there.
-                        shell.org = None;
                         shell.route = Route::Chat;
                         shell.space_boot_applied = false;
                         shell.workspace_boot_applied = false;
@@ -660,14 +537,10 @@ impl Shell {
     pub(super) fn render_sync_overlay(
         &mut self,
         viewport: gpui::Size<Pixels>,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let theme = Theme::of(cx).clone();
-        let needs_org = matches!(
-            self.state.read(cx).auth.as_ref(),
-            Some(AuthState::NeedsOrganization { .. })
-        );
         let remote_engine = self
             .state
             .read(cx)
@@ -681,14 +554,6 @@ impl Shell {
             "Quit Komet"
         };
 
-        if self.sync_flow == SyncFlow::Enabling && needs_org {
-            return Some(self.render_org_gate(window, cx));
-        }
-
-        let signed_in_email: Option<SharedString> = match self.state.read(cx).auth.as_ref() {
-            Some(AuthState::SignedIn { user, .. }) => Some(SharedString::from(user.email.clone())),
-            _ => None,
-        };
         // Spaces count as local work too: a projects-only profile must get
         // the import choice, not a bare "Switch now".
         let (local_chats, local_spaces) = {
@@ -698,32 +563,14 @@ impl Shell {
         let work_phrase = local_work_phrase(local_chats, local_spaces);
 
         let card = match self.sync_flow {
-            SyncFlow::Canceling => popover::dialog_card(&theme)
-                .child(popover::dialog_title(&theme, "Canceling sync setup…"))
-                .child(
-                    div().mt(px(6.0)).child(popover::dialog_body(
-                        &theme,
-                        "Removing the partial sign-in before returning to your local workspace.",
-                    )),
-                )
-                .into_any_element(),
             // ── in-place switch wizard ────────────────────────────────────
             SyncFlow::SwitchOffer { notice_open: true } => {
                 let has_local_work = work_phrase.is_some();
-                let body: SharedString = match (&signed_in_email, &work_phrase) {
-                    (Some(email), Some(phrase)) => format!(
-                        "You're signed in as {email}. Bring {phrase} from this device into your synced workspace, or start it fresh."
-                    )
-                    .into(),
-                    (Some(email), None) => format!(
-                        "You're signed in as {email}. Komet can switch to your synced workspace now."
-                    )
-                    .into(),
-                    (None, Some(phrase)) => format!(
-                        "Bring {phrase} from this device into your synced workspace, or start it fresh."
-                    )
-                    .into(),
-                    (None, None) => "Komet can switch to your synced workspace now.".into(),
+                let body: SharedString = match work_phrase {
+                    Some(phrase) => format!(
+                        "Bring {phrase} from this device into the configured synced workspace, or start fresh."
+                    ).into(),
+                    None => "Switch to the configured synced workspace now.".into(),
                 };
                 let mut actions = div()
                     .mt(px(16.0))
@@ -954,138 +801,13 @@ impl Shell {
                         ),
                 )
                 .into_any_element(),
-            SyncFlow::SignOutConfirm => popover::dialog_card(&theme)
-                .child(popover::dialog_title(&theme, "Sign out?"))
-                .child(
-                    div().mt(px(6.0)).child(popover::dialog_body(
-                        &theme,
-                        "Komet will remove your credentials, close the synced workspace, and continue in local mode.",
-                    )),
-                )
-                .child(
-                    div()
-                        .mt(px(16.0))
-                        .flex()
-                        .flex_row()
-                        .justify_end()
-                        .gap(px(8.0))
-                        .child(
-                            popover::btn_ghost(&theme, "Cancel", "signout-cancel", cx.entity_id())
-                                .id("signout-cancel")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.sync_flow = SyncFlow::Idle;
-                                    cx.notify();
-                                })),
-                        )
-                        .child(
-                            popover::btn_danger(&theme, "Sign out")
-                                .id("signout-confirm")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.confirm_sign_out(cx)
-                                })),
-                        ),
-                )
-                .into_any_element(),
-            SyncFlow::SigningOut => popover::dialog_card(&theme)
-                .child(popover::dialog_title(&theme, "Signing out…"))
-                .child(
-                    div().mt(px(6.0)).child(popover::dialog_body(
-                        &theme,
-                        "Removing account credentials and closing the synced workspace.",
-                    )),
-                )
-                .into_any_element(),
             SyncFlow::Idle
-            | SyncFlow::Enabling
             | SyncFlow::SwitchOffer { notice_open: false }
             | SyncFlow::ImportFailed { notice_open: false }
             | SyncFlow::RestartPending { notice_open: false }
-            | SyncFlow::SignedOutRestartRequired => return None,
+            => return None,
         };
 
         Some(popover::modal("sync-lifecycle-dialog", viewport, card))
-    }
-
-    pub(super) fn render_signed_out_restart(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let theme = Theme::of(cx).clone();
-        let runtime_change_label = if self.runtime_change_task.is_some() {
-            "Stopping engine…"
-        } else {
-            "Retry local mode"
-        };
-        let card = div()
-            .w(px(380.0))
-            .px(px(32.0))
-            .py(px(40.0))
-            .rounded(px(12.0))
-            .border_1()
-            .border_color(theme.border)
-            .bg(theme.surface_card)
-            .shadow_lg()
-            .flex()
-            .flex_col()
-            .items_center()
-            .text_center()
-            .child(
-                icon(icons::KOMET_LOGO)
-                    .size(px(36.0))
-                    .text_color(theme.text),
-            )
-            .child(
-                div()
-                    .mt(px(24.0))
-                    .text_size(px(18.0))
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(theme.text)
-                    .child(SharedString::from("Signed out")),
-            )
-            .child(
-                div()
-                    .mt(px(6.0))
-                    .mb(px(24.0))
-                    .text_size(px(13.0))
-                    .line_height(px(19.0))
-                    .text_color(theme.text_muted)
-                    .child(SharedString::from(
-                        "Komet removed your credentials but could not finish closing the previous synced workspace. Retry before continuing in local mode.",
-                    )),
-            )
-            .when_some(self.runtime_change_error.clone(), |card, error| {
-                card.child(
-                    div()
-                        .mb(px(16.0))
-                        .text_size(px(12.0))
-                        .line_height(px(17.0))
-                        .text_color(theme.danger)
-                        .child(error),
-                )
-            })
-            .child(
-                popover::btn_primary(&theme, runtime_change_label)
-                    .id("signed-out-quit")
-                    .when(self.runtime_change_task.is_some(), |button| {
-                        button.opacity(0.6)
-                    })
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.start_local_runtime_transition(false, cx)
-                    })),
-            );
-
-        div()
-            .absolute()
-            .inset_0()
-            .occlude()
-            .bg(theme.bg)
-            .child(grid_backdrop(&theme))
-            .child(
-                div()
-                    .absolute()
-                    .inset_0()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(motion::fade_in("signed-out-restart", card)),
-            )
-            .into_any_element()
     }
 }

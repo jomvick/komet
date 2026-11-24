@@ -48,16 +48,17 @@ pub mod workspace_host;
 pub mod workspace_runtime;
 
 pub use agent_accounts::{AgentAccounts, AgentAccountsConfig, CliProviderFiles, UsageMode};
-pub use auth::{Auth, AuthConfig, AuthState, AuthUser, OrgMembership};
+pub use auth::{Auth, AuthConfig};
 pub use diff_sync::{
     CheckoutDiffSync, DiffFileTextPair, DiffSidecar, DiffSnapshot, TurnSnapshot,
     capture_commit_diff, capture_diff, capture_diff_against, capture_turn_diff, merge_base,
     read_diff_file_text, snapshot_tree, working_diff_base,
 };
-pub use doc_host::{ChatDocHandle, DocHost, DocHostConfig, EdgeConfig};
+pub use doc_host::{ChatDocHandle, DocHost, DocHostConfig, SyncConfig};
 pub use env_hosts::{EnvAddError, EnvHosts};
 pub use environments::{AddOutcome, EnvStoreError, EnvironmentStore};
 pub use instance_lock::InstanceLock;
+pub use komet_proto::SyncStatus;
 pub use profile::EngineProfile;
 pub use registry::{HarnessDescriptor, HarnessRegistry, default_registry};
 pub use repos::{CheckoutIdentity, Repos, worktree_branch_from_title};
@@ -107,15 +108,14 @@ pub struct EngineConfig {
     pub data_dir: PathBuf,
     /// Edge base URL.
     pub edge_url: String,
-    /// Explicit development bearer for edge room joins. Synced WorkOS runtimes
-    /// obtain their bearer from [`Auth`]; development stays offline when this is absent.
+    /// Optional development identity override. It is not the sync bearer; the
+    /// server credential is `sync_token`.
     pub edge_token: Option<String>,
     /// Localhost IPC port for the UI.
     pub ipc_port: u16,
     /// Harness for doc-command runs on chats without a workspace `config` row.
     pub default_harness: HarnessId,
     /// Workspace-doc org (`ws/{orgId}` room). `None` = `$KOMET_ORG_ID` or the dev default.
-    /// In WorkOS mode the signed-in session's org wins.
     pub org_id: Option<String>,
     pub sync_token: Option<String>,
 }
@@ -173,11 +173,13 @@ impl EngineCore {
         data_dir: &Path,
         registry: Arc<HarnessRegistry>,
         default_harness: HarnessId,
-        edge: Option<EdgeConfig>,
+        edge: Option<SyncConfig>,
     ) -> Result<Self, EngineError> {
         let org_id = env_or("KOMET_ORG_ID", DEFAULT_ORG_ID);
         let user_id = env_or("KOMET_USER_ID", DEFAULT_USER_ID);
-        let profile = EngineProfile::development(data_dir, &org_id, &user_id);
+        let profile = crate::profile::adopt_legacy_store(EngineProfile::development(
+            data_dir, &org_id, &user_id,
+        ));
         Self::assemble_with_profile(profile, registry, default_harness, edge)
     }
 
@@ -185,7 +187,7 @@ impl EngineCore {
         data_dir: &Path,
         registry: Arc<HarnessRegistry>,
         default_harness: HarnessId,
-        edge: Option<EdgeConfig>,
+        edge: Option<SyncConfig>,
         org_id: &str,
         user_id: &str,
     ) -> Result<Self, EngineError> {
@@ -198,7 +200,7 @@ impl EngineCore {
         profile: EngineProfile,
         registry: Arc<HarnessRegistry>,
         default_harness: HarnessId,
-        edge: Option<EdgeConfig>,
+        edge: Option<SyncConfig>,
     ) -> Result<Self, EngineError> {
         let data_dir = profile.device_root();
         std::fs::create_dir_all(data_dir)?;
@@ -216,7 +218,7 @@ impl EngineCore {
         profile: EngineProfile,
         registry: Arc<HarnessRegistry>,
         default_harness: HarnessId,
-        edge: Option<EdgeConfig>,
+        edge: Option<SyncConfig>,
         lock: InstanceLock,
     ) -> Result<Self, EngineError> {
         let assembly_start = std::time::Instant::now();
@@ -505,8 +507,7 @@ impl EngineCore {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(auth);
     }
 
-    /// The attached auth service, or a lazily-created dev-mode one (in-process embeds
-    /// that never wired WorkOS still answer AuthStatus honestly).
+    /// The attached auth service, or a lazily-created local identity for in-process embeds.
     pub fn auth(&self) -> Auth {
         let mut slot = self
             .auth
@@ -517,12 +518,11 @@ impl EngineCore {
                 .ok()
                 .filter(|s| !s.trim().is_empty())
                 .unwrap_or_else(|| "dev-user".into());
-            let mut config = AuthConfig::new("http://localhost:27640", std::env::temp_dir());
-            config.dev_user_id = dev_user.clone();
-            // The dev identity IS its bearer: relays and room joins need a
-            // non-None token source even fully offline (the pre-local-first
-            // behavior — without it start_host_relay idles "not signed in").
-            config.sync_token = Some(dev_user);
+            let mut config = AuthConfig::new();
+            config.dev_user_id = dev_user;
+            // This fallback supplies a stable local namespace identity.
+            // Runtime sync credentials are configured separately.
+            config.sync_token = None;
             Auth::new(config)
         })
         .clone()
@@ -724,7 +724,7 @@ pub struct Engine {
 
 /// A fully assembled identity-scoped engine plus the relay handle whose lifetime
 /// keeps this device reachable. Used by both the headless server and the headed
-/// in-process engine so their production authentication paths cannot diverge.
+/// in-process engine so their sync credential paths cannot diverge.
 pub struct EngineRuntime {
     core: Arc<EngineCore>,
     host_relay: std::sync::Mutex<Option<komet_rpc::HostRelay>>,
@@ -823,35 +823,37 @@ impl Engine {
         Self { config }
     }
 
-    /// Resolve the shared dev/WorkOS auth configuration for headed and headless
-    /// modes. A clean WorkOS boot deliberately avoids probing Edge: signed-out
-    /// installations must be able to start locally without network access.
+    /// Resolve the shared-token configuration for headed and headless modes.
     pub async fn build_auth(config: &EngineConfig) -> Auth {
-        let mut auth_config = AuthConfig::new(config.edge_url.clone(), config.data_dir.clone());
+        let mut auth_config = AuthConfig::new();
         auth_config.sync_token = config
             .sync_token
             .clone()
-            .or_else(|| std::env::var("KOMET_SYNC_TOKEN").ok());
+            .filter(|token| !token.trim().is_empty())
+            .or_else(|| {
+                std::env::var("KOMET_SYNC_TOKEN")
+                    .ok()
+                    .filter(|token| !token.trim().is_empty())
+            });
         if let Some(token) = &config.edge_token {
             auth_config.dev_user_id = token.clone();
+        } else if let Ok(user_id) = std::env::var("KOMET_USER_ID") {
+            auth_config.dev_user_id = user_id;
         }
         Auth::new(auth_config)
     }
 
-    /// Capture the workspace boundary once, before refresh or sign-in can mutate auth.
-    pub fn initial_workspace_scope(auth: &Auth) -> WorkspaceScope {
-        if !auth.workos_enabled() {
-            WorkspaceScope::Development
-        } else if auth.loaded_workos_session() {
-            WorkspaceScope::Synced
-        } else {
-            WorkspaceScope::Local
-        }
+    /// Resolve the profile namespace used for a new runtime.
+    ///
+    /// Local-development storage is kept at its established account-scoped path
+    /// for upgrade compatibility. Sync transport is independently enabled only
+    /// when a server URL and shared bearer are configured.
+    pub fn initial_workspace_scope() -> WorkspaceScope {
+        WorkspaceScope::Development
     }
 
-    /// Resolve a profile for the captured scope. A synced session without an
-    /// organization returns `None` until onboarding selects one; it never falls
-    /// through to the local or development profile.
+    /// Resolve a profile for the captured scope. Identity comes from explicit
+    /// local configuration; no hosted account or organization lookup exists.
     pub fn resolve_profile(
         config: &EngineConfig,
         auth: &Auth,
@@ -869,29 +871,24 @@ impl Engine {
                 let org_id = dev_token_org
                     .or(config.org_id.clone())
                     .unwrap_or_else(|| env_or("KOMET_ORG_ID", DEFAULT_ORG_ID));
-                let user_id = auth
-                    .user_id()
-                    .unwrap_or_else(|| env_or("KOMET_USER_ID", DEFAULT_USER_ID));
-                Ok(Some(EngineProfile::development(
-                    &config.data_dir,
-                    &org_id,
-                    &user_id,
+                let user_id = auth.user_id();
+                // Upgrade path: keep a pre-hosted-auth store reachable instead
+                // of opening an empty workspace beside it.
+                Ok(Some(crate::profile::adopt_legacy_store(
+                    EngineProfile::development(&config.data_dir, &org_id, &user_id),
                 )))
             }
             WorkspaceScope::Synced => {
-                let state = auth.state();
-                let Some(user) = state.user() else {
-                    return Err(EngineError::Other(
-                        "captured synced session no longer exposes its user identity".into(),
-                    ));
-                };
-                let Some(org_id) = state.org_id() else {
-                    return Ok(None);
-                };
+                let org_id = config
+                    .org_id
+                    .as_deref()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| env_or("KOMET_ORG_ID", DEFAULT_ORG_ID));
+                let user_id = auth.user_id();
                 Ok(Some(EngineProfile::synced(
                     &config.data_dir,
-                    org_id,
-                    &user.id,
+                    &org_id,
+                    &user_id,
                 )))
             }
         }
@@ -939,27 +936,19 @@ impl Engine {
         lock: Option<InstanceLock>,
     ) -> anyhow::Result<EngineRuntime> {
         tracing::info!("assembling engine core");
-        let edge_enabled = match profile.scope() {
+        let sync_enabled = match profile.scope() {
             WorkspaceScope::Local => false,
-            WorkspaceScope::Synced => {
-                // Validate a persisted session once so definitive revocation
-                // still transitions auth to SignedOut. A transient failure
-                // must not gate construction of the recovery supervisors.
-                let _ = auth.access_token().await;
-                true
+            // Both account-scoped and development profiles need the same
+            // explicit self-hosted connection. `edge_token` is a development
+            // identity override; the actual room bearer is `KOMET_SYNC_TOKEN`
+            // carried by Auth.
+            WorkspaceScope::Synced | WorkspaceScope::Development => {
+                !config.edge_url.trim().is_empty() && auth.access_token().await.is_some()
             }
-            // Dev Auth always exposes `dev_user_id` as its synthetic access
-            // token, including when WorkOS was merely disabled with
-            // KOMET_WORKOS_CLIENT_ID="". Only an explicitly configured,
-            // non-empty bearer opts this runtime into Edge rooms and relays.
-            WorkspaceScope::Development => config
-                .edge_token
-                .as_deref()
-                .is_some_and(|token| !token.trim().is_empty()),
         };
         let device_id = load_or_create_device_id(profile.device_root())?;
-        let edge = edge_enabled.then(|| {
-            EdgeConfig::new(config.edge_url.clone(), Arc::new(auth.clone())).with_device(device_id)
+        let edge = sync_enabled.then(|| {
+            SyncConfig::new(config.edge_url.clone(), Arc::new(auth.clone())).with_device(device_id)
         });
 
         let core = match lock {
@@ -989,7 +978,7 @@ impl Engine {
             Arc::new(move || !sessions.any_active() && !terminals.any_open())
         };
         let updater = komet_update::Updater::spawn(Some(quiescent));
-        if let Some(mut token_changes) = edge.as_ref().and_then(EdgeConfig::token_changes) {
+        if let Some(mut token_changes) = edge.as_ref().and_then(SyncConfig::token_changes) {
             let updater_for_tokens = updater.clone();
             let wake = tokio::spawn(async move {
                 while token_changes.changed().await.is_ok() {
@@ -1025,8 +1014,8 @@ impl Engine {
         })
     }
 
-    /// Run until ctrl-c: auth (dev or WorkOS), sessions engine + doc host + command
-    /// executor, IPC server, and — when edge+auth are ready — the device-room host
+    /// Run until ctrl-c: the sessions engine + doc host + command
+    /// executor, IPC server, and — when sync is configured — the device-room host
     /// relay + peer link cache (targetDeviceId routing).
     pub async fn run(self) -> anyhow::Result<()> {
         let config = self.config;
@@ -1034,20 +1023,9 @@ impl Engine {
 
         std::fs::create_dir_all(&config.data_dir)?;
         let auth = Self::build_auth(&config).await;
-        let mut auth_state = auth.watch_state();
-        let workspace_scope = Self::initial_workspace_scope(&auth);
-        let mut profile = Self::resolve_profile(&config, &auth, workspace_scope)?;
-        let _refresh_loop = auth.spawn_refresh_loop();
-
-        // A captured cloud session without an organization must finish onboarding
-        // before its profile can open. A clean signed-out install is local and never
-        // enters the terminal sign-in flow.
-        if workspace_scope == WorkspaceScope::Synced && profile.is_none() {
-            terminal_sign_in(&auth).await?;
-            profile = Self::resolve_profile(&config, &auth, workspace_scope)?;
-        }
-        let profile = profile
-            .ok_or_else(|| EngineError::Other("synced workspace profile is not ready".into()))?;
+        let workspace_scope = Self::initial_workspace_scope();
+        let profile = Self::resolve_profile(&config, &auth, workspace_scope)?
+            .ok_or_else(|| EngineError::Other("workspace profile is not ready".into()))?;
         // Assembly (stores + provider probes) is the long, silent part of a cold
         // boot; bracket it so a slow start is attributable in the log.
         tracing::info!(
@@ -1075,30 +1053,11 @@ impl Engine {
                     tracing::info!("headless shutdown requested over IPC");
                 }
             }
-            _ = wait_for_signed_out(&mut auth_state), if workspace_scope == WorkspaceScope::Synced => {
-                // Edge transports observe the same auth signal and close at
-                // once. Leave a brief reply window for a SignOut RPC before
-                // the localhost server itself is aborted.
-                runtime.disconnect_edge();
-                tracing::info!("headless authentication revoked; stopping synced runtime");
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            }
         }
         tracing::info!("shutting down");
         server.abort();
         runtime.shutdown().await;
         Ok(())
-    }
-}
-
-async fn wait_for_signed_out(state: &mut tokio::sync::watch::Receiver<AuthState>) {
-    loop {
-        if matches!(&*state.borrow(), AuthState::SignedOut) {
-            return;
-        }
-        if state.changed().await.is_err() {
-            return;
-        }
     }
 }
 
@@ -1161,165 +1120,6 @@ pub async fn serve_ipc_with_router(
         let _published = published;
         komet_rpc::serve_ws_listener_with_router(listener, router, token).await;
     }))
-}
-
-/// Block until the WorkOS session is signed in AND org-scoped. On a TTY, print the
-/// headless (paste-code) sign-in URL, read the pasted `state.code` from stdin, and
-/// run workspace onboarding (create / auto-join / numbered picker). Off a TTY this
-/// errors immediately — a daemon under systemd/launchd must load the session that
-/// `komet login` persisted, never wait on a prompt nobody can see.
-pub async fn terminal_sign_in(auth: &Auth) -> Result<(), EngineError> {
-    use std::io::IsTerminal;
-    let interactive = std::io::stdin().is_terminal();
-    let mut state_rx = auth.watch_state();
-    let mut stdin_reader: Option<tokio::task::JoinHandle<()>> = None;
-    let mut org_reader: Option<tokio::task::JoinHandle<()>> = None;
-    loop {
-        let state = state_rx.borrow().clone();
-        match state {
-            AuthState::SignedIn { user, org_id } => {
-                tracing::info!(email = %user.email, org = org_id.as_deref().unwrap_or("<none>"),
-                    "auth: session ready");
-                break;
-            }
-            AuthState::NeedsOrganization { user } => {
-                if !interactive {
-                    // No reader tasks have been spawned on this path (both spawns
-                    // are TTY-gated), so an early return leaks nothing.
-                    return Err(EngineError::Other(format!(
-                        "signed in as {} but no workspace is selected — run `komet login` on this machine to pick one",
-                        user.email
-                    )));
-                }
-                if org_reader.is_none() {
-                    // Workspace onboarding on the TTY (old komet's
-                    // `backend login` flow): create if none, auto-join a
-                    // single membership, numbered picker otherwise.
-                    println!("Signed in as {}.", user.email);
-                    org_reader = Some(tokio::spawn(run_org_onboarding(auth.clone())));
-                }
-            }
-            AuthState::SignedOut => {
-                if !interactive {
-                    return Err(EngineError::Other(
-                        "not signed in — run `komet login` on this machine first".into(),
-                    ));
-                }
-                if stdin_reader.is_none() {
-                    let url = auth.start_headless_sign_in();
-                    println!("Sign in to Komet:\n\n  {url}\n");
-                    println!("Then paste the code shown in the browser here and press enter.");
-                    let auth = auth.clone();
-                    stdin_reader = Some(tokio::spawn(async move {
-                        loop {
-                            let Some(line) = read_stdin_line().await else {
-                                return;
-                            };
-                            let pasted = line.trim();
-                            if pasted.is_empty() {
-                                continue;
-                            }
-                            match auth.complete_sign_in(pasted).await {
-                                Ok(()) => return,
-                                Err(err) => println!("Sign-in failed: {err}"),
-                            }
-                        }
-                    }));
-                }
-            }
-        }
-        if state_rx.changed().await.is_err() {
-            break;
-        }
-    }
-    if let Some(reader) = stdin_reader {
-        reader.abort();
-    }
-    if let Some(reader) = org_reader {
-        reader.abort();
-    }
-    Ok(())
-}
-
-/// One line from stdin (blocking read off the runtime). `None` = stdin closed.
-async fn read_stdin_line() -> Option<String> {
-    tokio::task::spawn_blocking(|| {
-        let mut line = String::new();
-        match std::io::stdin().read_line(&mut line) {
-            Ok(0) | Err(_) => None, // EOF / error
-            Ok(_) => Some(line),
-        }
-    })
-    .await
-    .ok()
-    .flatten()
-}
-
-/// TTY workspace onboarding for an org-less session (ports old komet's
-/// `backend login` flow): no memberships → prompt a name and create; exactly
-/// one → auto-join; several → numbered picker. Success flips the auth state to
-/// `SignedIn`, which ends [`wait_for_sign_in`]'s wait (and aborts this task).
-async fn run_org_onboarding(auth: Auth) {
-    let orgs = match auth.list_orgs().await {
-        Ok(orgs) => orgs,
-        Err(err) => {
-            println!(
-                "Could not list workspaces ({err}) — create or select one from the Komet UI to continue."
-            );
-            return;
-        }
-    };
-    match orgs.len() {
-        0 => {
-            println!("No workspaces yet — name your new workspace and press enter:");
-            loop {
-                let Some(line) = read_stdin_line().await else {
-                    return;
-                };
-                let name = line.trim();
-                if name.is_empty() {
-                    continue;
-                }
-                match auth.create_org(name).await {
-                    Ok(()) => return,
-                    Err(err) => println!("Creating workspace failed: {err}"),
-                }
-            }
-        }
-        1 => {
-            let only = &orgs[0];
-            println!("Joining workspace \"{}\"…", only.name);
-            if let Err(err) = auth.select_org(&only.organization_id).await {
-                println!("Joining workspace failed: {err}");
-            }
-        }
-        _ => {
-            println!("\nYour workspaces:");
-            for (index, org) in orgs.iter().enumerate() {
-                println!("  {}. {}", index + 1, org.name);
-            }
-            println!("Pick a workspace [1-{}]:", orgs.len());
-            loop {
-                let Some(line) = read_stdin_line().await else {
-                    return;
-                };
-                let choice = line
-                    .trim()
-                    .parse::<usize>()
-                    .ok()
-                    .and_then(|n| n.checked_sub(1))
-                    .and_then(|index| orgs.get(index));
-                let Some(org) = choice else {
-                    println!("Pick a workspace [1-{}]:", orgs.len());
-                    continue;
-                };
-                match auth.select_org(&org.organization_id).await {
-                    Ok(()) => return,
-                    Err(err) => println!("Joining workspace failed: {err}"),
-                }
-            }
-        }
-    }
 }
 
 /// Best-effort human name for this device's registry row.

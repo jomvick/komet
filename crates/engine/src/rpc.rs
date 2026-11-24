@@ -15,9 +15,7 @@
 //! - `EngineInfo` → `{deviceId, workspaceScope}` — this runtime's fixed identity
 //!   and data boundary (never forwarded)
 //! - `LocalDevice` → `{deviceId}` — legacy engine identity (never forwarded)
-//! - AuthRpc (feature-inventory §2): `AuthStatus` (stream), `SignIn`/`SignInHeadless` →
-//!   `{url}`, `CompleteSignIn {code}`, `SignOut`, `ListOrgs`, `CreateOrg {name}`,
-//!   `SelectOrg {organizationId}`
+//! - SyncStatus: reports whether a self-hosted bearer is configured.
 //! - Repos (§3.5): `ListRepos`, `AddRepo {path}`, `CloneRepo {url}`,
 //!   `CreateRepo {name}`, `ListBranches {repoPath}` (default branch first),
 //!   `ListFolders {path?}`, `CreateWorktree {repoPath, branch}`, `DeleteWorktree
@@ -31,8 +29,8 @@
 //!   `TerminalScreen`, `ReadTerminalTail {terminalId, lines}` →
 //!   `TerminalTail`, `ReadTerminalDelta {terminalId, sinceSeq}` →
 //!   `TerminalDelta`. Agents list and read every terminal over MCP but never
-//!   write to one (see `crate::terminals` and docs/security.md). M5 is single-user local:
-//!   per-user owner checks land with real multi-account auth in M6.
+//!   write to one (see `crate::terminals` and docs/security.md). Terminal ownership
+//!   remains scoped to the device that hosts the engine.
 //! - Agent accounts (§3.7): `ListAgentAccounts {usageMode?, forceUsage?}` →
 //!   `AgentAccountsSnapshot`, `ActivateAgentAccount`/`ForgetAgentAccount`
 //!   `{harness, accountId}` → snapshot, `StartAgentLogin {harness}` →
@@ -727,7 +725,7 @@ impl EngineRpc {
         self
     }
 
-    /// Attach the auth service (AuthStatus + AuthRpc mutations).
+    /// Attach the local sync identity status stream.
     pub fn with_auth(mut self, auth: Auth) -> Self {
         self.auth = Some(auth);
         self
@@ -1861,100 +1859,31 @@ fn doc_messages_stream(
     .boxed()
 }
 
-/// Authentication-only RPC surface used while the headed app is waiting for a
-/// production WorkOS session. Keeping this independent from [`EngineRpc`] lets
-/// the UI show its sign-in and organization gates before identity-scoped Loro
-/// stores are opened.
+/// Local sync credential status used during engine bootstrap. Keeping it
+/// separate from [`EngineRpc`] lets the shell connect before profile stores
+/// open; it owns [`methods::WATCH_SYNC_CREDENTIALS`] only, so the unary
+/// room-stats read on [`methods::SYNC_STATUS`] still reaches [`EngineRpc`].
 #[derive(Clone)]
-pub struct AuthRpc {
+pub struct SyncStatusRpc {
     auth: Auth,
 }
 
-impl AuthRpc {
+impl SyncStatusRpc {
     pub fn new(auth: Auth) -> Self {
         Self { auth }
     }
 
     pub fn handles(method: &str) -> bool {
-        matches!(
-            method,
-            methods::AUTH_STATUS
-                | methods::SIGN_IN
-                | methods::SIGN_IN_HEADLESS
-                | methods::COMPLETE_SIGN_IN
-                | methods::SIGN_OUT
-                | methods::LIST_ORGS
-                | methods::CREATE_ORG
-                | methods::SELECT_ORG
-        )
+        method == methods::WATCH_SYNC_CREDENTIALS
     }
 }
 
 #[async_trait]
-impl RpcService for AuthRpc {
-    async fn handle(&self, method: &str, params: serde_json::Value) -> Result<RpcReply, RpcError> {
+impl RpcService for SyncStatusRpc {
+    async fn handle(&self, method: &str, _params: serde_json::Value) -> Result<RpcReply, RpcError> {
         match method {
-            methods::AUTH_STATUS => Ok(RpcReply::Stream(watch_stream(self.auth.watch_state()))),
-            methods::SIGN_IN => {
-                let url = self
-                    .auth
-                    .start_sign_in()
-                    .await
-                    .map_err(|e| RpcError::Failed(e.to_string()))?;
-                RpcReply::value(&serde_json::json!({ "url": url }))
-            }
-            methods::SIGN_IN_HEADLESS => {
-                let url = self.auth.start_headless_sign_in();
-                RpcReply::value(&serde_json::json!({ "url": url }))
-            }
-            methods::COMPLETE_SIGN_IN => {
-                #[derive(Deserialize)]
-                struct P {
-                    code: String,
-                }
-                let p: P = parse_params(params)?;
-                self.auth
-                    .complete_sign_in(&p.code)
-                    .await
-                    .map_err(|e| RpcError::Failed(e.to_string()))?;
-                RpcReply::value(&serde_json::json!({ "ok": true }))
-            }
-            methods::SIGN_OUT => {
-                self.auth.sign_out();
-                RpcReply::value(&serde_json::json!({ "ok": true }))
-            }
-            methods::LIST_ORGS => {
-                let orgs = self
-                    .auth
-                    .list_orgs()
-                    .await
-                    .map_err(|e| RpcError::Failed(e.to_string()))?;
-                RpcReply::value(&serde_json::json!({ "orgs": orgs }))
-            }
-            methods::CREATE_ORG => {
-                #[derive(Deserialize)]
-                struct P {
-                    name: String,
-                }
-                let p: P = parse_params(params)?;
-                self.auth
-                    .create_org(&p.name)
-                    .await
-                    .map_err(|e| RpcError::Failed(e.to_string()))?;
-                RpcReply::value(&serde_json::json!({ "ok": true }))
-            }
-            methods::SELECT_ORG => {
-                #[derive(Deserialize)]
-                #[serde(rename_all = "camelCase")]
-                struct P {
-                    organization_id: String,
-                }
-                let p: P = parse_params(params)?;
-                self.auth
-                    .select_org(&p.organization_id)
-                    .await
-                    .map_err(|e| RpcError::Failed(e.to_string()))?;
-                RpcReply::value(&serde_json::json!({ "ok": true }))
+            methods::WATCH_SYNC_CREDENTIALS => {
+                Ok(RpcReply::Stream(watch_stream(self.auth.watch_status())))
             }
             _ => Err(RpcError::UnknownMethod(method.to_string())),
         }
@@ -2028,8 +1957,8 @@ impl RpcService for EngineRpc {
             let target = target.to_string();
             return self.forward(&target, method, params).await;
         }
-        if AuthRpc::handles(method) {
-            return AuthRpc::new(self.auth()?.clone())
+        if SyncStatusRpc::handles(method) {
+            return SyncStatusRpc::new(self.auth()?.clone())
                 .handle(method, params)
                 .await;
         }
@@ -2322,6 +2251,19 @@ impl RpcService for EngineRpc {
                     "workspace": workspace.as_ref().map(room_json),
                     "chats": chats,
                 }))
+            }
+            methods::SYNC_LEGACY => RpcReply::value(&serde_json::json!({
+                "deviceId": self.doc_host.device_id(),
+                "chats": self.doc_host.legacy_chat_rows(),
+            })),
+            methods::SYNC_MIGRATE => {
+                #[derive(serde::Deserialize)]
+                struct MigrateParams {
+                    #[serde(rename = "dryRun", default)]
+                    dry_run: bool,
+                }
+                let p: MigrateParams = parse_params(params)?;
+                RpcReply::value(&self.doc_host.migrate_legacy(p.dry_run).await)
             }
             methods::WATCH_CHATS => {
                 Ok(RpcReply::Stream(watch_stream(self.workspace.watch_chats())))

@@ -411,7 +411,7 @@ async fn ws_handler(
     query: axum::extract::RawQuery,
 ) -> impl IntoResponse {
     // Room clients carry the bearer as `?token=` (the protocol the engine's
-    // `RoomClient`/`RegistryClient` speak, and what the old Durable Object
+    // `RoomClient`/`RegistryClient` speak, and what the registry room
     // accepted); HTTP routes use the header. Either one authorizes the socket.
     if !check_auth(&state, &headers) && !check_query_token(&state, query.0.as_deref()) {
         return Err((StatusCode::UNAUTHORIZED, "unauthorized"));

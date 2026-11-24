@@ -1,6 +1,6 @@
 //! Session doc schema over `loro` — Rust port of `packages/session-doc/src/schema.ts`.
 //!
-//! Container layout (MUST stay shape-compatible with the TS edge/tail materializer):
+//! Container layout for persisted session documents and sync replication:
 //! - `meta`:     LoroMap  { chatId: string, schemaVersion: number }         (host-only writer)
 //! - `messages`: LoroList of LoroMap {
 //!   id, role, parts: LoroList<part map>, createdAt, deviceId, status?, continuationOf? }
@@ -88,7 +88,7 @@ struct DocPartJson {
     /// Capped inline tool diff (additive; pre-strip writers only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     diff: Option<serde_json::Value>,
-    /// Sidecar key of the full output (additive, docs/chat2-sync.md A1).
+    /// Sidecar key of the full output (additive, session document schema).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     output_ref: Option<String>,
     /// Full-output byte length (additive).

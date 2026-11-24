@@ -1,13 +1,10 @@
-//! Live-edge interop: two Rust `RegistryClient`s converge through a REAL
-//! RegistryRoom Durable Object (the TS implementation in
-//! edge/src/registry-room.ts), proving the JSON protocol and the mirrored
-//! merge semantics are byte-compatible across the language boundary.
+//! Live-server interop: two Rust RegistryClients converge through the
+//! self-hosted Komet sync server using its registry room protocol.
 //!
-//! Ignored by default — requires the TS edge running (`wrangler dev` in
-//! `edge/` with AUTH_MODE=dev). Run with:
+//! Ignored by default; run against a local server with:
 //!
 //! ```sh
-//! KOMET_EDGE_WS=ws://127.0.0.1:27640 cargo test -p komet-sync --test registry_edge -- --ignored
+//! KOMET_EDGE_WS=ws://127.0.0.1:27640 cargo test -p komet-sync --test registry_server -- --ignored
 //! ```
 
 use std::sync::{Arc, Mutex};
@@ -93,7 +90,7 @@ async fn two_rust_clients_converge_through_a_real_registry_do() {
     client_a.nudge();
     wait_until(|| doc_a.lock().unwrap().pending_len() == 0).await;
 
-    // B joins fresh and receives the full state from the DO's row table.
+    // B joins fresh and receives the full state from the room service's row table.
     let client_b = RegistryClient::connect(&url, doc_b.clone(), "dev-live-b")
         .await
         .expect("b connects to the real DO");

@@ -1,11 +1,11 @@
 //! RegistryClient — WebSocket transport for the workspace registry
-//! (docs/registry-sync.md): hello/cursor handshake, push/ack for pending op
+//! (docs/sync.md): hello/cursor handshake, push/ack for pending op
 //! batches, merged-row broadcasts, presence beats, probe/redial liveness, and
 //! reconnect with exponential backoff.
 //!
 //! The client owns no row semantics: everything applies through the shared
 //! [`komet_doc::RegistryDoc`] under a lock. Wire frames are JSON text —
-//! byte-compatible with `edge/src/registry-room.ts`.
+//! byte-compatible with `shared protocol behavior`.
 //!
 //! Liveness discipline is inherited from `room.rs` and its incidents: the
 //! transport-level text ping elicits a runtime auto-pong that proves NOTHING
@@ -17,39 +17,19 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use futures::future::BoxFuture;
-use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use tokio::net::TcpStream;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
-use tokio_tungstenite::tungstenite::Message as WsMessage;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use komet_doc::{PendingBatch, RegistryDoc, RegistryRow, StateOutcome};
 
+use crate::transport::{
+    self, Connector, HELLO_DEADLINE, Liveness, Pipe, Session, SessionEnd, Signals,
+};
 use crate::types::{RoomStatsSnapshot, StaticUrl, SyncError, UrlProvider};
 
-/// Text `"ping"` keepalive interval (answered by the DO auto-response pair
-/// without waking it — transport liveness only).
-const PING_INTERVAL: Duration = Duration::from_secs(15);
-/// Transport silence lease: pongs count, so a healthy socket never trips this.
-const SILENCE_LEASE: Duration = Duration::from_secs(45);
-/// Bound on one dial attempt (URL fetch + WS handshake).
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
-/// The server must answer a hello with `state` within this deadline.
-const HELLO_DEADLINE: Duration = Duration::from_secs(15);
-/// A probe's `probe-ok` (or any other protocol frame) must arrive within this
-/// deadline, or the session is torn down for a fresh socket.
-const PROBE_DEADLINE: Duration = Duration::from_secs(10);
 /// Presence entries older than this are treated as expired (mirrors the
 /// EphemeralStore's 30s TTL the old workspace room used).
 const PRESENCE_TTL: Duration = Duration::from_secs(30);
-const BACKOFF_BASE: Duration = Duration::from_millis(250);
-const BACKOFF_CAP: Duration = Duration::from_secs(30);
-
-/// Quiet-room probe cadence default. The workspace registry is one room per
-/// engine, so a fixed 15min cadence costs ~100 DO wakes/day total.
-const PROBE_QUIET_DEFAULT: Duration = Duration::from_secs(900);
 
 /// Per-client tuning.
 #[derive(Clone, Copy, Debug)]
@@ -61,7 +41,7 @@ pub struct RegistryTuning {
 impl Default for RegistryTuning {
     fn default() -> Self {
         Self {
-            probe_quiet: PROBE_QUIET_DEFAULT,
+            probe_quiet: transport::PROBE_QUIET_DEFAULT,
         }
     }
 }
@@ -79,7 +59,7 @@ pub enum RegistryEvent {
     Presence,
 }
 
-// ── wire frames (JSON text; mirror edge/src/registry-room.ts) ───────────────
+// ── wire frames (JSON text; mirror shared protocol behavior) ───────────────
 
 #[derive(Serialize)]
 #[serde(tag = "t", rename_all = "lowercase")]
@@ -135,90 +115,9 @@ enum ServerFrame {
     },
 }
 
-// ── transport plumbing (text-frame sibling of room.rs's Pipe) ───────────────
+// ── transport plumbing (text frames; codec owned by transport.rs) ───────────
 
-pub(crate) struct TextPipe {
-    pub(crate) tx: mpsc::Sender<String>,
-    pub(crate) rx: mpsc::Receiver<String>,
-}
-
-pub(crate) trait TextConnector: Send + Sync + 'static {
-    fn connect(&self) -> BoxFuture<'static, Result<TextPipe, SyncError>>;
-}
-
-struct WsTextConnector {
-    url: Arc<dyn UrlProvider>,
-}
-
-impl TextConnector for WsTextConnector {
-    fn connect(&self) -> BoxFuture<'static, Result<TextPipe, SyncError>> {
-        let provider = self.url.clone();
-        Box::pin(async move {
-            let url = provider.url().await?;
-            let ws = crate::dial::connect_ws(&url)
-                .await
-                .map_err(|e| SyncError::WebSocket(e.to_string()))?;
-            let (out_tx, out_rx) = mpsc::channel(64);
-            let (in_tx, in_rx) = mpsc::channel(64);
-            tokio::spawn(pump(ws, out_rx, in_tx));
-            Ok(TextPipe {
-                tx: out_tx,
-                rx: in_rx,
-            })
-        })
-    }
-}
-
-/// Shuttle text frames between the WebSocket and the actor's channels, plus
-/// the ping keepalive and the transport silence lease.
-async fn pump(
-    ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
-    mut out_rx: mpsc::Receiver<String>,
-    in_tx: mpsc::Sender<String>,
-) {
-    let (mut sink, mut stream) = ws.split();
-    let mut ping = tokio::time::interval(PING_INTERVAL);
-    ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    ping.tick().await;
-    let mut last_rx = tokio::time::Instant::now();
-    loop {
-        tokio::select! {
-            frame = out_rx.recv() => match frame {
-                Some(text) => {
-                    if sink.send(WsMessage::Text(text)).await.is_err() {
-                        break;
-                    }
-                }
-                None => {
-                    let _ = sink.send(WsMessage::Close(None)).await;
-                    break;
-                }
-            },
-            frame = stream.next() => match frame {
-                Some(Ok(WsMessage::Text(text))) => {
-                    last_rx = tokio::time::Instant::now();
-                    let text = text.to_string();
-                    if text != "pong" && in_tx.send(text).await.is_err() {
-                        break;
-                    }
-                }
-                Some(Ok(_)) => {
-                    last_rx = tokio::time::Instant::now();
-                }
-                Some(Err(_)) | None => break,
-            },
-            _ = ping.tick() => {
-                if sink.send(WsMessage::Text("ping".into())).await.is_err() {
-                    break;
-                }
-            }
-            _ = tokio::time::sleep_until(last_rx + SILENCE_LEASE) => {
-                tracing::warn!("registry socket silent past lease; treating as dead");
-                break;
-            }
-        }
-    }
-}
+pub(crate) type TextPipe = Pipe<String>;
 
 // ── stats (RoomStatsSnapshot-compatible so SyncStatus/`komet sync` render it) ─
 
@@ -309,23 +208,30 @@ impl RegistryClient {
         device_id: &str,
         tuning: RegistryTuning,
     ) -> Result<Self, SyncError> {
-        let connector = Arc::new(WsTextConnector { url: provider });
+        let connector: Arc<dyn Connector<String>> = Arc::new(transport::WsConnector::new(provider));
         Self::connect_with_tuned(connector, doc, device_id, tuning).await
     }
 
     pub(crate) async fn connect_with_tuned(
-        connector: Arc<dyn TextConnector>,
+        connector: Arc<dyn Connector<String>>,
         doc: Arc<Mutex<RegistryDoc>>,
         device_id: &str,
         tuning: RegistryTuning,
     ) -> Result<Self, SyncError> {
         let (events, _) = broadcast::channel(256);
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (ready_tx, ready_rx) = oneshot::channel();
-        let (nudge_tx, nudge_rx) = mpsc::channel(1);
-        let (probe_tx, probe_rx) = mpsc::channel(1);
-        let (redial_tx, redial_rx) = mpsc::channel(1);
-        let (presence_tx, presence_rx) = mpsc::channel(4);
+        let Signals {
+            nudge_tx,
+            nudge_rx,
+            probe_tx,
+            probe_rx,
+            redial_tx,
+            redial_rx,
+            presence_tx,
+            presence_rx,
+            shutdown_tx,
+            shutdown_rx,
+        } = Signals::new(4);
         let presence = Arc::new(Mutex::new(HashMap::new()));
         let stats = Arc::new(Stats::default());
 
@@ -343,7 +249,9 @@ impl RegistryClient {
             presence: presence.clone(),
             stats: stats.clone(),
         };
-        let task = tokio::spawn(actor.run(ready_tx));
+        // Aborts the actor if this connect future is dropped before the join
+        // completes (a caller that gave up must not leave a client running).
+        let task = transport::AbortOnDrop::new(tokio::spawn(actor.run(ready_tx)));
 
         match ready_rx.await {
             Ok(Ok(())) => Ok(Self {
@@ -356,16 +264,10 @@ impl RegistryClient {
                 presence_out: presence_tx,
                 presence,
                 stats,
-                task: Some(task),
+                task: Some(task.release()),
             }),
-            Ok(Err(err)) => {
-                task.abort();
-                Err(err)
-            }
-            Err(_) => {
-                task.abort();
-                Err(SyncError::Closed)
-            }
+            Ok(Err(err)) => Err(err),
+            Err(_) => Err(SyncError::Closed),
         }
     }
 
@@ -434,7 +336,7 @@ impl Drop for RegistryClient {
 struct Actor {
     doc: Arc<Mutex<RegistryDoc>>,
     device_id: String,
-    connector: Arc<dyn TextConnector>,
+    connector: Arc<dyn Connector<String>>,
     tuning: RegistryTuning,
     events: broadcast::Sender<RegistryEvent>,
     shutdown: watch::Receiver<bool>,
@@ -446,111 +348,19 @@ struct Actor {
     stats: Arc<Stats>,
 }
 
-enum SessionEnd {
-    /// Transport died / probe deadline / requested redial: back off, redial.
-    Reconnect,
-    /// System wake: the socket sat through a suspend, so redial at once with a
-    /// fresh backoff — sleeping first would delay the recovery it announced.
-    Wake,
-    /// Shutdown requested: stop the actor.
-    Stop,
+impl Actor {
+    async fn run(self, ready: oneshot::Sender<Result<(), SyncError>>) {
+        let connector = self.connector.clone();
+        let shutdown = self.shutdown.clone();
+        transport::run(connector, self, shutdown, ready).await
+    }
 }
 
-impl Actor {
-    async fn run(mut self, ready: oneshot::Sender<Result<(), SyncError>>) {
-        let mut ready = Some(ready);
-        let mut backoff = BACKOFF_BASE;
-        loop {
-            if *self.shutdown.borrow() {
-                return;
-            }
-            let dial = tokio::time::timeout(CONNECT_TIMEOUT, self.connector.connect()).await;
-            let pipe = match dial {
-                Ok(Ok(pipe)) => pipe,
-                Ok(Err(err)) => {
-                    if let Some(ready) = ready.take() {
-                        let _ = ready.send(Err(err));
-                        return; // first join failed: caller owns the retry
-                    }
-                    tracing::warn!(error = %err, "registry dial failed; backing off");
-                    if self.sleep_or_shutdown(backoff).await {
-                        return;
-                    }
-                    backoff = (backoff * 2).min(BACKOFF_CAP);
-                    continue;
-                }
-                Err(_) => {
-                    if let Some(ready) = ready.take() {
-                        let _ = ready.send(Err(SyncError::WebSocket("connect timeout".into())));
-                        return;
-                    }
-                    tracing::warn!("registry dial timed out; backing off");
-                    if self.sleep_or_shutdown(backoff).await {
-                        return;
-                    }
-                    backoff = (backoff * 2).min(BACKOFF_CAP);
-                    continue;
-                }
-            };
-
-            match self.run_session(pipe, &mut ready).await {
-                SessionEnd::Stop => return,
-                SessionEnd::Wake => {
-                    // The socket sat through a suspend: it is dead even though
-                    // no transport error was reported, so the session must be
-                    // unwound exactly as a drop is — otherwise a push that was
-                    // in flight keeps its batch marked `in_flight` and is never
-                    // replayed on the replacement connection.
-                    self.note_session_end();
-                    // Resume is an event, not a timeout: no backoff sleep, and
-                    // the next failure starts the ladder over.
-                    backoff = BACKOFF_BASE;
-                }
-                SessionEnd::Reconnect => {
-                    self.note_session_end();
-                    if ready.is_some() {
-                        // Handshake failed on the very first session.
-                        if let Some(ready) = ready.take() {
-                            let _ = ready
-                                .send(Err(SyncError::Protocol("registry handshake failed".into())));
-                        }
-                        return;
-                    }
-                    if self.sleep_or_shutdown(backoff).await {
-                        return;
-                    }
-                    backoff = (backoff * 2).min(BACKOFF_CAP);
-                }
-            }
-        }
-    }
-
-    /// Unwind a session that is no longer usable: everything unacked becomes
-    /// pushable again and the public stats stop claiming a live connection.
-    /// Called for `Reconnect` (transport died) and `Wake` (suspend killed the
-    /// socket silently) so both recover the same way.
-    fn note_session_end(&self) {
-        use std::sync::atomic::Ordering::Relaxed;
-        lock(&self.doc).mark_disconnected();
-        self.stats.connected.store(false, Relaxed);
-        self.stats.disconnects.fetch_add(1, Relaxed);
-        let _ = self.events.send(RegistryEvent::Disconnected);
-    }
-
-    /// True = shutdown observed.
-    async fn sleep_or_shutdown(&mut self, wait: Duration) -> bool {
-        tokio::select! {
-            // Wake/online events cut the backoff short; an offline-reported
-            // path parks the wait instead of burning futile dials.
-            _ = crate::wake::reconnect_wait(wait) => false,
-            _ = self.shutdown.changed() => *self.shutdown.borrow(),
-        }
-    }
-
-    async fn run_session(
-        &mut self,
+impl Session<String> for Actor {
+    async fn run_session<'a>(
+        &'a mut self,
         mut pipe: TextPipe,
-        ready: &mut Option<oneshot::Sender<Result<(), SyncError>>>,
+        ready: &'a mut Option<oneshot::Sender<Result<(), SyncError>>>,
     ) -> SessionEnd {
         use std::sync::atomic::Ordering::Relaxed;
 
@@ -637,19 +447,16 @@ impl Actor {
         }
 
         // ── steady state ────────────────────────────────────────────────────
-        let mut last_frame = tokio::time::Instant::now();
-        let mut probe_deadline: Option<tokio::time::Instant> = None;
+        let mut liveness = Liveness::new();
         loop {
-            let quiet_probe_at = last_frame + self.tuning.probe_quiet;
-            let deadline_at = probe_deadline
-                .unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(86_400));
+            let quiet_probe_at = liveness.quiet_at(self.tuning.probe_quiet);
+            let deadline_at = liveness.deadline_at();
             tokio::select! {
                 frame = pipe.rx.recv() => {
                     let Some(text) = frame else {
                         return SessionEnd::Reconnect;
                     };
-                    last_frame = tokio::time::Instant::now();
-                    probe_deadline = None;
+                    liveness.note_frame();
                     if !self.handle_frame(&text) {
                         return SessionEnd::Reconnect;
                     }
@@ -669,7 +476,7 @@ impl Actor {
                     }
                 }
                 _ = self.probe_rx.recv() => {
-                    if !self.send_probe(&mut pipe, &mut probe_deadline).await {
+                    if !self.send_probe(&mut pipe, &mut liveness).await {
                         return SessionEnd::Reconnect;
                     }
                 }
@@ -682,18 +489,19 @@ impl Actor {
                     return SessionEnd::Wake;
                 }
                 _ = tokio::time::sleep_until(quiet_probe_at) => {
-                    if !self.send_probe(&mut pipe, &mut probe_deadline).await {
+                    if !self.send_probe(&mut pipe, &mut liveness).await {
                         return SessionEnd::Reconnect;
                     }
                     // Don't re-arm the quiet timer against the same silence.
-                    last_frame = tokio::time::Instant::now();
+                    liveness.touch();
                 }
                 _ = tokio::time::sleep_until(deadline_at) => {
                     tracing::warn!("registry: probe unanswered past deadline; redialing");
                     return SessionEnd::Reconnect;
                 }
-                _ = self.shutdown.changed() => {
-                    if *self.shutdown.borrow() {
+                observed = self.shutdown.changed() => {
+                    // A closed channel means the supervisor is gone: stop.
+                    if observed.is_err() || *self.shutdown.borrow() {
                         return SessionEnd::Stop;
                     }
                 }
@@ -701,36 +509,50 @@ impl Actor {
         }
     }
 
-    async fn send_probe(
-        &self,
-        pipe: &mut TextPipe,
-        probe_deadline: &mut Option<tokio::time::Instant>,
-    ) -> bool {
+    /// Unwind a session that is no longer usable: everything unacked becomes
+    /// pushable again and the public stats stop claiming a live connection.
+    /// Called for `Reconnect` (transport died) and `Wake` (suspend killed the
+    /// socket silently) so both recover the same way.
+    fn on_session_end(&mut self, _end: SessionEnd) {
+        use std::sync::atomic::Ordering::Relaxed;
+        lock(&self.doc).mark_disconnected();
+        self.stats.connected.store(false, Relaxed);
+        self.stats.disconnects.fetch_add(1, Relaxed);
+        let _ = self.events.send(RegistryEvent::Disconnected);
+    }
+
+    fn protocol_name(&self) -> &'static str {
+        "registry"
+    }
+}
+
+impl Actor {
+    async fn send_probe(&self, pipe: &mut TextPipe, liveness: &mut Liveness) -> bool {
         use std::sync::atomic::Ordering::Relaxed;
         self.stats.probes.fetch_add(1, Relaxed);
         let frame = serde_json::to_string(&ClientFrame::Probe).expect("probe serializes");
         if pipe.tx.send(frame).await.is_err() {
             return false;
         }
-        if probe_deadline.is_none() {
-            *probe_deadline = Some(tokio::time::Instant::now() + PROBE_DEADLINE);
-        }
+        liveness.note_probe_sent();
         true
     }
 
     async fn push_pending(&self, pipe: &mut TextPipe) -> bool {
         let batches: Vec<PendingBatch> = lock(&self.doc).take_pushable();
-        for batch in batches {
-            let frame = serde_json::to_string(&ClientFrame::Push {
-                batch: &batch.batch,
-                ops: &batch.ops,
+        let frames: Vec<String> = batches
+            .iter()
+            .map(|batch| {
+                serde_json::to_string(&ClientFrame::Push {
+                    batch: &batch.batch,
+                    ops: &batch.ops,
+                })
+                .expect("push serializes")
             })
-            .expect("push serializes");
-            if pipe.tx.send(frame).await.is_err() {
-                return false;
-            }
-        }
-        true
+            .collect();
+        // Drains replies while a full outbound queue waits: a burst bigger than
+        // the channel must not wedge the pump against the actor.
+        transport::push_all(pipe, frames, |text| self.handle_frame(&text)).await
     }
 
     /// Apply one inbound protocol frame. False = protocol breakdown, redial.
@@ -795,13 +617,14 @@ pub mod mock_server;
 #[cfg(test)]
 mod session_end_tests {
     use super::*;
+    use futures::future::BoxFuture;
     use komet_proto::Device;
 
     /// A dialer that is never used: these tests exercise the post-session
     /// bookkeeping, not the transport.
     struct NoDial;
 
-    impl TextConnector for NoDial {
+    impl Connector<String> for NoDial {
         fn connect(&self) -> BoxFuture<'static, Result<TextPipe, SyncError>> {
             Box::pin(async { Err(SyncError::WebSocket("not dialed in this test".into())) })
         }
@@ -858,13 +681,15 @@ mod session_end_tests {
             );
         }
 
-        let (actor, mut events_rx) = actor(doc.clone());
+        let (mut actor, mut events_rx) = actor(doc.clone());
         actor
             .stats
             .connected
             .store(true, std::sync::atomic::Ordering::Relaxed);
 
-        actor.note_session_end(); // the `SessionEnd::Wake` path
+        // The `SessionEnd::Wake` path: the supervisor calls this for both
+        // Reconnect and Wake.
+        actor.on_session_end(SessionEnd::Wake);
 
         assert!(
             !actor

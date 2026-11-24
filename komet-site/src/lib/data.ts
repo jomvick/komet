@@ -75,7 +75,7 @@ export const faq = [
   },
   {
     q: "What about multi-device sync?",
-    a: "Shipped and off by default. Komet syncs through Loro CRDT across your own server (a VPS or a Cloudflare Worker is enough) — you opt in explicitly with komet sync-init, never automatically.",
+    a: "Shipped and off by default. Komet syncs through Loro CRDT across your own server (a VPS running the self-hosted sync server is enough) — you opt in explicitly with komet sync-init, never automatically.",
   },
 ];
 

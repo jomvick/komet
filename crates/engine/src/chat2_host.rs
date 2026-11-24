@@ -1,4 +1,4 @@
-//! chat2 host wiring (docs/chat2-sync.md C3): the engine-side implementations
+//! chat2 host wiring (chat2 engine integration): the engine-side implementations
 //! of [`komet_sync::chat_client::ChatDocSink`] and
 //! [`komet_sync::chat_client::CheckpointFetcher`], binding a
 //! [`crate::doc_host::ChatDocHandle`]'s live doc to a chat2 room.
@@ -15,9 +15,9 @@ use komet_doc::SessionDoc;
 use komet_sync::chat_client::{ChatDocSink, CheckpointFetcher};
 use komet_sync::{DocsStore, SyncError};
 
-use crate::doc_host::EdgeConfig;
+use crate::doc_host::SyncConfig;
 
-/// Doc epoch stamped on every chat2-synced snapshot (docs/chat2-sync.md M1:
+/// Doc epoch stamped on every chat2-synced snapshot (chat2 snapshot format:
 /// thin docs are lineage epoch 2; M3 readers discard-and-adopt below it).
 pub const CHAT2_DOC_EPOCH: u32 = 2;
 
@@ -124,12 +124,12 @@ impl ChatDocSink for EngineChatSink {
 /// of checkpoint-over-HTTP on the 1.2 Mbps links this design targets.
 pub struct EdgeCheckpointFetcher {
     http: reqwest::Client,
-    edge: EdgeConfig,
+    edge: SyncConfig,
     chat_id: String,
 }
 
 impl EdgeCheckpointFetcher {
-    pub fn new(http: reqwest::Client, edge: EdgeConfig, chat_id: impl Into<String>) -> Self {
+    pub fn new(http: reqwest::Client, edge: SyncConfig, chat_id: impl Into<String>) -> Self {
         Self {
             http,
             edge,

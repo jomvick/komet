@@ -1,4 +1,5 @@
 use komet_engine::InstanceLock;
+use komet_proto::WorkspaceScope;
 
 use super::*;
 
@@ -201,7 +202,7 @@ fn account_actions_follow_the_attached_workspace_scope() {
     );
     assert_eq!(
         account_menu_action(Some(WorkspaceScope::Synced), SyncFlow::Idle),
-        Some(AccountMenuAction::SignOut)
+        None
     );
     assert_eq!(
         account_menu_action(Some(WorkspaceScope::Development), SyncFlow::Idle),
@@ -210,69 +211,34 @@ fn account_actions_follow_the_attached_workspace_scope() {
 }
 
 #[test]
-fn local_sign_in_offers_the_in_place_switch() {
-    let signed_in = AuthState::SignedIn {
-        user: komet_proto::UserProfile {
-            id: "user-1".into(),
-            email: "user@example.com".into(),
-            name: None,
-        },
-        org_id: Some("org-1".into()),
+fn local_sync_configuration_offers_an_in_place_switch() {
+    let configured = komet_proto::SyncStatus {
+        token_configured: true,
     };
-
+    let disabled = komet_proto::SyncStatus {
+        token_configured: false,
+    };
     assert_eq!(
-        sync_flow_after_auth(
-            SyncFlow::Enabling,
+        sync_flow_for_status(
+            SyncFlow::Idle,
             Some(WorkspaceScope::Local),
-            Some(&signed_in),
+            Some(&configured)
         ),
         SyncFlow::SwitchOffer { notice_open: true }
     );
     assert_eq!(
-        sync_flow_after_auth(
-            SyncFlow::Idle,
-            Some(WorkspaceScope::Local),
-            Some(&signed_in),
-        ),
-        SyncFlow::SwitchOffer { notice_open: true },
-        "another viewport derives the pending switch from AuthStatus"
-    );
-    assert_eq!(
-        sync_flow_after_auth(
+        sync_flow_for_status(
             SyncFlow::SwitchOffer { notice_open: false },
             Some(WorkspaceScope::Local),
-            Some(&signed_in),
+            Some(&configured),
         ),
         SyncFlow::SwitchOffer { notice_open: false },
-        "shared auth updates do not reopen a postponed wizard"
+        "status updates do not reopen a postponed wizard"
     );
     assert_eq!(
-        sync_flow_after_auth(
-            SyncFlow::RestartPending { notice_open: false },
-            Some(WorkspaceScope::Local),
-            Some(&signed_in),
-        ),
-        SyncFlow::RestartPending { notice_open: false },
-        "the quit fallback survives shared auth updates too"
+        sync_flow_for_status(SyncFlow::Idle, Some(WorkspaceScope::Local), Some(&disabled)),
+        SyncFlow::Idle
     );
-    assert_eq!(
-        account_menu_action(
-            Some(WorkspaceScope::Local),
-            SyncFlow::SwitchOffer { notice_open: false },
-        ),
-        Some(AccountMenuAction::RestartPending)
-    );
-    for notice_open in [true, false] {
-        assert_eq!(
-            sync_flow_after_auth(
-                SyncFlow::SwitchOffer { notice_open },
-                Some(WorkspaceScope::Local),
-                Some(&AuthState::SignedOut),
-            ),
-            SyncFlow::Idle,
-            "revoked credentials cancel the pending switch"
-        );
-    }
 }
 
 #[test]
@@ -322,57 +288,74 @@ fn spaces_only_local_work_still_gets_the_import_offer() {
 }
 
 #[test]
-fn dismissed_import_failure_stays_reachable_on_a_synced_runtime() {
-    let signed_in = AuthState::SignedIn {
-        user: komet_proto::UserProfile {
-            id: "user-1".into(),
-            email: "user@example.com".into(),
-            name: None,
-        },
-        org_id: Some("org-1".into()),
-    };
-
-    // "Later" postpones the failure notice; it must not evaporate.
-    let dismissed = SyncFlow::ImportFailed { notice_open: false };
+fn unknown_sync_status_never_opens_the_restart_notice() {
+    // An older daemon (or a frame that has not arrived yet) reports nothing:
+    // that is unknown, not "missing credentials", and must not gate the shell.
+    for flow in [SyncFlow::Idle, SyncFlow::SwitchOffer { notice_open: false }] {
+        assert_eq!(
+            sync_flow_for_status(flow, Some(WorkspaceScope::Synced), None),
+            SyncFlow::Idle,
+        );
+    }
     assert_eq!(
-        sync_flow_after_auth(dismissed, Some(WorkspaceScope::Synced), Some(&signed_in)),
-        dismissed,
-        "a postponed import failure survives auth/scope updates"
+        sync_flow_for_status(
+            SyncFlow::RestartPending { notice_open: true },
+            Some(WorkspaceScope::Synced),
+            None,
+        ),
+        SyncFlow::RestartPending { notice_open: true },
+        "an unknown status must not discard a pending notice either"
     );
+}
 
-    // …and the account menu on the SYNCED runtime still exposes the
-    // re-entry point. This is the whole point: after the switch there is
-    // no local runtime left to re-derive an offer from, so this menu row
-    // is the only path back to the retry dialog.
+#[test]
+fn dismissed_restart_notice_stays_dismissed_but_reachable() {
+    let disabled = komet_proto::SyncStatus {
+        token_configured: false,
+    };
+    let dismissed = SyncFlow::RestartPending { notice_open: false };
+    // "Later" survives the next render: the status is unchanged, so the
+    // notice must not reopen on its own.
+    assert_eq!(
+        sync_flow_for_status(dismissed, Some(WorkspaceScope::Synced), Some(&disabled)),
+        dismissed,
+    );
+    // First entry into the pending state still opens it.
+    assert_eq!(
+        sync_flow_for_status(
+            SyncFlow::Idle,
+            Some(WorkspaceScope::Synced),
+            Some(&disabled)
+        ),
+        SyncFlow::RestartPending { notice_open: true },
+    );
+    // And the account menu keeps the only way back in.
     assert_eq!(
         account_menu_action(Some(WorkspaceScope::Synced), dismissed),
         Some(AccountMenuAction::RestartPending),
-        "retry must remain reachable after dismissal"
     );
-    assert_eq!(
-        account_menu_action(
-            Some(WorkspaceScope::Synced),
-            SyncFlow::ImportFailed { notice_open: true },
-        ),
-        Some(AccountMenuAction::RestartPending)
-    );
+}
 
-    // Resolving the failure restores the normal synced menu.
+#[test]
+fn dismissed_import_failure_stays_reachable_on_a_synced_runtime() {
+    let configured = komet_proto::SyncStatus {
+        token_configured: true,
+    };
+    let dismissed = SyncFlow::ImportFailed { notice_open: false };
     assert_eq!(
-        account_menu_action(Some(WorkspaceScope::Synced), SyncFlow::Idle),
-        Some(AccountMenuAction::SignOut)
+        sync_flow_for_status(dismissed, Some(WorkspaceScope::Synced), Some(&configured)),
+        dismissed,
+    );
+    assert_eq!(
+        account_menu_action(Some(WorkspaceScope::Synced), dismissed),
+        Some(AccountMenuAction::RestartPending),
     );
 }
 
 #[test]
 fn switch_lifecycle_survives_the_runtime_replacement_window() {
-    let signed_in = AuthState::SignedIn {
-        user: komet_proto::UserProfile {
-            id: "user-1".into(),
-            email: "user@example.com".into(),
-            name: None,
-        },
-        org_id: Some("org-1".into()),
+    let configured = komet_proto::SyncStatus {
+        token_configured: true,
     };
     for flow in [
         SyncFlow::Switching { import: true },
@@ -384,59 +367,16 @@ fn switch_lifecycle_survives_the_runtime_replacement_window() {
         SyncFlow::ImportFailed { notice_open: true },
         SyncFlow::ImportFailed { notice_open: false },
     ] {
-        // Local (before the stop), detached (mid-replacement), and synced
-        // (replacement runtime up): the driver owns these states — auth
-        // and scope edges must never reset them.
         assert_eq!(
-            sync_flow_after_auth(flow, Some(WorkspaceScope::Local), Some(&signed_in)),
+            sync_flow_for_status(flow, Some(WorkspaceScope::Local), Some(&configured)),
             flow
         );
-        assert_eq!(sync_flow_after_auth(flow, None, None), flow);
+        assert_eq!(sync_flow_for_status(flow, None, None), flow);
         assert_eq!(
-            sync_flow_after_auth(flow, Some(WorkspaceScope::Synced), Some(&signed_in)),
+            sync_flow_for_status(flow, Some(WorkspaceScope::Synced), Some(&configured)),
             flow
         );
     }
-}
-
-#[test]
-fn synced_sign_out_blocks_every_viewport_and_cannot_switch_accounts() {
-    let signed_in_as_another_user = AuthState::SignedIn {
-        user: komet_proto::UserProfile {
-            id: "user-2".into(),
-            email: "other@example.com".into(),
-            name: None,
-        },
-        org_id: Some("org-2".into()),
-    };
-
-    assert_eq!(
-        sync_flow_after_auth(
-            SyncFlow::SigningOut,
-            Some(WorkspaceScope::Synced),
-            Some(&AuthState::SignedOut),
-        ),
-        SyncFlow::SignedOutRestartRequired,
-        "the viewport that requested sign-out is blocked by AuthStatus"
-    );
-    assert_eq!(
-        sync_flow_after_auth(
-            SyncFlow::Idle,
-            Some(WorkspaceScope::Synced),
-            Some(&AuthState::SignedOut),
-        ),
-        SyncFlow::SignedOutRestartRequired,
-        "another viewport observing the same runtime is also blocked"
-    );
-    assert_eq!(
-        sync_flow_after_auth(
-            SyncFlow::SignedOutRestartRequired,
-            Some(WorkspaceScope::Synced),
-            Some(&signed_in_as_another_user),
-        ),
-        SyncFlow::SignedOutRestartRequired,
-        "new credentials cannot reopen the previous account's store"
-    );
 }
 
 #[test]

@@ -3,7 +3,7 @@
 //! The registry is the sidebar's authority (which chats, spaces and devices exist),
 //! so unlike the chat rooms — which relay opaque Loro frames — it needs a stateful
 //! peer: `hello` → `state`, `push` → merge each op and `ack`, `presence`, `probe`.
-//! Semantics mirror the Durable Object this server replaced (and the Rust mock in
+//! Semantics are shared with the Rust registry mock in
 //! `komet-sync/src/registry/mock_server.rs`); the difference is that rows and `seq`
 //! are persisted, so a restart neither resets the sequence nor loses the sidebar.
 

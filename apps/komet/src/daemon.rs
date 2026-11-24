@@ -4,9 +4,10 @@
 //! the current executable with the `KOMET_*` environment captured at install
 //! time, so `KOMET_EDGE_URL=… komet daemon install` bakes that override in.
 //!
-//! Auth is decoupled: without a saved session the service remains up on the
-//! local-only profile. `komet login` and a service restart opt into sync.
+//! Sync is configured explicitly with `KOMET_EDGE_URL` and `KOMET_SYNC_TOKEN`;
+//! those values are captured when the service is installed.
 
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -18,11 +19,7 @@ use anyhow::{Context, bail};
 mod win;
 
 const LAUNCHD_LABEL: &str = "sh.komet.app";
-/// Unit name written by `komet daemon install`. Komet's curl|sh installer
-/// (`edge/src/install.sh`) used to write this same name so the two paths
-/// wouldn't fight over the unit; that installer no longer exists in Komet
-/// (the `edge` crate was dropped), so `komet daemon install` is the sole
-/// owner now.
+/// Unit name written by `komet daemon install`.
 const SYSTEMD_UNIT: &str = "komet.service";
 
 /// Windows service key name (SCM database) and the registry service subkey.
@@ -57,11 +54,9 @@ const CAPTURED_ENV: &[&str] = &[
     "KOMET_DATA_DIR",
     "KOMET_EDGE_URL",
     "KOMET_EDGE_TOKEN",
+    "KOMET_SYNC_TOKEN",
     "KOMET_ORG_ID",
-    "KOMET_WORKOS_CLIENT_ID",
-    "KOMET_WORKOS_API_BASE",
     "KOMET_IPC_PORT",
-    "KOMET_CALLBACK_PORT",
     "KOMET_HARNESS",
     "KOMET_DEVICE_NAME",
     // Captured, not defaulted: a daemon pointed at a plain-HTTP LAN server warns
@@ -87,9 +82,9 @@ pub fn install_with_args(data_dir: &Path, args: &[&str]) -> anyhow::Result<()> {
         std::fs::create_dir_all(data_dir)?;
         // Reinstall-friendly: unload any previous incarnation before rewriting.
         let _ = run_quiet("launchctl", &["bootout", &launchd_service_target()?]);
-        std::fs::write(
+        write_secret_file(
             &plist,
-            render_launchd_plist(&exe, &env, &data_dir.join("daemon.log"), args),
+            &render_launchd_plist(&exe, &env, &data_dir.join("daemon.log"), args),
         )?;
         run(
             "launchctl",
@@ -102,7 +97,7 @@ pub fn install_with_args(data_dir: &Path, args: &[&str]) -> anyhow::Result<()> {
     } else if cfg!(target_os = "linux") {
         let unit = systemd_unit_path()?;
         std::fs::create_dir_all(unit.parent().expect("systemd user dir"))?;
-        std::fs::write(&unit, render_systemd_unit(&exe, &env, args))?;
+        write_secret_file(&unit, &render_systemd_unit(&exe, &env, args))?;
         run("systemctl", &["--user", "daemon-reload"])?;
         run("systemctl", &["--user", "enable", "--now", SYSTEMD_UNIT])?;
         println!("Installed and started {SYSTEMD_UNIT} ({}).", unit.display());
@@ -115,9 +110,7 @@ pub fn install_with_args(data_dir: &Path, args: &[&str]) -> anyhow::Result<()> {
     } else {
         bail!("komet daemon is only supported on macOS (launchd) and Linux (systemd)");
     }
-    println!(
-        "Without a saved account the engine stays local-only; sign-in and restart are optional for sync."
-    );
+    println!("Sync uses the KOMET_EDGE_URL and KOMET_SYNC_TOKEN captured at install time.");
     println!(
         "Logs: {}",
         if cfg!(target_os = "macos") {
@@ -289,6 +282,32 @@ fn captured_env() -> Vec<(String, String)> {
         .collect()
 }
 
+/// Write a service descriptor that carries the captured environment — and so
+/// `KOMET_SYNC_TOKEN` — with owner-only permissions.
+///
+/// `std::fs::write` creates the file with the process umask (022 on a default
+/// install), which leaves the shared bearer readable by every local user under
+/// a searchable `~/.config` or `~/Library/LaunchAgents`. The file is created
+/// 0600, and an existing descriptor from an earlier install is tightened before
+/// it is truncated (`create` never changes the mode of a file that exists).
+fn write_secret_file(path: &Path, contents: &str) -> std::io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    file.write_all(contents.as_bytes())?;
+    file.flush()
+}
+
 fn render_systemd_unit(exe: &Path, env: &[(String, String)], args: &[&str]) -> String {
     let mut unit = String::from(
         "[Unit]\nDescription=Komet headless engine\nAfter=network-online.target\nStartLimitIntervalSec=60\nStartLimitBurst=5\n\n[Service]\n",
@@ -450,11 +469,13 @@ mod tests {
 
     #[test]
     fn systemd_unit_shape() {
+        assert!(CAPTURED_ENV.contains(&"KOMET_SYNC_TOKEN"));
         let unit = render_systemd_unit(
             Path::new("/usr/local/bin/komet"),
             &[
                 ("PATH".into(), "/usr/bin:/bin".into()),
                 ("KOMET_EDGE_URL".into(), "https://edge.example".into()),
+                ("KOMET_SYNC_TOKEN".into(), "shared-secret".into()),
                 ("RUST_LOG".into(), "info,komet=\"debug\"".into()),
             ],
             &["headless"],
@@ -462,6 +483,7 @@ mod tests {
         assert!(unit.contains("ExecStart=/usr/local/bin/komet headless\n"));
         assert!(unit.contains("Environment=\"PATH=/usr/bin:/bin\"\n"));
         assert!(unit.contains("Environment=\"KOMET_EDGE_URL=https://edge.example\"\n"));
+        assert!(unit.contains("Environment=\"KOMET_SYNC_TOKEN=shared-secret\"\n"));
         // Inner quotes escaped so systemd re-parses the value verbatim.
         assert!(unit.contains("Environment=\"RUST_LOG=info,komet=\\\"debug\\\"\"\n"));
         assert!(unit.contains("StartLimitIntervalSec=60\n"));
@@ -487,13 +509,6 @@ mod tests {
         );
         assert!(plist.contains("<string>serve</string>"));
     }
-
-    // The curl|sh installer (edge/src/install.sh) shipped a duplicate unit
-    // spec that this test cross-checked against `render_systemd_unit`. The
-    // `edge` crate was removed as part of Komet's local-first divergence from
-    // Komet, so the installer no longer exists — `komet daemon install` is
-    // now the only path that writes the unit, and `systemd_unit_shape` above
-    // already covers its shape directly.
 
     #[test]
     fn installed_exe_uses_the_current_symlink() {
@@ -533,5 +548,34 @@ mod tests {
         assert!(
             plist.contains("<key>StandardOutPath</key><string>/Users/x/.komet/daemon.log</string>")
         );
+    }
+
+    /// The unit/plist carry the captured `KOMET_SYNC_TOKEN`: nobody but the
+    /// owner may read them, including after a reinstall over an older file.
+    #[test]
+    fn service_files_holding_the_bearer_are_owner_only() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            let dir = tempfile::tempdir().unwrap();
+            let unit = dir.path().join("komet.service");
+            write_secret_file(&unit, "Environment=\"KOMET_SYNC_TOKEN=shared-secret\"\n").unwrap();
+            let mode = std::fs::metadata(&unit).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "fresh descriptor must be owner-only");
+            assert!(
+                std::fs::read_to_string(&unit)
+                    .unwrap()
+                    .contains("shared-secret")
+            );
+
+            // A descriptor left behind by an older install is tightened too:
+            // creating over an existing path keeps its old mode otherwise.
+            std::fs::set_permissions(&unit, std::fs::Permissions::from_mode(0o644)).unwrap();
+            write_secret_file(&unit, "rewritten\n").unwrap();
+            let mode = std::fs::metadata(&unit).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "reinstall must tighten an existing descriptor");
+            assert_eq!(std::fs::read_to_string(&unit).unwrap(), "rewritten\n");
+        }
     }
 }

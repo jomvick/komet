@@ -150,10 +150,18 @@ impl Shell {
                     crate::theme::wash(0.0),
                     crate::theme::wash(0.14),
                 ))
-                .on_hover(motion::hover_listener(
-                    "project-tree-toggle",
-                    cx.entity_id(),
-                ))
+                .on_hover(cx.listener(|this, hovered: &bool, window, cx| {
+                    motion::set_hover(
+                        "project-tree-toggle",
+                        cx.entity_id(),
+                        *hovered,
+                        motion::reduced_motion(cx),
+                    );
+                    if *hovered && !this.spaces_menu.is_open() {
+                        this.open_spaces_menu(window, cx);
+                    }
+                    cx.notify();
+                }))
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.settings.project_tree_expanded = !this.settings.project_tree_expanded;
                     this.schedule_save(cx);
@@ -194,6 +202,23 @@ impl Shell {
                     .flex_none()
                     .text_color(theme.text_muted.opacity(0.65)),
                 );
+
+            // In the unfiltered state, `project_header` replaces the dropdown
+            // trigger above. Keep the same menu available here so actions such
+            // as Import project do not disappear when “All projects” is active.
+            let project_header = if self.spaces_menu.get().is_some() {
+                let closing = self.spaces_menu.closing_since();
+                let menu = self.render_spaces_menu(theme, cx);
+                project_header
+                    .relative()
+                    .child(popover::anchored_menu_below_unfrosted(
+                        "spaces-filter-menu",
+                        menu,
+                        closing,
+                    ))
+            } else {
+                project_header
+            };
 
             div()
                 .flex_1()

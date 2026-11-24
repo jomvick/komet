@@ -1,4 +1,4 @@
-//! ChatClient — WebSocket transport for chat2 rooms (docs/chat2-sync.md C1):
+//! ChatClient — WebSocket transport for chat2 rooms (current chat2 protocol):
 //! hello/state handshake with client-side checkpoint precision, cursor-based
 //! row backfill, push/ack with a pending-unacked queue, opaque presence
 //! relay, probe/redial liveness, and reconnect with exponential backoff.
@@ -7,7 +7,7 @@
 //! [`ChatDocSink`] the engine implements over its `ChatDocHandle` (import +
 //! persist doc AND cursor in one transaction — the C2 rule). Wire frames are
 //! the binary chat2 codec ([`crate::chat_frames`]), byte-compatible with
-//! `edge/src/chat-frames.ts`.
+//! `shared protocol behavior`.
 //!
 //! Liveness discipline is inherited from `registry.rs` and its incidents:
 //! transport pings prove nothing about the DO; room health is judged only by
@@ -18,27 +18,17 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use futures::future::BoxFuture;
-use futures::{SinkExt, StreamExt};
-use tokio::net::TcpStream;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
-use tokio_tungstenite::tungstenite::Message as WsMessage;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use crate::chat_frames::{self as wire, frame_type};
+use crate::transport::{
+    self, Connector, HELLO_DEADLINE, Liveness, Pipe, Session, SessionEnd, Signals,
+};
 use crate::types::{StaticUrl, SyncError, UrlProvider};
 
-const PING_INTERVAL: Duration = Duration::from_secs(15);
-const SILENCE_LEASE: Duration = Duration::from_secs(45);
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
-const HELLO_DEADLINE: Duration = Duration::from_secs(15);
 /// Backfill after hello must complete (rowsDone) within this deadline —
 /// post-strip rooms are KB-scale, so this is generous even at 1.2 Mbps.
 const BACKFILL_DEADLINE: Duration = Duration::from_secs(120);
-const PROBE_DEADLINE: Duration = Duration::from_secs(10);
-const BACKOFF_BASE: Duration = Duration::from_millis(250);
-const BACKOFF_CAP: Duration = Duration::from_secs(30);
-/// Quiet-room probe cadence default (matches the registry's fleet math).
-const PROBE_QUIET_DEFAULT: Duration = Duration::from_secs(900);
 /// A checkpoint fetch that hasn't finished by now is treated as a dead link
 /// and the session redials (the fetch itself is Range-resumable, so a retry
 /// picks up where the bytes stopped). Sized for MAX_CHECKPOINT_BYTES over
@@ -47,7 +37,7 @@ const CHECKPOINT_FETCH_DEADLINE: Duration = Duration::from_secs(120);
 /// Re-push cadence after a `quota` rejection (server window is 60 s; pending
 /// batches must not wait for the next enqueue/probe to retry).
 const QUOTA_RETRY: Duration = Duration::from_secs(5);
-/// Client-side push cap: the DO's per-row cap (`chat-log.ts MAX_ROW_BYTES`,
+/// Client-side push cap: the room service's per-row cap (`chat-log.ts MAX_ROW_BYTES`,
 /// 1 MiB) minus frame-overhead headroom. The headroom matters: the runtime
 /// closes WS messages at 1 MiB BEFORE the DO runs, so a payload within a
 /// frame-header's width of the row cap would die with no error frame (and no
@@ -65,7 +55,7 @@ pub struct ChatTuning {
 impl Default for ChatTuning {
     fn default() -> Self {
         Self {
-            probe_quiet: PROBE_QUIET_DEFAULT,
+            probe_quiet: transport::PROBE_QUIET_DEFAULT,
         }
     }
 }
@@ -161,90 +151,9 @@ pub fn plan_catch_up(
     }
 }
 
-// ── transport plumbing (binary sibling of registry.rs's TextPipe) ───────────
+// ── transport plumbing (binary frames; codec owned by transport.rs) ─────────
 
-pub(crate) struct BinPipe {
-    pub(crate) tx: mpsc::Sender<Vec<u8>>,
-    pub(crate) rx: mpsc::Receiver<Vec<u8>>,
-}
-
-pub(crate) trait BinConnector: Send + Sync + 'static {
-    fn connect(&self) -> BoxFuture<'static, Result<BinPipe, SyncError>>;
-}
-
-struct WsBinConnector {
-    url: Arc<dyn UrlProvider>,
-}
-
-impl BinConnector for WsBinConnector {
-    fn connect(&self) -> BoxFuture<'static, Result<BinPipe, SyncError>> {
-        let provider = self.url.clone();
-        Box::pin(async move {
-            let url = provider.url().await?;
-            let ws = crate::dial::connect_ws(&url)
-                .await
-                .map_err(|e| SyncError::WebSocket(e.to_string()))?;
-            let (out_tx, out_rx) = mpsc::channel(64);
-            let (in_tx, in_rx) = mpsc::channel(64);
-            tokio::spawn(pump(ws, out_rx, in_tx));
-            Ok(BinPipe {
-                tx: out_tx,
-                rx: in_rx,
-            })
-        })
-    }
-}
-
-/// Shuttle binary frames between the WebSocket and the actor's channels; the
-/// text `"ping"` keepalive rides the same socket (runtime-answered pair).
-async fn pump(
-    ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
-    mut out_rx: mpsc::Receiver<Vec<u8>>,
-    in_tx: mpsc::Sender<Vec<u8>>,
-) {
-    let (mut sink, mut stream) = ws.split();
-    let mut ping = tokio::time::interval(PING_INTERVAL);
-    ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    ping.tick().await;
-    let mut last_rx = tokio::time::Instant::now();
-    loop {
-        tokio::select! {
-            frame = out_rx.recv() => match frame {
-                Some(bytes) => {
-                    if sink.send(WsMessage::Binary(bytes)).await.is_err() {
-                        break;
-                    }
-                }
-                None => {
-                    let _ = sink.send(WsMessage::Close(None)).await;
-                    break;
-                }
-            },
-            frame = stream.next() => match frame {
-                Some(Ok(WsMessage::Binary(bytes))) => {
-                    last_rx = tokio::time::Instant::now();
-                    if in_tx.send(bytes.to_vec()).await.is_err() {
-                        break;
-                    }
-                }
-                Some(Ok(_)) => {
-                    // Text pong / control frames: transport liveness only.
-                    last_rx = tokio::time::Instant::now();
-                }
-                Some(Err(_)) | None => break,
-            },
-            _ = ping.tick() => {
-                if sink.send(WsMessage::Text("ping".into())).await.is_err() {
-                    break;
-                }
-            }
-            _ = tokio::time::sleep_until(last_rx + SILENCE_LEASE) => {
-                tracing::warn!("chat2 socket silent past lease; treating as dead");
-                break;
-            }
-        }
-    }
-}
+pub(crate) type BinPipe = Pipe<Vec<u8>>;
 
 // ── shared client state ─────────────────────────────────────────────────────
 
@@ -351,7 +260,8 @@ impl ChatClient {
         device_id: &str,
         initial_cursor: u64,
     ) -> Result<Self, SyncError> {
-        let connector = Arc::new(WsBinConnector { url: provider });
+        let connector: Arc<dyn Connector<Vec<u8>>> =
+            Arc::new(transport::WsConnector::new(provider));
         Self::connect_with_tuned(
             connector,
             sink,
@@ -364,7 +274,7 @@ impl ChatClient {
     }
 
     pub(crate) async fn connect_with_tuned(
-        connector: Arc<dyn BinConnector>,
+        connector: Arc<dyn Connector<Vec<u8>>>,
         sink: Arc<dyn ChatDocSink>,
         fetcher: Arc<dyn CheckpointFetcher>,
         device_id: &str,
@@ -372,12 +282,19 @@ impl ChatClient {
         tuning: ChatTuning,
     ) -> Result<Self, SyncError> {
         let (events, _) = broadcast::channel(256);
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (ready_tx, ready_rx) = oneshot::channel();
-        let (nudge_tx, nudge_rx) = mpsc::channel(1);
-        let (probe_tx, probe_rx) = mpsc::channel(1);
-        let (redial_tx, redial_rx) = mpsc::channel(1);
-        let (presence_tx, presence_rx) = mpsc::channel(4);
+        let Signals {
+            nudge_tx,
+            nudge_rx,
+            probe_tx,
+            probe_rx,
+            redial_tx,
+            redial_rx,
+            presence_tx,
+            presence_rx,
+            shutdown_tx,
+            shutdown_rx,
+        } = Signals::new(4);
         let shared = Arc::new(Mutex::new(Shared {
             cursor: initial_cursor,
             ..Shared::default()
@@ -400,7 +317,9 @@ impl ChatClient {
             flags: flags.clone(),
             resumed: false,
         };
-        let task = tokio::spawn(actor.run(ready_tx));
+        // Aborts the actor if this connect future is dropped before the join
+        // completes (the engine bounds its join wait and may give up first).
+        let task = transport::AbortOnDrop::new(tokio::spawn(actor.run(ready_tx)));
 
         match ready_rx.await {
             Ok(Ok(())) => Ok(Self {
@@ -412,16 +331,10 @@ impl ChatClient {
                 redial: redial_tx,
                 presence_out: presence_tx,
                 flags,
-                task: Some(task),
+                task: Some(task.release()),
             }),
-            Ok(Err(err)) => {
-                task.abort();
-                Err(err)
-            }
-            Err(_) => {
-                task.abort();
-                Err(SyncError::Closed)
-            }
+            Ok(Err(err)) => Err(err),
+            Err(_) => Err(SyncError::Closed),
         }
     }
 
@@ -544,7 +457,7 @@ struct Actor {
     sink: Arc<dyn ChatDocSink>,
     fetcher: Arc<dyn CheckpointFetcher>,
     device_id: String,
-    connector: Arc<dyn BinConnector>,
+    connector: Arc<dyn Connector<Vec<u8>>>,
     tuning: ChatTuning,
     events: broadcast::Sender<ChatEvent>,
     shutdown: watch::Receiver<bool>,
@@ -567,96 +480,19 @@ struct Actor {
     resumed: bool,
 }
 
-enum SessionEnd {
-    /// Transport died / probe deadline / requested redial: back off, redial.
-    Reconnect,
-    /// System wake: the socket sat through a suspend, so redial at once with a
-    /// fresh backoff — sleeping first would delay the recovery it announced.
-    Wake,
-    Stop,
+impl Actor {
+    async fn run(self, ready: oneshot::Sender<Result<(), SyncError>>) {
+        let connector = self.connector.clone();
+        let shutdown = self.shutdown.clone();
+        transport::run(connector, self, shutdown, ready).await
+    }
 }
 
-impl Actor {
-    async fn run(mut self, ready: oneshot::Sender<Result<(), SyncError>>) {
-        let mut ready = Some(ready);
-        let mut backoff = BACKOFF_BASE;
-        loop {
-            if *self.shutdown.borrow() {
-                return;
-            }
-            let dial = tokio::time::timeout(CONNECT_TIMEOUT, self.connector.connect()).await;
-            let pipe = match dial {
-                Ok(Ok(pipe)) => pipe,
-                Ok(Err(err)) => {
-                    if let Some(ready) = ready.take() {
-                        let _ = ready.send(Err(err));
-                        return; // first join failed: caller owns the retry
-                    }
-                    tracing::warn!(error = %err, "chat2 dial failed; backing off");
-                    if self.sleep_or_shutdown(backoff).await {
-                        return;
-                    }
-                    backoff = (backoff * 2).min(BACKOFF_CAP);
-                    continue;
-                }
-                Err(_) => {
-                    if let Some(ready) = ready.take() {
-                        let _ = ready.send(Err(SyncError::WebSocket("connect timeout".into())));
-                        return;
-                    }
-                    tracing::warn!("chat2 dial timed out; backing off");
-                    if self.sleep_or_shutdown(backoff).await {
-                        return;
-                    }
-                    backoff = (backoff * 2).min(BACKOFF_CAP);
-                    continue;
-                }
-            };
-
-            match self.run_session(pipe, &mut ready).await {
-                SessionEnd::Stop => return,
-                SessionEnd::Wake => {
-                    // Resume is an event, not a timeout: no backoff sleep, and
-                    // the next failure starts the ladder over (the network
-                    // path just changed, so the old delay says nothing about
-                    // the new one).
-                    backoff = BACKOFF_BASE;
-                }
-                SessionEnd::Reconnect => {
-                    use std::sync::atomic::Ordering::Relaxed;
-                    self.flags.connected.store(false, Relaxed);
-                    self.flags.disconnects.fetch_add(1, Relaxed);
-                    let _ = self.events.send(ChatEvent::Disconnected);
-                    if ready.is_some() {
-                        if let Some(ready) = ready.take() {
-                            let _ = ready
-                                .send(Err(SyncError::Protocol("chat2 handshake failed".into())));
-                        }
-                        return;
-                    }
-                    if self.sleep_or_shutdown(backoff).await {
-                        return;
-                    }
-                    backoff = (backoff * 2).min(BACKOFF_CAP);
-                }
-            }
-        }
-    }
-
-    /// True = shutdown observed.
-    async fn sleep_or_shutdown(&mut self, wait: Duration) -> bool {
-        tokio::select! {
-            // Wake/online events cut the backoff short; an offline-reported
-            // path parks the wait instead of burning futile dials.
-            _ = crate::wake::reconnect_wait(wait) => false,
-            _ = self.shutdown.changed() => *self.shutdown.borrow(),
-        }
-    }
-
-    async fn run_session(
-        &mut self,
+impl Session<Vec<u8>> for Actor {
+    async fn run_session<'a>(
+        &'a mut self,
         mut pipe: BinPipe,
-        ready: &mut Option<oneshot::Sender<Result<(), SyncError>>>,
+        ready: &'a mut Option<oneshot::Sender<Result<(), SyncError>>>,
     ) -> SessionEnd {
         use std::sync::atomic::Ordering::Relaxed;
 
@@ -739,6 +575,8 @@ impl Actor {
                 let fetch = self.fetcher.fetch();
                 let fetched = tokio::select! {
                     fetched = tokio::time::timeout(CHECKPOINT_FETCH_DEADLINE, fetch) => fetched,
+                    // Any change — a `true`, or the watch closing because the
+                    // supervisor was dropped — must not leave this waiting.
                     _ = self.shutdown.changed() => return SessionEnd::Stop,
                 };
                 let bytes = match fetched {
@@ -814,13 +652,11 @@ impl Actor {
         }
 
         // ── steady state ────────────────────────────────────────────────────
-        let mut last_frame = tokio::time::Instant::now();
-        let mut probe_deadline: Option<tokio::time::Instant> = None;
+        let mut liveness = Liveness::new();
         let mut wake = crate::wake::subscribe();
         loop {
-            let quiet_probe_at = last_frame + self.tuning.probe_quiet;
-            let deadline_at = probe_deadline
-                .unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(86_400));
+            let quiet_probe_at = liveness.quiet_at(self.tuning.probe_quiet);
+            let deadline_at = liveness.deadline_at();
             let retry_at = lock(&self.shared)
                 .retry_at
                 .unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(86_400));
@@ -829,8 +665,7 @@ impl Actor {
                     let Some(bytes) = frame else {
                         return SessionEnd::Reconnect;
                     };
-                    last_frame = tokio::time::Instant::now();
-                    probe_deadline = None;
+                    liveness.note_frame();
                     let Some(frame) = wire::decode(&bytes) else {
                         tracing::warn!("chat2: unparseable frame");
                         return SessionEnd::Reconnect;
@@ -857,7 +692,7 @@ impl Actor {
                     }
                 }
                 _ = self.probe_rx.recv() => {
-                    if !self.send_probe(&mut pipe, &mut probe_deadline).await {
+                    if !self.send_probe(&mut pipe, &mut liveness).await {
                         return SessionEnd::Reconnect;
                     }
                 }
@@ -882,17 +717,19 @@ impl Actor {
                     }
                 }
                 _ = tokio::time::sleep_until(quiet_probe_at) => {
-                    if !self.send_probe(&mut pipe, &mut probe_deadline).await {
+                    if !self.send_probe(&mut pipe, &mut liveness).await {
                         return SessionEnd::Reconnect;
                     }
-                    last_frame = tokio::time::Instant::now();
+                    // Don't re-arm the quiet timer against the same silence.
+                    liveness.touch();
                 }
                 _ = tokio::time::sleep_until(deadline_at) => {
                     tracing::warn!("chat2: probe unanswered past deadline; redialing");
                     return SessionEnd::Reconnect;
                 }
-                _ = self.shutdown.changed() => {
-                    if *self.shutdown.borrow() {
+                observed = self.shutdown.changed() => {
+                    // A closed channel means the supervisor is gone: stop.
+                    if observed.is_err() || *self.shutdown.borrow() {
                         return SessionEnd::Stop;
                     }
                 }
@@ -900,18 +737,29 @@ impl Actor {
         }
     }
 
-    async fn send_probe(
-        &self,
-        pipe: &mut BinPipe,
-        probe_deadline: &mut Option<tokio::time::Instant>,
-    ) -> bool {
+    /// A session that ended badly leaves the pending queue untouched —
+    /// batches replay by batchId on the next connection — so unwinding is
+    /// stats + event only. Runs for `Reconnect` AND `Wake`: a suspend kills
+    /// the socket silently, so the wake path recovers like a transport drop.
+    fn on_session_end(&mut self, _end: SessionEnd) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.flags.connected.store(false, Relaxed);
+        self.flags.disconnects.fetch_add(1, Relaxed);
+        let _ = self.events.send(ChatEvent::Disconnected);
+    }
+
+    fn protocol_name(&self) -> &'static str {
+        "chat2"
+    }
+}
+
+impl Actor {
+    async fn send_probe(&self, pipe: &mut BinPipe, liveness: &mut Liveness) -> bool {
         let frame = wire::encode(frame_type::PROBE, &serde_json::json!({}), &[]);
         if pipe.tx.send(frame).await.is_err() {
             return false;
         }
-        if probe_deadline.is_none() {
-            *probe_deadline = Some(tokio::time::Instant::now() + PROBE_DEADLINE);
-        }
+        liveness.note_probe_sent();
         true
     }
 
@@ -950,12 +798,12 @@ impl Actor {
                 )
             })
             .collect();
-        for frame in frames {
-            if pipe.tx.send(frame).await.is_err() {
-                return false;
-            }
-        }
-        true
+        // Drains replies while a full outbound queue waits: a burst bigger than
+        // the channel must not wedge the pump against the actor.
+        transport::push_all(pipe, frames, |bytes| {
+            wire::decode(&bytes).is_some_and(|frame| self.handle_frame(frame))
+        })
+        .await
     }
 
     /// Apply one inbound protocol frame. False = protocol breakdown, redial.

@@ -571,7 +571,7 @@ fn summary_row(theme: &Theme, label: &str, value: SharedString) -> gpui::Div {
         )
 }
 
-/// Solid action button (the sign-in gate's white button).
+/// Solid action button shared by first-run setup surfaces.
 fn primary_button(
     theme: &Theme,
     id: &'static str,

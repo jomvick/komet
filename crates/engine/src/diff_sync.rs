@@ -40,7 +40,7 @@ use tokio_util::sync::CancellationToken;
 use komet_proto::{Chat, CheckoutDiff, DiffFileSummary};
 
 use crate::EngineError;
-use crate::doc_host::EdgeConfig;
+use crate::doc_host::SyncConfig;
 use crate::repos::{CheckoutIdentity, Repos};
 use crate::workspace_host::WorkspaceHost;
 
@@ -136,7 +136,7 @@ struct DiffSyncInner {
     repos: Repos,
     workspace: WorkspaceHost,
     device_id: String,
-    edge: Option<EdgeConfig>,
+    edge: Option<SyncConfig>,
     http: reqwest::Client,
     entries: Mutex<HashMap<String, Arc<CheckoutEntry>>>,
     diffs_tx: watch::Sender<Vec<CheckoutDiff>>,
@@ -164,7 +164,7 @@ impl CheckoutDiffSync {
         repos: Repos,
         workspace: WorkspaceHost,
         device_id: &str,
-        edge: Option<EdgeConfig>,
+        edge: Option<SyncConfig>,
     ) -> Self {
         let (diffs_tx, _) = watch::channel(Vec::new());
         let sync = Self {

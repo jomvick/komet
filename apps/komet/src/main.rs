@@ -1,11 +1,10 @@
-//! komet — headed by default; `komet headless` runs the engine alone. Both start
-//! local-only without credentials. `komet login` and `komet logout` select the
-//! profile used by the next engine start without mutating a live runtime.
+//! komet — headed by default; `komet headless` runs the engine alone. Sync is
+//! configured explicitly with `KOMET_EDGE_URL` and `KOMET_SYNC_TOKEN`.
 
-mod auth_cli;
 mod daemon;
 mod models_cli;
 mod serve;
+mod status_cli;
 mod update_cli;
 
 use clap::{Parser, Subcommand};
@@ -61,15 +60,16 @@ enum Command {
         #[command(subcommand)]
         command: Option<EngineCommand>,
     },
-    /// Sign in and enable sync on the next engine start.
-    Login,
-    /// Remove the saved session and return to local-only on the next start.
-    Logout,
-    /// Show workspace mode, optional auth, and engine status.
+    /// Show sync configuration and engine status.
     Status,
     /// Live sync introspection from the running engine: per-room connection
     /// state, last pushed-frame/ack ages, rejoin/probe/resync counters.
-    Sync,
+    /// `status --legacy` lists chats still on the s2 room; `migrate`
+    /// drives the s2→chat2 cutover on this device.
+    Sync {
+        #[command(subcommand)]
+        command: Option<SyncCommand>,
+    },
     /// List available models for an agent harness.
     Models {
         /// Target agent harness (claude-code, cline, codex, opencode, cursor, grok, hermes, pi, antigravity, mock).
@@ -107,6 +107,22 @@ enum Command {
 }
 
 #[derive(Subcommand)]
+enum SyncCommand {
+    /// Per-room sync state (default) — `--legacy` lists s2 chats instead.
+    Status {
+        /// List registry chats still on the legacy s2 room (roomGen < 2).
+        #[arg(long)]
+        legacy: bool,
+    },
+    /// Migrate legacy s2 chats hosted by this device to chat2. Idempotent;
+    /// `--dry-run` only reports what would happen.
+    Migrate {
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum EngineCommand {
     /// Gracefully stop the background engine.
     Stop,
@@ -128,17 +144,13 @@ enum DaemonCommand {
     Status,
 }
 
-/// Production edge URL used when sync is enabled — overridden by `KOMET_EDGE_URL`
-/// (local dev / self-hosting). Unused while the app runs local-only.
-const DEFAULT_EDGE_URL: &str = "https://edge.komet.sh";
-
+/// Self-hosted sync server URL. An unset value keeps the runtime local-only.
 fn edge_url_from_env() -> String {
-    let url = std::env::var("KOMET_EDGE_URL")
+    std::env::var("KOMET_EDGE_URL")
         .ok()
         .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| DEFAULT_EDGE_URL.into());
-    komet_sync_server::warn_if_insecure_sync_url(&url);
-    url
+        .inspect(|url| komet_sync_server::warn_if_insecure_sync_url(url))
+        .unwrap_or_default()
 }
 
 /// mimalloc: system malloc (macOS libmalloc especially) never returns the
@@ -289,21 +301,13 @@ fn main() -> anyhow::Result<()> {
             let runtime = tokio::runtime::Runtime::new()?;
             runtime.block_on(stop_engine(engine_config_from_env().ipc_port))
         }
-        Some(Command::Login) => {
-            let runtime = tokio::runtime::Runtime::new()?;
-            runtime.block_on(auth_cli::login(engine_config_from_env()))
-        }
-        Some(Command::Logout) => {
-            let runtime = tokio::runtime::Runtime::new()?;
-            runtime.block_on(auth_cli::logout(engine_config_from_env()))
-        }
         Some(Command::Status) => {
             let runtime = tokio::runtime::Runtime::new()?;
-            runtime.block_on(auth_cli::status(engine_config_from_env()))
+            runtime.block_on(status_cli::status(engine_config_from_env()))
         }
-        Some(Command::Sync) => {
+        Some(Command::Sync { command }) => {
             let runtime = tokio::runtime::Runtime::new()?;
-            runtime.block_on(sync_cli(engine_config_from_env().ipc_port))
+            runtime.block_on(sync_cli(engine_config_from_env().ipc_port, command))
         }
         Some(Command::Models {
             harness,
@@ -364,9 +368,7 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
-/// The env-resolved engine configuration shared by `headless`, `login`,
-/// `logout`, and `status` — one resolution so the CLI auth commands always
-/// operate on the exact session the daemon will load.
+/// Resolve the engine configuration from the current process environment.
 fn engine_config_from_env() -> komet_engine::EngineConfig {
     komet_engine::EngineConfig {
         data_dir: std::env::var_os("KOMET_DATA_DIR")
@@ -441,7 +443,7 @@ async fn stop_engine(ipc_port: u16) -> anyhow::Result<()> {
 /// `komet sync`: dial the running engine's IPC and print per-room sync state.
 /// The introspection surface every 2026-08 incident was missing — "is this
 /// device's workspace room actually receiving?" as a one-liner.
-async fn sync_cli(ipc_port: u16) -> anyhow::Result<()> {
+async fn sync_cli(ipc_port: u16, command: Option<SyncCommand>) -> anyhow::Result<()> {
     let token = komet_rpc::ipc_token::read_default(ipc_port).map_err(|e| {
         anyhow::anyhow!("no engine token for port {ipc_port} ({e}); is komet running?")
     })?;
@@ -450,6 +452,106 @@ async fn sync_cli(ipc_port: u16) -> anyhow::Result<()> {
         .map_err(|e| {
             anyhow::anyhow!("no engine listening on 127.0.0.1:{ipc_port} ({e}) — is komet running?")
         })?;
+    match command {
+        Some(SyncCommand::Status { legacy: true }) => {
+            let status = client
+                .call(komet_rpc::methods::SYNC_LEGACY, serde_json::json!({}))
+                .await
+                .map_err(|e| anyhow::anyhow!("SyncLegacy failed: {e}"))?;
+            let chats = status
+                .get("chats")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            if chats.is_empty() {
+                println!("No legacy s2 chats — everything is on chat2.");
+                return Ok(());
+            }
+            for chat in &chats {
+                let id = chat.get("chatId").and_then(|v| v.as_str()).unwrap_or("?");
+                let title = chat.get("title").and_then(|v| v.as_str()).unwrap_or("");
+                let host = if chat.get("hostedHere").and_then(|v| v.as_bool()) == Some(true) {
+                    "this device"
+                } else {
+                    chat.get("hostDevice")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("?")
+                };
+                let local = if chat.get("localDoc").and_then(|v| v.as_bool()) == Some(true) {
+                    "local doc"
+                } else {
+                    "NO local doc"
+                };
+                println!(
+                    "{}  {}  host={}  {}{}",
+                    &id[..id.len().min(8)],
+                    title,
+                    host,
+                    local,
+                    if chat.get("archived").and_then(|v| v.as_bool()) == Some(true) {
+                        "  (archived)"
+                    } else {
+                        ""
+                    },
+                );
+            }
+            return Ok(());
+        }
+        Some(SyncCommand::Migrate { dry_run }) => {
+            let result = client
+                .call(
+                    komet_rpc::methods::SYNC_MIGRATE,
+                    serde_json::json!({ "dryRun": dry_run }),
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("SyncMigrate failed: {e}"))?;
+            if dry_run {
+                let chats = result
+                    .get("chats")
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                println!("dry-run: {} legacy chat(s) would be migrated", chats.len());
+                for chat in &chats {
+                    println!(
+                        "  {}  {}",
+                        chat.get("chatId").and_then(|v| v.as_str()).unwrap_or("?"),
+                        chat.get("title").and_then(|v| v.as_str()).unwrap_or(""),
+                    );
+                }
+                return Ok(());
+            }
+            if let Some(outcomes) = result.get("outcomes").and_then(|v| v.as_array()) {
+                for o in outcomes {
+                    println!(
+                        "{}: {}{}",
+                        o.get("chatId").and_then(|v| v.as_str()).unwrap_or("?"),
+                        o.get("result").and_then(|v| v.as_str()).unwrap_or("?"),
+                        o.get("reason")
+                            .and_then(|v| v.as_str())
+                            .map(|r| format!(" ({r})"))
+                            .unwrap_or_default(),
+                    );
+                }
+            }
+            let pending = result
+                .get("outcomes")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter(|o| o.get("result").and_then(|v| v.as_str()) == Some("pending"))
+                        .count()
+                })
+                .unwrap_or(0);
+            if pending > 0 {
+                println!(
+                    "{pending} chat(s) still pending — rerun `komet sync migrate` or let the background sweep finish."
+                );
+            }
+            return Ok(());
+        }
+        _ => {}
+    }
     let status = client
         .call(komet_rpc::methods::SYNC_STATUS, serde_json::json!({}))
         .await

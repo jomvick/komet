@@ -1,4 +1,4 @@
-//! komet-sync — Loro room client (loro-protocol over WebSocket against the TS edge),
+//! komet-sync — Loro room client (loro-protocol over WebSocket to komet-sync-server),
 //! ephemeral presence, and the local `DocsStore` (SQLite snapshots + processed-command ledger).
 //!
 //! - [`RoomClient`]: joins a SessionRoom DO room (`wss://…/session/{chatId}/ws?token=`),
@@ -16,6 +16,7 @@ pub mod net_path;
 pub mod registry;
 mod room;
 mod store;
+pub mod transport;
 mod types;
 pub mod wake;
 

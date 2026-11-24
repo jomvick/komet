@@ -1,5 +1,5 @@
 //! `RoomClient` — a loro-protocol room client over WebSocket, speaking to the
-//! TS edge's SessionRoom Durable Object (`edge/src/session-room.ts`).
+//! self-hosted session room protocol.
 //!
 //! Wire format (loro-protocol 0.3, identical bytes to the npm package the edge
 //! imports): every frame is `4-byte CRDT magic ("%LOR"/"%EPH"/…), varbytes
@@ -44,6 +44,8 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
+use crate::transport;
+
 pub use crate::types::{RoomStatsSnapshot, StaticUrl, SyncError, UrlProvider};
 
 /// Payload bytes per outbound fragment — mirrors the edge's `FRAGMENT_BYTES`
@@ -54,7 +56,7 @@ const MAX_REASSEMBLED_BYTES: usize = 256 * 1024 * 1024;
 const MAX_FRAGMENT_COUNT: u64 = 16 * 1024;
 /// Presence timeout, matching the edge's `new EphemeralStore(30_000)`.
 const EPHEMERAL_TIMEOUT_MS: i64 = 30_000;
-/// Text `"ping"` keepalive interval — answered by the DO's hibernation-safe
+/// Text `"ping"` keepalive interval — answered by the room service's hibernation-safe
 /// auto-response pair without waking it. 15s for the same reason as the
 /// device relay's (crates/rpc/src/device_room.rs): an idle-flow reaper on a
 /// laptop's uplink can fire inside a minute, and a 30s keepalive races it.
@@ -79,7 +81,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// INCIDENT (2026-07-30): the workspace DO (`ws3/{orgId}/{userId}`) refused
 /// upgrades for ~3 minutes, then accepted sockets whose JoinRequests it never
 /// processed. The ping→pong auto-response kept resetting the silence lease —
-/// pongs prove only that Cloudflare is up, never that the room is — and with
+/// pongs prove only that the server is reachable, never that the room is — and with
 /// `joined_lor` false nothing was ever pushed, so no binary frame arrived to
 /// betray the wedge either. All four engines sat on dead-but-healthy-looking
 /// sockets for 3+ hours with ZERO log lines; recovery took a manual engine
@@ -427,7 +429,9 @@ impl RoomClient {
             events: events.clone(),
             shutdown: shutdown_rx,
         };
-        let task = tokio::spawn(actor.run(ready_tx));
+        // Aborts the actor if this connect future is dropped before the join
+        // completes (a caller that gave up must not leave a client running).
+        let task = transport::AbortOnDrop::new(tokio::spawn(actor.run(ready_tx)));
 
         match ready_rx.await {
             Ok(Ok(())) => Ok(Self {
@@ -438,17 +442,11 @@ impl RoomClient {
                 probe: probe_tx,
                 redial: redial_tx,
                 stats,
-                task: Some(task),
+                task: Some(task.release()),
                 _subs: vec![sub_doc, sub_eph],
             }),
-            Ok(Err(err)) => {
-                task.abort();
-                Err(err)
-            }
-            Err(_) => {
-                task.abort();
-                Err(SyncError::Closed)
-            }
+            Ok(Err(err)) => Err(err),
+            Err(_) => Err(SyncError::Closed),
         }
     }
 
@@ -623,7 +621,11 @@ impl RoomActor {
                 tokio::select! {
                     _ = &mut sleep => break false,
                     _ = wake.recv() => break true,
-                    _ = self.shutdown.changed() => return,
+                    observed = self.shutdown.changed() => {
+                        if observed.is_err() || *self.shutdown.borrow() {
+                            return;
+                        }
+                    }
                     Some(_) = self.local_rx.recv() => {}
                     Some(_) = self.eph_rx.recv() => {}
                     // Probe/redial hints while disconnected: the redial

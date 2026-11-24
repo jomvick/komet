@@ -30,7 +30,7 @@ use gpui_tokio::Tokio;
 use komet_doc::SessionMessageEntry;
 use komet_engine::environments::LOCAL_ENV_ID;
 use komet_proto::{
-    AuthState, Chat, ChatIndicator, Device, Environment, Session, Space, WorkspaceScope,
+    Chat, ChatIndicator, Device, Environment, Session, Space, SyncStatus, WorkspaceScope,
 };
 use komet_rpc::{RpcClient, methods};
 
@@ -60,14 +60,10 @@ pub(crate) use engine::{
 pub use komet_proto::view::{
     ChatGroup, ConnectionStatus, GatePhase, Indicator, RECONNECT_MAX_ATTEMPTS, SESSION_STALE_MS,
     attention_rank, chat_location, display_status, effective_indicator, format_ms, format_time_ago,
-    gate_phase, group_chats, next_reconnect_step, parse_auth_state, project_label,
-    reconnect_base_delay_ms, reconnect_jittered_delay_ms, reconnect_should_retry, sort_active,
-    sort_chats, sort_spaces, sort_tabs,
+    gate_phase, group_chats, next_reconnect_step, project_label, reconnect_base_delay_ms,
+    reconnect_jittered_delay_ms, reconnect_should_retry, sort_active, sort_chats, sort_spaces,
+    sort_tabs,
 };
-
-pub mod org;
-
-pub use org::{OrgRow, org_name_valid, parse_orgs, sort_memberships};
 
 // ---------------------------------------------------------------------------
 // AppState entity
@@ -99,11 +95,10 @@ struct UploadProgress {
 /// glue ([`Self::bootstrap`], [`Self::select_chat`]) layers subscriptions on top.
 pub struct AppState {
     pub connection: ConnectionStatus,
-    /// Fixed data boundary of the attached engine. Authentication may change
-    /// in place, but changing this scope requires assembling a new runtime.
+    /// Fixed data boundary of the attached engine; changing it requires a new runtime.
     pub workspace_scope: Option<WorkspaceScope>,
-    /// Auth stream value; `None` until the engine reports one (M4).
-    pub auth: Option<AuthState>,
+    /// Self-hosted sync configuration reported by the attached engine.
+    pub sync_status: Option<SyncStatus>,
     pub devices: Vec<Device>,
     /// Sorted (see [`sort_spaces`]).
     pub spaces: Vec<Space>,
@@ -272,7 +267,7 @@ impl AppState {
         Self {
             connection: ConnectionStatus::Connecting,
             workspace_scope: None,
-            auth: None,
+            sync_status: None,
             devices: Vec::new(),
             spaces: Vec::new(),
             chats: Vec::new(),

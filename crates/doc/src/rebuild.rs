@@ -1,4 +1,4 @@
-//! M1 epoch rebuild (docs/chat2-sync.md) — the whale-healing step.
+//! M1 epoch rebuild (docs/sync.md) — the whale-healing step.
 //!
 //! On first chat2 seed the host does NOT upload its fat doc: it rebuilds a
 //! thin one. Every entry is copied with the A1 strip applied retroactively —

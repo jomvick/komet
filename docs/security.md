@@ -104,7 +104,7 @@ they constrain the agent CLI, not the machine.
 ### One shared bearer per server
 
 - Each environment has exactly one static bearer. `komet serve` keeps it in
-  `{data_dir}/serve.json` (0600); a standalone `komet-sync-server` reads
+  `{data_dir}/serve.json` (0600 on Unix); a standalone `komet-sync-server` reads
   `KOMET_SYNC_TOKEN`. Setting `KOMET_SYNC_TOKEN` does not configure or rotate the token
   of an environment paired through `komet serve` — that token lives in the paired host's
   `serve.json` and changes only there. Every client of a server uses the same value;
@@ -113,8 +113,10 @@ they constrain the agent CLI, not the machine.
 - The server compares that one value in constant time, from
   `Authorization: Bearer …`, `x-komet-token`, or `?token=` on WebSocket upgrades.
   A valid token authorizes any room and the device relay; there is no per-room ACL.
-- On the controller, the token lives in `{data_dir}/environments.json` (0600, written
-  temp-file + rename). Listings and every environment reply are redacted to an empty
+- On the controller, the token lives in `{data_dir}/environments.json` (0600 on Unix, written
+  temp-file + rename). Windows currently relies on the data directory's inherited ACL; the
+  application does not set an explicit DACL on this file. Keep the Komet data directory private
+  to the user account until the Windows ACL audit is complete. Listings and every environment reply are redacted to an empty
   token; the one deliberate exception is the local-only `EnvironmentLink` call that
   backs **Copy link**, which is never logged or embedded in an error message.
 - Rotating the token means editing `serve.json` and restarting (or changing

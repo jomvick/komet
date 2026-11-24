@@ -98,6 +98,21 @@ pub mod methods {
     /// counters for the workspace room and every open chat doc. No params;
     /// IPC-only.
     pub const SYNC_STATUS: &str = "SyncStatus";
+    /// Credential readiness (`tokenConfigured`) as a live watch. Deliberately
+    /// a different method from [`Self::SYNC_STATUS`]: that one is a unary
+    /// room-stats read (`komet sync status`), while this one never sends
+    /// `done` — a client that took the stream for a reply would hang forever.
+    /// No params; IPC-only. The first frame arrives immediately.
+    pub const WATCH_SYNC_CREDENTIALS: &str = "WatchSyncCredentials";
+    /// s2→chat2 migration inventory (`komet sync status --legacy` /
+    /// `komet sync migrate --dry-run`): registry chats still on roomGen < 2,
+    /// with per-chat host/local-doc flags. Params: none; IPC-only.
+    pub const SYNC_LEGACY: &str = "SyncLegacy";
+    /// Drive the s2→chat2 migration on demand (`komet sync migrate`): opens
+    /// each legacy chat this device hosts so the quiet-seed flips it, then
+    /// waits (bounded) and reports per-chat outcomes. Params `{dryRun?}`;
+    /// IPC-only.
+    pub const SYNC_MIGRATE: &str = "SyncMigrate";
     pub const WATCH_CHATS: &str = "WatchChats";
     pub const WATCH_DEVICES: &str = "WatchDevices";
     pub const WATCH_SESSIONS: &str = "WatchSessions";
@@ -119,15 +134,6 @@ pub mod methods {
     /// Headed IPC owners do not implement this method: closing another app's
     /// engine behind its windows would leave that process unusable.
     pub const STOP_ENGINE: &str = "StopEngine";
-    pub const AUTH_STATUS: &str = "AuthStatus";
-    // AuthRpc mutations (feature-inventory §2 AuthRpc; IPC-only).
-    pub const SIGN_IN: &str = "SignIn";
-    pub const SIGN_IN_HEADLESS: &str = "SignInHeadless";
-    pub const COMPLETE_SIGN_IN: &str = "CompleteSignIn";
-    pub const SIGN_OUT: &str = "SignOut";
-    pub const LIST_ORGS: &str = "ListOrgs";
-    pub const CREATE_ORG: &str = "CreateOrg";
-    pub const SELECT_ORG: &str = "SelectOrg";
     /// One-time local→synced profile import: what's importable (unary).
     pub const LOCAL_IMPORT_STATUS: &str = "LocalImportStatus";
     /// One-time local→synced profile import: run it (stream of progress items).
@@ -191,7 +197,7 @@ pub mod methods {
     pub const UPLOAD_CHUNK: &str = "UploadChunk";
     pub const UPLOAD_COMMIT: &str = "UploadCommit";
     pub const READ_ATTACHMENT_CHUNK: &str = "ReadAttachmentChunk";
-    /// Lazy full-tool-output fetch from the R2 sidecar by doc-resident ref
+    /// Lazy full-tool-output fetch from the parked sidecar by doc-resident ref
     /// (chat2-sync A3). Edge-direct from any device — never relay-forwarded.
     pub const FETCH_TOOL_BLOB: &str = "FetchToolBlob";
     // Updates (ControlRpc, relay-forwardable — a device reports/applies its own

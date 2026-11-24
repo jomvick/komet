@@ -3,10 +3,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use chrono::Utc;
-use gpui::{
-    AnyElement, Context, IntoElement, MouseButton, Pixels, SharedString, Window, div, prelude::*,
-    px,
-};
+use gpui::{AnyElement, Context, IntoElement, MouseButton, Pixels, SharedString, Window, div, px};
 use gpui_tokio::Tokio;
 use komet_engine::harness_cli::HarnessCliStatus;
 use komet_engine::registry::{HarnessDescriptor, descriptor_enabled};
@@ -1027,18 +1024,6 @@ impl Shell {
                         )
                         .child(SharedString::from("Finish sync setup"))
                         .into_any_element(),
-                        AccountMenuAction::SignOut => {
-                            popover::menu_row(theme, false, "user-menu-signout", cx.entity_id())
-                                .id("user-menu-signout")
-                                .on_click(cx.listener(|this, _, _, cx| this.request_sign_out(cx)))
-                                .child(
-                                    icon(icons::LOGOUT_2)
-                                        .size(px(16.0))
-                                        .text_color(theme.text_muted),
-                                )
-                                .child(SharedString::from("Sign out"))
-                                .into_any_element()
-                        }
                     };
                     menu.child(row).child(popover::menu_separator())
                 })

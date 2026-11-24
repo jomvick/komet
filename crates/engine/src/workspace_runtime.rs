@@ -12,7 +12,7 @@ use komet_proto::HarnessId;
 use komet_sync::DocsStore;
 
 use crate::EngineError;
-use crate::doc_host::{DocHost, DocHostConfig, EdgeConfig};
+use crate::doc_host::{DocHost, DocHostConfig, SyncConfig};
 use crate::workspace_host::{WorkspaceHost, WorkspaceHostConfig};
 
 #[derive(Clone)]
@@ -35,7 +35,7 @@ impl WorkspaceRuntime {
         org_id: &str,
         user_id: &str,
         default_harness: HarnessId,
-        edge: Option<EdgeConfig>,
+        edge: Option<SyncConfig>,
         register_device: bool,
     ) -> Result<Self, EngineError> {
         let store = Arc::new(DocsStore::open(store_root)?);

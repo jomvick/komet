@@ -6,6 +6,8 @@
 use std::collections::VecDeque;
 use std::sync::Mutex;
 
+use futures::future::BoxFuture;
+
 use super::*;
 use crate::chat_frames::{decode, encode, frame_type};
 
@@ -35,7 +37,7 @@ struct ChanConnector {
     pipes: Mutex<VecDeque<BinPipe>>,
 }
 
-impl BinConnector for ChanConnector {
+impl Connector<Vec<u8>> for ChanConnector {
     fn connect(&self) -> BoxFuture<'static, Result<BinPipe, SyncError>> {
         let pipe = lock(&self.pipes).pop_front();
         Box::pin(async move { pipe.ok_or(SyncError::Closed) })

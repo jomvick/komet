@@ -73,6 +73,14 @@ impl EngineProfile {
         self.scope
     }
 
+    /// Point this profile at an existing store root instead of the one its
+    /// identity derives (see [`adopt_legacy_store`]).
+    fn select_store_root(mut self, store_root: PathBuf) -> Self {
+        self.uploads_root = store_root.join(LEGACY_UPLOADS_DIR);
+        self.store_root = store_root;
+        self
+    }
+
     pub fn device_root(&self) -> &Path {
         &self.device_root
     }
@@ -147,6 +155,66 @@ struct LocalProfileFile {
 struct LegacyUploadsOwner {
     org_id: String,
     user_id: String,
+}
+
+/// Adopt the pre-upgrade account-scoped store when this install would
+/// otherwise start on an empty workspace.
+///
+/// Releases before the hosted-auth removal stored account data under
+/// `orgs/<hosted org>/<hosted user>`. That identity went away with the hosted
+/// auth, so the development profile this build resolves is a *different*
+/// directory and an upgraded installation would open an empty project list
+/// while its sessions sat on disk, unreachable. Selecting the existing store
+/// (rather than copying it) keeps the old files where they are and makes them
+/// visible again.
+///
+/// Only an unused target is taken over, and only the newest legacy store when
+/// several exist — a store this build already wrote to always wins.
+pub fn adopt_legacy_store(profile: EngineProfile) -> EngineProfile {
+    if store_has_contents(profile.store_root()) {
+        return profile;
+    }
+    let Some(legacy) = newest_account_store(profile.device_root(), profile.store_root()) else {
+        return profile;
+    };
+    tracing::info!(
+        store = %legacy.display(),
+        "adopting the pre-upgrade workspace store"
+    );
+    profile.select_store_root(legacy)
+}
+
+/// Anything the engine wrote (snapshots, journals, usage) makes a store used;
+/// a directory left empty by a failed first boot must not block adoption.
+fn store_has_contents(store_root: &Path) -> bool {
+    std::fs::read_dir(store_root).is_ok_and(|mut entries| entries.next().is_some())
+}
+
+/// Newest `orgs/<org>/<user>` store other than `current`, by mtime.
+fn newest_account_store(device_root: &Path, current: &Path) -> Option<PathBuf> {
+    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+    let orgs = std::fs::read_dir(device_root.join("orgs")).ok()?;
+    for org in orgs.flatten() {
+        let Ok(users) = std::fs::read_dir(org.path()) else {
+            continue;
+        };
+        for user in users.flatten() {
+            let path = user.path();
+            if path == current || !path.is_dir() || !store_has_contents(&path) {
+                continue;
+            }
+            let Ok(modified) = std::fs::metadata(&path).and_then(|m| m.modified()) else {
+                continue;
+            };
+            if best
+                .as_ref()
+                .is_none_or(|(best_modified, _)| modified > *best_modified)
+            {
+                best = Some((modified, path));
+            }
+        }
+    }
+    best.map(|(_, path)| path)
 }
 
 fn load_or_create_local_profile_id(data_dir: &Path) -> Result<String, EngineError> {
@@ -418,5 +486,44 @@ mod tests {
             );
         }
         core.shutdown().await;
+    }
+
+    /// An upgrade from the hosted-auth era must not present an empty workspace
+    /// while the user's sessions sit in the old account-scoped store.
+    #[test]
+    fn development_profile_adopts_a_pre_upgrade_account_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir
+            .path()
+            .join("orgs")
+            .join("hosted-org-123")
+            .join("hosted-user-456");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("chats.json"), "[]").unwrap();
+
+        let profile =
+            adopt_legacy_store(EngineProfile::development(dir.path(), "dev-org", "local"));
+
+        assert_eq!(profile.scope(), WorkspaceScope::Development);
+        assert_eq!(profile.store_root(), legacy);
+        assert_eq!(profile.uploads_root(), legacy.join("uploads"));
+    }
+
+    /// A store this build already wrote to is authoritative: adoption only ever
+    /// fills an unused root.
+    #[test]
+    fn an_in_use_store_is_never_replaced_by_a_legacy_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("orgs").join("old-org").join("old-user");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("chats.json"), "[]").unwrap();
+        let own = dir.path().join("orgs").join("dev-org").join("local");
+        std::fs::create_dir_all(&own).unwrap();
+        std::fs::write(own.join("chats.json"), "[]").unwrap();
+
+        let profile =
+            adopt_legacy_store(EngineProfile::development(dir.path(), "dev-org", "local"));
+
+        assert_eq!(profile.store_root(), own);
     }
 }

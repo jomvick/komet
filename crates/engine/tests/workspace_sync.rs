@@ -117,7 +117,7 @@ fn assemble(dir: &std::path::Path, device_id: &str) -> EngineCore {
     EngineCore::assemble(dir, registry(), HarnessId::Mock, None).expect("engine core assembles")
 }
 
-/// The in-process room: an in-memory registry server speaking the DO's JSON
+/// The in-process room: an in-memory registry server speaking the room service's JSON
 /// WS protocol (what the RegistryRoom DO does over the wire), with both
 /// engines' hosts wired to it via the test seam.
 async fn bridge(
@@ -548,28 +548,32 @@ async fn chat_config_selects_the_run_harness() {
 }
 
 /// Live-edge variant: the same convergence through a real workspace room. Requires
-/// the TS edge (`wrangler dev` in `edge/` with AUTH_MODE=dev):
+/// the self-hosted `komet-sync-server` and the shared bearer it was started with:
 ///
 /// ```sh
-/// KOMET_EDGE_WS=ws://127.0.0.1:8787 cargo test -p komet-engine -- --ignored
+/// KOMET_EDGE_WS=ws://127.0.0.1:8787 KOMET_SYNC_TOKEN=... \
+///     cargo test -p komet-engine -- --ignored
 /// ```
 #[tokio::test]
-#[ignore = "requires a live edge: set KOMET_EDGE_WS (e.g. ws://127.0.0.1:8787)"]
+#[ignore = "requires a live edge: set KOMET_EDGE_WS and KOMET_SYNC_TOKEN"]
 async fn two_engines_converge_through_a_real_workspace_room() {
-    use komet_engine::doc_host::EdgeConfig;
+    use komet_engine::doc_host::SyncConfig;
 
     let base = std::env::var("KOMET_EDGE_WS")
         .expect("set KOMET_EDGE_WS to the edge origin, e.g. ws://127.0.0.1:8787");
+    // The self-hosted server accepts only the bearer it was configured with,
+    // on both the `?token=` query and the header — a per-run synthetic token is
+    // rejected before any frame reaches a room.
+    let token = std::env::var("KOMET_SYNC_TOKEN")
+        .expect("set KOMET_SYNC_TOKEN to the server's configured shared bearer");
     let org = format!("org-{}", uuid::Uuid::new_v4().simple());
 
     let assemble_live = |dir: &std::path::Path, device_id: &str, user: &str| {
         std::fs::create_dir_all(dir).expect("create data dir");
         std::fs::write(dir.join("device-id"), device_id).expect("write device id");
-        // Dev-mode bearer `user@org` carries the org claim the workspace route checks.
-        let edge = Some(EdgeConfig::with_static_token(
-            base.clone(),
-            format!("{user}@{org}"),
-        ));
+        let edge = Some(SyncConfig::with_static_token(base.clone(), token.clone()));
+        // The org scope is the engine's own identity (`&org` below), not a claim
+        // carried by the bearer: the shared token has no org in it.
         EngineCore::assemble_with_identity(dir, registry(), HarnessId::Mock, edge, &org, user)
             .expect("engine core assembles")
     };

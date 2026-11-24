@@ -98,14 +98,13 @@ pub struct UiConfig {
     pub data_dir: PathBuf,
     /// Localhost IPC port: connect if an engine daemon is listening, embed if not.
     pub ipc_port: u16,
-    /// Edge base URL for the embedded engine.
+    /// Self-hosted sync server URL for the embedded engine.
     pub edge_url: String,
-    /// Edge bearer; `None` runs offline.
+    /// Development identity override; this is not the sync bearer.
     pub edge_token: Option<String>,
-    /// Workspace org override for explicit dev-mode runs.
+    /// Workspace namespace override for explicit development runs.
     pub org_id: Option<String>,
-    /// WorkOS client id; `Some` makes the embedded headed engine require a
-    /// production session before opening identity-scoped stores.
+    /// Shared bearer for the self-hosted sync server.
     pub sync_token: Option<String>,
     /// Harness for doc-command runs until per-chat config lands (M4).
     pub default_harness: HarnessId,

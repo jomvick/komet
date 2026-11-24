@@ -1,5 +1,5 @@
 //! Fake-transport unit tests: an in-memory duplex (`mpsc` pipes) to a
-//! `FakeEdge` that mirrors `edge/src/session-room.ts` semantics — join with VV
+//! `FakeEdge` that mirrors `shared protocol behavior` semantics — join with VV
 //! backfill, DocUpdate import + Ack + broadcast, fragmentation above the
 //! payload budget, and injectable InvalidUpdate acks for the stale-peer path.
 
