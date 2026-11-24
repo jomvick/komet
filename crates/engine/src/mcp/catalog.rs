@@ -345,6 +345,14 @@ impl McpCatalog {
                 readonly: true,
                 composio_slug: None,
             },
+            ToolDef {
+                name: "browser_annotations".into(),
+                title: "Browser: annotations".into(),
+                description: "Read and drain the user's annotations: elements the user picked in the visible Browser (\"Add to chat\" in select mode) since the last call, each with role/text/tag/selector/rect and the latest screenshot path. Empty = no pending annotation — never invented.".into(),
+                input_schema: obj_schema(&[], &[]),
+                readonly: true,
+                composio_slug: None,
+            },
         ];
         let order = defs
             .iter()
@@ -1112,6 +1120,7 @@ mod tests {
                 "browser_wait".to_string(),
                 "browser_screenshot".to_string(),
                 "browser_console".to_string(),
+                "browser_annotations".to_string(),
             ]
         );
         let v = catalog

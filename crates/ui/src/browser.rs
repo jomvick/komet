@@ -323,6 +323,9 @@ pub struct BrowserSurface {
     screenshot_seq: u64,
     /// Chemin de la dernière capture enregistrée (agent + bouton manuel).
     last_screenshot_path: Option<PathBuf>,
+    /// Annotations de l'utilisateur (Phase 4) : éléments pris en mode
+    /// sélection, en attente de lecture par l'agent (`browser_annotations`).
+    annotations: Vec<ElementContext>,
     show_overlay: bool,
     /// Mode « Add element » : le clic ne part plus dans la page, le survol
     /// affiche contour + pastille, Échap quitte (touche N = badges numérotés).
@@ -595,6 +598,7 @@ impl BrowserSurface {
             elements_seq: 0,
             screenshot_seq: 0,
             last_screenshot_path: None,
+            annotations: Vec::new(),
             show_overlay: false,
             select_mode: false,
             select_hover: None,
@@ -1252,6 +1256,17 @@ impl BrowserSurface {
     }
 
     /// Journal console filtré (dernier 100, le plus récent en dernier).
+    /// Annotations en attente : vidées à la lecture (l'agent ne doit pas
+    /// re-recevoir les mêmes). La capture jointe est celle de la dernière
+    /// prise (`last_screenshot_path`), quand elle existe.
+    pub(crate) fn agent_drain_annotations(&mut self) -> Vec<(ElementContext, Option<PathBuf>)> {
+        let shot = self.last_screenshot_path.clone();
+        self.annotations
+            .drain(..)
+            .map(|ctx| (ctx, shot.clone()))
+            .collect()
+    }
+
     pub(crate) fn agent_console(&self, level: Option<&str>) -> Vec<(String, String)> {
         let wanted = |entry_level: &str| match level {
             Some("error") => entry_level == "error",
@@ -1767,6 +1782,10 @@ impl BrowserSurface {
                         context.tag.clone()
                     };
                     self.flash_status(format!("Added <{tag}> to chat"), cx);
+                    // Phase 4 : l'annotation est aussi mise à disposition de
+                    // l'agent (outil `browser_annotations`), avec la capture
+                    // la plus récente comme contexte visuel.
+                    self.annotations.push(context.as_ref().clone());
                     cx.emit(BrowserSurfaceEvent::AddElement(context));
                     changed = true;
                 }

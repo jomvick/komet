@@ -164,5 +164,6 @@ Le plan de travail consolidé (phases 0–4) est repris dans `docs/PARITY.md` :
   explicites sans surface ouverte ; écritures passées par la politique d'approbation MCP ;
   `PollBrowserJobs`/`BrowserJobResult` IPC-only et jamais relay-forwarded. Voir la spec du
   2026-11-24.
-- **Annotations** — l'utilisateur annote un élément dans la page, l'agent reçoit l'annotation
-  avec capture et contexte DOM (Phase 4, non commencé).
+- **Annotations** — *livré.* Les éléments pris par l'utilisateur en mode sélection (« Add to
+  chat ») sont aussi mis en file d'annotations ; l'outil `browser_annotations` les draine avec
+  une capture fraîche et leur contexte DOM (réponse vide = rien en attente, jamais inventé).

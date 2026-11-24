@@ -200,6 +200,48 @@ async fn execute_browser_job(
                 .collect();
             Ok(serde_json::json!({ "entries": entries }))
         }
+        "browser_annotations" => {
+            // Phase 4 : les annotations de l'utilisateur (+ une capture
+            // fraîche si la page est chargée — contexte visuel joint).
+            let has_page = surface.update(cx, |surface, _| surface.agent_has_page());
+            let shot_path = if has_page {
+                let before = surface.update(cx, |surface, _| surface.agent_screenshot_seq());
+                surface.update(cx, |surface, cx| surface.agent_request_screenshot(cx));
+                match wait_for(
+                    cx,
+                    surface.clone(),
+                    |surface| surface.agent_screenshot_seq() > before,
+                    AWAIT_TIMEOUT,
+                )
+                .await
+                {
+                    Ok(()) => surface.update(cx, |surface, _| surface.agent_screenshot_path()),
+                    Err(_) => None,
+                }
+            } else {
+                None
+            };
+            let annotations = surface.update(cx, |surface, _| surface.agent_drain_annotations());
+            let annotations: Vec<serde_json::Value> = annotations
+                .into_iter()
+                .map(|(ctx, _path)| {
+                    serde_json::json!({
+                        "role": ctx.role,
+                        "text": ctx.text,
+                        "tag": ctx.tag,
+                        "selector": ctx.selector,
+                        "x": ctx.x,
+                        "y": ctx.y,
+                        "width": ctx.width,
+                        "height": ctx.height,
+                        "screenshotPath": shot_path
+                            .as_ref()
+                            .map(|p| p.display().to_string()),
+                    })
+                })
+                .collect();
+            Ok(serde_json::json!({ "annotations": annotations }))
+        }
         other => Err(format!("unknown browser tool: {other}")),
     }
 }
