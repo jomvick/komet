@@ -323,6 +323,9 @@ pub struct BrowserSurface {
     screenshot_seq: u64,
     /// Chemin de la dernière capture enregistrée (agent + bouton manuel).
     last_screenshot_path: Option<PathBuf>,
+    /// Dernière URL effectivement rapportée par Chrome (l'event Page) — la
+    /// persistance d'onglets se base dessus, pas sur la cible de la barre.
+    reported_url: String,
     /// Annotations de l'utilisateur (Phase 4) : éléments pris en mode
     /// sélection, en attente de lecture par l'agent (`browser_annotations`).
     annotations: Vec<ElementContext>,
@@ -598,6 +601,7 @@ impl BrowserSurface {
             elements_seq: 0,
             screenshot_seq: 0,
             last_screenshot_path: None,
+            reported_url: String::new(),
             annotations: Vec::new(),
             show_overlay: false,
             select_mode: false,
@@ -1168,6 +1172,17 @@ impl BrowserSurface {
         self.has_page()
     }
 
+    /// Vrai si la surface est actuellement affichée (l'utilisateur voit le
+    /// panneau) — les jobs agent ne s'exécutent que sur une surface visible.
+    pub(crate) fn agent_is_visible(&self) -> bool {
+        self.visible
+    }
+
+    /// Génération courante des éléments (identifiant de snapshot).
+    pub(crate) fn agent_snapshot_id(&self) -> u64 {
+        self.elements_seq
+    }
+
     /// Navigation agent : même normalisation que la barre d'adresse
     /// (localhost en http, ports conservés, recherche si terme nu).
     pub(crate) fn agent_navigate(
@@ -1181,8 +1196,22 @@ impl BrowserSurface {
     }
 
     /// Élément par uid de la génération courante ; `Err` = snapshot périmé
-    /// ou absent — l'agent doit reprendre un snapshot.
-    pub(crate) fn agent_element(&self, uid: u32) -> Result<OverlayElement, String> {
+    /// ou absent — l'agent doit reprendre un snapshot. Un `snapshot`
+    /// (génération) passé par l'agent est vérifié : un uid resoumis après un
+    /// autre snapshot ou une navigation est refusé, jamais résolu à côté.
+    pub(crate) fn agent_element(
+        &self,
+        uid: u32,
+        snapshot: Option<u64>,
+    ) -> Result<OverlayElement, String> {
+        if let Some(expected) = snapshot
+            && expected != self.elements_seq
+        {
+            return Err(format!(
+                "stale snapshot: uid {uid} came from snapshot {expected}, current is {} — call browser_snapshot again",
+                self.elements_seq
+            ));
+        }
         self.elements
             .iter()
             .find(|el| el.uid == uid)
@@ -1196,8 +1225,13 @@ impl BrowserSurface {
             })
     }
 
-    pub(crate) fn agent_click(&mut self, uid: u32, _cx: &mut Context<Self>) -> Result<(), String> {
-        let el = self.agent_element(uid)?;
+    pub(crate) fn agent_click(
+        &mut self,
+        uid: u32,
+        snapshot: Option<u64>,
+        _cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let el = self.agent_element(uid, snapshot)?;
         let (x, y) = (el.x + el.width / 2.0, el.y + el.height / 2.0);
         self.commands.send(BrowserCommand::MousePress {
             x,
@@ -1703,6 +1737,13 @@ impl BrowserSurface {
                     let previous_url = self.url.clone();
                     let url_changed = previous_url != url;
                     self.url = url;
+                    // Changement de document → les uids du snapshot ne
+                    // désignent plus rien : liste invalidée (l'agent reprend
+                    // un snapshot, erreur « stale » en attendant).
+                    if url_changed {
+                        self.elements.clear();
+                        self.elements_seq += 1;
+                    }
                     // Changement d'hôte → zoom mémorisé par site (réglage).
                     self.apply_host_zoom(cx);
                     // La barre Find survit à la navigation : on relance la
@@ -1713,7 +1754,14 @@ impl BrowserSurface {
                     }
                     // Vraie page (pas `about:`, pas vide) → le shell mémorise
                     // l'URL pour la persistance d'onglets.
-                    if url_changed && is_web_url(&self.url) {
+                    // Vraie page (pas `about:`, pas vide) → le shell mémorise
+                    // l'URL pour la persistance d'onglets. Comparaison avec la
+                    // dernière URL *rapportée par Chrome* — pas la cible de la
+                    // barre d'adresse : `navigate_to` fixe `self.url` avant
+                    // le rapport, et Chrome peut confirmer exactement cette
+                    // URL (l'event Page arrive à chaque frame).
+                    if is_web_url(&self.url) && self.reported_url != self.url {
+                        self.reported_url = self.url.clone();
                         cx.emit(BrowserSurfaceEvent::UrlChanged(self.url.clone()));
                     }
                     if self.address.read(cx).text() == previous_url {
@@ -2191,7 +2239,10 @@ impl BrowserSurface {
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let panel = self.panel.as_ref()?;
-        let history = self.history.as_ref()?;
+        // Downloads et Network vivent en mémoire : ils se rendent même sans
+        // store d'historique (`data_dir: None`). Seuls History/Favorites
+        // exigent le store.
+        let history = self.history.as_ref();
         let now = chrono::Utc::now().timestamp_millis();
         let query = panel.query.trim().to_lowercase();
         let matches = |title: &str, url: &str| {
@@ -2209,7 +2260,8 @@ impl BrowserSurface {
             .flex_col();
 
         match panel.tab {
-            PanelTab::History => {
+            PanelTab::History if history.is_some() => {
+                let history = history.expect("checked above");
                 let entries: Vec<history::HistoryEntry> = history
                     .entries()
                     .iter()
@@ -2240,7 +2292,8 @@ impl BrowserSurface {
                     }
                 }
             }
-            PanelTab::Favorites => {
+            PanelTab::Favorites if history.is_some() => {
+                let history = history.expect("checked above");
                 let favorites: Vec<&history::Favorite> = history
                     .favorites()
                     .iter()
@@ -2253,6 +2306,11 @@ impl BrowserSurface {
                         body = body.child(self.panel_favorite_row(theme, ix, fav, cx));
                     }
                 }
+            }
+            // History/Favorites sans store (`data_dir: None`) : vide, jamais
+            // de panneau mort.
+            PanelTab::History | PanelTab::Favorites => {
+                body = body.child(self.panel_empty(theme, "No history yet"));
             }
             PanelTab::Downloads => {
                 if self.downloads.is_empty() {

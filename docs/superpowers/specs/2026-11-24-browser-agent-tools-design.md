@@ -44,9 +44,9 @@ navigateur visible de cette machine.
 | Outil | Args | Lecture seule | Réponse |
 |---|---|---|---|
 | `browser_navigate` | `{url}` | non | `{url}` |
-| `browser_snapshot` | `{}` | oui | `{url, title, elements: [{uid, role, text, tag, selector, x, y, width, height}]}` |
-| `browser_click` | `{uid}` | non | `{clicked: uid}` |
-| `browser_fill` | `{uid, text}` | non | `{filled: uid}` |
+| `browser_snapshot` | `{}` | oui | `{url, title, snapshot, elements: [{uid, role, text, tag, selector, x, y, width, height}]}` |
+| `browser_click` | `{uid, snapshot?}` | non | `{clicked: uid}` |
+| `browser_fill` | `{uid, text, snapshot?}` | non | `{filled: uid}` |
 | `browser_press_key` | `{key}` | non | `{key}` |
 | `browser_wait` | `{ms ≤ 10000}` | oui | `{waited: ms}` |
 | `browser_screenshot` | `{}` | non | `{path}` (fichier dans le dossier de téléchargements ; les pixels ne quittent jamais la machine) |
@@ -67,9 +67,24 @@ d'approbation habituel sert de confirmation explicite avant action sensible.
 - **Contenu de page non fiable** : les résultats (`text`, console) traversent le
   canal MCP comme du texte, jamais injectés dans des journaux persistants au-delà
   du transcript du run.
-- **UID éphémères** : valides pour le snapshot qui les a créés (génération
-  comptée côté surface) ; après navigation, `browser_click` répond une erreur
-  « stale snapshot » et l'agent reprend un snapshot.
+- **UID éphémères, épinglés au snapshot** : valides pour le snapshot qui les a
+  créés (génération comptée côté surface, renvoyée dans la réponse de
+  `browser_snapshot` sous `snapshot`). Changer de document invalide la liste
+  (navigation → liste vidée). `browser_click`/`browser_fill` acceptent un
+  argument `snapshot` optionnel : s'il ne correspond pas à la génération
+  courante, l'action est refusée avec une erreur « stale snapshot » explicite —
+  jamais résolue vers un élément voisin. Sans `snapshot`, l'uid est résolu
+  contre la liste courante (l'agent qui re-snapshot régulièrement reste
+  protégé par l'invalidation).
+- **Surface visible uniquement** : les jobs ne s'exécutent que sur la surface
+  du panneau courant, affichée (drapeau `visible` du rendu du pane). Surface
+  garée (pane fermé, autre onglet) ou autre panneau → erreur explicite, jamais
+  une action à l'insu de l'utilisateur.
+- **Job expiré jamais exécuté** : le pont écarter au drain les jobs dont le
+  caller a déjà reçu un timeout — l'exécuteur ne peut pas démarrer une action
+  dont l'agent a déjà vu l'échec (pas de double exécution). Le message de
+  timeout précise que la surface peut encore compléter une action déjà
+  démarrée.
 
 ## 4. Ce qui reste (Phase 4)
 

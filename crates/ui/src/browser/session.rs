@@ -311,6 +311,10 @@ pub(crate) fn run_client(
     download_dir: PathBuf,
 ) {
     let mut current_url = initial_url;
+    // Le dossier de téléchargements voulu survit aux tentatives : appliqué
+    // au démarrage de chaque session et mis à jour par SetDownloadDir où
+    // qu'il arrive (session active, surface garée, attente d'échec).
+    let mut download_dir = download_dir;
     loop {
         // Chrome partagé du pool (keeper thread) ; la lease rendue au bout de
         // la session décrémente le refcount — à 0 le pool tue le process.
@@ -326,7 +330,7 @@ pub(crate) fn run_client(
                     wake_read,
                     &mut current_url,
                     &page_ws,
-                    &download_dir,
+                    &mut download_dir,
                 )
             }
             Err(error) => Err(error),
@@ -345,6 +349,11 @@ pub(crate) fn run_client(
                             break;
                         }
                         Ok(BrowserCommand::Retry) => break,
+                        // changement de dossier pendant l'échec : retenu
+                        // pour la session suivante
+                        Ok(BrowserCommand::SetDownloadDir(path)) => {
+                            download_dir = PathBuf::from(path);
+                        }
                         Ok(BrowserCommand::Shutdown)
                         | Err(mpsc::RecvTimeoutError::Disconnected) => return,
                         Ok(_) | Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -362,7 +371,7 @@ fn run_session(
     wake_read: Option<i32>,
     current_url: &mut String,
     page_ws_url: &str,
-    download_dir: &Path,
+    download_dir: &mut PathBuf,
 ) -> Result<SessionResult, String> {
     let (mut socket, _response) = ws_connect(page_ws_url).map_err(|e| e.to_string())?;
     // id de la cible CDP (pour Target.closeTarget à la fermeture de la surface)
@@ -482,6 +491,14 @@ fn run_session(
                         scale,
                         emulation_mobile,
                     )?;
+                }
+                Ok(BrowserCommand::SetDownloadDir(path)) => {
+                    // Retenu pendant le parking et appliqué tout de suite : le
+                    // socket vit, le prochain téléchargement utilisera ce
+                    // dossier sans attendre le réveil.
+                    *download_dir = PathBuf::from(&path);
+                    let _ = socket.send(Message::Text(cdp::set_download_behavior(next_id, &path)));
+                    next_id += 1;
                 }
                 Ok(BrowserCommand::Shutdown) => {
                     let _ = socket.send(Message::Text(cdp::close_target(next_id, &target_id)));
@@ -808,6 +825,9 @@ fn run_session(
                     next_id += 1;
                 }
                 BrowserCommand::SetDownloadDir(path) => {
+                    // retenu pour les sessions à venir (Retry) et appliqué
+                    // tout de suite sur celle-ci
+                    *download_dir = PathBuf::from(&path);
                     let _ = socket.send(Message::Text(cdp::set_download_behavior(next_id, &path)));
                     next_id += 1;
                 }

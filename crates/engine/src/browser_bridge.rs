@@ -95,16 +95,40 @@ impl BrowserBridge {
             Ok(Err(_)) => Err("browser executor dropped the result (surface closed?)".into()),
             Err(_) => {
                 self.waiters.lock().expect("waiters poisoned").remove(&id);
-                Err("timed out — no visible Browser surface is executing browser tools".into())
+                // Le job peut déjà être drainé et en cours d'exécution par
+                // la surface : l'erreur ne prétend jamais qu'aucun effet de
+                // bord n'a eu lieu.
+                Err("timed out — the visible Browser surface may still complete this action".into())
             }
         }
     }
 
-    /// Draine jusqu'à `max` jobs (handler RPC `PollBrowserJobs`).
+    /// Draine jusqu'à `max` jobs (handler RPC `PollBrowserJobs`). Les jobs
+    /// dont le caller a déjà expiré sont écartés ici : l'exécuteur ne peut
+    /// pas démarrer une action dont l'agent a déjà reçu un échec. La longueur
+    /// est lue sous le même verrou que le drain (pas de course avec un
+    /// second poll concurrent).
     pub fn poll(&self, max: usize) -> Vec<BrowserJob> {
-        let max = max.min(self.pending_len());
         let mut pending = self.pending.lock().expect("pending poisoned");
-        pending.drain(..max).collect()
+        let mut kept = VecDeque::new();
+        let mut live = Vec::new();
+        while let Some(job) = pending.pop_front() {
+            if live.len() < max && self.waiter_alive(&job.id) {
+                live.push(job);
+            } else {
+                kept.push_back(job);
+            }
+        }
+        *pending = kept;
+        live
+    }
+
+    /// Vrai si le caller du job est toujours en attente (pas encore expiré).
+    fn waiter_alive(&self, id: &str) -> bool {
+        self.waiters
+            .lock()
+            .expect("waiters poisoned")
+            .contains_key(id)
     }
 
     /// Nombre de jobs en attente (diagnostic).
@@ -187,6 +211,25 @@ mod tests {
         });
         let err = caller.await.unwrap().unwrap_err();
         assert_eq!(err, "stale snapshot — call browser_snapshot again");
+    }
+
+    #[tokio::test]
+    async fn poll_drops_jobs_whose_caller_timed_out() {
+        let bridge = Arc::new(BrowserBridge::new());
+        let handle = {
+            let bridge = bridge.clone();
+            tokio::spawn(async move {
+                bridge
+                    .call("browser_click", serde_json::json!({"uid": 1}))
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        // le caller meurt (drop du task = waiter perdu)
+        handle.abort();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        // le waiter a disparu : le poll ne livre plus le job à l'exécuteur
+        assert!(bridge.poll(8).is_empty());
     }
 
     #[tokio::test]

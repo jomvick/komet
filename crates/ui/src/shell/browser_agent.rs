@@ -73,18 +73,16 @@ pub(super) fn start_bridge(cx: &mut gpui::Context<Shell>) {
 }
 
 impl Shell {
-    /// La surface qui porte les jobs agent : celle du panneau courant, sinon
-    /// n'importe laquelle ouverte (un seul navigateur visible à la fois en
-    /// pratique).
+    /// La surface qui porte les jobs agent : uniquement celle du panneau
+    /// courant, rendue dans le pane ouvert. Jamais de repli sur une autre
+    /// surface (l'utilisateur pourrait ne pas la voir) — sans surface dans le
+    /// panneau courant, les outils répondent leur erreur explicite.
     fn current_browser_surface(
         &mut self,
         cx: &mut gpui::Context<Self>,
     ) -> Option<gpui::Entity<crate::browser::BrowserSurface>> {
         let key = self.panel_key(cx);
-        self.browsers
-            .get(&key)
-            .cloned()
-            .or_else(|| self.browsers.values().next().cloned())
+        self.browsers.get(&key).cloned()
     }
 }
 
@@ -95,6 +93,15 @@ async fn execute_browser_job(
     job: &komet_engine::browser_bridge::BrowserJob,
     cx: &mut gpui::AsyncApp,
 ) -> Result<serde_json::Value, String> {
+    // L'utilisateur doit voir le panneau : surface garée (pane fermé ou
+    // autre onglet) → refus explicite, pas d'action à l'insu de l'utilisateur.
+    let visible = surface.update(cx, |surface, _| surface.agent_is_visible());
+    if !visible {
+        return Err(
+            "the Browser surface exists but is not currently visible — ask the user to open it"
+                .into(),
+        );
+    }
     let tool = job.tool.as_str();
     match tool {
         "browser_navigate" => {
@@ -124,14 +131,16 @@ async fn execute_browser_job(
         }
         "browser_click" => {
             let uid = uid_arg(&job.args)?;
+            let snapshot = snapshot_arg(&job.args);
             surface.update(cx, |surface, cx| {
                 surface
-                    .agent_click(uid, cx)
+                    .agent_click(uid, snapshot, cx)
                     .map(|_| serde_json::json!({ "clicked": uid }))
             })
         }
         "browser_fill" => {
             let uid = uid_arg(&job.args)?;
+            let snapshot = snapshot_arg(&job.args);
             let text = job
                 .args
                 .get("text")
@@ -140,7 +149,7 @@ async fn execute_browser_job(
                 .to_owned();
             surface.update(cx, |surface, cx| {
                 surface
-                    .agent_fill(uid, &text, cx)
+                    .agent_fill(uid, &text, snapshot, cx)
                     .map(|_| serde_json::json!({ "filled": uid }))
             })
         }
@@ -253,6 +262,12 @@ fn uid_arg(args: &serde_json::Value) -> Result<u32, String> {
         .ok_or_else(|| "missing argument: uid".to_string())
 }
 
+/// Génération de snapshot optionnelle passée par l'agent avec `uid` — si
+/// présente et différente de l'actuelle, l'action est refusée (stale).
+fn snapshot_arg(args: &serde_json::Value) -> Option<u64> {
+    args.get("snapshot").and_then(serde_json::Value::as_u64)
+}
+
 /// Réponse de snapshot : URL, titre et éléments de la génération courante.
 fn snapshot_value(
     surface: &gpui::Entity<browser::BrowserSurface>,
@@ -270,6 +285,7 @@ fn snapshot_value(
         Ok(serde_json::json!({
             "url": surface.agent_url(),
             "title": surface.agent_title(),
+            "snapshot": surface.agent_snapshot_id(),
             "elements": elements,
         }))
     })

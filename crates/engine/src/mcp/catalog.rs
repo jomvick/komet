@@ -291,18 +291,30 @@ impl McpCatalog {
             ToolDef {
                 name: "browser_click".into(),
                 title: "Browser: click".into(),
-                description: "Click an element by its snapshot uid (center of its box, real mouse events). Refuses with a stale-snapshot error if the page changed — take a new snapshot.".into(),
-                input_schema: obj_schema(&[("uid", "number")], &["uid"]),
+                description: "Click an element by its snapshot uid (center of its box, real mouse events). Pass the \"snapshot\" id returned by browser_snapshot to pin the action to that snapshot — a stale uid is refused with an explicit error, never resolved to a neighboring element.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "uid": {"type": "number"},
+                        "snapshot": {"type": "number", "description": "snapshot id from browser_snapshot"},
+                    },
+                    "required": ["uid"],
+                    "additionalProperties": false,
+                }),
                 readonly: false,
                 composio_slug: None,
             },
             ToolDef {
                 name: "browser_fill".into(),
                 title: "Browser: fill".into(),
-                description: "Set an input's value by its snapshot uid (focus + value + input/change events). Does not submit; submitting is your responsibility (and a human-approval gate applies).".into(),
+                description: "Set an input's value by its snapshot uid (focus + value + input/change events). Does not submit; submitting is your responsibility (and a human-approval gate applies). Pass the \"snapshot\" id from browser_snapshot to pin the fill to that snapshot.".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
-                    "properties": {"uid": {"type": "number"}, "text": {"type": "string"}},
+                    "properties": {
+                        "uid": {"type": "number"},
+                        "text": {"type": "string"},
+                        "snapshot": {"type": "number", "description": "snapshot id from browser_snapshot"},
+                    },
                     "required": ["uid", "text"],
                     "additionalProperties": false,
                 }),
