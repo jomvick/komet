@@ -1911,6 +1911,10 @@ impl RpcService for EngineRpc {
             methods::REMOVE_ENVIRONMENT,
             methods::PREVIEW_ENVIRONMENT,
             methods::ENVIRONMENT_LINK,
+            // The visible Browser is this device's UI surface: a remote
+            // environment connection never drives it.
+            methods::POLL_BROWSER_JOBS,
+            methods::BROWSER_JOB_RESULT,
         ];
         if self.environment.is_some() && LOCAL_ONLY.contains(&method) {
             return Err(RpcError::Failed(format!("local_only: {method}")));
@@ -2616,6 +2620,31 @@ impl RpcService for EngineRpc {
             }
             methods::LOCAL_DEVICE => {
                 RpcReply::value(&serde_json::json!({ "deviceId": self.doc_host.device_id() }))
+            }
+            // Browser visible → agent (spec 2026-11-24). IPC-only en pratique :
+            // LOCAL_ONLY rejette les connexions d'environnement, et la méthode
+            // n'est pas relay-forwardable.
+            methods::POLL_BROWSER_JOBS => {
+                let max = params
+                    .get("max")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(8)
+                    .min(32) as usize;
+                match self.sessions.browser_bridge() {
+                    Some(bridge) => {
+                        RpcReply::value(&serde_json::json!({ "jobs": bridge.poll(max) }))
+                    }
+                    None => RpcReply::value(&serde_json::json!({ "jobs": [] })),
+                }
+            }
+            methods::BROWSER_JOB_RESULT => {
+                let frame: crate::browser_bridge::BrowserJobResultFrame = parse_params(params)?;
+                let bridge = self
+                    .sessions
+                    .browser_bridge()
+                    .ok_or_else(|| RpcError::Failed("browser bridge not wired".to_string()))?;
+                bridge.complete(frame);
+                RpcReply::value(&serde_json::json!({}))
             }
             methods::LOCAL_IMPORT_STATUS => {
                 let importer = self.local_importer()?.clone();

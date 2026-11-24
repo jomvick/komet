@@ -1,6 +1,8 @@
 # Surface navigateur Komet unifiée (Humain & Agent CLI) — Design
 
-Date : 2026-11-08. Statut : approuvé. Périmètre : surface Browser intégrée au panneau droit de Komet,
+Date : 2026-11-08. Statut : approuvé, partiellement réalisé. Mis à jour le 2026-11-24 :
+§2 décrit désormais le code présent (Chromium système + CDP), §6 marque les jalons livrés
+et §7 liste les écarts restants. Périmètre : surface Browser intégrée au panneau droit de Komet,
 interactive pour l'humain et pilotable sans friction par les agents CLI, architecture unifiée
 **CDP-First** inspirée d'Obscura (`h4ckf0r0day/obscura`).
 
@@ -19,22 +21,29 @@ Komet offre un navigateur intégré moderne qui sert à la fois :
 
 ## 2. État actuel (mesuré, pas supposé)
 
+> Réécrit le 2026-11-24. La version d'origine mesurait un sidecar Obscura/Servo
+> (`ego.*`, viewport figé 1280×800, polling PNG 120 ms, localhost forcé en HTTPS).
+> Ce chemin a été remplacé par Chromium système + CDP ; le tableau ci-dessous décrit
+> le code présent. La matrice de parité vit dans `docs/PARITY.md` (lignes 1.17, 1.18, 3.6).
+
 | Constat | Preuve |
 |---|---|
-| Viewport figé 1280×800, jamais redimensionné | `crates/ui/src/browser.rs:31` ; le bridge n'expose aucun `resize` |
-| Frames = PNG pleine page, poll toutes les 120 ms | `browser.rs:771-807` (`ego.capture`) |
-| Coût réel d'une frame : 1,9 s (page vide) à 3–14 s (Wikipédia) | sonde directe du sidecar |
-| Le moteur produit déjà des frames « sales » | `webview/engine/src/lib.rs:622-651` (`EngineEvent::Frame`), ignorées par l'UI |
-| Molette envoyée en (0,0) | `webview/engine/src/lib.rs:527-535` |
-| Clavier = caractères imprimables seulement | `browser.rs:241-258` |
-| `localhost:5173` forcé en `https://` → échec TLS | `browser.rs:544-551` |
-| Pas de console, pas de resize, pas d'IME, pas de presse-papier | UI et bridge |
-| Compatibilité Servo partielle (pas de WebGL/IndexedDB/SW, pas de codecs) | sonde |
-
-Conclusion : le plafond n'est pas le moteur mais le **pipeline de rendu et la couche
-d'entrée**. Le moteur expose déjà tout ce qu'il faut (`InputEvent::Ime`,
-`EditingAction`, `ClipboardAction`, `Cursor`, `show_console_message`,
-`request_create_new`, préférences DevTools).
+| Moteur = binaire Chromium/Chrome/Brave/Edge/Obscura déjà installé, lancé headless | `browser/process.rs:313-400` (découverte `CHROME_PATH`/`KOMET_BROWSER_BIN` → PATH → chemins OS), `:195-217` (`--headless=new --ozone-platform=headless --remote-debugging-port=0`) |
+| CDP sur WebSocket loopback, port dynamique ; UA de la version réelle du binaire (le jeton `HeadlessChrome` déclenchait les anti-bots) | `process.rs:224-233`, `:271-286` |
+| Un Chrome par clé de panneau (`profile_key`), refcounté ; la dernière surface fermée tue le process via le keeper, et `PR_SET_PDEATHSIG` protège des orphelins si Komet meurt | `process.rs:13-115`, `:235-243` |
+| Profil **persistant** par panneau (cookies/stockage conservés entre sessions), sous `{data_dir}/komet/browser-profiles/{sha256(profile_key)}` — pas de profil isolé par session | `process.rs:580-600`, `settings.rs` |
+| Rendu push : `Page.startScreencast` + `Page.screencastFrameAck` par frame (contrôle de flux), plus de polling | `browser/cdp.rs:71-99`, `browser.rs:4716-4760` |
+| Viewport = taille réelle du panneau × facteur d'échelle, via `Emulation.setDeviceMetricsOverride` ; presets appareil (téléphone/tablette/laptop) + taille custom + rotation | `browser.rs:890-907`, `:979-1115`, `:57-73` |
+| `localhost`, `*.localhost`, IP privées et `:PORT` en `http://` ; TLS auto-signé local accepté par `--allow-insecure-localhost`, aucune désactivation globale des vérifications | `browser.rs:4438-4490`, `process.rs:230` |
+| Clavier (`Input.dispatchKeyEvent` / `Input.insertText`), souris, scroll, collage, dialogues JS (`Page.handleJavaScriptDialog`), find-in-page (script JS injecté + compteur) | `browser.rs:1802-1960`, `:5049-5060`, `browser/cdp.rs` |
+| Console intégrée : `Runtime.consoleAPICalled` + `Runtime.exceptionThrown`, filtres par niveau, REPL `Runtime.evaluate` | `browser.rs:395-419`, `:1729-1745` |
+| Éléments : mode sélection, badges `CSS.highlights`, description DOM au survol, « Add to chat » | `browser/element.rs`, `browser.rs:1476-1503` |
+| Historique (rétention 30/90/365 jours/illimité), favoris, clear storage (`Storage.clearDataForOrigin`, `Network.clearBrowserCookies/Cache`) | `browser/history.rs`, `browser/clear.rs` |
+| Échec de lancement ou perte CDP = état d'erreur visible + bouton **Retry** (relance la session CDP), pas de crash silencieux | `browser.rs:390-400`, `:4649-4660`, `:5319` |
+| **Pas de téléchargements** : seule sortie fichier = `Page.captureScreenshot` vers `capture_dir` | `browser.rs:1758-1770` ; aucun `Browser.setDownloadBehavior`/`Page.download*` |
+| **Pas d'inspection réseau** : aucun `Network.requestWillBeSent`/`loadingFailed`/`responseReceived` | `browser/cdp.rs` (méthodes Network = clear uniquement) |
+| **Aucun outil agent** vers cette surface : le MCP moteur n'expose que les terminaux | `crates/engine/src/mcp/catalog.rs` ; aucun outil browser |
+| Onglets = onglets du panneau droit, une surface CDP par onglet ; pas de restauration au redémarrage | `shell/right_pane.rs:214-225` |
 
 ## 3. Objectifs / non-objectifs
 
@@ -48,19 +57,17 @@ d'entrée**. Le moteur expose déjà tout ce qu'il faut (`InputEvent::Ime`,
 
 **Non-objectifs (v1)**
 
-- Parité Firefox/Chrome, DRM, extensions, Service Workers.
-- Lecture audio/vidéo (exigerait `media-gstreamer` : dépendance système lourde).
-- Téléchargements, impression, gestion de mots de passe.
+- Parité Firefox/Chrome, DRM, extensions, Service Workers (le moteur Chromium système les
+  gère, Komet ne les expose pas comme fonctionnalités).
+- Lecture audio/vidéo dédiée, impression, gestion de mots de passe (audio muet par `--mute-audio`).
 - Navigateur quotidien : c'est un navigateur d'aperçu/test.
-- Navigateur **des agents** : l'automatisation agent reste sur `chrome-devtools-mcp`
-  (spec `2026-10-12-browser-use-komet-design.md`) ; cette surface est pour l'humain.
 - Pages web généralistes cassées sans recours : la barre d'acceptation est « une app
   Vite/React et des pages de doc s'affichent », pas « tout le web ».
-- **HTTPS auto-signé** (Vite `--https`, Next dev, mkcert) : hors v1. `http://` localhost
-  seulement ; une erreur TLS explicite est affichée. Pas de `ignore_certificate_errors`
-  global (il accepterait aussi les certificats invalides sur Internet).
-- **macOS et Windows** : pas de sidecar en v1. La surface affiche un état « moteur
-  indisponible » avec la commande de build (voir §5.7).
+- **HTTPS auto-signé** : accepté uniquement pour `localhost`
+  (`--allow-insecure-localhost`) ; une erreur de certificat distante reste affichée.
+  Pas de `ignore_certificate_errors` global.
+- **Téléchargements et inspection réseau** : hors de la v1 ci-dessus, traités en phase 2
+  du plan navigateur (voir §7).
 
 **Anti-objectifs**
 
@@ -119,8 +126,44 @@ Au lieu d'un protocole WebSocket ad-hoc propriétaire (`ego.*`), Komet s'aligne 
 
 ## 6. Plan de Réalisation par Jalons
 
-1. **Jalon 1 (Détection & Processus)** : Module de probing multi-OS des navigateurs disponibles et lancement du sous-processus headless avec port CDP dynamique.
-2. **Jalon 2 (Client CDP & Screencast)** : Connexion WebSocket CDP, handshake, `Page.navigate` et boucle de réception push `Page.screencastFrame` rendue dans GPUI.
-3. **Jalon 3 (Interactivité Humaine & Responsive)** : Dispatching des clics souris, scroll, frappe clavier, et redimensionnement dynamique du viewport.
-4. **Jalon 4 (Fonctionnalités Clés : Capture & Overlay Obscura)** : Ajout du bouton Capture d'écran, du mode overlay avec badges UIDs et du tiroir Console/Network.
-5. **Jalon 5 (Bridge Agent CLI)** : Liaison sans friction avec les outils de l'agent pour le pilotage et la synchronisation live.
+1. **Jalon 1 (Détection & Processus)** — *livré.* Probe multi-OS, lancement headless avec port
+   CDP dynamique, pool par profil, keeper sans orphelin (`browser/process.rs`).
+2. **Jalon 2 (Client CDP & Screencast)** — *livré.* Handshake, `Page.navigate`, screencast push
+   avec ack, rendu GPUI (`browser.rs`, `browser/cdp.rs`).
+3. **Jalon 3 (Interactivité Humaine & Responsive)** — *livré.* Souris, scroll, clavier/IME,
+   redimensionnement dynamique, dialogues JS, find-in-page, zoom.
+4. **Jalon 4 (Capture & Overlay, Console)** — *livré pour la capture, l'overlay d'éléments, la
+   console/REPL, les téléchargements et l'onglet Network (erreurs + liste des requêtes).*
+   **Reste :** vue des corps requête/réponse.
+5. **Jalon 5 (Bridge Agent CLI)** — *livré (v1).* Outils MCP sur la surface visible via le pont
+   moteur (spec `2026-11-24-browser-agent-tools-design.md`, rows 3.6 de `docs/PARITY.md`) ;
+   l'utilisateur voit chaque action et reprend la main en fermant/reprenant la surface.
+
+## 7. Écarts restants au 2026-11-24
+
+Le plan de travail consolidé (phases 0–4) est repris dans `docs/PARITY.md` :
+
+- **Recherche par défaut** — *livré.* Google est le défaut (`DEFAULT_SEARCH_URL`,
+  `BrowserPrefs::default`) et une migration à la lecture remplace l'ancien défaut DuckDuckGo
+  exact ; tout choix explicite est conservé (`BrowserPrefs::migrate`, testé).
+- **Téléchargements** — *livré.* `Browser.setDownloadBehavior {behavior: allow, eventsEnabled}`
+  au démarrage de session (dossier = réglage ou Téléchargements), événements
+  `downloadWillBegin`/`downloadProgress` → onglet Downloads (progression throttlée 250 ms,
+  Open/Reveal via gpui, « Clear finished »), réglage « Downloads folder » ré-appliqué en direct.
+- **Inspection réseau (erreurs + liste requêtes)** — *livré.* `Network.enable` → onglet Network
+  (méthode, URL, statut/erreur, annulations ≠ erreurs, `ERR_CERT_*` signalé, hôte local / http /
+  https distingués, plafond 300 entrées, Clear). Reste : voir les corps requête/réponse.
+- **Onglets et profils** — *livré.* Les URLs des surfaces Browser sont mémorisées
+  (`UiSettings.browserUrls`, les plus récentes d'abord, 10 max via
+  `BrowserSurfaceEvent::UrlChanged`) : à la réouverture du panneau sans page d'accueil, la
+  dernière page est restaurée. L'espace de noms `agent:` (`process::agent_profile_key`, testé)
+  réserve les profils aux sessions d'agent, sans cookies de l'utilisateur.
+- **Outils agent** — *livré (v1).* Outils MCP typés vers la surface visible via le pont moteur
+  (`browser_bridge.rs`) et l'exécuteur UI (`shell/browser_agent.rs`) : navigate/snapshot/
+  click/fill/press_key/wait/screenshot/console ; uids valides pour un seul snapshot ; erreurs
+  explicites sans surface ouverte ; écritures passées par la politique d'approbation MCP ;
+  `PollBrowserJobs`/`BrowserJobResult` IPC-only et jamais relay-forwarded. Voir la spec du
+  2026-11-24.
+- **Annotations** — *livré.* Les éléments pris par l'utilisateur en mode sélection (« Add to
+  chat ») sont aussi mis en file d'annotations ; l'outil `browser_annotations` les draine avec
+  une capture fraîche et leur contexte DOM (réponse vide = rien en attente, jamais inventé).

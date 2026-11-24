@@ -1,26 +1,33 @@
 mod cdp;
 mod clear;
+mod downloads;
 mod element;
 mod history;
 mod menu;
+mod network;
 mod process;
+mod session;
 
 pub use clear::ClearSelection;
 pub use element::{ElementContext, ElementHover};
 pub use history::{BrowserHistory, clear_history_file, clear_storage_files};
 pub use menu::{BrowserAction, MenuItem, MenuStates, action_shipped};
 
+// Couche session (contrôleur CDP) extraite dans `browser/session.rs` —
+// l'API vue par la surface et les tests reste inchangée. `BrowserCommand`/
+// `BrowserEvent` restent exportés publiquement comme avant l'extraction.
+pub use session::{BrowserCommand, BrowserEvent};
+use session::{CommandPipe, WakeRx, WakeTx, run_client};
+
 use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD;
 use futures::StreamExt;
 use gpui::{
     AnyElement, App, Bounds, ClipboardItem, Context, Element, Empty, Entity, FocusHandle,
@@ -28,13 +35,8 @@ use gpui::{
     MouseButton, ObjectFit, Pixels, Point, Render, RenderImage, ScrollDelta, ScrollWheelEvent,
     SharedString, Window, div, img, prelude::*, px,
 };
-use image::{Frame, RgbaImage};
-use serde_json::Value;
-use tungstenite::stream::MaybeTlsStream;
-use tungstenite::{Message, WebSocket, connect as ws_connect};
 
 pub use cdp::{ConsoleLog, FindPageResult, OverlayElement, cdp_modifiers};
-use process::acquire_browser;
 
 use crate::composer::{ComposerInput, ComposerInputEvent};
 use crate::icons;
@@ -195,8 +197,6 @@ fn zoom_step_level(zoom: f32, dir: i32) -> f32 {
     }
 }
 
-type WsStream = WebSocket<MaybeTlsStream<std::net::TcpStream>>;
-
 /// Bout de pipe en écriture : chaque commande envoyée au thread CDP écrit un
 /// octet pour réveiller son poll(2) immédiatement (zéro latence, zéro timer).
 #[cfg(target_os = "linux")]
@@ -215,42 +215,6 @@ impl Drop for FdGuard {
 #[derive(Debug)]
 struct FdGuard;
 
-/// Canal de commandes UI → CDP, doublé du self-pipe de réveil.
-#[derive(Clone)]
-struct CommandPipe {
-    tx: mpsc::Sender<BrowserCommand>,
-    wake_fd: Option<i32>,
-}
-
-impl CommandPipe {
-    fn send(&self, command: BrowserCommand) {
-        if self.tx.send(command).is_err() {
-            return;
-        }
-        #[cfg(target_os = "linux")]
-        if let Some(fd) = self.wake_fd {
-            // non-bloquant : pipe plein = octets en attente = déjà réveillé
-            unsafe { libc::write(fd, b"x".as_ptr().cast(), 1) };
-        }
-    }
-}
-
-// wake CDP → UI : le thread CDP signale chaque lot d'événements ; la tâche
-// gpui attend dessus (futures channel) au lieu de timer toutes les 8 ms.
-type WakeTx = futures::channel::mpsc::UnboundedSender<()>;
-type WakeRx = futures::channel::mpsc::UnboundedReceiver<()>;
-
-fn push_event(events: &mpsc::SyncSender<BrowserEvent>, wake: &WakeTx, event: BrowserEvent) {
-    let _ = events.send(event);
-    let _ = wake.unbounded_send(());
-}
-
-/// Pour les frames : channel plein → frame perdue (l'UI garde la dernière).
-fn push_event_lossy(events: &mpsc::SyncSender<BrowserEvent>, wake: &WakeTx, event: BrowserEvent) {
-    let _ = events.try_send(event);
-    let _ = wake.unbounded_send(());
-}
-
 /// Événements surface → shell : le panneau demande au shell d'ouvrir un
 /// nouvel onglet, la page settings, d'indexer un élément dans le composer ou
 /// le panneau d'historique.
@@ -262,6 +226,9 @@ pub enum BrowserSurfaceEvent {
     /// Le preset d'émulation a changé dans la barre device — le shell le
     /// persiste dans `BrowserPrefs.emulation_preset` (`None` = off).
     EmulationChanged(Option<String>),
+    /// La surface a navigué vers une vraie page (non `about:`) : le shell
+    /// mémorise l'URL pour restaurer l'onglet à la réouverture du panneau.
+    UrlChanged(String),
     /// « Clear Storage » confirmé avec « History » coché : le journal est
     /// partagé entre surfaces (même data_dir), le shell purge la mémoire
     /// de TOUTES les surfaces — les favoris survivent.
@@ -269,133 +236,6 @@ pub enum BrowserSurfaceEvent {
 }
 
 impl gpui::EventEmitter<BrowserSurfaceEvent> for BrowserSurface {}
-
-pub enum BrowserCommand {
-    Back,
-    Forward,
-    GetNavHistory,
-    Reload,
-    Retry,
-    Navigate(String),
-    KeyPress {
-        key: &'static str,
-        code: &'static str,
-        vk: Option<u32>,
-        modifiers: u32,
-    },
-    KeyRelease {
-        key: &'static str,
-        code: &'static str,
-        modifiers: u32,
-    },
-    InsertText(String),
-    MousePress {
-        x: f32,
-        y: f32,
-        button: &'static str,
-        count: u32,
-    },
-    MouseRelease {
-        x: f32,
-        y: f32,
-        button: &'static str,
-        count: u32,
-    },
-    MouseMove {
-        x: f32,
-        y: f32,
-    },
-    Scroll {
-        x: f32,
-        y: f32,
-        delta_x: f64,
-        delta_y: f64,
-    },
-    /// Sonde de survol du mode « Add element » : `elementFromPoint` +
-    /// rectangle/pastille, ~25×/s max côté UI.
-    ProbeAt {
-        x: f32,
-        y: f32,
-    },
-    /// Clic en mode sélection : décrit l'élément sous le point et émet
-    /// `BrowserSurfaceEvent::AddElement`.
-    DescribeAt {
-        x: f32,
-        y: f32,
-    },
-    /// Find in Page : `step` 0 = nouvelle recherche, ±1 = occurrence
-    /// suivante/précédente (même requête, sans rescanner le DOM).
-    FindInPage {
-        query: String,
-        step: i32,
-    },
-    /// Ferme Find in Page : retire surlignages et style injecté.
-    ClearFind,
-    /// Device emulation : `Some` applique viewport mobile/UA/touch,
-    /// `None` revient au viewport fluide de la zone.
-    SetEmulation {
-        device: Option<EmulatedDevice>,
-    },
-    /// Dialogue « Clear Storage » confirmé : `origins` = origines connues
-    /// (historique + favoris + page courante) pour `Storage.clearDataForOrigin`.
-    ClearBrowsingData {
-        selection: ClearSelection,
-        origins: Vec<String>,
-    },
-    TypeText(String),
-    Resize {
-        width: u32,
-        height: u32,
-        scale: f32,
-    },
-    CaptureScreenshot,
-    ToggleOverlay,
-    Evaluate(String),
-    /// Le panneau browser s'affiche / se cache : caché, la session CDP se
-    /// gare (stopScreencast, attente bloquante — zéro réveil CPU).
-    SetVisible(bool),
-    /// L'UI a consommé la frame ; le thread CDP acquitte Chrome (backpressure :
-    /// au plus une frame non affichée, jamais de rattrapage coûteux).
-    AckFrame(u64),
-    Shutdown,
-}
-
-pub enum BrowserEvent {
-    Page {
-        image: Arc<RenderImage>,
-        title: String,
-        url: String,
-        session_id: u64,
-    },
-    Title(String),
-    Loading(bool),
-    NavHistory {
-        can_back: bool,
-        can_forward: bool,
-    },
-    Elements(Vec<OverlayElement>),
-    Console(ConsoleLog),
-    /// Résultat d'un `ProbeAt` : `None` quand plus rien ne survole
-    /// (`elementFromPoint` → null).
-    ElementHover(Option<ElementHover>),
-    /// Résultat d'un `DescribeAt` : contexte complet de l'élément cliqué.
-    ElementContext(Box<ElementContext>),
-    /// Résultat d'un `FindInPage` : nombre d'occurrences et index courant
-    /// (-1 quand aucune correspondance).
-    FindResult {
-        count: usize,
-        index: i64,
-    },
-    Screenshot(Vec<u8>),
-    Failed(String),
-    /// Dégradation signalée à l'utilisateur (ex. repli --no-sandbox).
-    Warning(String),
-}
-
-enum SessionResult {
-    Retry,
-    Shutdown,
-}
 
 /// Filtre du tiroir DevTools (Console).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -428,11 +268,13 @@ impl Render for ConsoleDragGhost {
     }
 }
 
-/// Onglet du panneau History/Favorites.
+/// Onglet du panneau History/Favorites/Downloads/Network.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PanelTab {
     History,
     Favorites,
+    Downloads,
+    Network,
 }
 
 /// Case à cocher du dialogue « Clear Storage ».
@@ -474,6 +316,19 @@ pub struct BrowserSurface {
     can_forward: bool,
     error: Option<String>,
     elements: Vec<OverlayElement>,
+    /// Génération des éléments : +1 à chaque extraction — les uids agent ne
+    /// sont valides que pour la génération du snapshot qui les a donnés.
+    elements_seq: u64,
+    /// Génération des captures : +1 à chaque `BrowserEvent::Screenshot`.
+    screenshot_seq: u64,
+    /// Chemin de la dernière capture enregistrée (agent + bouton manuel).
+    last_screenshot_path: Option<PathBuf>,
+    /// Dernière URL effectivement rapportée par Chrome (l'event Page) — la
+    /// persistance d'onglets se base dessus, pas sur la cible de la barre.
+    reported_url: String,
+    /// Annotations de l'utilisateur (Phase 4) : éléments pris en mode
+    /// sélection, en attente de lecture par l'agent (`browser_annotations`).
+    annotations: Vec<ElementContext>,
     show_overlay: bool,
     /// Mode « Add element » : le clic ne part plus dans la page, le survol
     /// affiche contour + pastille, Échap quitte (touche N = badges numérotés).
@@ -505,6 +360,10 @@ pub struct BrowserSurface {
     history: Option<BrowserHistory>,
     /// Panneau History/Favorites affiché à la place de la page.
     panel: Option<HistoryPanel>,
+    /// Téléchargements suivis (GUID CDP → item), du début à l'ouverture.
+    downloads: Vec<downloads::DownloadItem>,
+    /// Journal réseau (requêtes/réponses/erreurs, plafonné).
+    network: network::NetworkLog,
     /// Suggestions de la barre d'adresse (lignes historique + « Search … »).
     suggestions: Vec<history::Suggestion>,
     /// Ligne surlignée (0 = première) pour ↑/↓ + Entrée.
@@ -630,6 +489,7 @@ impl BrowserSurface {
         let (event_tx, event_rx) = mpsc::sync_channel(8);
         let (wake_tx, wake_rx): (WakeTx, WakeRx) = futures::channel::mpsc::unbounded();
         let initial_url = url.clone();
+        let initial_download_dir = downloads::resolve_download_dir(prefs.download_dir.as_deref());
         {
             let startup_events = event_tx.clone();
             let spawn_wake = wake_tx.clone();
@@ -643,6 +503,7 @@ impl BrowserSurface {
                         wake_read,
                         initial_url,
                         profile_key,
+                        initial_download_dir,
                     )
                 })
             {
@@ -737,6 +598,11 @@ impl BrowserSurface {
             can_forward: false,
             error: None,
             elements: Vec::new(),
+            elements_seq: 0,
+            screenshot_seq: 0,
+            last_screenshot_path: None,
+            reported_url: String::new(),
+            annotations: Vec::new(),
             show_overlay: false,
             select_mode: false,
             select_hover: None,
@@ -760,6 +626,8 @@ impl BrowserSurface {
                 store
             }),
             panel: None,
+            downloads: Vec::new(),
+            network: network::NetworkLog::default(),
             suggestions: Vec::new(),
             suggestion_sel: 0,
             prefs,
@@ -818,6 +686,13 @@ impl BrowserSurface {
     /// Recherche/captures/page d'accueil sont lus à l'usage via `prefs` ;
     /// la rétention et le zoom par défaut sont reappliqués tout de suite.
     pub fn update_prefs(&mut self, prefs: BrowserPrefs, cx: &mut Context<Self>) {
+        // Dossier de téléchargements modifié : ré-appliqué sur la session
+        // ouverte (`Browser.setDownloadBehavior`), pas seulement au prochain
+        // démarrage de session.
+        let dir = downloads::resolve_download_dir(prefs.download_dir.as_deref());
+        self.commands.send(BrowserCommand::SetDownloadDir(
+            dir.to_string_lossy().into_owned(),
+        ));
         if let Some(history) = self.history.as_mut() {
             history.set_retention_days(prefs.history_retention_days);
         }
@@ -1253,7 +1128,197 @@ impl BrowserSurface {
         history.record(&self.url.clone(), &self.title.clone(), now);
     }
 
-    /// Panneau History/Favorites : même onglet → fermeture, autre → switch.
+    // ---- Pont agent (Phase 3, spec 2026-11-24) --------------------------
+    // L'exécuteur UI (shell/browser_agent.rs) appelle ces méthodes pour
+    // servir les outils MCP `browser_*` sur CETTE surface visible.
+
+    pub(crate) fn agent_elements_seq(&self) -> u64 {
+        self.elements_seq
+    }
+
+    pub(crate) fn agent_elements(&self) -> Vec<OverlayElement> {
+        self.elements.clone()
+    }
+
+    pub(crate) fn agent_request_elements(&mut self, _cx: &mut Context<Self>) {
+        if self.has_page() {
+            self.commands.send(BrowserCommand::ToggleOverlay);
+        }
+    }
+
+    pub(crate) fn agent_request_screenshot(&mut self, _cx: &mut Context<Self>) {
+        if self.has_page() {
+            self.commands.send(BrowserCommand::CaptureScreenshot);
+        }
+    }
+
+    pub(crate) fn agent_screenshot_seq(&self) -> u64 {
+        self.screenshot_seq
+    }
+
+    pub(crate) fn agent_screenshot_path(&self) -> Option<PathBuf> {
+        self.last_screenshot_path.clone()
+    }
+
+    pub(crate) fn agent_url(&self) -> String {
+        self.url.clone()
+    }
+
+    pub(crate) fn agent_title(&self) -> String {
+        self.title.clone()
+    }
+
+    pub(crate) fn agent_has_page(&self) -> bool {
+        self.has_page()
+    }
+
+    /// Vrai si la surface est actuellement affichée (l'utilisateur voit le
+    /// panneau) — les jobs agent ne s'exécutent que sur une surface visible.
+    pub(crate) fn agent_is_visible(&self) -> bool {
+        self.visible
+    }
+
+    /// Génération courante des éléments (identifiant de snapshot).
+    pub(crate) fn agent_snapshot_id(&self) -> u64 {
+        self.elements_seq
+    }
+
+    /// Navigation agent : même normalisation que la barre d'adresse
+    /// (localhost en http, ports conservés, recherche si terme nu).
+    pub(crate) fn agent_navigate(
+        &mut self,
+        url: &str,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let target = normalize_url(url)?;
+        self.navigate_to(target, cx);
+        Ok(())
+    }
+
+    /// Élément par uid de la génération courante ; `Err` = snapshot périmé
+    /// ou absent — l'agent doit reprendre un snapshot. Un `snapshot`
+    /// (génération) passé par l'agent est vérifié : un uid resoumis après un
+    /// autre snapshot ou une navigation est refusé, jamais résolu à côté.
+    pub(crate) fn agent_element(
+        &self,
+        uid: u32,
+        snapshot: Option<u64>,
+    ) -> Result<OverlayElement, String> {
+        if let Some(expected) = snapshot
+            && expected != self.elements_seq
+        {
+            return Err(format!(
+                "stale snapshot: uid {uid} came from snapshot {expected}, current is {} — call browser_snapshot again",
+                self.elements_seq
+            ));
+        }
+        self.elements
+            .iter()
+            .find(|el| el.uid == uid)
+            .cloned()
+            .ok_or_else(|| {
+                if self.elements.is_empty() {
+                    "no snapshot — call browser_snapshot first".to_string()
+                } else {
+                    format!("stale snapshot: uid {uid} is gone — call browser_snapshot again")
+                }
+            })
+    }
+
+    pub(crate) fn agent_click(
+        &mut self,
+        uid: u32,
+        snapshot: Option<u64>,
+        _cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let el = self.agent_element(uid, snapshot)?;
+        let (x, y) = (el.x + el.width / 2.0, el.y + el.height / 2.0);
+        self.commands.send(BrowserCommand::MousePress {
+            x,
+            y,
+            button: "left",
+            count: 1,
+        });
+        self.commands.send(BrowserCommand::MouseRelease {
+            x,
+            y,
+            button: "left",
+            count: 1,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn agent_fill(
+        &mut self,
+        uid: u32,
+        text: &str,
+        _cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let el = self.agent_element(uid)?;
+        self.commands
+            .send(BrowserCommand::Evaluate(cdp::fill_element_script(
+                &el.selector,
+                text,
+            )));
+        Ok(())
+    }
+
+    /// Touche clavier par nom CDP ("Enter", "Escape", "Tab"…) — les mêmes
+    /// que la carte du clavier humain, en minuscules.
+    pub(crate) fn agent_press_key(
+        &mut self,
+        key: &str,
+        _cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let (key, code, vk) = gpui_key_to_cdp(&key.to_ascii_lowercase()).ok_or_else(|| {
+            format!(
+                "unsupported key {key:?} — use Enter, Escape, Tab, Backspace, Delete, ArrowLeft/Right/Up/Down, Home or End"
+            )
+        })?;
+        self.commands.send(BrowserCommand::KeyPress {
+            key,
+            code,
+            vk: Some(vk),
+            modifiers: cdp::cdp_modifiers(false, false, false, false),
+        });
+        self.commands.send(BrowserCommand::KeyRelease {
+            key,
+            code,
+            modifiers: cdp::cdp_modifiers(false, false, false, false),
+        });
+        Ok(())
+    }
+
+    /// Journal console filtré (dernier 100, le plus récent en dernier).
+    /// Annotations en attente : vidées à la lecture (l'agent ne doit pas
+    /// re-recevoir les mêmes). La capture jointe est celle de la dernière
+    /// prise (`last_screenshot_path`), quand elle existe.
+    pub(crate) fn agent_drain_annotations(&mut self) -> Vec<(ElementContext, Option<PathBuf>)> {
+        let shot = self.last_screenshot_path.clone();
+        self.annotations
+            .drain(..)
+            .map(|ctx| (ctx, shot.clone()))
+            .collect()
+    }
+
+    pub(crate) fn agent_console(&self, level: Option<&str>) -> Vec<(String, String)> {
+        let wanted = |entry_level: &str| match level {
+            Some("error") => entry_level == "error",
+            Some("warning") => matches!(entry_level, "warning" | "warn"),
+            Some("log") => !matches!(entry_level, "error" | "warning" | "warn"),
+            _ => true,
+        };
+        self.console_logs
+            .iter()
+            .filter(|entry| wanted(&entry.level))
+            .map(|entry| (entry.level.clone(), entry.text.clone()))
+            .collect()
+    }
+
+    fn panel_visible_with(&self, tab: PanelTab) -> bool {
+        self.panel.as_ref().is_some_and(|panel| panel.tab == tab)
+    }
+
     fn toggle_panel(&mut self, tab: PanelTab, cx: &mut Context<Self>) {
         if self.panel.as_ref().is_some_and(|p| p.tab == tab) {
             self.panel = None;
@@ -1672,6 +1737,13 @@ impl BrowserSurface {
                     let previous_url = self.url.clone();
                     let url_changed = previous_url != url;
                     self.url = url;
+                    // Changement de document → les uids du snapshot ne
+                    // désignent plus rien : liste invalidée (l'agent reprend
+                    // un snapshot, erreur « stale » en attendant).
+                    if url_changed {
+                        self.elements.clear();
+                        self.elements_seq += 1;
+                    }
                     // Changement d'hôte → zoom mémorisé par site (réglage).
                     self.apply_host_zoom(cx);
                     // La barre Find survit à la navigation : on relance la
@@ -1679,6 +1751,18 @@ impl BrowserSurface {
                     // l'URL change — l'événement Page arrive à chaque frame).
                     if url_changed && self.find_open && !self.find_query.is_empty() {
                         self.run_find(0, cx);
+                    }
+                    // Vraie page (pas `about:`, pas vide) → le shell mémorise
+                    // l'URL pour la persistance d'onglets.
+                    // Vraie page (pas `about:`, pas vide) → le shell mémorise
+                    // l'URL pour la persistance d'onglets. Comparaison avec la
+                    // dernière URL *rapportée par Chrome* — pas la cible de la
+                    // barre d'adresse : `navigate_to` fixe `self.url` avant
+                    // le rapport, et Chrome peut confirmer exactement cette
+                    // URL (l'event Page arrive à chaque frame).
+                    if is_web_url(&self.url) && self.reported_url != self.url {
+                        self.reported_url = self.url.clone();
+                        cx.emit(BrowserSurfaceEvent::UrlChanged(self.url.clone()));
                     }
                     if self.address.read(cx).text() == previous_url {
                         let address = self.url.clone();
@@ -1724,6 +1808,7 @@ impl BrowserSurface {
                 }
                 Ok(BrowserEvent::Elements(elements)) => {
                     self.elements = elements;
+                    self.elements_seq += 1;
                     changed = true;
                 }
                 Ok(BrowserEvent::Console(log)) => {
@@ -1745,6 +1830,10 @@ impl BrowserSurface {
                         context.tag.clone()
                     };
                     self.flash_status(format!("Added <{tag}> to chat"), cx);
+                    // Phase 4 : l'annotation est aussi mise à disposition de
+                    // l'agent (outil `browser_annotations`), avec la capture
+                    // la plus récente comme contexte visuel.
+                    self.annotations.push(context.as_ref().clone());
                     cx.emit(BrowserSurfaceEvent::AddElement(context));
                     changed = true;
                 }
@@ -1767,6 +1856,7 @@ impl BrowserSurface {
                         .unwrap_or_else(|| PathBuf::from("."));
                     let path = dir.join(&file_name);
                     if let Ok(()) = std::fs::write(&path, &bytes) {
+                        self.last_screenshot_path = Some(path.clone());
                         self.flash_status(format!("Saved: {}", path.display()), cx);
                     } else {
                         self.flash_status(
@@ -1774,7 +1864,95 @@ impl BrowserSurface {
                             cx,
                         );
                     }
+                    self.screenshot_seq += 1;
                     changed = true;
+                }
+                Ok(BrowserEvent::DownloadStart { id, filename, url }) => {
+                    downloads::apply_event(
+                        &mut self.downloads,
+                        &id,
+                        &filename,
+                        &url,
+                        None,
+                        None,
+                        None,
+                        None,
+                    );
+                    self.flash_status(format!("Downloading {filename}…"), cx);
+                    changed = true;
+                }
+                Ok(BrowserEvent::DownloadProgress {
+                    id,
+                    received,
+                    total,
+                }) => {
+                    downloads::apply_event(
+                        &mut self.downloads,
+                        &id,
+                        "",
+                        "",
+                        None,
+                        Some(received),
+                        total,
+                        None,
+                    );
+                    changed = true;
+                }
+                Ok(BrowserEvent::DownloadDone { id, ok, path }) => {
+                    let state = if ok {
+                        downloads::DownloadState::Completed
+                    } else {
+                        downloads::DownloadState::Canceled
+                    };
+                    downloads::apply_event(
+                        &mut self.downloads,
+                        &id,
+                        "",
+                        "",
+                        Some(state),
+                        None,
+                        None,
+                        path.as_deref().map(Path::new),
+                    );
+                    let name = self
+                        .downloads
+                        .iter()
+                        .find(|item| item.id == id)
+                        .map(|item| item.filename.clone())
+                        .unwrap_or_default();
+                    self.flash_status(
+                        if ok {
+                            format!("Download complete: {name}")
+                        } else {
+                            format!("Download canceled: {name}")
+                        },
+                        cx,
+                    );
+                    changed = true;
+                }
+                Ok(BrowserEvent::NetworkStart { id, url, method }) => {
+                    self.network.started(&id, &url, &method);
+                    // Re-rendu seulement si le panneau Réseau est visible :
+                    // chaque requête ne doit pas réveiller toute la surface.
+                    if self.panel_visible_with(PanelTab::Network) {
+                        changed = true;
+                    }
+                }
+                Ok(BrowserEvent::NetworkResponded { id, status }) => {
+                    self.network.responded(&id, status);
+                    if self.panel_visible_with(PanelTab::Network) {
+                        changed = true;
+                    }
+                }
+                Ok(BrowserEvent::NetworkFailed {
+                    id,
+                    error,
+                    canceled,
+                }) => {
+                    self.network.failed(&id, &error, canceled);
+                    if self.panel_visible_with(PanelTab::Network) {
+                        changed = true;
+                    }
                 }
                 Ok(BrowserEvent::Failed(error)) => {
                     self.error = Some(error);
@@ -2061,7 +2239,10 @@ impl BrowserSurface {
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let panel = self.panel.as_ref()?;
-        let history = self.history.as_ref()?;
+        // Downloads et Network vivent en mémoire : ils se rendent même sans
+        // store d'historique (`data_dir: None`). Seuls History/Favorites
+        // exigent le store.
+        let history = self.history.as_ref();
         let now = chrono::Utc::now().timestamp_millis();
         let query = panel.query.trim().to_lowercase();
         let matches = |title: &str, url: &str| {
@@ -2079,7 +2260,8 @@ impl BrowserSurface {
             .flex_col();
 
         match panel.tab {
-            PanelTab::History => {
+            PanelTab::History if history.is_some() => {
+                let history = history.expect("checked above");
                 let entries: Vec<history::HistoryEntry> = history
                     .entries()
                     .iter()
@@ -2110,7 +2292,8 @@ impl BrowserSurface {
                     }
                 }
             }
-            PanelTab::Favorites => {
+            PanelTab::Favorites if history.is_some() => {
+                let history = history.expect("checked above");
                 let favorites: Vec<&history::Favorite> = history
                     .favorites()
                     .iter()
@@ -2124,12 +2307,38 @@ impl BrowserSurface {
                     }
                 }
             }
+            // History/Favorites sans store (`data_dir: None`) : vide, jamais
+            // de panneau mort.
+            PanelTab::History | PanelTab::Favorites => {
+                body = body.child(self.panel_empty(theme, "No history yet"));
+            }
+            PanelTab::Downloads => {
+                if self.downloads.is_empty() {
+                    body = body.child(self.panel_empty(theme, "No downloads yet"));
+                } else {
+                    for (ix, item) in self.downloads.iter().enumerate().rev() {
+                        body = body.child(self.panel_download_row(theme, ix, item, cx));
+                    }
+                }
+            }
+            PanelTab::Network => {
+                if self.network.is_empty() {
+                    body = body.child(self.panel_empty(theme, "No requests yet"));
+                } else {
+                    for (ix, entry) in self.network.entries().iter().enumerate().rev() {
+                        body = body.child(self.panel_network_row(theme, ix, entry, cx));
+                    }
+                }
+            }
         }
 
         let tab_history_active = panel.tab == PanelTab::History;
         let tab_fav_active = panel.tab == PanelTab::Favorites;
-        let clear_open = panel.clear_open;
+        let tab_dl_active = panel.tab == PanelTab::Downloads;
+        let tab_net_active = panel.tab == PanelTab::Network;
         let search = panel.search.clone();
+        let history_like = tab_history_active || tab_fav_active;
+        let clear_open = panel.clear_open;
 
         Some(
             div()
@@ -2166,21 +2375,41 @@ impl BrowserSurface {
                                 this.toggle_panel(PanelTab::Favorites, cx);
                             }),
                         ))
+                        .child(self.panel_tab_button(
+                            theme,
+                            "browser-panel-tab-downloads",
+                            "Downloads",
+                            tab_dl_active,
+                            cx.listener(|this, _, _, cx| {
+                                this.toggle_panel(PanelTab::Downloads, cx);
+                            }),
+                        ))
+                        .child(self.panel_tab_button(
+                            theme,
+                            "browser-panel-tab-network",
+                            "Network",
+                            tab_net_active,
+                            cx.listener(|this, _, _, cx| {
+                                this.toggle_panel(PanelTab::Network, cx);
+                            }),
+                        ))
                         .child(div().flex_1())
-                        .child(
-                            div()
-                                .id("browser-panel-search")
-                                .w(px(200.0))
-                                .h(px(24.0))
-                                .rounded(px(6.0))
-                                .border_1()
-                                .border_color(theme.border)
-                                .bg(crate::theme::ink(0.04))
-                                .px(px(6.0))
-                                .flex()
-                                .items_center()
-                                .child(search),
-                        )
+                        .when(history_like, |el| {
+                            el.child(
+                                div()
+                                    .id("browser-panel-search")
+                                    .w(px(200.0))
+                                    .h(px(24.0))
+                                    .rounded(px(6.0))
+                                    .border_1()
+                                    .border_color(theme.border)
+                                    .bg(crate::theme::ink(0.04))
+                                    .px(px(6.0))
+                                    .flex()
+                                    .items_center()
+                                    .child(search),
+                            )
+                        })
                         .when(panel.tab == PanelTab::History, |el| {
                             el.child(
                                 div()
@@ -2241,11 +2470,277 @@ impl BrowserSurface {
                                         )
                                     }),
                             )
+                        })
+                        .when(panel.tab == PanelTab::Network, |el| {
+                            el.child(
+                                div()
+                                    .id("browser-panel-clear-network")
+                                    .h(px(24.0))
+                                    .px(px(8.0))
+                                    .flex()
+                                    .items_center()
+                                    .rounded(px(6.0))
+                                    .cursor_pointer()
+                                    .text_size(px(12.0))
+                                    .text_color(theme.text_muted)
+                                    .hover(|s| s.bg(crate::theme::ink(0.06)))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.network.clear();
+                                        cx.notify();
+                                    }))
+                                    .child("Clear"),
+                            )
+                        })
+                        .when(panel.tab == PanelTab::Downloads, |el| {
+                            el.child(
+                                div()
+                                    .id("browser-panel-clear-downloads")
+                                    .h(px(24.0))
+                                    .px(px(8.0))
+                                    .flex()
+                                    .items_center()
+                                    .rounded(px(6.0))
+                                    .cursor_pointer()
+                                    .text_size(px(12.0))
+                                    .text_color(theme.text_muted)
+                                    .hover(|s| s.bg(crate::theme::ink(0.06)))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        // Les items en cours restent suivis ;
+                                        // on purge seulement l'historique.
+                                        this.downloads.retain(|item| !item.is_terminal());
+                                        cx.notify();
+                                    }))
+                                    .child("Clear finished"),
+                            )
                         }),
                 )
                 .child(body)
                 .into_any_element(),
         )
+    }
+
+    /// Ligne du panneau Downloads : nom, progression (barre + %), état ;
+    /// terminé → « Open » (application par défaut) et « Reveal » (dossier).
+    fn panel_download_row(
+        &self,
+        theme: &crate::theme::Theme,
+        ix: usize,
+        item: &downloads::DownloadItem,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        use downloads::DownloadState;
+        let state_label = match item.state {
+            DownloadState::InProgress => "Downloading…".to_string(),
+            DownloadState::Completed => "Completed".to_string(),
+            DownloadState::Canceled => "Canceled".to_string(),
+        };
+        let percent = item
+            .progress()
+            .map(|p| format!("{:.0}%", p * 100.0))
+            .unwrap_or_default();
+        let from = host_of(&item.url).unwrap_or_default();
+        let open_path = item.path.clone();
+        let reveal_path = item.path.clone();
+        div()
+            .id(("browser-panel-download", ix))
+            .h(px(44.0))
+            .w_full()
+            .px(px(12.0))
+            .py(px(6.0))
+            .flex()
+            .flex_col()
+            .justify_center()
+            .gap(px(3.0))
+            .border_b_1()
+            .border_color(theme.border)
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_size(px(12.5))
+                            .text_color(theme.text)
+                            .child(item.filename.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(px(11.0))
+                            .text_color(theme.text_muted)
+                            .child(if percent.is_empty() {
+                                state_label.clone()
+                            } else {
+                                format!("{state_label} · {percent}")
+                            }),
+                    ),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(
+                        // barre de progression (0 quand la taille est inconnue)
+                        div()
+                            .flex_1()
+                            .h(px(3.0))
+                            .rounded(px(2.0))
+                            .bg(crate::theme::ink(0.08))
+                            .child(
+                                div()
+                                    .h_full()
+                                    .w(gpui::relative(
+                                        item.progress().unwrap_or(0.0).clamp(0.0, 1.0),
+                                    ))
+                                    .rounded(px(2.0))
+                                    .bg(theme.accent),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .max_w(px(160.0))
+                            .overflow_hidden()
+                            .text_size(px(10.5))
+                            .text_color(theme.text_muted)
+                            .child(from),
+                    )
+                    .when(item.state == DownloadState::Completed, |el| {
+                        el.child(
+                            div()
+                                .id(("browser-panel-download-open", ix))
+                                .flex_none()
+                                .px(px(6.0))
+                                .h(px(18.0))
+                                .flex()
+                                .items_center()
+                                .rounded(px(4.0))
+                                .cursor_pointer()
+                                .text_size(px(11.0))
+                                .text_color(theme.text)
+                                .hover(|s| s.bg(crate::theme::ink(0.10)))
+                                .on_click(cx.listener(move |_, _, _, cx| {
+                                    if let Some(path) = &open_path {
+                                        cx.open_with_system(path);
+                                    }
+                                }))
+                                .child("Open"),
+                        )
+                        .child(
+                            div()
+                                .id(("browser-panel-download-reveal", ix))
+                                .flex_none()
+                                .px(px(6.0))
+                                .h(px(18.0))
+                                .flex()
+                                .items_center()
+                                .rounded(px(4.0))
+                                .cursor_pointer()
+                                .text_size(px(11.0))
+                                .text_color(theme.text_muted)
+                                .hover(|s| s.bg(crate::theme::ink(0.10)))
+                                .on_click(cx.listener(move |_, _, _, cx| {
+                                    // gpui révèle le fichier dans le
+                                    // gestionnaire de fichiers de l'OS
+                                    if let Some(path) = reveal_path.as_ref() {
+                                        cx.reveal_path(path);
+                                    }
+                                }))
+                                .child("Reveal"),
+                        )
+                    }),
+            )
+    }
+
+    /// Ligne du panneau Network : méthode, URL, statut/erreur. Erreurs en
+    /// rouge, certificats signalés, hôte local marqué, HTTP non chiffré
+    /// distingué d'HTTPS.
+    fn panel_network_row(
+        &self,
+        theme: &crate::theme::Theme,
+        ix: usize,
+        entry: &network::NetworkEntry,
+        _cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let scheme_https = entry.url.starts_with("https://");
+        let local = network::is_local_host(&entry.url);
+        let cert = entry.cert_error();
+        let status_color = if cert || entry.failed() {
+            theme.danger
+        } else {
+            theme.text_muted
+        };
+        let scheme_label = if local {
+            "local".to_string()
+        } else if scheme_https {
+            "https".to_string()
+        } else if entry.url.starts_with("http://") {
+            "http".to_string()
+        } else {
+            String::new()
+        };
+        let scheme_color = if cert || entry.failed() {
+            theme.danger
+        } else if local || scheme_https {
+            theme.success
+        } else {
+            theme.warning
+        };
+        div()
+            .id(("browser-panel-network", ix))
+            .h(px(30.0))
+            .w_full()
+            .px(px(12.0))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.0))
+            .border_b_1()
+            .border_color(theme.border)
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(44.0))
+                    .text_size(px(10.5))
+                    .text_color(theme.text_muted)
+                    .child(entry.method.clone()),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .text_size(px(11.5))
+                    .text_color(theme.text)
+                    .child(entry.url.clone()),
+            )
+            .when(!scheme_label.is_empty(), |el| {
+                el.child(
+                    div()
+                        .flex_none()
+                        .text_size(px(10.5))
+                        .text_color(scheme_color)
+                        .child(scheme_label),
+                )
+            })
+            .child(
+                div()
+                    .flex_none()
+                    .max_w(px(170.0))
+                    .overflow_hidden()
+                    .text_size(px(10.5))
+                    .text_color(status_color)
+                    .child(entry.status_label()),
+            )
     }
 
     fn panel_empty(&self, theme: &crate::theme::Theme, label: &'static str) -> gpui::Div {
@@ -4381,13 +4876,14 @@ fn browser_button_toggle(
         )
 }
 
-fn gpui_render_image(image: RgbaImage) -> Arc<RenderImage> {
-    Arc::new(RenderImage::new(vec![Frame::new(image)]))
-}
-
-/// Modèle de recherche par défaut (DuckDuckGo) — `KOMET_SEARCH_URL` et le
+/// Modèle de recherche par défaut (Google) — `KOMET_SEARCH_URL` et le
 /// réglage Settings → Browser le remplacent.
-pub const DEFAULT_SEARCH_URL: &str = "https://duckduckgo.com/?q={q}";
+pub const DEFAULT_SEARCH_URL: &str = "https://www.google.com/search?q={q}";
+
+/// Ancien défaut (DuckDuckGo) : à la lecture des réglages, une valeur
+/// sauvegardée exactement égale à celle-ci est migrée vers le nouveau défaut.
+/// Toute autre valeur (preset choisi ou modèle custom) est conservée.
+pub const LEGACY_DEFAULT_SEARCH_URL: &str = "https://duckduckgo.com/?q={q}";
 
 /// `KOMET_SEARCH_URL` prime sur le réglage (compat scripts/dev), puis le
 /// `BrowserPrefs.search_url` de la surface, sinon le défaut.
@@ -4536,57 +5032,6 @@ fn private_ipv4(host: &str) -> bool {
     a == 0 || a == 10 || a == 127 || (a == 192 && b == 168) || (a == 172 && (16..=31).contains(&b))
 }
 
-/// Suit quelle frame CDP est la frame principale, pour ne jamais confondre URL
-/// d'iframe et URL de la barre d'adresse.
-#[derive(Default)]
-struct UrlTracker {
-    main_frame_id: Option<String>,
-}
-
-impl UrlTracker {
-    #[cfg(test)]
-    fn main_frame_id(&self) -> Option<&str> {
-        self.main_frame_id.as_deref()
-    }
-
-    /// Renvoie la nouvelle URL courante si l'événement affecte la frame principale.
-    /// `Page.navigatedWithinDocument` porte l'URL dans `params.url` (pas
-    /// `params.frame.url`) — c'était le bug de la barre d'URL sur les SPA.
-    fn on_nav_event(&mut self, method: &str, params: &Value) -> Option<String> {
-        if method == "Page.navigatedWithinDocument" {
-            let frame_id = params.get("frameId").and_then(Value::as_str)?;
-            if self.main_frame_id.as_deref() != Some(frame_id) {
-                return None;
-            }
-            return params.get("url").and_then(Value::as_str).map(str::to_owned);
-        }
-        if method == "Page.frameNavigated" {
-            let frame = params.get("frame")?;
-            if frame.get("parentId").is_some() {
-                // event frameNavigated est aussi émis pour les iframes
-                return None;
-            }
-            let url = frame.get("url").and_then(Value::as_str)?.to_owned();
-            if let Some(id) = frame.get("id").and_then(Value::as_str) {
-                self.main_frame_id = Some(id.to_owned());
-            }
-            return Some(url);
-        }
-        None
-    }
-
-    fn on_loading_event(&self, method: &str, frame_id: &str) -> Option<bool> {
-        if self.main_frame_id.as_deref() != Some(frame_id) {
-            return None;
-        }
-        match method {
-            "Page.frameStartedLoading" => Some(true),
-            "Page.frameStoppedLoading" => Some(false),
-            _ => None,
-        }
-    }
-}
-
 /// GPUI key name → (key, code, windowsVirtualKeyCode) CDP.
 /// Les caractères imprimables ne passent pas ici (Input.char le fait déjà).
 fn gpui_key_to_cdp(key: &str) -> Option<(&'static str, &'static str, u32)> {
@@ -4606,962 +5051,6 @@ fn gpui_key_to_cdp(key: &str) -> Option<(&'static str, &'static str, u32)> {
     }
 }
 
-fn navigate_error_message(error_text: &str, url: &str) -> String {
-    if error_text.contains("ERR_CONNECTION_REFUSED") {
-        format!("{url} ne répond pas — lance ton serveur, puis clique Recharger/Réessayer.")
-    } else if error_text.contains("ERR_NAME_NOT_RESOLVED") {
-        format!("{url} : adresse introuvable ({error_text}).")
-    } else {
-        format!("{url} : {error_text}")
-    }
-}
-
-fn run_client(
-    commands: Receiver<BrowserCommand>,
-    events: mpsc::SyncSender<BrowserEvent>,
-    wake: &WakeTx,
-    wake_read: Option<i32>,
-    initial_url: String,
-    profile_key: String,
-) {
-    let mut current_url = initial_url;
-    loop {
-        // Chrome partagé du pool (keeper thread) ; la lease rendue au bout de
-        // la session décrémente le refcount — à 0 le pool tue le process.
-        let result = match acquire_browser(&profile_key) {
-            Ok((page_ws, warning, _lease)) => {
-                if let Some(warning) = warning {
-                    push_event(&events, wake, BrowserEvent::Warning(warning));
-                }
-                run_session(
-                    &commands,
-                    &events,
-                    wake,
-                    wake_read,
-                    &mut current_url,
-                    &page_ws,
-                )
-            }
-            Err(error) => Err(error),
-        };
-        match result {
-            Ok(SessionResult::Shutdown) => break,
-            Ok(SessionResult::Retry) => {}
-            Err(error) => {
-                push_event(&events, wake, BrowserEvent::Failed(error));
-                loop {
-                    match commands.recv_timeout(Duration::from_secs(30)) {
-                        // une URL tapée pendant l'échec relance le moteur
-                        // comme Réessayer (sinon la surface reste morte)
-                        Ok(BrowserCommand::Navigate(url)) => {
-                            current_url = url;
-                            break;
-                        }
-                        Ok(BrowserCommand::Retry) => break,
-                        Ok(BrowserCommand::Shutdown)
-                        | Err(mpsc::RecvTimeoutError::Disconnected) => return,
-                        Ok(_) | Err(mpsc::RecvTimeoutError::Timeout) => {}
-                    }
-                }
-            }
-        }
-    }
-}
-
-fn run_session(
-    commands: &Receiver<BrowserCommand>,
-    events: &mpsc::SyncSender<BrowserEvent>,
-    wake: &WakeTx,
-    wake_read: Option<i32>,
-    current_url: &mut String,
-    page_ws_url: &str,
-) -> Result<SessionResult, String> {
-    let (mut socket, _response) = ws_connect(page_ws_url).map_err(|e| e.to_string())?;
-    // id de la cible CDP (pour Target.closeTarget à la fermeture de la surface)
-    let target_id = page_ws_url.rsplit('/').next().unwrap_or("").to_owned();
-
-    let mut next_id: u64 = 1;
-
-    // Initialize CDP session
-    socket
-        .send(Message::Text(cdp::page_enable(next_id)))
-        .map_err(|e| e.to_string())?;
-    next_id += 1;
-
-    socket
-        .send(Message::Text(cdp::runtime_enable(next_id)))
-        .map_err(|e| e.to_string())?;
-    next_id += 1;
-
-    // target=_blank / window.open : attacher automatiquement les popups pour
-    // pouvoir les rediriger vers la vue courante (voir Target.attachedToTarget)
-    socket
-        .send(Message::Text(cdp::set_auto_attach(next_id)))
-        .map_err(|e| e.to_string())?;
-    next_id += 1;
-
-    // Set initial device metrics to match default viewport
-    socket
-        .send(Message::Text(cdp::set_device_metrics(
-            next_id,
-            DEFAULT_VIEWPORT.0,
-            DEFAULT_VIEWPORT.1,
-            1.0,
-            false,
-        )))
-        .map_err(|e| e.to_string())?;
-    next_id += 1;
-
-    socket
-        .send(Message::Text(cdp::start_screencast(
-            next_id,
-            DEFAULT_VIEWPORT.0,
-            DEFAULT_VIEWPORT.1,
-            "jpeg",
-            90,
-        )))
-        .map_err(|e| e.to_string())?;
-    next_id += 1;
-
-    // La navigation part APRÈS le startScreencast : le screencast capture
-    // ainsi la page dès son premier paint. (Naviguer avant = la page finit
-    // de peindre avant l'attachement et Chrome n'émet plus aucun frame.)
-    // Sans URL (surface ouverte à vide) on reste sur about:blank.
-    let mut navigate_request_ids = std::collections::HashSet::new();
-    if !current_url.trim().is_empty() {
-        socket
-            .send(Message::Text(cdp::page_navigate(next_id, current_url)))
-            .map_err(|e| e.to_string())?;
-        navigate_request_ids.insert(next_id);
-        next_id += 1;
-    }
-
-    let mut page_title = String::new();
-    let mut screenshot_request_id: Option<u64> = None;
-    let mut title_request_id: Option<u64> = None;
-    let mut overlay_request_id: Option<u64> = None;
-    let mut dialog_request_id: Option<u64> = None;
-    let mut nav_history_request_id: Option<u64> = None;
-    let mut nav_history_step: i32 = 0;
-    let mut eval_request_ids = std::collections::HashSet::new();
-    let mut probe_ids = std::collections::HashSet::new();
-    let mut describe_id: Option<u64> = None;
-    let mut find_id: Option<u64> = None;
-    let mut url_tracker = UrlTracker::default();
-
-    // Set non-blocking on the underlying TCP stream so we can multiplex commands and frames
-    set_socket_nonblocking(&mut socket, true)?;
-
-    // frame screencast envoyée à l'UI mais pas encore acquittée par elle
-    let mut pending_frame: Option<u64> = None;
-    let mut visible = true;
-    let mut last_dims = (DEFAULT_VIEWPORT.0, DEFAULT_VIEWPORT.1, 1.0f32);
-    // `mobile` du dernier Emulation.setDeviceMetricsOverride — piloté par
-    // BrowserCommand::SetEmulation (émulation device).
-    let mut emulation_mobile = false;
-
-    loop {
-        // parké : attente bloquante, zéro réveil tant que le panneau est caché
-        if !visible {
-            match commands.recv() {
-                Ok(BrowserCommand::SetVisible(true)) => {
-                    visible = true;
-                    let (w, h, scale) = last_dims;
-                    send_screencast_restart(
-                        &mut socket,
-                        &mut next_id,
-                        w,
-                        h,
-                        scale,
-                        emulation_mobile,
-                    )?;
-                }
-                Ok(BrowserCommand::Shutdown) => {
-                    let _ = socket.send(Message::Text(cdp::close_target(next_id, &target_id)));
-                    return Ok(SessionResult::Shutdown);
-                }
-                Ok(BrowserCommand::Retry) => return Ok(SessionResult::Retry),
-                Ok(_) => {}
-                // plus d'UI : la surface est partie
-                Err(_) => return Ok(SessionResult::Shutdown),
-            }
-            continue;
-        }
-
-        // 1. Process pending UI commands
-        loop {
-            let cmd = match commands.try_recv() {
-                Ok(cmd) => cmd,
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => return Ok(SessionResult::Shutdown),
-            };
-            match cmd {
-                BrowserCommand::Back | BrowserCommand::Forward | BrowserCommand::GetNavHistory => {
-                    let step = match cmd {
-                        BrowserCommand::Back => -1,
-                        BrowserCommand::Forward => 1,
-                        _ => 0,
-                    };
-                    nav_history_request_id = Some(next_id);
-                    nav_history_step = step;
-                    socket
-                        .send(Message::Text(cdp::get_navigation_history(next_id)))
-                        .map_err(|e| e.to_string())?;
-                    next_id += 1;
-                }
-                BrowserCommand::Reload => {
-                    push_event_lossy(events, wake, BrowserEvent::Loading(true));
-                    socket
-                        .send(Message::Text(cdp::page_reload(next_id)))
-                        .map_err(|e| e.to_string())?;
-                    next_id += 1;
-                }
-                BrowserCommand::Retry => return Ok(SessionResult::Retry),
-                BrowserCommand::Navigate(url) => {
-                    push_event_lossy(events, wake, BrowserEvent::Loading(true));
-                    socket
-                        .send(Message::Text(cdp::page_navigate(next_id, &url)))
-                        .map_err(|e| e.to_string())?;
-                    navigate_request_ids.insert(next_id);
-                    next_id += 1;
-                    *current_url = url;
-                }
-                BrowserCommand::KeyPress {
-                    key,
-                    code,
-                    vk,
-                    modifiers,
-                } => {
-                    socket
-                        .send(Message::Text(cdp::dispatch_key_event(
-                            next_id,
-                            "rawKeyDown",
-                            key,
-                            code,
-                            vk,
-                            modifiers,
-                        )))
-                        .map_err(|e| e.to_string())?;
-                    next_id += 1;
-                }
-                BrowserCommand::KeyRelease {
-                    key,
-                    code,
-                    modifiers,
-                } => {
-                    socket
-                        .send(Message::Text(cdp::dispatch_key_event(
-                            next_id, "keyUp", key, code, None, modifiers,
-                        )))
-                        .map_err(|e| e.to_string())?;
-                    next_id += 1;
-                }
-                BrowserCommand::InsertText(text) => {
-                    socket
-                        .send(Message::Text(cdp::insert_text(next_id, &text)))
-                        .map_err(|e| e.to_string())?;
-                    next_id += 1;
-                }
-                BrowserCommand::MousePress {
-                    x,
-                    y,
-                    button,
-                    count,
-                } => {
-                    socket
-                        .send(Message::Text(cdp::dispatch_mouse_click(
-                            next_id,
-                            "mousePressed",
-                            x,
-                            y,
-                            button,
-                            count,
-                        )))
-                        .map_err(|e| e.to_string())?;
-                    next_id += 1;
-                }
-                BrowserCommand::MouseRelease {
-                    x,
-                    y,
-                    button,
-                    count,
-                } => {
-                    socket
-                        .send(Message::Text(cdp::dispatch_mouse_click(
-                            next_id,
-                            "mouseReleased",
-                            x,
-                            y,
-                            button,
-                            count,
-                        )))
-                        .map_err(|e| e.to_string())?;
-                    next_id += 1;
-                }
-                BrowserCommand::MouseMove { x, y } => {
-                    socket
-                        .send(Message::Text(cdp::dispatch_mouse_move(next_id, x, y)))
-                        .map_err(|e| e.to_string())?;
-                    next_id += 1;
-                }
-                BrowserCommand::Scroll {
-                    x,
-                    y,
-                    delta_x,
-                    delta_y,
-                } => {
-                    socket
-                        .send(Message::Text(cdp::dispatch_mouse_wheel(
-                            next_id, x, y, delta_x, delta_y,
-                        )))
-                        .map_err(|e| e.to_string())?;
-                    next_id += 1;
-                }
-                BrowserCommand::TypeText(text) => {
-                    for ch in text.chars() {
-                        socket
-                            .send(Message::Text(cdp::dispatch_char_event(
-                                next_id,
-                                &ch.to_string(),
-                            )))
-                            .map_err(|e| e.to_string())?;
-                        next_id += 1;
-                    }
-                }
-                BrowserCommand::Resize {
-                    width,
-                    height,
-                    scale,
-                } => {
-                    let dims_changed = last_dims.0 != width || last_dims.1 != height;
-                    last_dims = (width, height, scale);
-                    if dims_changed {
-                        // redémarre le screencast avec les nouvelles dimensions ;
-                        // à dimensions identiques, rien à faire (pas de restart)
-                        send_screencast_restart(
-                            &mut socket,
-                            &mut next_id,
-                            width,
-                            height,
-                            scale,
-                            emulation_mobile,
-                        )?;
-                    } else {
-                        socket
-                            .send(Message::Text(cdp::set_device_metrics(
-                                next_id,
-                                width,
-                                height,
-                                scale,
-                                emulation_mobile,
-                            )))
-                            .map_err(|e| e.to_string())?;
-                        next_id += 1;
-                    }
-                }
-                BrowserCommand::SetEmulation { device } => {
-                    emulation_mobile = device.as_ref().is_some_and(|d| d.mobile);
-                    // User-Agent : chaîne vide = retour à l'UA du Chrome.
-                    socket
-                        .send(Message::Text(cdp::set_user_agent_override(
-                            next_id,
-                            device.as_ref().and_then(|d| d.user_agent),
-                        )))
-                        .map_err(|e| e.to_string())?;
-                    next_id += 1;
-                    let touch = device.as_ref().is_some_and(|d| d.touch);
-                    socket
-                        .send(Message::Text(cdp::set_touch_emulation(next_id, touch)))
-                        .map_err(|e| e.to_string())?;
-                    next_id += 1;
-                    // Ré-applique les métriques courantes avec le flag
-                    // `mobile` — le Resize suivant (viewport device) suit.
-                    let (w, h, scale) = last_dims;
-                    socket
-                        .send(Message::Text(cdp::set_device_metrics(
-                            next_id,
-                            w,
-                            h,
-                            scale,
-                            emulation_mobile,
-                        )))
-                        .map_err(|e| e.to_string())?;
-                    next_id += 1;
-                }
-                BrowserCommand::SetVisible(false) => {
-                    visible = false;
-                    let _ = socket.send(Message::Text(cdp::stop_screencast(next_id)));
-                    next_id += 1;
-                }
-                BrowserCommand::SetVisible(true) => {}
-                BrowserCommand::AckFrame(session_id) => {
-                    if pending_frame == Some(session_id) {
-                        pending_frame = None;
-                        let _ = socket.send(Message::Text(cdp::screencast_frame_ack(
-                            next_id, session_id,
-                        )));
-                        next_id += 1;
-                    }
-                }
-                BrowserCommand::Shutdown => {
-                    // la surface ferme SA cible ; le Chrome du pool survit si
-                    // d'autres surfaces l'utilisent (kill à 0 ref par le pool)
-                    let _ = socket.send(Message::Text(cdp::close_target(next_id, &target_id)));
-                    return Ok(SessionResult::Shutdown);
-                }
-                BrowserCommand::CaptureScreenshot => {
-                    screenshot_request_id = Some(next_id);
-                    socket
-                        .send(Message::Text(cdp::capture_screenshot(next_id)))
-                        .map_err(|e| e.to_string())?;
-                    next_id += 1;
-                }
-                BrowserCommand::ToggleOverlay => {
-                    overlay_request_id = Some(next_id);
-                    socket
-                        .send(Message::Text(cdp::evaluate(
-                            next_id,
-                            &cdp::extract_elements_script(),
-                        )))
-                        .map_err(|e| e.to_string())?;
-                    next_id += 1;
-                }
-                BrowserCommand::ProbeAt { x, y } => {
-                    probe_ids.insert(next_id);
-                    socket
-                        .send(Message::Text(cdp::evaluate(
-                            next_id,
-                            &cdp::probe_at_script(x, y),
-                        )))
-                        .map_err(|e| e.to_string())?;
-                    next_id += 1;
-                }
-                BrowserCommand::DescribeAt { x, y } => {
-                    describe_id = Some(next_id);
-                    socket
-                        .send(Message::Text(cdp::evaluate(
-                            next_id,
-                            &cdp::describe_at_script(x, y),
-                        )))
-                        .map_err(|e| e.to_string())?;
-                    next_id += 1;
-                }
-                BrowserCommand::FindInPage { query, step } => {
-                    // Une seule recherche « en vol » compte : les réponses
-                    // arrivent dans l'ordre d'envoi, seule la dernière est
-                    // à jour — les anciennes sont ignorées par l'id.
-                    find_id = Some(next_id);
-                    socket
-                        .send(Message::Text(cdp::evaluate(
-                            next_id,
-                            &cdp::find_in_page_script(&query, step),
-                        )))
-                        .map_err(|e| e.to_string())?;
-                    next_id += 1;
-                }
-                BrowserCommand::ClearFind => {
-                    socket
-                        .send(Message::Text(cdp::evaluate(
-                            next_id,
-                            &cdp::find_clear_script(),
-                        )))
-                        .map_err(|e| e.to_string())?;
-                    next_id += 1;
-                }
-                BrowserCommand::ClearBrowsingData { selection, origins } => {
-                    // Cookies/cache : une commande chacun, effet profil.
-                    if selection.cookies {
-                        socket
-                            .send(Message::Text(cdp::clear_browser_cookies(next_id)))
-                            .map_err(|e| e.to_string())?;
-                        next_id += 1;
-                    }
-                    if selection.cache {
-                        socket
-                            .send(Message::Text(cdp::clear_browser_cache(next_id)))
-                            .map_err(|e| e.to_string())?;
-                        next_id += 1;
-                    }
-                    // Données de sites : par origine connue (historique +
-                    // favoris + page courante), pas de « toutes origines ».
-                    if selection.site_data {
-                        for origin in origins {
-                            socket
-                                .send(Message::Text(cdp::clear_data_for_origin(next_id, &origin)))
-                                .map_err(|e| e.to_string())?;
-                            next_id += 1;
-                        }
-                    }
-                }
-                BrowserCommand::Evaluate(expr) => {
-                    eval_request_ids.insert(next_id);
-                    socket
-                        .send(Message::Text(cdp::evaluate(next_id, &expr)))
-                        .map_err(|e| e.to_string())?;
-                    next_id += 1;
-                }
-            }
-        }
-
-        // 2. Attendre du travail : socket CDP ou self-pipe de commandes
-        // (le poll bloque — plus de boucle occupée à 4 ms)
-        #[cfg(target_os = "linux")]
-        match raw_socket_fd(&socket) {
-            Some(fd) => {
-                if wait_io(fd, wake_read) {
-                    continue; // commande en attente → re-drain au prochain tour
-                }
-            }
-            None => thread::sleep(Duration::from_millis(4)),
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = &wake_read;
-            thread::sleep(Duration::from_millis(4));
-        }
-
-        // 3. Read CDP messages
-        match socket.read() {
-            Ok(Message::Text(text)) => {
-                let Ok(val) = serde_json::from_str::<Value>(text.as_ref()) else {
-                    continue;
-                };
-
-                // Check method
-                if let Some(method) = val.get("method").and_then(Value::as_str) {
-                    match method {
-                        "Page.screencastFrame" => {
-                            if let Some(params) = val.get("params") {
-                                let session_id = params.get("sessionId").and_then(Value::as_u64);
-                                if let Some(session_id) = session_id {
-                                    // backpressure : l'UI acquitte en consommant
-                                    // (AckFrame). Une nouvelle frame avant l'ack →
-                                    // l'ancienne est perdue (ack immédiat, Chrome
-                                    // continue de produire).
-                                    if let Some(stale) = pending_frame.replace(session_id) {
-                                        let _ = socket.send(Message::Text(
-                                            cdp::screencast_frame_ack(next_id, stale),
-                                        ));
-                                        next_id += 1;
-                                    }
-                                }
-
-                                if let Some(base64_data) =
-                                    params.get("data").and_then(Value::as_str)
-                                    && let Ok(bytes) = STANDARD.decode(base64_data)
-                                    && let Ok(dyn_image) = image::load_from_memory_with_format(
-                                        &bytes,
-                                        image::ImageFormat::Jpeg,
-                                    )
-                                {
-                                    let rgba = dyn_image.into_rgba8();
-                                    let render_img = gpui_render_image(rgba);
-                                    push_event_lossy(
-                                        events,
-                                        wake,
-                                        BrowserEvent::Page {
-                                            image: render_img,
-                                            title: page_title.clone(),
-                                            url: current_url.clone(),
-                                            session_id: session_id.unwrap_or(0),
-                                        },
-                                    );
-                                }
-                            }
-                        }
-                        "Page.navigatedWithinDocument" | "Page.frameNavigated" => {
-                            // Le UrlTracker filtre les iframes ; l'URL vient de
-                            // params.url (navigatedWithinDocument) ou params.frame.url.
-                            if let Some(params) = val.get("params")
-                                && let Some(url) = url_tracker.on_nav_event(method, params)
-                            {
-                                *current_url = url;
-                                // rafraîchit les états back/forward après chaque navigation
-                                nav_history_request_id = Some(next_id);
-                                nav_history_step = 0;
-                                socket
-                                    .send(Message::Text(cdp::get_navigation_history(next_id)))
-                                    .map_err(|e| e.to_string())?;
-                                next_id += 1;
-                            }
-                        }
-                        "Page.frameStartedLoading" | "Page.frameStoppedLoading" => {
-                            if let Some(frame_id) = val
-                                .get("params")
-                                .and_then(|p| p.get("frameId"))
-                                .and_then(Value::as_str)
-                                && let Some(loading) =
-                                    url_tracker.on_loading_event(method, frame_id)
-                            {
-                                push_event_lossy(events, wake, BrowserEvent::Loading(loading));
-                                if method == "Page.frameStoppedLoading" {
-                                    title_request_id = Some(next_id);
-                                    let _ = socket.send(Message::Text(cdp::evaluate(
-                                        next_id,
-                                        "document.title",
-                                    )));
-                                    next_id += 1;
-                                }
-                            }
-                        }
-                        "Page.javascriptDialogOpening" => {
-                            if let Some(params) = val.get("params") {
-                                let message =
-                                    params.get("message").and_then(Value::as_str).unwrap_or("");
-                                let prompt = params
-                                    .get("defaultPrompt")
-                                    .and_then(Value::as_str)
-                                    .map(str::to_owned);
-                                // auto-accept : sinon la page reste bloquée sur alert()
-                                dialog_request_id = Some(next_id);
-                                socket
-                                    .send(Message::Text(cdp::handle_java_script_dialog(
-                                        next_id,
-                                        true,
-                                        prompt.as_deref(),
-                                    )))
-                                    .map_err(|e| e.to_string())?;
-                                next_id += 1;
-                                push_event(
-                                    events,
-                                    wake,
-                                    BrowserEvent::Console(ConsoleLog {
-                                        level: "dialog".into(),
-                                        text: format!("{message} (accepté automatiquement)"),
-                                    }),
-                                );
-                            }
-                        }
-                        "Target.attachedToTarget" => {
-                            if let Some(target_info) = val.pointer("/params/targetInfo") {
-                                let is_page =
-                                    target_info.get("type").and_then(Value::as_str) == Some("page");
-                                let has_opener = target_info.get("openerId").is_some();
-                                // popup ouvert par la page → on y navigue dans la vue courante
-                                if is_page
-                                    && has_opener
-                                    && let Some(url) =
-                                        target_info.get("url").and_then(Value::as_str)
-                                {
-                                    *current_url = url.to_owned();
-                                    push_event_lossy(events, wake, BrowserEvent::Loading(true));
-                                    socket
-                                        .send(Message::Text(cdp::page_navigate(next_id, url)))
-                                        .map_err(|e| e.to_string())?;
-                                    navigate_request_ids.insert(next_id);
-                                    next_id += 1;
-                                }
-                            }
-                        }
-                        "Runtime.consoleAPICalled" => {
-                            if let Some(params) = val.get("params") {
-                                let level = params
-                                    .get("type")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("log")
-                                    .to_owned();
-                                let mut text_parts = Vec::new();
-                                if let Some(args) = params.get("args").and_then(Value::as_array) {
-                                    for arg in args {
-                                        if let Some(val) = arg.get("value") {
-                                            text_parts.push(val.to_string());
-                                        } else if let Some(desc) =
-                                            arg.get("description").and_then(Value::as_str)
-                                        {
-                                            text_parts.push(desc.to_owned());
-                                        }
-                                    }
-                                }
-                                push_event(
-                                    events,
-                                    wake,
-                                    BrowserEvent::Console(ConsoleLog {
-                                        level,
-                                        text: text_parts.join(" "),
-                                    }),
-                                );
-                            }
-                        }
-                        "Runtime.exceptionThrown" => {
-                            if let Some(params) = val.get("params") {
-                                let desc = params
-                                    .get("exceptionDetails")
-                                    .and_then(|e| e.get("text"))
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("Uncaught exception")
-                                    .to_owned();
-                                push_event(
-                                    events,
-                                    wake,
-                                    BrowserEvent::Console(ConsoleLog {
-                                        level: "error".into(),
-                                        text: desc,
-                                    }),
-                                );
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-
-                // Check responses to requests
-                if let Some(resp_id) = val.get("id").and_then(Value::as_u64) {
-                    if navigate_request_ids.remove(&resp_id) {
-                        if let Some(error_text) = val
-                            .get("result")
-                            .and_then(|r| r.get("errorText"))
-                            .and_then(Value::as_str)
-                            && !error_text.is_empty()
-                        {
-                            push_event(
-                                events,
-                                wake,
-                                BrowserEvent::Failed(navigate_error_message(
-                                    error_text,
-                                    current_url,
-                                )),
-                            );
-                        }
-                    } else if dialog_request_id == Some(resp_id) {
-                        dialog_request_id = None;
-                    } else if nav_history_request_id == Some(resp_id) {
-                        nav_history_request_id = None;
-                        if let Some(result) = val.get("result") {
-                            let index = result
-                                .get("currentIndex")
-                                .and_then(Value::as_i64)
-                                .unwrap_or(0);
-                            let entries = result.get("entries").and_then(Value::as_array);
-                            if let Some(entries) = entries {
-                                let can_back = index > 0;
-                                let can_forward = (index as usize) + 1 < entries.len();
-                                push_event_lossy(
-                                    events,
-                                    wake,
-                                    BrowserEvent::NavHistory {
-                                        can_back,
-                                        can_forward,
-                                    },
-                                );
-                                if nav_history_step != 0 {
-                                    let target = index + nav_history_step as i64;
-                                    if let Some(entry) = entries.get(target.unsigned_abs() as usize)
-                                        && let Some(entry_id) =
-                                            entry.get("id").and_then(Value::as_u64)
-                                    {
-                                        socket
-                                            .send(Message::Text(cdp::navigate_to_history_entry(
-                                                next_id, entry_id,
-                                            )))
-                                            .map_err(|e| e.to_string())?;
-                                        next_id += 1;
-                                    }
-                                    nav_history_step = 0;
-                                }
-                            }
-                        }
-                    }
-                    if screenshot_request_id == Some(resp_id) {
-                        screenshot_request_id = None;
-                        if let Some(base64_data) = val
-                            .get("result")
-                            .and_then(|r| r.get("data"))
-                            .and_then(Value::as_str)
-                            && let Ok(bytes) = STANDARD.decode(base64_data)
-                        {
-                            push_event(events, wake, BrowserEvent::Screenshot(bytes));
-                        }
-                    } else if title_request_id == Some(resp_id) {
-                        title_request_id = None;
-                        if let Some(title) = val
-                            .get("result")
-                            .and_then(|r| r.get("result"))
-                            .and_then(|res| res.get("value"))
-                            .and_then(Value::as_str)
-                        {
-                            page_title = title.to_owned();
-                            push_event_lossy(events, wake, BrowserEvent::Title(page_title.clone()));
-                        }
-                    } else if overlay_request_id == Some(resp_id) {
-                        overlay_request_id = None;
-                        if let Some(value) = val
-                            .get("result")
-                            .and_then(|r| r.get("result"))
-                            .and_then(|res| res.get("value"))
-                            && let Ok(elements) =
-                                serde_json::from_value::<Vec<OverlayElement>>(value.clone())
-                        {
-                            push_event(events, wake, BrowserEvent::Elements(elements));
-                        }
-                    } else if probe_ids.remove(&resp_id) {
-                        // `null` côté page → plus d'élément survolé.
-                        let hover = val
-                            .pointer("/result/result/value")
-                            .and_then(|v| {
-                                serde_json::from_value::<Option<ElementHover>>(v.clone()).ok()
-                            })
-                            .flatten();
-                        push_event_lossy(events, wake, BrowserEvent::ElementHover(hover));
-                    } else if describe_id == Some(resp_id) {
-                        describe_id = None;
-                        if let Some(value) = val
-                            .get("result")
-                            .and_then(|r| r.get("result"))
-                            .and_then(|res| res.get("value"))
-                            && let Ok(context) =
-                                serde_json::from_value::<ElementContext>(value.clone())
-                        {
-                            push_event(
-                                events,
-                                wake,
-                                BrowserEvent::ElementContext(Box::new(context)),
-                            );
-                        }
-                    } else if find_id == Some(resp_id) {
-                        find_id = None;
-                        // `{count, index}` produit par find_in_page_script ;
-                        // toute autre forme (erreur JS, page sans CSS.highlights)
-                        // est ignorée — le compteur reste à son état précédent.
-                        if let Some(value) = val.pointer("/result/result/value")
-                            && let Ok(result) =
-                                serde_json::from_value::<FindPageResult>(value.clone())
-                        {
-                            push_event(
-                                events,
-                                wake,
-                                BrowserEvent::FindResult {
-                                    count: result.count,
-                                    index: result.index,
-                                },
-                            );
-                        }
-                    } else if eval_request_ids.remove(&resp_id) {
-                        let text = if let Some(err) = val.get("error") {
-                            format!("Error: {err}")
-                        } else if let Some(res) = val.get("result").and_then(|r| r.get("result")) {
-                            res.get("value")
-                                .map(|v| v.to_string())
-                                .unwrap_or_else(|| res.to_string())
-                        } else {
-                            "undefined".into()
-                        };
-                        push_event(
-                            events,
-                            wake,
-                            BrowserEvent::Console(ConsoleLog {
-                                level: "result".into(),
-                                text,
-                            }),
-                        );
-                    }
-                }
-            }
-            Ok(Message::Ping(payload)) => {
-                let _ = socket.send(Message::Pong(payload));
-            }
-            Ok(Message::Close(_)) => return Ok(SessionResult::Shutdown),
-            Err(tungstenite::Error::Io(e))
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut =>
-            {
-                thread::sleep(Duration::from_millis(4));
-            }
-            Err(e) => {
-                return Err(format!("CDP connection error: {e}"));
-            }
-            _ => {}
-        }
-    }
-}
-
-fn set_socket_nonblocking(socket: &mut WsStream, nonblocking: bool) -> Result<(), String> {
-    match socket.get_mut() {
-        MaybeTlsStream::Plain(stream) => stream
-            .set_nonblocking(nonblocking)
-            .map_err(|e| e.to_string()),
-        _ => Ok(()),
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn raw_socket_fd(socket: &WsStream) -> Option<i32> {
-    use std::os::fd::AsRawFd;
-    match socket.get_ref() {
-        MaybeTlsStream::Plain(stream) => Some(stream.as_raw_fd()),
-        _ => None,
-    }
-}
-
-/// Bloque jusqu'à activité sur le socket CDP ou le self-pipe de commandes.
-/// Renvoie true si le pipe a réveillé (des commandes attendent). Zéro réveil
-/// à vide : le thread dort dans poll(2), pas dans une boucle à 4 ms.
-#[cfg(target_os = "linux")]
-fn wait_io(socket_fd: i32, wake_fd: Option<i32>) -> bool {
-    let mut fds = [
-        libc::pollfd {
-            fd: socket_fd,
-            events: libc::POLLIN,
-            revents: 0,
-        },
-        libc::pollfd {
-            fd: wake_fd.unwrap_or(-1),
-            events: libc::POLLIN,
-            revents: 0,
-        },
-    ];
-    let count = if wake_fd.is_some() { 2 } else { 1 };
-    loop {
-        let ready = unsafe { libc::poll(fds.as_mut_ptr(), count, -1) };
-        if ready < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
-            continue;
-        }
-        break;
-    }
-    let pipe_fired = fds[1].revents & libc::POLLIN != 0;
-    if pipe_fired {
-        // vide le pipe (sinon poll re-rentre immédiatement en boucle)
-        if let Some(fd) = wake_fd {
-            let mut buf = [0u8; 64];
-            unsafe { while libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) > 0 {} }
-        }
-    }
-    pipe_fired
-}
-
-/// Métriques + redémarrage du screencast aux nouvelles dimensions.
-fn send_screencast_restart(
-    socket: &mut WsStream,
-    next_id: &mut u64,
-    width: u32,
-    height: u32,
-    scale: f32,
-    mobile: bool,
-) -> Result<(), String> {
-    socket
-        .send(Message::Text(cdp::set_device_metrics(
-            *next_id, width, height, scale, mobile,
-        )))
-        .map_err(|e| e.to_string())?;
-    *next_id += 1;
-
-    let _ = socket.send(Message::Text(cdp::stop_screencast(*next_id)));
-    *next_id += 1;
-
-    let physical_w = ((width as f32) * scale).round() as u32;
-    let physical_h = ((height as f32) * scale).round() as u32;
-    socket
-        .send(Message::Text(cdp::start_screencast(
-            *next_id,
-            physical_w.max(width),
-            physical_h.max(height),
-            "jpeg",
-            90,
-        )))
-        .map_err(|e| e.to_string())?;
-    *next_id += 1;
-    Ok(())
-}
-
 // stubs RED (TDD #76) — implémentation dans la phase GREEN
 fn push_console(logs: &mut VecDeque<ConsoleLog>, log: ConsoleLog) {
     if logs.len() >= 120 {
@@ -5578,6 +5067,8 @@ fn overlay_refresh_needed(prev_loading: bool, new_loading: bool, show_overlay: b
 mod tests {
     use super::*;
     use serde_json::json;
+
+    use session::{UrlTracker, navigate_error_message};
 
     #[test]
     fn normalizes_addresses_and_searches() {
@@ -5599,7 +5090,7 @@ mod tests {
         );
         assert_eq!(
             normalize_url("komet browser").unwrap(),
-            "https://duckduckgo.com/?q=komet%20browser"
+            "https://www.google.com/search?q=komet%20browser"
         );
         assert_eq!(normalize_url("about:blank").unwrap(), "about:blank");
     }
@@ -5740,7 +5231,7 @@ mod tests {
         }
         assert_eq!(
             normalize_url("komet browser").unwrap(),
-            "https://duckduckgo.com/?q=komet%20browser"
+            "https://www.google.com/search?q=komet%20browser"
         );
     }
 

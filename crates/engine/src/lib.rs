@@ -15,6 +15,7 @@ use komet_rpc::{RpcError, RpcReply, RpcService, methods};
 
 pub mod agent_accounts;
 pub mod auth;
+pub mod browser_bridge;
 pub mod chat2_host;
 pub mod composio;
 pub mod crash_shield;
@@ -386,6 +387,9 @@ impl EngineCore {
         // The internal MCP catalog reaches the terminals (terminal_list /
         // terminal_read); the RPC service gets the same handle below.
         sessions.set_terminals(terminals.clone());
+        // Agent → visible-Browser bridge (spec 2026-11-24): the MCP catalog
+        // and the RPC surface share this handle.
+        sessions.set_browser_bridge(Arc::new(crate::browser_bridge::BrowserBridge::new()));
         let uploads = Uploads::from_root_with_fallback(
             profile.uploads_root(),
             legacy_uploads_root.as_deref(),

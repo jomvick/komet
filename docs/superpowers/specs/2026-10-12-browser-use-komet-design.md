@@ -1,6 +1,15 @@
 # Browser-use Komet — Design
 
-Date : 2026-10-12. Statut : proposé. Périmètre : automation browser côté agent + affichage UI, calqué sur freebuff `browser-use`, adapté à la stack Rust/gpui de Komet.
+Date : 2026-10-12. Statut : **proposé, non implémenté** ; chemin d'automatisation **distinct** du
+Browser intégré. Mis à jour le 2026-11-24 : cette spec décrit un Chrome headless isolé piloté par
+`chrome-devtools-mcp`, ce qui reste utile pour automatiser sans interface, mais ne satisfait pas
+l'objectif d'un agent qui voit et utilise la **même surface** que l'utilisateur. Ce dernier objectif
+est porté par `2026-11-08-browser-surface-usable-design.md` (jalon 5, non commencé) et suivi dans
+`docs/PARITY.md` §3.6. Pendant le développement, la spec du 2026-11-08 et la matrice de parité font
+autorité sur l'état du Browser ; les décisions ci-dessous restent valables pour l'automatisation
+headless optionnelle.
+
+Périmètre : automation browser côté agent + affichage UI, calqué sur freebuff `browser-use`, adapté à la stack Rust/gpui de Komet.
 
 ## Contexte vérifié
 
@@ -71,3 +80,25 @@ Vérifié dans le code :
 - Screenshots (mon choix par défaut) : traités comme pixels de page non fiables, locaux uniquement (`protect_attachments`, jamais en doc sync), en attente de décision produit.
 
 Reste au produit (reporté dans l'issue) : prérequis Node/npx + règle sandbox pour Chrome ; pré-seedé/`always_load` vs ajout manuel ; politique privacy exacte des screenshots.
+
+## Mise à jour 2026-11-24 — ce qui reste valable
+
+Vérifié dans l'arbre : aucun outil navigateur n'est exposé par le moteur/MCP, et la surface
+Browser n'est pas pilotable par un agent. Les phases 1–2 de cette spec (serveur
+`chrome-devtools-mcp` déclarable, gate Chrome, vignettes de screenshots) n'ont pas été
+implémentées.
+
+Répartition retenue :
+
+- **Browser intégré** (`crates/ui/src/browser*`) = navigateur visible de l'utilisateur, Chromium
+  système + CDP, profil persistant par panneau. Référence : spec du 2026-11-08.
+- **Browser-use agent** = surface d'outils typée **dans le moteur/MCP**, agissant sur cette même
+  surface visible (voir §3.6 de `docs/PARITY.md`). Le protocole proposé ici
+  (`navigate_page`/`take_snapshot`/`click{uid}`/…) reste le bon modèle d'outils, mais pas via un
+  Chrome headless séparé : un navigateur séparé ne voit ni la page ni la session de l'utilisateur.
+- **`chrome-devtools-mcp --headless --isolated`** reste acceptable comme prototype rapide ou pour
+  des tâches sans interface, jamais comme produit final ni comme substitut à la surface visible.
+
+Conséquences pour cette spec si elle repart : les identifiants d'éléments doivent être valides
+seulement pour le snapshot qui les a créés, les actions doivent rapporter un résultat explicite,
+et le port CDP brut ne doit jamais être exposé hors de l'interface locale.

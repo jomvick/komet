@@ -64,6 +64,7 @@ pub struct BrowserPage {
     home_input: gpui::Entity<ComposerInput>,
     search_input: gpui::Entity<ComposerInput>,
     capture_input: gpui::Entity<ComposerInput>,
+    download_input: gpui::Entity<ComposerInput>,
     _subs: Vec<Subscription>,
 }
 
@@ -131,11 +132,29 @@ impl BrowserPage {
             },
         ));
 
+        let download_input = cx.new(|cx| ComposerInput::new("~/Downloads", cx));
+        download_input.update(cx, |input, cx| {
+            input.set_text(prefs.download_dir.clone().unwrap_or_default(), cx);
+        });
+        subs.push(cx.subscribe(
+            &download_input,
+            |this: &mut Self,
+             input: gpui::Entity<ComposerInput>,
+             event: &ComposerInputEvent,
+             cx: &mut Context<Self>| {
+                if matches!(event, ComposerInputEvent::Edited) {
+                    this.prefs.download_dir = opt_text(&input, cx);
+                    this.emit(cx);
+                }
+            },
+        ));
+
         Self {
             prefs,
             home_input,
             search_input,
             capture_input,
+            download_input,
             _subs: subs,
         }
     }
@@ -482,17 +501,28 @@ impl Render for BrowserPage {
                     ),
             );
 
-        // --- Captures ------------------------------------------------------
-        let capture_card = widgets::section_card(&theme).child(
-            self.field_row(
-                &theme,
-                icons::CAMERA,
-                "Capture folder",
-                "Screenshots from the DevTools drawer are saved here (default: Downloads).",
-                self.text_field(&theme, self.capture_input.clone())
-                    .into_any_element(),
-            ),
-        );
+        // --- Captures + téléchargements -------------------------------------
+        let capture_card = widgets::section_card(&theme)
+            .child(
+                self.field_row(
+                    &theme,
+                    icons::CAMERA,
+                    "Capture folder",
+                    "Screenshots from the DevTools drawer are saved here (default: Downloads).",
+                    self.text_field(&theme, self.capture_input.clone())
+                        .into_any_element(),
+                ),
+            )
+            .child(
+                self.field_row(
+                    &theme,
+                    icons::ALT_ARROW_DOWN,
+                    "Downloads folder",
+                    "Where page downloads land; Open/Reveal from the Downloads panel (default: Downloads).",
+                    self.text_field(&theme, self.download_input.clone())
+                        .into_any_element(),
+                ),
+            );
 
         // --- Emulation -----------------------------------------------------
         let emu_current = EMULATION_PRESETS

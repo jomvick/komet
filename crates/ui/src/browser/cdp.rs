@@ -64,6 +64,27 @@ pub fn runtime_enable(id: u64) -> String {
     make_request(id, "Runtime.enable", json!({}))
 }
 
+/// Active les événements Network (requêtes/réponses/erreurs) pour la page.
+/// Léger : pas de corps de requête capturé.
+pub fn network_enable(id: u64) -> String {
+    make_request(id, "Network.enable", json!({}))
+}
+
+/// Téléchargements : comportement « allow » (nom d'origine) + dossier Komet,
+/// avec événements de progression. Envoyé sur la session de page — Chrome
+/// l'applique au navigateur entier du profil.
+pub fn set_download_behavior(id: u64, download_path: &str) -> String {
+    make_request(
+        id,
+        "Browser.setDownloadBehavior",
+        json!({
+            "behavior": "allow",
+            "downloadPath": download_path,
+            "eventsEnabled": true
+        }),
+    )
+}
+
 pub fn page_navigate(id: u64, url: &str) -> String {
     make_request(id, "Page.navigate", json!({ "url": url }))
 }
@@ -261,6 +282,20 @@ pub fn set_auto_attach(id: u64) -> String {
             "flatten": true,
             "waitForDebuggerOnStart": false
         }),
+    )
+}
+
+/// Script `fill` agent : focus + value + événements input/change sur le
+/// sélecteur du snapshot. Chaînes sérialisées JSON (sélecteur/texte non
+/// fiables — jamais interpolés dans du code JS).
+pub fn fill_element_script(selector: &str, text: &str) -> String {
+    let selector = serde_json::to_string(selector).unwrap_or_else(|_| "\"\"".into());
+    let text = serde_json::to_string(text).unwrap_or_else(|_| "\"\"".into());
+    format!(
+        "(() => {{ const el = document.querySelector({selector}); if (!el) return false; \
+         el.focus(); el.value = {text}; \
+         el.dispatchEvent(new Event('input', {{ bubbles: true }})); \
+         el.dispatchEvent(new Event('change', {{ bubbles: true }})); return true; }})()"
     )
 }
 

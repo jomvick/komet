@@ -217,6 +217,11 @@ pub struct UiSettings {
     /// the explicit "Show onboarding" replay.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub onboarding_completed: Option<bool>,
+    /// URLs récentes des surfaces Browser (les plus récentes d'abord, 10
+    /// max) : à la réouverture du panneau sans page d'accueil configurée,
+    /// la dernière page visitée est restaurée.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub browser_urls: Vec<String>,
     /// Set by [`UiSettings::load`] when the file parsed but carried no
     /// `onboardingCompleted` key. Never persisted, never serialized: only the
     /// debug-build replay reads it so `cargo run` shows the tour on a
@@ -247,6 +252,9 @@ pub struct BrowserPrefs {
     pub remember_zoom: bool,
     /// Dossier des captures d'écran ; `None` = dossier Téléchargements.
     pub capture_dir: Option<String>,
+    /// Dossier des téléchargements ; `None` = dossier Téléchargements de
+    /// l'OS. Appliqué à la session CDP via `Browser.setDownloadBehavior`.
+    pub download_dir: Option<String>,
     /// Preset d'émulation par défaut (`None` = responsive désactivé).
     pub emulation_preset: Option<String>,
 }
@@ -255,15 +263,39 @@ impl Default for BrowserPrefs {
     fn default() -> Self {
         Self {
             home_url: None,
-            search_url: "https://duckduckgo.com/?q={q}".into(),
+            search_url: crate::browser::DEFAULT_SEARCH_URL.into(),
             history_enabled: true,
             history_retention_days: Some(90),
             zoom_default: 1.0,
             remember_zoom: false,
             capture_dir: None,
+            download_dir: None,
             emulation_preset: None,
         }
     }
+}
+
+impl BrowserPrefs {
+    /// Migration à la lecture (en mémoire, à chaque boot) : le défaut
+    /// DuckDuckGo d'avant la PR devient Google ; tout autre choix explicite
+    /// (preset ou modèle custom) est conservé tel quel.
+    pub fn migrate(&mut self) {
+        if self.search_url.trim() == crate::browser::LEGACY_DEFAULT_SEARCH_URL {
+            self.search_url = crate::browser::DEFAULT_SEARCH_URL.to_string();
+        }
+    }
+}
+
+/// Mémorise une URL de surface Browser : les plus récentes d'abord, sans
+/// doublon, 10 max (plafond volontaire — ce n'est pas un historique).
+pub fn remember_browser_url(urls: &mut Vec<String>, url: &str) {
+    let url = url.trim();
+    if url.is_empty() || url.starts_with("about:") {
+        return;
+    }
+    urls.retain(|u| u != url);
+    urls.insert(0, url.to_owned());
+    urls.truncate(10);
 }
 
 fn default_usage_agents() -> Vec<String> {
@@ -306,6 +338,7 @@ impl Default for UiSettings {
             files_show_all: false,
             usage_agents: default_usage_agents(),
             browser: BrowserPrefs::default(),
+            browser_urls: Vec::new(),
             onboarding_completed: None,
             onboarding_key_absent: false,
         }
@@ -504,6 +537,13 @@ pub fn display_combo(combo: &str) -> String {
 
 impl UiSettings {
     /// Clamp widths into their legal ranges (also heals NaN to defaults).
+    /// Migrations one-shot entre versions de `ui-settings.json`. Appliquées
+    /// uniquement à la lecture : tant que la version courante n'a pas
+    /// sauvegardé, le fichier reste tel quel.
+    pub fn migrate(&mut self) {
+        self.browser.migrate();
+    }
+
     pub fn clamped(mut self) -> Self {
         self.sidebar_width = clamp_or(
             self.sidebar_width,
@@ -559,6 +599,7 @@ impl UiSettings {
             Ok(text) => match serde_json::from_str::<UiSettings>(&text) {
                 Ok(mut settings) => {
                     settings.onboarding_key_absent = settings.onboarding_completed.is_none();
+                    settings.migrate();
                     settings.clamped()
                 }
                 Err(err) => {
@@ -674,8 +715,10 @@ mod tests {
                 zoom_default: 1.25,
                 remember_zoom: true,
                 capture_dir: Some("/tmp/shots".into()),
+                download_dir: Some("/tmp/dl".into()),
                 emulation_preset: Some("iphone-se".into()),
             },
+            browser_urls: vec!["https://example.com".into()],
             onboarding_completed: Some(true),
             onboarding_key_absent: false,
         };
@@ -702,6 +745,52 @@ mod tests {
         let loaded = UiSettings::load(dir.path());
         assert_eq!(loaded.wallpaper_path, None);
         assert_eq!(loaded.sidebar_width, 300.0);
+    }
+
+    #[test]
+    fn browser_urls_keep_most_recent_first_without_duplicates() {
+        let mut urls = Vec::new();
+        remember_browser_url(&mut urls, "https://a.example");
+        remember_browser_url(&mut urls, "https://b.example");
+        remember_browser_url(&mut urls, "https://a.example");
+        assert_eq!(urls, vec!["https://a.example", "https://b.example"]);
+        // pages internes et vides jamais mémorisées
+        remember_browser_url(&mut urls, "about:blank");
+        remember_browser_url(&mut urls, "   ");
+        assert_eq!(urls.len(), 2);
+        // plafond 10
+        for i in 0..15 {
+            remember_browser_url(&mut urls, &format!("https://h{i}.example"));
+        }
+        assert_eq!(urls.len(), 10);
+        assert_eq!(urls[0], "https://h14.example");
+    }
+
+    #[test]
+    fn legacy_duckduckgo_search_default_migrates_to_google() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            UiSettings::path(dir.path()),
+            r#"{"browser": {"searchUrl": "https://duckduckgo.com/?q={q}"}}"#,
+        )
+        .unwrap();
+
+        // Le défaut de l'époque est migré vers Google…
+        assert_eq!(
+            UiSettings::load(dir.path()).browser.search_url,
+            crate::browser::DEFAULT_SEARCH_URL
+        );
+
+        // …mais un choix explicite (autre preset ou custom) est conservé.
+        std::fs::write(
+            UiSettings::path(dir.path()),
+            r#"{"browser": {"searchUrl": "https://search.brave.com/search?q={q}"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            UiSettings::load(dir.path()).browser.search_url,
+            "https://search.brave.com/search?q={q}"
+        );
     }
 
     #[test]
