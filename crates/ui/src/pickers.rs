@@ -384,6 +384,12 @@ pub struct Pickers {
     worktrees_only: bool,
     /// Highlighted row in the open list (keyboard nav).
     active: usize,
+    /// Device column selection in the space popover. `None` = the canvas's
+    /// effective device; picking another lists that machine's projects without
+    /// re-homing the canvas or closing the popover.
+    space_device: Option<String>,
+    /// Workspace that owns `space_device`; `None` follows the active workspace.
+    space_env: Option<String>,
     /// Models-list scroll — keyboard nav keeps the highlighted row in view
     /// (`scroll_to_item`; the add-space palette standard).
     model_scroll: gpui::ScrollHandle,
@@ -552,6 +558,8 @@ impl Pickers {
             refs_space: None,
             worktrees_only: false,
             active: 0,
+            space_device: None,
+            space_env: None,
             model_scroll: gpui::ScrollHandle::new(),
             search,
             search_reset_muted: false,
@@ -837,6 +845,10 @@ impl Pickers {
             return;
         }
         self.open.open(kind);
+        if kind == PickerKind::Space {
+            self.space_device = None;
+            self.space_env = None;
+        }
         // Clearing stale text emits Edited AFTER this function returns —
         // mute that one event so its reset can't clobber the highlight
         // anchored below (the no-op clear is also skipped for the same
@@ -1850,21 +1862,25 @@ impl Pickers {
 
     // ---- the space picker (new-session canvas) ----
 
-    /// The picker's project rows: scoped to the canvas's device — the device
-    /// switcher narrows the list, projects on other devices don't show
-    /// (pick the device first, then its project). Unscoped only while the
-    /// device is still unknown (pre-probe boot).
+    /// The picker's project rows: scoped to the device picked in the panel's
+    /// right column, or the canvas's device when nothing was picked. The local
+    /// workspace rows and paired-workspace caches keep this a local filter.
     fn scoped_space_rows(&self, cx: &App) -> Vec<Space> {
         let state = self.state.read(cx);
-        let device = state.effective_device_id();
+        let workspace_id = self
+            .space_env
+            .clone()
+            .unwrap_or_else(|| state.active_workspace.clone());
+        let device = self.space_device.clone().or_else(|| {
+            (workspace_id == state.active_workspace)
+                .then(|| state.effective_device_id())
+                .flatten()
+        });
         state
-            .spaces_sorted()
+            .project_picker_spaces(&workspace_id)
+            .unwrap_or_default()
             .into_iter()
-            .filter(|s| match device.as_deref() {
-                Some(d) => s.device_id == d,
-                None => true,
-            })
-            .cloned()
+            .filter(|space| device.as_deref().is_none_or(|id| space.device_id == id))
             .collect()
     }
 
@@ -1903,6 +1919,19 @@ impl Pickers {
     /// heavy lifting: branch draft, ref cache, and the per-device
     /// harness/model catalogs all invalidate on the project change.
     fn pick_space(&mut self, space_id: String, cx: &mut Context<Self>) {
+        let source_workspace = self
+            .space_env
+            .clone()
+            .unwrap_or_else(|| self.state.read(cx).active_workspace.clone());
+        if source_workspace != self.state.read(cx).active_workspace {
+            self.active = self
+                .filtered_space_rows(cx)
+                .iter()
+                .position(|space| space.id == space_id)
+                .unwrap_or(NO_ACTIVE_ROW);
+            cx.notify();
+            return;
+        }
         self.state
             .update(cx, |s, cx| s.select_space(Some(space_id), cx));
         self.remember_target(cx);
@@ -1914,6 +1943,62 @@ impl Pickers {
             .update(cx, |s, cx| s.select_device(device_id, cx));
         self.remember_target(cx);
         self.close(cx);
+    }
+
+    /// Retarget the space popover's list to a machine without closing it or
+    /// touching the canvas. The workspace and device ids are retained so the
+    /// footer action can route an import from the selected source.
+    fn pick_project_source_device(
+        &mut self,
+        workspace_id: String,
+        device_id: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.space_env = Some(workspace_id);
+        self.space_device = Some(device_id);
+        self.active = self.selected_space_index(cx);
+        cx.notify();
+    }
+
+    /// The popover's bottom row (and Ctrl O): add on the workspace's own
+    /// machine, import from any other machine's project.
+    fn space_primary_action(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (device, source_env, destination_device, active_env) = {
+            let state = self.state.read(cx);
+            let device = self
+                .space_device
+                .clone()
+                .or_else(|| state.effective_device_id());
+            let source_env = self
+                .space_env
+                .clone()
+                .unwrap_or_else(|| state.active_workspace.clone());
+            let destination_device = state.workspace_device_for(&state.active_workspace);
+            (
+                device,
+                source_env,
+                destination_device,
+                state.active_workspace.clone(),
+            )
+        };
+        self.close(cx);
+        if source_env == active_env && device == destination_device {
+            window.dispatch_action(Box::new(crate::shell::PickProjectFolder), cx);
+            return;
+        }
+        let seed = self
+            .filtered_space_rows(cx)
+            .get(self.active)
+            .map(|space| space.path.clone())
+            .unwrap_or_default();
+        let device = match device {
+            Some(device) => device,
+            None => return,
+        };
+        self.state.update(cx, |state, _| {
+            state.pending_import = Some((source_env, seed, device));
+        });
+        window.dispatch_action(Box::new(crate::shell::ImportProject), cx);
     }
 
     /// Persist the device/project picks — the "last selected" defaults the
@@ -2057,6 +2142,10 @@ impl Pickers {
     /// (check on the current pick), then a "New project…" action row. Rows
     /// are device-scoped, so no per-row `@ device` tag — the device chip next
     /// door names the host.
+    /// The new-session canvas's project selector: a wide panel with the
+    /// project list on the left and the machines of this workspace on the
+    /// right. A machine click retargets the list; the bottom row adds on the
+    /// workspace's own machine and imports from any other one.
     fn render_space_popover(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let rows = self.filtered_space_rows(cx);
@@ -2064,12 +2153,21 @@ impl Pickers {
             .state
             .read(cx)
             .selected_space_row()
-            .map(|s| s.id.clone());
+            .map(|space| space.id.clone());
         let active = self.active;
-        let body: AnyElement = if rows.is_empty() {
-            // Distinguish "the filter ate everything" from "this device has
-            // no projects yet" — the scoped list makes the latter common.
-            let empty: &str = if self.search.read(cx).text().is_empty() {
+        let source_workspace = self
+            .space_env
+            .clone()
+            .unwrap_or_else(|| self.state.read(cx).active_workspace.clone());
+        let spaces_loaded = self
+            .state
+            .read(cx)
+            .project_picker_spaces(&source_workspace)
+            .is_some();
+        let list: AnyElement = if rows.is_empty() {
+            let empty = if !spaces_loaded {
+                "Loading projects…"
+            } else if self.search.read(cx).text().is_empty() {
                 "No projects on this device."
             } else {
                 "No projects match."
@@ -2086,10 +2184,11 @@ impl Pickers {
                 .flex()
                 .flex_col()
                 .gap(px(2.0))
-                .max_h(px(224.0))
+                .max_h(px(264.0))
                 .overflow_y_scroll()
                 .children(rows.into_iter().enumerate().map(|(ix, space)| {
                     let label: SharedString = space.display_name().to_string().into();
+                    let path: SharedString = space.path.clone().into();
                     let is_selected = selected.as_deref() == Some(space.id.as_str());
                     let pick_id = space.id.clone();
                     popover::menu_row_nav(
@@ -2100,58 +2199,195 @@ impl Pickers {
                         cx.entity_id(),
                     )
                     .id(("space-row", ix))
+                    .border_b_1()
+                    .border_color(crate::theme::hairline(0.12))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.pick_space(pick_id.clone(), cx);
                     }))
-                    .child(div().flex_1().min_w_0().truncate().child(label))
+                    .child(
+                        div()
+                            .size(px(18.0))
+                            .flex_none()
+                            .rounded(px(5.0))
+                            .border_1()
+                            .border_color(theme.border)
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_size(px(10.0))
+                            .text_color(theme.text_muted)
+                            .child(SharedString::from(
+                                label
+                                    .chars()
+                                    .next()
+                                    .map(|c| c.to_uppercase().to_string())
+                                    .unwrap_or_default(),
+                            )),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap(px(1.0))
+                            .child(div().truncate().child(label))
+                            .child(
+                                div()
+                                    .text_size(px(11.0))
+                                    .text_color(theme.text_muted.opacity(0.7))
+                                    .truncate()
+                                    .child(path),
+                            ),
+                    )
+                    .child(
+                        crate::icons::icon(crate::icons::ALT_ARROW_RIGHT)
+                            .size(px(13.0))
+                            .flex_none()
+                            .text_color(theme.text_muted.opacity(0.4)),
+                    )
                 }))
                 .into_any_element()
         };
-        // Action row under a hairline: mint a project.
-        let new_project = popover::menu_row_nav(
-            &theme,
-            false,
-            false,
-            "project-new".to_string(),
-            cx.entity_id(),
-        )
-        .id("project-new")
-        .on_click(cx.listener(|this, _, window, cx| {
-            this.close(cx);
-            window.dispatch_action(Box::new(crate::shell::PickProjectFolder), cx);
-        }))
-        .child(
-            crate::icons::icon(crate::icons::PLUS)
-                .size(px(12.0))
-                .flex_none()
-                .text_color(theme.text_muted.opacity(0.7)),
-        )
-        .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .truncate()
-                .child(SharedString::from("New project…")),
-        );
+
+        let (selected_device, active_workspace, destination_device, home, devices) = {
+            let state = self.state.read(cx);
+            let selected_device = self.space_device.clone().or_else(|| {
+                (source_workspace == state.active_workspace)
+                    .then(|| state.effective_device_id())
+                    .flatten()
+            });
+            let devices = state.project_source_devices();
+            (
+                selected_device,
+                state.active_workspace.clone(),
+                state.workspace_device_for(&state.active_workspace),
+                state.home_device_id.clone(),
+                devices,
+            )
+        };
+        let same_machine =
+            source_workspace == active_workspace && selected_device == destination_device;
+        let (action_label, action_icon) = if same_machine {
+            ("Add a project", crate::icons::PLUS)
+        } else {
+            ("Import a project", crate::icons::ARCHIVE_MINIMALISTIC)
+        };
+        let action = popover::menu_row(&theme, false, "space-primary", cx.entity_id())
+            .id("space-primary")
+            .on_click(cx.listener(|this, _, window, cx| this.space_primary_action(window, cx)))
+            .child(
+                crate::icons::icon(action_icon)
+                    .size(px(15.0))
+                    .flex_none()
+                    .text_color(theme.text_muted),
+            )
+            .child(div().flex_1().min_w_0().truncate().child(action_label))
+            .child(
+                div()
+                    .flex_none()
+                    .text_size(px(10.0))
+                    .text_color(theme.text_muted.opacity(0.55))
+                    .child("CTRL O"),
+            );
+
+        let device_rows: Vec<AnyElement> = devices
+            .into_iter()
+            .map(|row| {
+                let is_selected = source_workspace == row.workspace_id
+                    && selected_device.as_deref() == Some(row.device.id.as_str());
+                let workspace_id = row.workspace_id.clone();
+                let device_id = row.device.id.clone();
+                let is_home = home.as_deref() == Some(device_id.as_str());
+                let glyph = if is_home {
+                    crate::icons::MONITOR
+                } else {
+                    crate::icons::CLOUD
+                };
+                let dot_color = match row.status {
+                    crate::state::WorkspaceStatus::Online => theme.success,
+                    crate::state::WorkspaceStatus::Connecting => theme.warning,
+                    crate::state::WorkspaceStatus::Offline => theme.text_faint,
+                };
+                popover::menu_row_nav(
+                    &theme,
+                    is_selected,
+                    false,
+                    format!("space-device-{}", row.device.id),
+                    cx.entity_id(),
+                )
+                .id(SharedString::from(format!(
+                    "space-device-{}",
+                    row.device.id
+                )))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.pick_project_source_device(workspace_id.clone(), device_id.clone(), cx);
+                }))
+                .child(
+                    crate::icons::icon(glyph)
+                        .size(px(14.0))
+                        .flex_none()
+                        .text_color(theme.text_muted),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .min_h_0()
+                        .child(div().truncate().child(row.device.name))
+                        .when(row.workspace_id != active_workspace, |el| {
+                            el.child(
+                                div()
+                                    .text_size(px(10.0))
+                                    .text_color(theme.text_muted.opacity(0.7))
+                                    .truncate()
+                                    .child(row.workspace_label),
+                            )
+                        }),
+                )
+                .when(is_home, |el| {
+                    el.child(
+                        div()
+                            .flex_none()
+                            .text_size(px(10.0))
+                            .text_color(theme.text_muted.opacity(0.5))
+                            .child("You"),
+                    )
+                })
+                .child(div().size(px(7.0)).flex_none().rounded_full().bg(dot_color))
+                .into_any_element()
+            })
+            .collect();
+
         div()
             .flex()
-            .flex_col()
-            // Same 2px rhythm as the list's own row gap — the action rows
-            // sat flush while list rows breathed (user report).
-            .gap(px(2.0))
-            .child(self.search_box(&theme))
-            .child(body)
+            .flex_row()
+            .items_stretch()
             .child(
-                // Full-bleed through the card's 4px inset — a divider
-                // stopping short of the edges read as a mistake.
                 div()
-                    .my(px(2.0))
-                    .mx(px(-4.0))
-                    .h(px(1.0))
-                    .flex_none()
-                    .bg(theme.border.opacity(0.6)),
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .child(self.search_box(&theme))
+                    .child(list)
+                    .child(popover::menu_separator())
+                    .child(action),
             )
-            .child(new_project)
+            .child(
+                div()
+                    .w(px(176.0))
+                    .flex_none()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .border_l_1()
+                    .border_color(crate::theme::hairline(0.2))
+                    .child(popover::menu_heading(&theme, "Devices"))
+                    .children(device_rows),
+            )
             .into_any_element()
     }
 
@@ -2178,10 +2414,18 @@ impl Pickers {
         }
     }
 
-    fn on_key_down(&mut self, event: &KeyDownEvent, window: &Window, cx: &mut Context<Self>) {
+    fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         // The frame stays mounted (and possibly focused) through the exit
         // animation — keys must not drive a dying popover.
         if !self.open.is_open() {
+            return;
+        }
+        // Ctrl O: the project panel's bottom row (add / import).
+        if self.open_kind() == Some(PickerKind::Space)
+            && event.keystroke.key.eq_ignore_ascii_case("o")
+            && event.keystroke.modifiers.control
+        {
+            self.space_primary_action(window, cx);
             return;
         }
         // ⌘1…⌘9 jump-picks the Nth visible model row (t3 modelPickerKeys;
@@ -2393,11 +2637,13 @@ impl Pickers {
                     .text_color(theme.text_muted.opacity(0.7)),
             )
             .child(div().min_w_0().truncate().child(label))
-            .child(
-                crate::icons::icon(crate::icons::ALT_ARROW_DOWN)
-                    .size(px(12.0))
-                    .text_color(theme.text_muted.opacity(0.5)),
-            )
+            .when(kind != PickerKind::Space, |el| {
+                el.child(
+                    crate::icons::icon(crate::icons::ALT_ARROW_DOWN)
+                        .size(px(12.0))
+                        .text_color(theme.text_muted.opacity(0.5)),
+                )
+            })
     }
 
     /// A read-only footer label (locked sessions — t3code's
@@ -2427,15 +2673,21 @@ impl Pickers {
             .child(div().min_w_0().truncate().child(label))
     }
 
-    /// The new-session canvas's project selector. Its popover anchors below;
+    /// The new-session canvas's project selector. Its popover opens centered
+    /// in the window (OpenCode command-palette placement);
     /// device selection lives in the sidebar above Settings.
-    pub fn render_target_selectors(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    pub fn render_target_selectors(
+        &mut self,
+        window: &Window,
+        sidebar_width: f32,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let closing = self.open.closing_since();
         let mut overlay: Option<(PickerKind, AnyElement)> = match self.mounted_kind() {
             Some(PickerKind::Space) => {
                 let content = self.render_space_popover(cx);
-                Some((PickerKind::Space, self.popover_frame(280.0, content, cx)))
+                Some((PickerKind::Space, self.popover_frame(544.0, content, cx)))
             }
             _ => None,
         };
@@ -2446,6 +2698,23 @@ impl Pickers {
                 .map(|s| s.display_name().to_string())
                 .unwrap_or_else(|| "No project".to_string())
                 .into()
+        };
+        let viewport = window.viewport_size();
+        let panel = if overlay
+            .as_ref()
+            .is_some_and(|(kind, _)| *kind == PickerKind::Space)
+        {
+            overlay.take().map(|(_, content)| {
+                popover::centered_menu(
+                    "project-popover",
+                    content,
+                    closing,
+                    viewport,
+                    px(sidebar_width / 2.0),
+                )
+            })
+        } else {
+            None
         };
         let project_chip = self.footer_chip(
             PickerKind::Space,
@@ -2460,13 +2729,8 @@ impl Pickers {
             .flex_row()
             .items_center()
             .gap(px(4.0))
-            .child(attach_overlay_below(
-                project_chip,
-                &mut overlay,
-                PickerKind::Space,
-                "project-popover",
-                closing,
-            ))
+            .child(project_chip)
+            .when_some(panel, |el, panel| el.child(panel))
             .into_any_element()
     }
 
@@ -3928,21 +4192,6 @@ fn attach_overlay(
 
 /// [`attach_overlay`] opening DOWNWARD — the canvas target selectors sit
 /// mid-screen, so their menus drop below the chips.
-fn attach_overlay_below(
-    chip: gpui::Stateful<gpui::Div>,
-    overlay: &mut Option<(PickerKind, AnyElement)>,
-    kind: PickerKind,
-    id: &'static str,
-    closing: Option<std::time::Instant>,
-) -> gpui::Stateful<gpui::Div> {
-    if overlay.as_ref().is_some_and(|(k, _)| *k == kind)
-        && let Some((_, element)) = overlay.take()
-    {
-        return chip.child(popover::anchored_menu_below(id, element, closing));
-    }
-    chip
-}
-
 /// [`attach_overlay`] with the menu RIGHT-ALIGNED to the trigger (t3code
 /// `align="end"` — right-edge triggers like the ref picker open leftward).
 fn attach_overlay_end(
@@ -4542,6 +4791,7 @@ mod tests {
             installed: true,
             enabled: None,
             surface: komet_proto::HarnessInteractionSurface::default(),
+            capabilities: Default::default(),
         };
         let mixed = vec![
             descriptor(HarnessId::Mock, "Mock"),
@@ -4569,6 +4819,7 @@ mod tests {
             installed: true,
             enabled,
             surface: komet_proto::HarnessInteractionSurface::default(),
+            capabilities: Default::default(),
         };
         let catalog = |claude: Option<bool>, codex: Option<bool>, grok: Option<bool>| {
             vec![

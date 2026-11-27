@@ -570,6 +570,7 @@ fn space(id: &str, device_id: &str, path: &str, created_min: i64) -> Space {
         device_id: device_id.into(),
         path: path.into(),
         name: None,
+        logo: None,
         git_detected: false,
         git_checked_at: None,
         checkout_id: None,

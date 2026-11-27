@@ -43,6 +43,7 @@ impl Shell {
             focus: cx.focus_handle(),
             focus_pending: true,
             list_scroll: gpui::ScrollHandle::new(),
+            import_destination: false,
         });
         self.remote_folder_browser_load(cx);
         cx.notify();
@@ -50,7 +51,7 @@ impl Shell {
 
     /// (Re)load the requested folder on the environment's engine. `path:
     /// None` asks for the device's home dir.
-    fn remote_folder_browser_load(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn remote_folder_browser_load(&mut self, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             if let Some(browser) = self.remote_folder_browser.as_mut() {
                 browser.loading = false;
@@ -59,25 +60,20 @@ impl Shell {
             cx.notify();
             return;
         };
-        let (path, generation, target) = {
+        let (path, generation) = {
             let Some(browser) = self.remote_folder_browser.as_mut() else {
                 return;
             };
             browser.loading = true;
             browser.error = None;
             browser.generation += 1;
-            (
-                browser.path.clone(),
-                browser.generation,
-                browser.device.id.clone(),
-            )
+            (browser.path.clone(), browser.generation)
         };
         let client = engine.client_arc();
         cx.spawn(async move |this, cx| {
-            // `targetDeviceId` makes the env-scoped EngineRpc relay the call to
-            // the environment's own device — without it ListFolders would be
-            // answered by THIS machine's repos service (local folders).
-            let mut params = serde_json::json!({ "targetDeviceId": target });
+            // This client is already scoped to the selected workspace's own
+            // machine, so no device relay is needed for its filesystem.
+            let mut params = serde_json::json!({});
             if let (Some(path), Some(map)) = (path, params.as_object_mut()) {
                 map.insert("path".into(), path.into());
             }
@@ -125,7 +121,16 @@ impl Shell {
             cx.notify();
             return;
         };
-        self.create_space_at(browser.device, listing.path, cx);
+        if browser.import_destination {
+            if let Some(dialog) = self.import_dialog.as_ref() {
+                dialog
+                    .dest_input
+                    .update(cx, |input, cx| input.set_text(listing.path, cx));
+            }
+            cx.notify();
+        } else {
+            self.create_space_at(browser.device, listing.path, cx);
+        }
     }
 
     /// The browser modal — appended to the shell's overlay list by
@@ -137,7 +142,7 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let theme = Theme::of(cx).clone();
-        let (device, listing, loading, error, focus, scroll) = {
+        let (device, listing, loading, error, focus, scroll, import_destination) = {
             let browser = self.remote_folder_browser.as_mut()?;
             if std::mem::take(&mut browser.focus_pending) {
                 window.focus(&browser.focus, cx);
@@ -149,6 +154,7 @@ impl Shell {
                 browser.error.clone(),
                 browser.focus.clone(),
                 browser.list_scroll.clone(),
+                browser.import_destination,
             )
         };
         let device_label = self
@@ -257,7 +263,11 @@ impl Shell {
             }))
             .child(popover::dialog_title(
                 &theme,
-                &format!("Add project on {device_label}"),
+                &if import_destination {
+                    format!("Choose destination on {device_label}")
+                } else {
+                    format!("Add project on {device_label}")
+                },
             ))
             .child(
                 div()
@@ -286,11 +296,18 @@ impl Shell {
                         })),
                     )
                     .child(
-                        popover::btn_primary(&theme, "Add this folder")
-                            .id("remote-folder-add")
-                            .on_click(
-                                cx.listener(|this, _, _, cx| this.remote_folder_browser_submit(cx)),
-                            ),
+                        popover::btn_primary(
+                            &theme,
+                            if import_destination {
+                                "Use this folder"
+                            } else {
+                                "Add this folder"
+                            },
+                        )
+                        .id("remote-folder-add")
+                        .on_click(
+                            cx.listener(|this, _, _, cx| this.remote_folder_browser_submit(cx)),
+                        ),
                     ),
             )
             .into_any_element();

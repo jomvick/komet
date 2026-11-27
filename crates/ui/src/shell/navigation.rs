@@ -143,6 +143,8 @@ pub enum Route {
 pub enum RightSurface {
     #[default]
     Picker,
+    /// Independent new-session canvas hosted in the right pane.
+    NewSession,
     Browser,
     Files,
     File(u64),

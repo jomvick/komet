@@ -478,11 +478,10 @@ impl Shell {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let (label, host, status, rows, active_id) = {
+        let (label, status, rows, active_id) = {
             let state = self.state.read(cx);
             (
                 state.active_workspace_label(),
-                state.active_workspace_host(),
                 state.active_workspace_status(),
                 state.workspace_switcher(),
                 state.active_workspace.clone(),
@@ -495,58 +494,34 @@ impl Shell {
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(Theme::SPACE_SM))
-            .h(px(28.0))
-            .px(px(Theme::SPACE_SM))
+            .gap(px(10.0))
+            .h(px(50.0))
+            .px(px(10.0))
             .rounded(px(8.0))
             .cursor_pointer()
-            .text_size(px(12.0))
+            .text_size(px(13.0))
             .font_weight(gpui::FontWeight::MEDIUM)
-            .text_color(motion::hover_blend(
+            .text_color(theme.text)
+            .bg(motion::hover_blend(
                 "workspace-switcher",
-                theme.text.opacity(0.8),
-                theme.text,
+                theme.element_hover,
+                theme.glass_hover(),
             ))
-            .bg(if open {
-                theme.glass_hover()
-            } else {
-                motion::hover_blend(
-                    "workspace-switcher",
-                    theme.glass_hover().opacity(0.0),
-                    theme.glass_hover(),
-                )
-            })
+            .when(open, |el| el.bg(theme.glass_hover()))
             .on_hover(motion::hover_listener("workspace-switcher", cx.entity_id()))
             .on_click(cx.listener(|this, _, _, cx| this.toggle_devices_menu(cx)))
-            .child(self.workspace_dot(status, theme))
             .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .flex()
-                    .flex_col()
-                    .child(div().truncate().child(label))
-                    // The host is the point of the badge: two workspaces can
-                    // carry the same label (a VPS re-paired later), and the
-                    // machine you are actually working on must be visible
-                    // without opening the switcher. This computer has no host.
-                    .when(!host.is_empty(), |el| {
-                        el.child(
-                            div()
-                                .truncate()
-                                .text_size(px(10.0))
-                                .font_weight(gpui::FontWeight::NORMAL)
-                                .text_color(theme.text_muted.opacity(0.8))
-                                .child(host),
-                        )
-                    }),
+                icon(if active_id == LOCAL_ENV_ID {
+                    icons::MONITOR
+                } else {
+                    icons::CLOUD
+                })
+                .size(px(15.0))
+                .flex_none()
+                .text_color(theme.text_muted),
             )
-            .child(
-                icon(icons::ALT_ARROW_DOWN)
-                    .size(px(12.0))
-                    .flex_none()
-                    .text_color(theme.text_muted.opacity(0.6)),
-            );
+            .child(div().flex_1().min_w_0().truncate().child(label))
+            .child(self.workspace_dot(status, theme));
         let strip = |inner: AnyElement| {
             div()
                 .flex_none()

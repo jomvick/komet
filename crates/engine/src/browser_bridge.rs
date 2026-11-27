@@ -113,7 +113,16 @@ impl BrowserBridge {
         let mut kept = VecDeque::new();
         let mut live = Vec::new();
         while let Some(job) = pending.pop_front() {
-            if live.len() < max && self.waiter_alive(&job.id) {
+            if !self.waiter_alive(&job.id) {
+                // The caller was aborted or timed out: drop the job and its
+                // stale waiter entry instead of leaving them queued forever.
+                self.waiters
+                    .lock()
+                    .expect("waiters poisoned")
+                    .remove(&job.id);
+                continue;
+            }
+            if live.len() < max {
                 live.push(job);
             } else {
                 kept.push_back(job);
@@ -124,11 +133,15 @@ impl BrowserBridge {
     }
 
     /// Vrai si le caller du job est toujours en attente (pas encore expiré).
+    /// A waiter is alive only while its receiver is still held. `contains_key`
+    /// is not enough: aborting the caller drops the receiver but leaves the
+    /// sender in the map, and `Sender::is_closed()` reports exactly that.
     fn waiter_alive(&self, id: &str) -> bool {
         self.waiters
             .lock()
             .expect("waiters poisoned")
-            .contains_key(id)
+            .get(id)
+            .is_some_and(|sender| !sender.is_closed())
     }
 
     /// Nombre de jobs en attente (diagnostic).
@@ -227,7 +240,9 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(20)).await;
         // le caller meurt (drop du task = waiter perdu)
         handle.abort();
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        // Abort is asynchronous: await it so the task (and its waiter) is
+        // really dropped before asserting, instead of racing on a sleep.
+        let _ = handle.await;
         // le waiter a disparu : le poll ne livre plus le job à l'exécuteur
         assert!(bridge.poll(8).is_empty());
     }

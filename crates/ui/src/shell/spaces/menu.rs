@@ -331,16 +331,12 @@ impl Shell {
                 let (worktrees_enabled, settings_enabled) =
                     self.project_menu_action_availability(cx);
                 match self.spaces_menu.get().map(|menu| (menu.page, menu.active)) {
-                    Some((SpacesMenuPage::Actions, 0)) => {
-                        self.open_project_menu_page(SpacesMenuPage::Projects, window, cx);
-                        return;
-                    }
-                    Some((SpacesMenuPage::Actions, 1)) if worktrees_enabled => {
+                    Some((SpacesMenuPage::Actions, 0)) if worktrees_enabled => {
                         self.open_project_menu_worktrees(window, cx);
                         return;
                     }
                     Some((SpacesMenuPage::Actions, active))
-                        if settings_enabled && active == 1 + usize::from(worktrees_enabled) =>
+                        if settings_enabled && active == usize::from(worktrees_enabled) =>
                     {
                         self.open_project_menu_page(SpacesMenuPage::Settings, window, cx);
                         return;

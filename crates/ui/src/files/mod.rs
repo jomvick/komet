@@ -10,7 +10,8 @@ use gpui::{
     Context, Entity, EventEmitter, FocusHandle, ListAlignment, ListState, Pixels, Point, Render,
     SharedString, Subscription, Task, Window, div, prelude::*, px,
 };
-use komet_proto::ListWorkspaceDirectoryRequest;
+use komet_proto::{CheckoutDiff, ListWorkspaceDirectoryRequest};
+use komet_rpc::methods;
 
 use crate::{
     composer::{ComposerInput, ComposerInputEvent},
@@ -21,6 +22,7 @@ pub mod client;
 pub mod document;
 pub mod editor;
 pub mod editor_adapter;
+pub mod image;
 pub mod model;
 pub mod preview;
 pub mod search;
@@ -164,6 +166,9 @@ pub struct FilesSurface {
     watch_task: Option<Task<()>>,
     watch_sequence: Option<u64>,
     watch_error: Option<SharedString>,
+    git_status: HashMap<String, String>,
+    git_status_for: Option<FilesRequestContext>,
+    git_status_task: Option<Task<()>>,
     preview: FilePreviewState,
     editor_context_menu: crate::popover::Popup<EditorContextMenu>,
     loads: HashMap<(String, Option<String>), Task<()>>,
@@ -282,7 +287,43 @@ impl Render for FilesSurface {
             && self.preview.has_active()
             && self.preview.is_wide()
             && self.preview.tree_sidebar_visible();
-        let body = if wide {
+        let body = if !is_editor {
+            let main = if self.preview.has_active() {
+                self.render_preview(window, cx)
+            } else {
+                div()
+                    .size_full()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .gap(px(12.0))
+                    .text_size(px(12.0))
+                    .text_color(theme.text_muted.opacity(0.7))
+                    .child(
+                        crate::icons::icon(crate::icons::FOLDER_WITH_FILES)
+                            .size(px(22.0))
+                            .text_color(theme.text_muted.opacity(0.45)),
+                    )
+                    .child("Select a file from the navigation")
+                    .into_any_element()
+            };
+            div()
+                .size_full()
+                .min_w_0()
+                .flex()
+                .child(
+                    div()
+                        .w(px(220.0))
+                        .h_full()
+                        .flex_none()
+                        .border_r_1()
+                        .border_color(theme.border)
+                        .child(tree_pane),
+                )
+                .child(div().flex_1().min_w_0().h_full().child(main))
+                .into_any_element()
+        } else if wide {
             div()
                 .size_full()
                 .min_w_0()
@@ -380,6 +421,21 @@ struct FilesSurfaceParams {
     show_all_files: bool,
 }
 
+fn status_by_path(diff: &CheckoutDiff) -> HashMap<String, String> {
+    let mut statuses = HashMap::new();
+    for file in &diff.files {
+        statuses.insert(file.path.clone(), file.status.clone());
+        let mut parent = file.path.rsplit_once('/').map(|(parent, _)| parent);
+        while let Some(path) = parent.filter(|path| !path.is_empty()) {
+            statuses
+                .entry(path.to_string())
+                .or_insert_with(|| "modified".to_string());
+            parent = path.rsplit_once('/').map(|(parent, _)| parent);
+        }
+    }
+    statuses
+}
+
 impl FilesSurface {
     pub fn new(
         state: Entity<AppState>,
@@ -446,7 +502,7 @@ impl FilesSurface {
         cx: &mut Context<Self>,
     ) -> Self {
         let search = cx.new(|cx| {
-            ComposerInput::new("Search files", cx)
+            ComposerInput::new("Search files…", cx)
                 .with_accessibility_role(gpui::Role::SearchInput)
                 .with_text_metrics(11.0, 16.0)
         });
@@ -500,6 +556,9 @@ impl FilesSurface {
             watch_task: None,
             watch_sequence: None,
             watch_error: None,
+            git_status: HashMap::new(),
+            git_status_for: None,
+            git_status_task: None,
             preview: FilePreviewState::new(autosave_delay_ms, word_wrap, editor_font_size),
             editor_context_menu: crate::popover::Popup::default(),
             loads: HashMap::new(),
@@ -667,6 +726,7 @@ impl FilesSurface {
             return;
         }
         self.ensure_watch(cx);
+        self.load_git_status(cx);
         if self.presentation.is_editor()
             && !self.preview.has_active()
             && let Some(path) = self.editor_path.clone()
@@ -693,6 +753,9 @@ impl FilesSurface {
         self.sync_tree_list();
         self.started = true;
         self.load_directory(String::new(), None, cx);
+        self.git_status.clear();
+        self.git_status_for = None;
+        self.load_git_status(cx);
     }
 
     pub fn tab_title(&self) -> SharedString {
@@ -715,16 +778,16 @@ impl FilesSurface {
             return;
         }
 
-        self.presentation = FilesPresentation::Editor;
-        self.editor_path = Some(path.clone());
         self.open_file(path, cx);
-        cx.emit(FilesEvent::TitleChanged);
     }
 
-    fn toggle_ignored(&mut self, cx: &mut Context<Self>) {
-        cx.emit(FilesEvent::ShowAllFilesChanged(
-            !self.tree.include_ignored(),
-        ));
+    pub(super) fn open_preview_in_editor(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self.preview.active_path().map(str::to_string) else {
+            return;
+        };
+        self.presentation = FilesPresentation::Editor;
+        self.editor_path = Some(path);
+        cx.emit(FilesEvent::TitleChanged);
     }
 
     fn apply_show_all_files(&mut self, show_all_files: bool, cx: &mut Context<Self>) {
@@ -860,6 +923,9 @@ impl FilesSurface {
         self.watch_task = None;
         self.watch_sequence = None;
         self.watch_error = None;
+        self.git_status.clear();
+        self.git_status_for = None;
+        self.git_status_task = None;
         self.editor_context_menu = crate::popover::Popup::default();
         self.preview.reset();
         self.tree.reset();
@@ -873,6 +939,55 @@ impl FilesSurface {
         self.started = false;
     }
 
+    fn load_git_status(&mut self, cx: &mut Context<Self>) {
+        let Some(context) = self.request_context.clone() else {
+            return;
+        };
+        if self.git_status_for.as_ref() == Some(&context) {
+            return;
+        }
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        let mut params = serde_json::Map::new();
+        params.insert("cwd".into(), serde_json::Value::String(context.cwd.clone()));
+        params.insert(
+            "mode".into(),
+            serde_json::Value::String("workingTree".into()),
+        );
+        if let Some(chat_id) = context.target.chat_id.clone() {
+            params.insert("chatId".into(), serde_json::Value::String(chat_id));
+        }
+        if let Some(target) = context.target_device_id.clone() {
+            params.insert("targetDeviceId".into(), serde_json::Value::String(target));
+        }
+        self.git_status_for = Some(context.clone());
+        self.git_status_task = Some(cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(
+                    methods::GET_CHECKOUT_DIFF,
+                    serde_json::Value::Object(params),
+                )
+                .await
+                .and_then(|value| {
+                    serde_json::from_value::<CheckoutDiff>(value)
+                        .map_err(|error| komet_rpc::RpcError::Failed(error.to_string()))
+                });
+            this.update(cx, |this, cx| {
+                if this.request_context.as_ref() != Some(&context) {
+                    return;
+                }
+                this.git_status_task = None;
+                if let Ok(diff) = result {
+                    this.git_status = status_by_path(&diff);
+                    cx.notify();
+                }
+            })
+            .ok();
+        }));
+    }
+
     fn sync_tree_list(&self) {
         self.tree_list
             .reset_with_uniform_height(self.tree.visible_rows().len(), px(tree::TREE_ROW_HEIGHT));
@@ -881,77 +996,119 @@ impl FilesSurface {
     fn render_header(
         &mut self,
         theme: &crate::theme::Theme,
-        background: gpui::Hsla,
+        _background: gpui::Hsla,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
+        let root_name = self
+            .request_context
+            .as_ref()
+            .map(|context| {
+                context
+                    .cwd
+                    .trim_end_matches('/')
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or("Workspace")
+                    .to_string()
+            })
+            .unwrap_or_else(|| "Workspace".to_string());
         let include_ignored = self.tree.include_ignored();
-        let icon_button = |id: &'static str| {
-            div()
-                .id(id)
-                .size(px(TOOLBAR_BUTTON_SIZE))
-                .flex_none()
-                .rounded(px(TOOLBAR_BUTTON_RADIUS))
-                .flex()
-                .items_center()
-                .justify_center()
-                .cursor_pointer()
-                .hover(|style| style.bg(crate::theme::wash(0.09)))
-        };
         div()
-            .h(px(31.0))
             .flex_none()
-            .px(px(8.0))
             .flex()
-            .items_center()
-            .gap(px(5.0))
-            .border_t_1()
+            .flex_col()
             .border_b_1()
             .border_color(theme.border)
-            .bg(background)
             .child(
                 div()
-                    .h(px(TOOLBAR_BUTTON_SIZE))
-                    .min_w_0()
-                    .flex_1()
+                    .h(px(42.0))
+                    .flex_none()
                     .px(px(8.0))
-                    .rounded(px(7.0))
-                    .bg(crate::theme::ink(0.035))
                     .flex()
                     .items_center()
-                    .gap(px(6.0))
-                    .text_size(px(11.5))
                     .child(
-                        crate::icons::icon(crate::icons::MAGNIFER)
-                            .size(px(12.0))
-                            .flex_none()
-                            .text_color(theme.text_faint),
-                    )
-                    .child(div().min_w_0().flex_1().child(self.search.clone())),
+                        div()
+                            .h(px(28.0))
+                            .w_full()
+                            .px(px(9.0))
+                            .rounded(px(7.0))
+                            .border_1()
+                            .border_color(theme.border_strong.opacity(0.45))
+                            .bg(theme.input_bg)
+                            .flex()
+                            .items_center()
+                            .gap(px(7.0))
+                            .child(
+                                crate::icons::icon(crate::icons::MAGNIFER)
+                                    .size(px(13.0))
+                                    .flex_none()
+                                    .text_color(theme.text_muted),
+                            )
+                            .child(div().min_w_0().flex_1().child(self.search.clone())),
+                    ),
             )
             .child(
-                icon_button("files-toggle-ignored")
-                    .role(gpui::Role::Button)
-                    .aria_label(if include_ignored {
-                        "Hide hidden and ignored files"
-                    } else {
-                        "Show all files (even hidden)"
-                    })
-                    .when(include_ignored, |element| {
-                        element.bg(crate::theme::wash(0.1))
-                    })
-                    .on_click(cx.listener(|this, _, _, cx| this.toggle_ignored(cx)))
+                div()
+                    .h(px(31.0))
+                    .flex_none()
+                    .px(px(14.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(7.0))
+                    .text_size(px(11.5))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(theme.text_muted)
+                    .child(crate::icons::icon(crate::icons::FOLDER).size(px(13.0)))
+                    .child(div().flex_1().min_w_0().truncate().child(root_name))
                     .child(
-                        crate::icons::icon(if include_ignored {
-                            crate::icons::EYE
-                        } else {
-                            crate::icons::EYE_CLOSED
-                        })
-                        .size(px(12.5))
-                        .text_color(if include_ignored {
-                            theme.text
-                        } else {
-                            theme.text_muted
-                        }),
+                        div()
+                            .id("files-toggle-show-ignored")
+                            .size(px(23.0))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(5.0))
+                            .cursor_pointer()
+                            .hover(|style| style.bg(crate::theme::wash(0.08)))
+                            .role(gpui::Role::Button)
+                            .aria_label(if include_ignored {
+                                "Hide ignored files"
+                            } else {
+                                "Show ignored files"
+                            })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.apply_show_all_files(!include_ignored, cx);
+                            }))
+                            .child(
+                                crate::icons::icon(if include_ignored {
+                                    crate::icons::EYE
+                                } else {
+                                    crate::icons::EYE_CLOSED
+                                })
+                                .size(px(13.0))
+                                .text_color(theme.text_muted),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("files-refresh")
+                            .size(px(23.0))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(5.0))
+                            .cursor_pointer()
+                            .hover(|style| style.bg(crate::theme::wash(0.08)))
+                            .role(gpui::Role::Button)
+                            .aria_label("Refresh files")
+                            .on_click(cx.listener(|this, _, _, cx| this.refresh(cx)))
+                            .child(
+                                crate::icons::icon(crate::icons::REFRESH)
+                                    .size(px(13.0))
+                                    .text_color(theme.text_muted),
+                            ),
                     ),
             )
     }

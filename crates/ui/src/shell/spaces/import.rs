@@ -47,14 +47,19 @@ struct GitView {
 pub(crate) struct ImportDialog {
     /// Workspace the project is copied FROM (an env id, `local` included).
     source_env: String,
+    /// Device picked in the canvas project picker, when it differs from that
+    /// workspace's own machine. Cleared when the user changes the source.
+    source_device: Option<String>,
     source_input: Entity<ComposerInput>,
     /// Base folder on the DESTINATION workspace.
-    dest_input: Entity<ComposerInput>,
+    pub(super) dest_input: Entity<ComposerInput>,
     include_secrets: bool,
     /// Git mode clones the remote on the destination instead of streaming the
     /// archive; only offered when the plan found a reachable remote.
     git_mode: bool,
     plan: Option<PlanView>,
+    /// Continue the import automatically after its first project inspection.
+    import_after_plan: bool,
     busy: bool,
     /// Bytes moved / total while the archive streams.
     progress: Option<(u64, u64)>,
@@ -78,7 +83,10 @@ impl Shell {
     /// view, source folder = the selected project (when there is one).
     pub(crate) fn open_import_dialog(&mut self, cx: &mut Context<Self>) {
         self.close_spaces_menu(cx);
-        let (source_env, seed_path, seed_dest) = {
+        let pending = self
+            .state
+            .update(cx, |state, _| state.pending_import.take());
+        let (source_env, seed_path) = {
             let state = self.state.read(cx);
             let source_env = state.active_workspace.clone();
             let seed_path = self
@@ -88,27 +96,25 @@ impl Shell {
                 .or_else(|| state.selected_space.clone())
                 .and_then(|id| state.space_row(&id).map(|s| s.path.clone()))
                 .unwrap_or_default();
-            let seed_dest = state
-                .space_row(&self.settings.space_filter.clone().unwrap_or_default())
-                .and_then(|s| {
-                    s.path
-                        .rsplit_once('/')
-                        .map(|(parent, _)| parent.to_string())
-                })
-                .unwrap_or_else(|| "~".to_string());
-            (source_env, seed_path, seed_dest)
+            (source_env, seed_path)
+        };
+        let (source_env, seed_path, source_device) = match pending {
+            Some((env, path, device)) => (env, path, Some(device)),
+            None => (source_env, seed_path, None),
         };
         let source_input = cx.new(|cx| ComposerInput::new("Source folder", cx));
         source_input.update(cx, |input, cx| input.set_text(seed_path, cx));
         let dest_input = cx.new(|cx| ComposerInput::new("Destination folder", cx));
-        dest_input.update(cx, |input, cx| input.set_text(seed_dest, cx));
+        dest_input.update(cx, |input, cx| input.set_text(String::new(), cx));
         self.import_dialog = Some(ImportDialog {
             source_env,
+            source_device,
             source_input,
             dest_input,
             include_secrets: false,
             git_mode: true,
             plan: None,
+            import_after_plan: false,
             busy: false,
             progress: None,
             error: None,
@@ -122,10 +128,86 @@ impl Shell {
         cx.notify();
     }
 
+    /// Open the destination folder chooser on the active workspace's device.
+    pub(crate) fn choose_import_destination(&mut self, cx: &mut Context<Self>) {
+        let (device_id, devices, local_workspace) = {
+            let state = self.state.read(cx);
+            (
+                state.workspace_device_for(&state.active_workspace),
+                state.devices.clone(),
+                state.is_local_workspace(),
+            )
+        };
+        let Some(device_id) = device_id else {
+            if let Some(dialog) = self.import_dialog.as_mut() {
+                dialog.error = Some("The destination workspace has no reachable device.".into());
+            }
+            cx.notify();
+            return;
+        };
+        let Some(device) = devices.into_iter().find(|device| device.id == device_id) else {
+            if let Some(dialog) = self.import_dialog.as_mut() {
+                dialog.error =
+                    Some("The destination device is still loading. Try again shortly.".into());
+            }
+            cx.notify();
+            return;
+        };
+        if local_workspace {
+            let receiver = cx.prompt_for_paths(gpui::PathPromptOptions {
+                files: false,
+                directories: true,
+                multiple: false,
+                prompt: Some("Choose import destination folder".into()),
+            });
+            cx.spawn(async move |this, cx| match receiver.await {
+                Ok(Ok(Some(paths))) => {
+                    if let Some(path) = paths.first() {
+                        let path = path.to_string_lossy().into_owned();
+                        let _ = this.update(cx, |shell, cx| {
+                            if let Some(dialog) = shell.import_dialog.as_ref() {
+                                dialog
+                                    .dest_input
+                                    .update(cx, |input, cx| input.set_text(path, cx));
+                            }
+                            cx.notify();
+                        });
+                    }
+                }
+                Ok(Ok(None)) | Ok(Err(_)) | Err(_) => {}
+            })
+            .detach();
+            return;
+        }
+        self.remote_folder_browser = Some(RemoteFolderBrowser {
+            device,
+            path: None,
+            listing: None,
+            loading: false,
+            error: None,
+            generation: 0,
+            focus: cx.focus_handle(),
+            focus_pending: true,
+            list_scroll: gpui::ScrollHandle::new(),
+            import_destination: true,
+        });
+        self.remote_folder_browser_load(cx);
+        cx.notify();
+    }
+
     /// The device that owns a workspace's filesystem: this machine for `local`,
     /// the paired workspace's home device otherwise.
     fn workspace_device(&self, env_id: &str, cx: &App) -> Option<String> {
         self.state.read(cx).workspace_device_for(env_id)
+    }
+
+    /// A project picked on a machine that is not its workspace's own needs an
+    /// explicit source device — `workspace_device_for` would name the wrong one.
+    fn dialog_source_device(&self, env_id: &str, cx: &App) -> Option<String> {
+        self.import_dialog
+            .as_ref()
+            .and_then(|dialog| dialog.source_device.clone())
+            .or_else(|| self.workspace_device(env_id, cx))
     }
 
     /// Ask the SOURCE device to inspect the folder; nothing is copied yet.
@@ -142,10 +224,15 @@ impl Shell {
             cx.notify();
             return;
         }
-        let Some(engine) = self.state.read(cx).engine().cloned() else {
+        let Some(client) = self.state.read(cx).workspace_rpc_client(&source_env) else {
+            if let Some(dialog) = self.import_dialog.as_mut() {
+                dialog.import_after_plan = false;
+                dialog.error = Some("The workspace connection is unavailable.".into());
+            }
+            cx.notify();
             return;
         };
-        let Some(device) = self.workspace_device(&source_env, cx) else {
+        let Some(device) = self.dialog_source_device(&source_env, cx) else {
             if let Some(dialog) = self.import_dialog.as_mut() {
                 dialog.error = Some("That workspace has no reachable device.".into());
             }
@@ -159,15 +246,23 @@ impl Shell {
             dialog.done = None;
         }
         cx.notify();
-        let client = engine.client_arc();
+        let target_device = {
+            let state = self.state.read(cx);
+            (state.workspace_device_for(&source_env).as_deref() != Some(device.as_str()))
+                .then_some(device.clone())
+        };
         cx.spawn(async move |this, cx| {
             let result = client
                 .call(
                     methods::PROJECT_TRANSFER_PLAN,
-                    serde_json::json!({ "path": path, "targetDeviceId": device }),
+                    with_target_device(
+                        serde_json::json!({ "path": path }),
+                        target_device.as_deref(),
+                    ),
                 )
                 .await;
             this.update(cx, |shell, cx| {
+                let mut continue_import = false;
                 if let Some(dialog) = shell.import_dialog.as_mut() {
                     dialog.busy = false;
                     match result {
@@ -179,17 +274,47 @@ impl Shell {
                                 // `git_allowed`).
                                 dialog.git_mode = plan.git_ready && plan.secrets.is_empty();
                                 dialog.plan = Some(plan);
+                                continue_import = std::mem::take(&mut dialog.import_after_plan);
                             }
-                            Err(err) => dialog.error = Some(format!("unexpected plan: {err}")),
+                            Err(err) => {
+                                dialog.import_after_plan = false;
+                                dialog.error = Some(format!("unexpected plan: {err}"));
+                            }
                         },
-                        Err(err) => dialog.error = Some(err.to_string()),
+                        Err(err) => {
+                            dialog.import_after_plan = false;
+                            dialog.error = Some(err.to_string());
+                        }
                     }
                 }
                 cx.notify();
+                if continue_import {
+                    shell.start_import(cx);
+                }
             })
             .ok();
         })
         .detach();
+    }
+
+    /// The primary action inspects a project on first click, then proceeds
+    /// directly with the import once the plan is ready.
+    pub(crate) fn import_or_prepare(&mut self, cx: &mut Context<Self>) {
+        let Some(dialog) = self.import_dialog.as_mut() else {
+            return;
+        };
+        if dialog.dest_input.read(cx).text().trim().is_empty() {
+            dialog.error = Some("Choose the destination folder to continue.".into());
+            cx.notify();
+            self.choose_import_destination(cx);
+            return;
+        }
+        if dialog.plan.is_some() {
+            self.start_import(cx);
+        } else {
+            dialog.import_after_plan = true;
+            self.request_import_plan(cx);
+        }
     }
 
     /// Run the archive transfer: export on the source device, stream the chunks
@@ -206,11 +331,21 @@ impl Shell {
         let git_mode = dialog.git_mode && dialog.git_allowed();
         let dest_base = dialog.dest_input.read(cx).text().trim().to_string();
         let dest_env = self.state.read(cx).active_workspace.clone();
-        let Some(engine) = self.state.read(cx).engine().cloned() else {
+        let (Some(source_client), Some(dest_client)) = ({
+            let state = self.state.read(cx);
+            (
+                state.workspace_rpc_client(&source_env),
+                state.workspace_rpc_client(&dest_env),
+            )
+        }) else {
+            if let Some(dialog) = self.import_dialog.as_mut() {
+                dialog.error = Some("The source or destination workspace is not connected.".into());
+            }
+            cx.notify();
             return;
         };
         let (Some(source_dev), Some(dest_dev)) = (
-            self.workspace_device(&source_env, cx),
+            self.dialog_source_device(&source_env, cx),
             self.workspace_device(&dest_env, cx),
         ) else {
             if let Some(dialog) = self.import_dialog.as_mut() {
@@ -259,7 +394,15 @@ impl Shell {
         }
         cx.notify();
 
-        let client = engine.client_arc();
+        let (source_target, dest_target) = {
+            let state = self.state.read(cx);
+            (
+                (state.workspace_device_for(&source_env).as_deref() != Some(source_dev.as_str()))
+                    .then_some(source_dev.clone()),
+                (state.workspace_device_for(&dest_env).as_deref() != Some(dest_dev.as_str()))
+                    .then_some(dest_dev.clone()),
+            )
+        };
         let source_path = plan.path.clone();
         let name = plan.name.clone();
         let remote = plan.git.as_ref().and_then(|git| git.remote.clone());
@@ -269,8 +412,8 @@ impl Shell {
                 let outcome = match remote {
                     Some(remote) => {
                         clone_project(
-                            client.clone(),
-                            &dest_dev,
+                            dest_client.clone(),
+                            dest_target.as_deref(),
                             &remote,
                             branch.as_deref(),
                             &dest_base,
@@ -286,11 +429,12 @@ impl Shell {
                 }
             } else {
                 match transfer_archive(
-                    client.clone(),
-                    &source_dev,
+                    source_client.clone(),
+                    dest_client.clone(),
+                    source_target.as_deref(),
                     &source_path,
                     include_secrets,
-                    &dest_dev,
+                    dest_target.as_deref(),
                     &dest_base,
                     &name,
                 )
@@ -310,7 +454,7 @@ impl Shell {
             let mut error = None;
             if let Some(path) = &created_path {
                 let space_id = uuid::Uuid::new_v4().to_string();
-                if let Err(err) = client
+                if let Err(err) = dest_client
                     .call(
                         methods::MUTATE,
                         serde_json::json!({
@@ -372,6 +516,18 @@ impl Shell {
             dialog.git_mode && dialog.git_allowed(),
         );
         let workspaces = self.state.read(cx).workspace_switcher();
+        let destination_env = self.state.read(cx).active_workspace.clone();
+        let destination_label = workspaces
+            .iter()
+            .find(|row| row.id == destination_env)
+            .map(|row| {
+                if row.host.is_empty() {
+                    row.label.clone()
+                } else {
+                    format!("{} · {}", row.label, row.host)
+                }
+            })
+            .unwrap_or_else(|| destination_env.clone());
         let plan = dialog.plan.clone();
         let error = dialog.error.clone();
         let done = dialog.done.clone();
@@ -380,13 +536,12 @@ impl Shell {
         let dest_input = dialog.dest_input.clone();
 
         let mut card = popover::dialog_card(&theme)
-            .w(px(460.0))
-            .child(popover::dialog_title(&theme, "Import project"))
+            .w(px(560.0))
+            .child(popover::dialog_title(&theme, "Import a project"))
             .child(
                 popover::dialog_body(
                     &theme,
-                    "Copy a project folder from another workspace. Its chats stay where they \
-                     are; the project is copied, not moved.",
+                    "Choose what to copy, then where it should go. The original project stays in place.",
                 )
                 .mt(px(6.0)),
             )
@@ -396,7 +551,7 @@ impl Shell {
                     .flex()
                     .flex_col()
                     .gap(px(10.0))
-                    // Source workspace: one chip per row, the active one marked.
+                    .child(div().text_size(px(11.0)).text_color(theme.text_muted).child("FROM · SOURCE WORKSPACE"))
                     .child(div().flex().flex_row().flex_wrap().gap(px(6.0)).children(
                         workspaces.into_iter().map(|row| {
                             let selected = row.id == source_env;
@@ -412,6 +567,7 @@ impl Shell {
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     if let Some(dialog) = this.import_dialog.as_mut() {
                                         dialog.source_env = id.clone();
+                                        dialog.source_device = None;
                                         dialog.plan = None;
                                     }
                                     cx.notify();
@@ -419,7 +575,22 @@ impl Shell {
                         }),
                     ))
                     .child(popover::dialog_field(source_input.into_any_element()))
-                    .child(popover::dialog_field(dest_input.into_any_element())),
+                    .child(
+                        div()
+                            .flex()
+                            .justify_center()
+                            .py(px(2.0))
+                            .child(icons::icon(icons::ALT_ARROW_DOWN).size(px(15.0)).text_color(theme.accent)),
+                    )
+                    .child(div().text_size(px(11.0)).text_color(theme.text_muted).child("TO · DESTINATION WORKSPACE"))
+                    .child(div().text_size(px(13.0)).text_color(theme.text).child(SharedString::from(destination_label)))
+                    .child(div().flex().flex_row().items_center().gap(px(8.0))
+                        .child(popover::btn_ghost(&theme, "Choose destination folder…", "import-choose-destination", cx.entity_id())
+                            .id("import-choose-destination")
+                            .on_click(cx.listener(|this, _, _, cx| this.choose_import_destination(cx))))
+                        .child(div().flex_1().text_size(px(12.0)).text_color(theme.text_muted)
+                            .child(SharedString::from(if dest_input.read(cx).text().is_empty() { "No destination selected".to_string() } else { dest_input.read(cx).text().to_string() }))))
+                    ,
             );
 
         if let Some(plan) = &plan {
@@ -628,7 +799,7 @@ impl Shell {
                 .child(
                     popover::btn_primary(&theme, if busy { "Importing…" } else { "Import" })
                         .id("import-start")
-                        .on_click(cx.listener(|this, _, _, cx| this.start_import(cx))),
+                        .on_click(cx.listener(|this, _, _, cx| this.import_or_prepare(cx))),
                 ),
         );
         Some(popover::modal(
@@ -650,23 +821,23 @@ fn git_mode_allowed(plan: &PlanView, include_secrets: bool) -> bool {
 /// URL/branch metadata crosses the wire.
 async fn clone_project(
     client: std::sync::Arc<komet_rpc::RpcClient>,
-    dest_dev: &str,
+    target_device: Option<&str>,
     remote: &str,
     branch: Option<&str>,
     base_path: &str,
     name: &str,
 ) -> Result<String, String> {
+    let params = with_target_device(
+        serde_json::json!({
+            "remote": remote,
+            "branch": branch,
+            "basePath": base_path,
+            "name": name,
+        }),
+        target_device,
+    );
     let value = client
-        .call(
-            methods::PROJECT_CLONE,
-            serde_json::json!({
-                "remote": remote,
-                "branch": branch,
-                "basePath": base_path,
-                "name": name,
-                "targetDeviceId": dest_dev,
-            }),
-        )
+        .call(methods::PROJECT_CLONE, params)
         .await
         .map_err(|err| format!("git clone failed: {err}"))?;
     Ok(value
@@ -697,22 +868,25 @@ struct TransferDone {
 }
 
 async fn transfer_archive(
-    client: std::sync::Arc<komet_rpc::RpcClient>,
-    source_dev: &str,
+    source_client: std::sync::Arc<komet_rpc::RpcClient>,
+    dest_client: std::sync::Arc<komet_rpc::RpcClient>,
+    source_target: Option<&str>,
     source_path: &str,
     include_secrets: bool,
-    dest_dev: &str,
+    dest_target: Option<&str>,
     dest_base: &str,
     name: &str,
 ) -> Result<TransferDone, String> {
-    let opened = client
+    let opened = source_client
         .call(
             methods::PROJECT_EXPORT_OPEN,
-            serde_json::json!({
-                "path": source_path,
-                "includeSecrets": include_secrets,
-                "targetDeviceId": source_dev,
-            }),
+            with_target_device(
+                serde_json::json!({
+                    "path": source_path,
+                    "includeSecrets": include_secrets,
+                }),
+                source_target,
+            ),
         )
         .await
         .map_err(|err| format!("export failed: {err}"))?;
@@ -728,15 +902,17 @@ async fn transfer_archive(
         .unwrap_or_default()
         .to_string();
 
-    let begun = client
+    let begun = dest_client
         .call(
             methods::PROJECT_IMPORT_BEGIN,
-            serde_json::json!({
-                "name": name,
-                "bytes": bytes,
-                "sha256": sha,
-                "targetDeviceId": dest_dev,
-            }),
+            with_target_device(
+                serde_json::json!({
+                    "name": name,
+                    "bytes": bytes,
+                    "sha256": sha,
+                }),
+                dest_target,
+            ),
         )
         .await
         .map_err(|err| format!("import begin failed: {err}"))?;
@@ -752,23 +928,28 @@ async fn transfer_archive(
         .div_ceil(komet_engine::project_transfer::CHUNK_BYTES)
         .max(1);
     loop {
-        let chunk = match client
+        let chunk = match source_client
             .call(
                 methods::PROJECT_EXPORT_CHUNK,
-                serde_json::json!({
-                    "transferId": transfer_id,
-                    "offset": offset,
-                    "targetDeviceId": source_dev,
-                }),
+                with_target_device(
+                    serde_json::json!({
+                        "transferId": transfer_id,
+                        "offset": offset,
+                    }),
+                    source_target,
+                ),
             )
             .await
         {
             Ok(chunk) => chunk,
             Err(err) => {
-                let _ = client
+                let _ = dest_client
                     .call(
                         methods::PROJECT_TRANSFER_CANCEL,
-                        serde_json::json!({ "transferId": import_id, "targetDeviceId": dest_dev }),
+                        with_target_device(
+                            serde_json::json!({ "transferId": import_id }),
+                            dest_target,
+                        ),
                     )
                     .await;
                 return Err(format!("export chunk failed: {err}"));
@@ -782,15 +963,17 @@ async fn transfer_archive(
             .get("nextOffset")
             .and_then(|v| v.as_u64())
             .unwrap_or(bytes);
-        client
+        dest_client
             .call(
                 methods::PROJECT_IMPORT_CHUNK,
-                serde_json::json!({
-                    "transferId": import_id,
-                    "offset": offset,
-                    "data": data,
-                    "targetDeviceId": dest_dev,
-                }),
+                with_target_device(
+                    serde_json::json!({
+                        "transferId": import_id,
+                        "offset": offset,
+                        "data": data,
+                    }),
+                    dest_target,
+                ),
             )
             .await
             .map_err(|err| format!("import chunk failed: {err}"))?;
@@ -800,15 +983,17 @@ async fn transfer_archive(
             break;
         }
     }
-    let committed = client
+    let committed = dest_client
         .call(
             methods::PROJECT_IMPORT_COMMIT,
-            serde_json::json!({
-                "transferId": import_id,
-                "basePath": dest_base,
-                "name": name,
-                "targetDeviceId": dest_dev,
-            }),
+            with_target_device(
+                serde_json::json!({
+                    "transferId": import_id,
+                    "basePath": dest_base,
+                    "name": name,
+                }),
+                dest_target,
+            ),
         )
         .await
         .map_err(|err| format!("import commit failed: {err}"))?;
@@ -822,6 +1007,13 @@ async fn transfer_archive(
         chunks,
         total_chunks,
     })
+}
+
+fn with_target_device(mut params: serde_json::Value, target: Option<&str>) -> serde_json::Value {
+    if let (Some(target), Some(object)) = (target, params.as_object_mut()) {
+        object.insert("targetDeviceId".into(), target.into());
+    }
+    params
 }
 
 #[cfg(test)]

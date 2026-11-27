@@ -36,10 +36,12 @@ use komet_doc::{
 };
 use komet_harness::{
     CancellationToken, Harness, RunControls, SteerMessage, capabilities::supports_dynamic_mcp_bool,
+    errors::classify_error,
 };
 use komet_proto::{
-    AgentEvent, CompactionStatus, ContextUsageSource, DoneReason, DoneStatus, ErrorKind, HarnessId,
-    RunPhase, RunRequest, Session, SessionStatus, UserInputAnswer, UserInputQuestion,
+    AgentEvent, CompactionStatus, ContextHandoff, ContextSource, ContextSourceKind,
+    ContextUsageSource, DoneReason, DoneStatus, ErrorKind, HarnessId, RunCause, RunPhase,
+    RunRequest, Session, SessionStatus, UserInputAnswer, UserInputQuestion,
 };
 
 use crate::agent_accounts::AgentAccounts;
@@ -91,6 +93,158 @@ fn is_ephemeral(event: &AgentEvent) -> bool {
         AgentEvent::ToolProgress { .. } | AgentEvent::RunPhase { .. } => true,
         AgentEvent::Subagent { event, .. } => is_ephemeral(event),
         _ => false,
+    }
+}
+
+/// Extract a child exit code from the free-text the adapters already carry
+/// ("process exited with code 1", "exit status 143"). Bounded, best-effort:
+/// `None` means the producer did not expose one, never zero.
+fn exit_code_from(message: &str) -> Option<i32> {
+    let lower = message.to_lowercase();
+    for key in ["exit code ", "exited with code ", "exit status "] {
+        if let Some(ix) = lower.find(key) {
+            let tail = &lower[ix + key.len()..];
+            let digits: String = tail.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if let Ok(code) = digits.parse::<i32>() {
+                return Some(code);
+            }
+        }
+    }
+    None
+}
+
+/// Pick the typed Error that explains this terminal frame. A matching message
+/// always wins; when the Done only carries a generic/unknown text (or none),
+/// the run's last typed Error is still the best explanation. A different,
+/// classifiable message is newer evidence and must not be masked.
+fn terminal_error_match<'a>(
+    message: &str,
+    last_error: Option<&'a (String, ErrorKind, Option<String>)>,
+) -> Option<&'a (String, ErrorKind, Option<String>)> {
+    last_error.filter(|(previous, kind, _)| {
+        *kind != ErrorKind::Unknown
+            && (message.trim().is_empty()
+                || previous == message
+                || classify_error(message, None).0 == ErrorKind::Unknown)
+    })
+}
+/// Classify why a `Done` is not `Completed`. The typed `Error` the harness
+/// already emitted wins; otherwise the Done's own error text and reason are
+/// classified, with protocol/process markers as the last resort.
+fn run_cause(
+    status: DoneStatus,
+    error: Option<&str>,
+    reason: Option<DoneReason>,
+    last_error: Option<&(String, ErrorKind, Option<String>)>,
+) -> RunCause {
+    if status == DoneStatus::Interrupted {
+        return match reason {
+            Some(DoneReason::EngineRestart) => RunCause::EngineRestart,
+            _ => RunCause::Cancelled,
+        };
+    }
+    let message = error.unwrap_or_default();
+    if let Some((_, kind, _)) = terminal_error_match(message, last_error) {
+        return RunCause::from_error_kind(*kind);
+    }
+    match reason {
+        Some(DoneReason::ChildExit) => {
+            let lower = message.to_lowercase();
+            let crash = lower.contains("exit code")
+                || lower.contains("exit status")
+                || lower.contains("signal")
+                || lower.contains("stderr")
+                || lower.contains("crash");
+            return if crash {
+                RunCause::Crash
+            } else {
+                RunCause::Process
+            };
+        }
+        Some(DoneReason::PromptStall) => return RunCause::Timeout,
+        Some(DoneReason::NoRunningTurn) => return RunCause::Protocol,
+        Some(DoneReason::UserRequested) => return RunCause::Cancelled,
+        Some(DoneReason::EngineRestart) => return RunCause::EngineRestart,
+        _ => {}
+    }
+    let (kind, _) = classify_error(message, None);
+    if kind != ErrorKind::Unknown {
+        return RunCause::from_error_kind(kind);
+    }
+    let lower = message.to_lowercase();
+    let has = |needles: &[&str]| needles.iter().any(|n| lower.contains(n));
+    if has(&[
+        "without done",
+        "without a done",
+        "protocol",
+        "empty turn",
+        "unexpected end",
+        "stream ended",
+    ]) {
+        return RunCause::Protocol;
+    }
+    if has(&[
+        "failed to spawn",
+        "could not spawn",
+        "failed to start",
+        "could not start",
+        "not installed",
+        "launch",
+    ]) {
+        return RunCause::Process;
+    }
+    RunCause::Unknown
+}
+
+/// Terminal frame for a path that knows its cause without a harness Error
+/// (request validation, policy rejection). Published immediately before Done.
+fn explicit_run_outcome(result: DoneStatus, cause: RunCause, message: &str) -> AgentEvent {
+    AgentEvent::RunOutcome {
+        result,
+        cause,
+        message: Some(message.to_owned()),
+        detail: None,
+        exit_code: None,
+    }
+}
+/// Build the additive terminal frame for a non-clean Done. It is published
+/// BEFORE the Done so the journal's "last event is Done" invariant holds.
+fn terminal_outcome(
+    status: DoneStatus,
+    error: Option<&str>,
+    reason: Option<DoneReason>,
+    last_error: Option<&(String, ErrorKind, Option<String>)>,
+) -> AgentEvent {
+    // A user stop / restart is not the run's last provider error: keep those
+    // diagnostics off the cancellation frame so the two stay distinguishable.
+    if status == DoneStatus::Interrupted {
+        return AgentEvent::RunOutcome {
+            result: status,
+            cause: run_cause(status, error, reason, None),
+            message: error
+                .filter(|error| !error.trim().is_empty())
+                .map(ToOwned::to_owned),
+            detail: None,
+            exit_code: None,
+        };
+    }
+    let message = error
+        .filter(|error| !error.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| last_error.map(|(message, _, _)| message.clone()));
+    let cause = run_cause(status, message.as_deref(), reason, last_error);
+    let detail = terminal_error_match(message.as_deref().unwrap_or_default(), last_error)
+        .and_then(|(_, _, detail)| detail.clone());
+    let exit_code = message
+        .as_deref()
+        .and_then(exit_code_from)
+        .or_else(|| detail.as_deref().and_then(exit_code_from));
+    AgentEvent::RunOutcome {
+        result: status,
+        cause,
+        message,
+        detail,
+        exit_code,
     }
 }
 
@@ -1076,6 +1230,10 @@ impl SessionsEngine {
             );
             self.inner.publish(
                 chat_id,
+                &explicit_run_outcome(DoneStatus::Errored, RunCause::Config, &message),
+            );
+            self.inner.publish(
+                chat_id,
                 &AgentEvent::Done {
                     status: DoneStatus::Errored,
                     result: None,
@@ -1123,6 +1281,10 @@ impl SessionsEngine {
             );
             self.inner.publish(
                 chat_id,
+                &explicit_run_outcome(DoneStatus::Errored, RunCause::Config, &message),
+            );
+            self.inner.publish(
+                chat_id,
                 &komet_proto::AgentEvent::Done {
                     status: komet_proto::DoneStatus::Errored,
                     result: None,
@@ -1152,6 +1314,10 @@ impl SessionsEngine {
                         detail: None,
                         retryable: false,
                     },
+                );
+                self.inner.publish(
+                    chat_id,
+                    &explicit_run_outcome(DoneStatus::Errored, RunCause::Config, &message),
                 );
                 self.inner.publish(
                     chat_id,
@@ -1313,6 +1479,7 @@ impl SessionsEngine {
                     to_harness: Some(harness_id.as_str().into()),
                     from_model: None,
                     to_model: None,
+                    context: None,
                 };
                 handle.doc().append_switch_part(&user_id, &marker)?;
             }
@@ -1360,6 +1527,16 @@ impl SessionsEngine {
             };
             resume_injected = request.resume.is_some();
         }
+        let objective = request
+            .prompt
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or_default()
+            .trim()
+            .chars()
+            .take(160)
+            .collect::<String>();
+        let mut transcript_replayed = false;
         if handle.doc().provider_switched()
             && !request.prompt.trim_start().starts_with('/')
             && !request
@@ -1373,6 +1550,7 @@ impl SessionsEngine {
                 .and_then(|mark| mark.seen);
             request.prompt =
                 replay_prompt(handle.doc(), seen.as_deref(), &user_id, &request.prompt)?;
+            transcript_replayed = true;
         }
         // Project-memory handoff (issue #78 Ph.1): inject the deterministic
         // briefing as a delimited context block — only for a fresh harness
@@ -1381,23 +1559,32 @@ impl SessionsEngine {
         // appended to the RUN prompt inside drive_run, after the user
         // message was already written to the doc — it is never persisted as
         // part of the user's message or the transcript.
+        let mut memory_warning = None;
         let memory_briefing = if request.prompt.trim_start().starts_with('/') {
             None
         } else {
             let fresh_or_switched = request.resume.is_none() || switched_from.is_some();
-            if fresh_or_switched
-                && let Some(indexer) = self.inner.memory.get()
-                && let Ok(Some(text)) = indexer.briefing(
+            if fresh_or_switched && let Some(indexer) = self.inner.memory.get() {
+                match indexer.briefing(
                     &request.cwd,
                     Some((chat_id, harness_id.as_str())),
                     Some(request.prompt.as_str()),
-                )
-            {
-                Some(crate::memory::memory_context_block(&text))
+                ) {
+                    Ok(Some(text)) => Some(crate::memory::memory_context_block(&text)),
+                    Ok(None) => None,
+                    Err(error) => {
+                        memory_warning = Some(format!("Project memory unavailable: {error}"));
+                        None
+                    }
+                }
             } else {
                 None
             }
         };
+        let memory_chars = memory_briefing
+            .as_ref()
+            .map(|block| block.chars().count())
+            .unwrap_or(0);
         if let Some(block) = &memory_briefing
             && let Some(indexer) = self.inner.memory.get()
         {
@@ -1407,6 +1594,60 @@ impl SessionsEngine {
                 harness_id.as_str(),
                 block.chars().count(),
             );
+        }
+        // Observable handoff: record what the receiving agent gets, attached to
+        // the same user turn so it survives reloads and other devices. The card
+        // names sources and sizes only — the briefing text stays out of the doc.
+        if let Some(from) = switched_from {
+            let mut sources = vec![ContextSource {
+                kind: ContextSourceKind::Request,
+                label: "Current request".into(),
+                detail: None,
+            }];
+            if transcript_replayed {
+                let earlier = handle
+                    .doc()
+                    .read_entries()
+                    .map(|entries| entries.len().saturating_sub(1))
+                    .unwrap_or(0);
+                sources.push(ContextSource {
+                    kind: ContextSourceKind::Transcript,
+                    label: "Conversation transcript".into(),
+                    detail: Some(format!("{earlier} earlier messages")),
+                });
+            }
+            if resume_injected {
+                sources.push(ContextSource {
+                    kind: ContextSourceKind::Agent,
+                    label: "Agent session resumed".into(),
+                    detail: None,
+                });
+            }
+            if memory_chars > 0 {
+                sources.push(ContextSource {
+                    kind: ContextSourceKind::Memory,
+                    label: "Project memory".into(),
+                    detail: Some(format!("{memory_chars} chars")),
+                });
+            }
+            let marker = MessagePart::Switch {
+                id: format!("handoff-{}", new_id()),
+                from: from.display_name().into(),
+                to: harness_id.display_name().into(),
+                from_harness: Some(from.as_str().into()),
+                to_harness: Some(harness_id.as_str().into()),
+                from_model: None,
+                to_model: None,
+                context: Some(ContextHandoff {
+                    objective,
+                    memory_chars,
+                    transcript_replayed,
+                    sources,
+                    warning: memory_warning,
+                    prepared_at: now_ms(),
+                }),
+            };
+            handle.doc().append_switch_part(&user_id, &marker)?;
         }
         let run_id = new_id();
         let (steer_tx, steer_rx) = mpsc::channel::<SteerMessage>(32);
@@ -1954,6 +2195,10 @@ impl SessionsEngine {
             } else {
                 "Run interrupted by engine restart"
             };
+            self.inner.publish(
+                &chat_id,
+                &explicit_run_outcome(DoneStatus::Interrupted, RunCause::EngineRestart, note),
+            );
             let done = AgentEvent::Done {
                 status: DoneStatus::Interrupted,
                 result: None,
@@ -2892,6 +3137,8 @@ async fn drive_run(
                     retryable: false,
                 },
             );
+            let outcome = terminal_outcome(DoneStatus::Errored, Some(&message), None, None);
+            inner.publish(&chat_id, &outcome);
             inner.publish(
                 &chat_id,
                 &AgentEvent::Done {
@@ -3005,6 +3252,10 @@ async fn drive_run(
             None => Some(std::time::Duration::from_secs(20)),
         };
     let mut self_continued_turn = false;
+    // The most recent typed Error this run emitted. It already carries the
+    // kind and capped stderr detail; RunOutcome enriches that same chip instead
+    // of guessing a second time.
+    let mut last_error: Option<(String, ErrorKind, Option<String>)> = None;
 
     let final_status = loop {
         let event: AgentEvent = tokio::select! {
@@ -3167,6 +3418,15 @@ async fn drive_run(
         // push the quiesce watchdog's window out.
         inner.touch_session(&chat_id);
         last_stream_activity = tokio::time::Instant::now();
+        if let AgentEvent::Error {
+            message,
+            kind,
+            detail,
+            ..
+        } = &event
+        {
+            last_error = Some((message.clone(), *kind, detail.clone()));
+        }
         // The engine's input bridge is the sole authority on input requests:
         // it mints the id and parks the resolver BEFORE emitting the event,
         // so a legitimate id is always pending here. A harness emitting its
@@ -3416,8 +3676,33 @@ async fn drive_run(
                     .await
                 {
                     tracing::error!(chat = %chat, error = %err, "startup-crash retry dispatch failed");
-                    // No run is coming: leaving the row Working would spin
-                    // the session forever with nothing behind it.
+                    // No run is coming: publish a visible terminal failure
+                    // (Error + RunOutcome + Done) instead of only flipping the
+                    // status, which would leave the turn unexplained.
+                    let message = err.to_string();
+                    engine.inner.publish(
+                        &chat,
+                        &AgentEvent::Error {
+                            message: message.clone(),
+                            kind: ErrorKind::Unknown,
+                            detail: None,
+                            retryable: false,
+                        },
+                    );
+                    engine.inner.publish(
+                        &chat,
+                        &explicit_run_outcome(DoneStatus::Errored, RunCause::Process, &message),
+                    );
+                    engine.inner.publish(
+                        &chat,
+                        &AgentEvent::Done {
+                            status: DoneStatus::Errored,
+                            result: None,
+                            error: Some(message),
+                            session_id: None,
+                            reason: None,
+                        },
+                    );
                     engine
                         .inner
                         .set_status(&chat, SessionStatus::Errored, false);
@@ -3525,6 +3810,23 @@ async fn drive_run(
                 inner.set_status(&chat_id, SessionStatus::Working, false);
             }
             _ => {}
+        }
+
+        // Terminal metadata goes out BEFORE Done (the journal's completion
+        // invariant is "last event is Done") and is folded now, so the Done's
+        // own error fallback sees the enriched chip and dedupes against it.
+        if let AgentEvent::Done {
+            status,
+            error,
+            reason,
+            ..
+        } = &event
+            && *status != DoneStatus::Completed
+        {
+            let outcome = terminal_outcome(*status, error.as_deref(), *reason, last_error.as_ref());
+            inner.publish(&chat_id, &outcome);
+            let summary_policy = inner.compaction_summary_policy();
+            fold_event_into_parts_with(&mut folded, &outcome, summary_policy);
         }
 
         // Live subagent counters FIRST: a viewer that snapshots a feed when it
@@ -3783,6 +4085,30 @@ async fn drive_run(
                     .await
                 {
                     tracing::warn!(chat = %chat, error = %err, "orphaned steer re-dispatch failed");
+                    let message = err.to_string();
+                    engine.inner.publish(
+                        &chat,
+                        &AgentEvent::Error {
+                            message: message.clone(),
+                            kind: ErrorKind::Unknown,
+                            detail: None,
+                            retryable: false,
+                        },
+                    );
+                    engine.inner.publish(
+                        &chat,
+                        &explicit_run_outcome(DoneStatus::Errored, RunCause::Process, &message),
+                    );
+                    engine.inner.publish(
+                        &chat,
+                        &AgentEvent::Done {
+                            status: DoneStatus::Errored,
+                            result: None,
+                            error: Some(message),
+                            session_id: None,
+                            reason: None,
+                        },
+                    );
                     engine
                         .inner
                         .set_status(&chat, SessionStatus::Errored, false);
@@ -3812,6 +4138,146 @@ mod tests {
         );
     }
 
+    #[test]
+    fn user_stop_and_engine_restart_are_different_causes() {
+        let stopped = terminal_outcome(
+            DoneStatus::Interrupted,
+            None,
+            Some(DoneReason::UserRequested),
+            None,
+        );
+        assert!(matches!(
+            stopped,
+            AgentEvent::RunOutcome {
+                result: DoneStatus::Interrupted,
+                cause: RunCause::Cancelled,
+                ..
+            }
+        ));
+
+        let last = (
+            "401".to_string(),
+            ErrorKind::Auth,
+            Some("stderr".to_string()),
+        );
+        let stopped_with_error = terminal_outcome(
+            DoneStatus::Interrupted,
+            None,
+            Some(DoneReason::UserRequested),
+            Some(&last),
+        );
+        assert!(matches!(
+            stopped_with_error,
+            AgentEvent::RunOutcome {
+                cause: RunCause::Cancelled,
+                message: None,
+                detail: None,
+                exit_code: None,
+                ..
+            }
+        ));
+
+        let restarted = terminal_outcome(
+            DoneStatus::Interrupted,
+            Some("Run interrupted by engine restart"),
+            Some(DoneReason::EngineRestart),
+            Some(&last),
+        );
+        assert!(matches!(
+            restarted,
+            AgentEvent::RunOutcome {
+                result: DoneStatus::Interrupted,
+                cause: RunCause::EngineRestart,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn typed_error_wins_over_keyword_guessing() {
+        let last = ("boom".to_string(), ErrorKind::Auth, Some("401".to_string()));
+        let outcome = terminal_outcome(DoneStatus::Errored, Some("boom"), None, Some(&last));
+        assert!(matches!(
+            outcome,
+            AgentEvent::RunOutcome {
+                cause: RunCause::Auth,
+                detail: Some(detail),
+                ..
+            } if detail == "401"
+        ));
+    }
+
+    #[test]
+    fn generic_done_text_keeps_the_runs_typed_error() {
+        let last = ("boom".to_string(), ErrorKind::Auth, Some("401".to_string()));
+        let outcome = terminal_outcome(DoneStatus::Errored, Some("run failed"), None, Some(&last));
+        assert!(matches!(
+            outcome,
+            AgentEvent::RunOutcome {
+                cause: RunCause::Auth,
+                detail: Some(detail),
+                ..
+            } if detail == "401"
+        ));
+    }
+
+    #[test]
+    fn newer_classifiable_done_text_is_not_masked_by_an_old_typed_error() {
+        let last = ("boom".to_string(), ErrorKind::Auth, Some("401".to_string()));
+        let outcome = terminal_outcome(
+            DoneStatus::Errored,
+            Some("network unreachable"),
+            None,
+            Some(&last),
+        );
+        assert!(matches!(
+            outcome,
+            AgentEvent::RunOutcome {
+                cause: RunCause::Network,
+                detail: None,
+                ..
+            }
+        ));
+    }
+    #[test]
+    fn child_exit_is_a_crash_and_carries_the_exit_code() {
+        let outcome = terminal_outcome(
+            DoneStatus::Errored,
+            Some("agent process exited with code 137 after a signal"),
+            Some(DoneReason::ChildExit),
+            None,
+        );
+        assert!(matches!(
+            outcome,
+            AgentEvent::RunOutcome {
+                cause: RunCause::Crash,
+                exit_code: Some(137),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn stall_and_missing_terminator_are_not_generic() {
+        assert_eq!(
+            run_cause(
+                DoneStatus::Errored,
+                Some("prompt stalled"),
+                Some(DoneReason::PromptStall),
+                None,
+            ),
+            RunCause::Timeout
+        );
+        assert_eq!(
+            run_cause(
+                DoneStatus::Errored,
+                Some("stream ended without Done"),
+                None,
+                None,
+            ),
+            RunCause::Protocol
+        );
+    }
     #[test]
     fn secret_answers_are_redacted_only_in_the_persisted_copy() {
         let answers = vec![

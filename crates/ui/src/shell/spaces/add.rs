@@ -84,6 +84,7 @@ impl Shell {
             device_id: device.id.clone(),
             path: path.clone(),
             name: None,
+            logo: None,
             git_detected: false,
             git_checked_at: None,
             checkout_id: None,

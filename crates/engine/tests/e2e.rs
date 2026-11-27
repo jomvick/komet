@@ -743,6 +743,7 @@ async fn recover_stale_does_not_resume_run_hosted_by_another_device() {
             device_id: host_device.into(),
             path: "/tmp/other".into(),
             name: None,
+            logo: None,
             git_detected: false,
             git_checked_at: None,
             checkout_id: None,

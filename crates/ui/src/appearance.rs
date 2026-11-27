@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use gpui::{App, Global, Subscription, Window};
 use serde::{Deserialize, Serialize};
 
-use crate::settings::UiSettings;
+use crate::settings::{AccentColor, CustomTheme, ThemePreset, UiSettings};
 use crate::theme::{Appearance, Theme};
 
 /// The user's appearance preference. Persisted in `ui-settings.json`.
@@ -59,6 +59,12 @@ impl AppearanceMode {
 pub struct AppearanceState {
     pub mode: AppearanceMode,
     pub system: Appearance,
+    pub accent_color: AccentColor,
+    pub theme_preset: ThemePreset,
+    /// Looks the user saved, shown next to the built-in presets.
+    pub custom_themes: Vec<CustomTheme>,
+    /// Name of the saved theme currently applied, for the picker's selection.
+    pub active_custom: Option<String>,
     /// Where `ui-settings.json` lives, so a menu action can persist the choice
     /// without routing through the shell entity that normally owns settings.
     pub data_dir: PathBuf,
@@ -79,15 +85,128 @@ pub fn resolve(mode: AppearanceMode, system: Appearance) -> Appearance {
 /// before any window opens, so the first frame is already the right palette
 /// (installing later produces a visible dark-to-light flash).
 pub fn init(mode: AppearanceMode, data_dir: impl Into<PathBuf>, cx: &mut App) {
+    let data_dir = data_dir.into();
+    let settings = UiSettings::load(&data_dir);
+    let accent_color = settings.accent_color;
+    let theme_preset = settings.theme_preset;
+    let custom_themes = settings.custom_themes;
+    let active_custom = settings.active_custom_theme;
     let system = Appearance::from_window(cx.window_appearance());
     tracing::debug!(?mode, ?system, "appearance: initial");
     cx.set_global(AppearanceState {
         mode,
         system,
-        data_dir: data_dir.into(),
+        accent_color,
+        theme_preset,
+        custom_themes,
+        active_custom,
+        data_dir,
     });
     sync_ns_appearance(mode);
     Theme::install(resolve(mode, system), cx);
+}
+
+pub fn theme_preset(cx: &App) -> ThemePreset {
+    cx.try_global::<AppearanceState>()
+        .map(|state| state.theme_preset)
+        .unwrap_or_default()
+}
+
+pub fn set_theme_preset(preset: ThemePreset, cx: &mut App) {
+    let Some((current, mode, system, data_dir)) = cx.try_global::<AppearanceState>().map(|state| {
+        (
+            state.theme_preset,
+            state.mode,
+            state.system,
+            state.data_dir.clone(),
+        )
+    }) else {
+        return;
+    };
+    if current == preset {
+        return;
+    }
+    cx.global_mut::<AppearanceState>().theme_preset = preset;
+    let mut settings = UiSettings::load(&data_dir);
+    settings.theme_preset = preset;
+    if let Err(error) = settings.save(&data_dir) {
+        tracing::warn!(error = %error, "could not persist theme preset");
+    }
+    Theme::install(resolve(mode, system), cx);
+    cx.refresh_windows();
+}
+
+pub fn custom_themes(cx: &App) -> Vec<CustomTheme> {
+    cx.try_global::<AppearanceState>()
+        .map(|state| state.custom_themes.clone())
+        .unwrap_or_default()
+}
+
+pub fn active_custom(cx: &App) -> Option<String> {
+    cx.try_global::<AppearanceState>()
+        .and_then(|state| state.active_custom.clone())
+}
+
+/// Record (or clear) the saved theme the current look came from and persist it.
+/// Called when the user picks a built-in preset or an accent directly, because
+/// the look no longer matches the saved theme.
+pub fn set_active_custom(name: Option<String>, cx: &mut App) {
+    let Some((current, data_dir)) = cx
+        .try_global::<AppearanceState>()
+        .map(|state| (state.active_custom.clone(), state.data_dir.clone()))
+    else {
+        return;
+    };
+    if current == name {
+        return;
+    }
+    cx.global_mut::<AppearanceState>().active_custom = name.clone();
+    let mut settings = UiSettings::load(&data_dir);
+    settings.active_custom_theme = name;
+    if let Err(error) = settings.save(&data_dir) {
+        tracing::warn!(error = %error, "could not persist the active saved theme");
+    }
+}
+
+/// Apply a saved theme: its wallpaper and scope, accent, and palette family.
+pub fn apply_custom_theme(theme: &CustomTheme, cx: &mut App) -> std::io::Result<()> {
+    crate::settings::wallpaper::set_scope(theme.wallpaper_scope, cx)?;
+    let path = theme.wallpaper_path.as_deref().map(PathBuf::from);
+    crate::settings::wallpaper::set_path(path, cx)?;
+    set_accent_color(theme.accent_color, cx);
+    set_theme_preset(theme.preset, cx);
+    set_active_custom(Some(theme.name.clone()), cx);
+    Ok(())
+}
+
+pub fn accent_color(cx: &App) -> AccentColor {
+    cx.try_global::<AppearanceState>()
+        .map(|state| state.accent_color)
+        .unwrap_or_default()
+}
+
+pub fn set_accent_color(color: AccentColor, cx: &mut App) {
+    let Some((current, mode, system, data_dir)) = cx.try_global::<AppearanceState>().map(|state| {
+        (
+            state.accent_color,
+            state.mode,
+            state.system,
+            state.data_dir.clone(),
+        )
+    }) else {
+        return;
+    };
+    if current == color {
+        return;
+    }
+    cx.global_mut::<AppearanceState>().accent_color = color;
+    let mut settings = UiSettings::load(&data_dir);
+    settings.accent_color = color;
+    if let Err(error) = settings.save(&data_dir) {
+        tracing::warn!(error = %error, "could not persist accent color");
+    }
+    Theme::install(resolve(mode, system), cx);
+    cx.refresh_windows();
 }
 
 /// The mode currently in effect (defaults to `System` before [`init`]).

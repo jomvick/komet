@@ -15,7 +15,7 @@ use gpui::{
     Anchor, AnyElement, ElementId, IntoElement, Pixels, Point, SharedString, div, prelude::*, px,
 };
 
-use crate::motion::{self, KOMET_PULSE};
+use crate::motion::{self, AnimationExt as _, KOMET_PULSE};
 use crate::theme::{Theme, hairline, ink};
 
 // ---------------------------------------------------------------------------
@@ -483,6 +483,52 @@ fn anchored_menu_below_gap_impl(
             .into_any_element(),
         )
         .into_any_element()
+}
+
+/// A floating menu centered in the window (OpenCode command-palette
+/// placement), independent of its trigger chip. The transparent full-window
+/// layer only centers; the card keeps its own occluding hitbox so clicks
+/// around it still reach the UI underneath.
+pub fn centered_menu(
+    id: impl Into<SharedString>,
+    content: AnyElement,
+    closing: Option<std::time::Instant>,
+    viewport: gpui::Size<Pixels>,
+    horizontal_offset: Pixels,
+) -> AnyElement {
+    let exit = closing.map(exit_progress);
+    let id = id.into();
+    let content = frosted_menu(exit, content);
+    let scrim = div().absolute().inset_0().bg(scrim_alpha(0.5));
+    let scrim = if let Some(progress) = exit {
+        scrim.opacity(1.0 - progress).into_any_element()
+    } else {
+        scrim
+            .with_animation(
+                SharedString::from(format!("{id}-scrim")),
+                motion::MENU_IN.animation(),
+                |el, t| el.opacity(t),
+            )
+            .into_any_element()
+    };
+    gpui::deferred(
+        gpui::anchored()
+            .position(gpui::point(horizontal_offset, px(0.0)))
+            .child(
+                div()
+                    .relative()
+                    .occlude()
+                    .w(viewport.width)
+                    .h(viewport.height)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(scrim)
+                    .child(menu_motion(id, exit, div().occlude().child(content))),
+            ),
+    )
+    .priority(1)
+    .into_any_element()
 }
 
 /// [`anchored_menu_below_gap`] right-aligned to the trigger's right edge, so

@@ -75,6 +75,18 @@ impl FilesSurface {
                     WorkspaceEntryKind::Directory => icons::FOLDER,
                     WorkspaceEntryKind::File | WorkspaceEntryKind::Symlink => icons::DOCUMENT,
                 };
+                let git_status = self.git_status.get(&path).map(|status| {
+                    let (label, color) = git_status_badge(status, &theme);
+                    div()
+                        .w(px(18.0))
+                        .flex_none()
+                        .text_right()
+                        .font_family(theme.font_mono.clone())
+                        .text_size(px(10.0))
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(color)
+                        .child(label)
+                });
                 div()
                     .id(("files-tree-entry", index))
                     .role(gpui::Role::TreeItem)
@@ -92,7 +104,10 @@ impl FilesSurface {
                     .cursor_pointer()
                     .when(node.entry.ignored, |element| element.opacity(0.52))
                     .when(selected, |element| {
-                        element.bg(crate::theme::wash(if focused { 0.12 } else { 0.08 }))
+                        element
+                            .border_l_2()
+                            .border_color(theme.accent.opacity(if focused { 0.9 } else { 0.6 }))
+                            .bg(theme.accent.opacity(if focused { 0.14 } else { 0.08 }))
                     })
                     .when(!selected, |element| {
                         element.hover(|style| style.bg(crate::theme::wash(0.055)))
@@ -137,12 +152,14 @@ impl FilesSurface {
                     .child(
                         div()
                             .min_w_0()
+                            .flex_1()
                             .truncate()
                             .font_family(theme.font_sans.clone())
-                            .text_size(px(11.5))
+                            .text_size(px(12.0))
                             .text_color(text_color)
                             .child(node.entry.name),
                     )
+                    .children(git_status)
                     .into_any_element()
             }
             VisibleRowKind::Loading { .. } => status_row(
@@ -317,6 +334,17 @@ impl FilesSurface {
         {
             self.tree_list.scroll_to_reveal_item(index);
         }
+    }
+}
+
+fn git_status_badge(status: &str, theme: &Theme) -> (&'static str, gpui::Hsla) {
+    match status {
+        "added" => ("A", theme.success),
+        "removed" => ("D", theme.danger_muted),
+        "renamed" | "copied" => ("R", theme.accent),
+        "unmerged" => ("!", theme.danger),
+        "modified" => ("M", theme.warning),
+        _ => ("M", theme.warning),
     }
 }
 

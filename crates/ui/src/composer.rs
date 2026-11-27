@@ -1800,6 +1800,20 @@ pub struct ComposerInput {
     /// input's own internal scroll instead of silently overflowing past the
     /// pane and getting clipped by the parent's `overflow_hidden`.
     max_content_height: f32,
+    /// Right-click menu (Cut/Copy/Paste/Select All) at the click position.
+    context_menu: crate::popover::Popup<InputContextMenu>,
+}
+
+/// Where the input's right-click menu opened.
+struct InputContextMenu {
+    position: Point<Pixels>,
+}
+
+/// Row availability in right-click order: Cut, Copy, Paste, Select All. Paste
+/// stays offered even with an empty clipboard — the click reads it, and an
+/// older clipboard shouldn't make the row look broken.
+fn context_menu_availability(text_len: usize, has_selection: bool) -> [bool; 4] {
+    [has_selection, has_selection, true, text_len > 0]
 }
 
 impl ComposerInput {
@@ -1861,6 +1875,7 @@ impl ComposerInput {
             mention_tooltip_view: None,
             syntax_doc: None,
             max_content_height: TEXTAREA_MAX - TEXTAREA_PAD_V,
+            context_menu: crate::popover::Popup::default(),
         }
     }
 
@@ -2881,6 +2896,111 @@ impl ComposerInput {
         self.drag_autoscroll_active = false;
     }
 
+    /// Right-click: keep a selection the click landed in (so Cut/Copy act on
+    /// it), otherwise put the caret under the pointer, then open the menu there.
+    fn on_right_mouse_down(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.invalidate_mention_tooltip();
+        window.focus(&self.focus_handle, cx);
+        let index = self.index_for_mouse_position(event.position);
+        if self.selected_range.is_empty() || !self.selected_range.contains(&index) {
+            self.move_to(index, cx);
+        }
+        self.context_menu.open(InputContextMenu {
+            position: event.position,
+        });
+        cx.notify();
+    }
+
+    fn close_context_menu(&mut self, cx: &mut Context<Self>) {
+        if self.context_menu.begin_close() {
+            crate::popover::reap_popup(cx, |input: &mut Self| &mut input.context_menu);
+            cx.notify();
+        }
+    }
+
+    /// The Cut/Copy/Paste/Select All menu at the right-click position. No
+    /// Spellcheck row: there is no spellcheck backend to drive.
+    fn render_context_menu(
+        &mut self,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        let position = self.context_menu.get()?.position;
+        let closing = self.context_menu.closing_since();
+        let has_selection = !self.selected_range.is_empty();
+        let [cut, copy, _, select_all_enabled] =
+            context_menu_availability(self.content.len(), has_selection);
+        let card = crate::popover::popover_card(theme)
+            .w(px(170.0))
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_context_menu(cx)))
+            .flex()
+            .flex_col()
+            .child(
+                crate::popover::menu_row(theme, false, "composer-context-cut", cx.entity_id())
+                    .id("composer-context-cut")
+                    .when(!cut, |row| row.opacity(0.38).cursor_default())
+                    .when(cut, |row| {
+                        row.on_click(cx.listener(|this, _, window, cx| {
+                            this.close_context_menu(cx);
+                            this.cut(&Cut, window, cx);
+                        }))
+                    })
+                    .child("Cut"),
+            )
+            .child(
+                crate::popover::menu_row(theme, false, "composer-context-copy", cx.entity_id())
+                    .id("composer-context-copy")
+                    .when(!copy, |row| row.opacity(0.38).cursor_default())
+                    .when(copy, |row| {
+                        row.on_click(cx.listener(|this, _, window, cx| {
+                            this.close_context_menu(cx);
+                            this.copy(&Copy, window, cx);
+                        }))
+                    })
+                    .child("Copy"),
+            )
+            .child(
+                crate::popover::menu_row(theme, false, "composer-context-paste", cx.entity_id())
+                    .id("composer-context-paste")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.close_context_menu(cx);
+                        this.paste(&Paste, window, cx);
+                    }))
+                    .child("Paste"),
+            )
+            .child(crate::popover::menu_separator())
+            .child(
+                crate::popover::menu_row(
+                    theme,
+                    false,
+                    "composer-context-select-all",
+                    cx.entity_id(),
+                )
+                .id("composer-context-select-all")
+                .when(!select_all_enabled, |row| {
+                    row.opacity(0.38).cursor_default()
+                })
+                .when(select_all_enabled, |row| {
+                    row.on_click(cx.listener(|this, _, window, cx| {
+                        this.close_context_menu(cx);
+                        this.select_all(&SelectAll, window, cx);
+                    }))
+                })
+                .child("Select All"),
+            );
+        Some(crate::popover::menu_at(
+            "composer-context-menu",
+            position,
+            card.into_any_element(),
+            closing,
+        ))
+    }
+
     fn on_mouse_move(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
         self.on_mention_pointer_move(event.position, cx);
         if self.is_selecting {
@@ -3723,6 +3843,8 @@ impl gpui::Element for ComposerTextElement {
 
 impl Render for ComposerInput {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let menu_theme = Theme::of(cx).clone();
+        let context_menu = self.render_context_menu(&menu_theme, cx);
         let theme = Theme::of(cx);
         let text_color = if self.content.is_empty() {
             theme.text_faint
@@ -3770,6 +3892,7 @@ impl Render for ComposerInput {
             .on_action(cx.listener(Self::undo))
             .on_action(cx.listener(Self::redo))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+            .on_mouse_down(MouseButton::Right, cx.listener(Self::on_right_mouse_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
@@ -3786,6 +3909,7 @@ impl Render for ComposerInput {
                 // override).
                 max_content_height: self.max_content_height,
             })
+            .when_some(context_menu, |el, menu| el.child(menu))
     }
 }
 
@@ -4059,6 +4183,9 @@ pub struct Composer {
     /// Draft checkout controls move above the composer on the home canvas;
     /// agent/model controls remain in the composer action row.
     home_canvas: bool,
+    /// Right-pane second chat: this composer owns its chat key and never
+    /// selects a chat globally (which would redirect the main conversation).
+    side: bool,
     /// Draft text per chat key ("" = new-chat canvas), surviving navigation.
     drafts: HashMap<String, String>,
     /// Last user prompt sent as a full turn (steers excluded): the error
@@ -4081,6 +4208,7 @@ pub struct Composer {
     /// In-flight file-picker prompt (paperclip).
     picker_task: Option<Task<()>>,
     attach_menu_open: bool,
+    access_menu_open: bool,
     mention_task: Option<Task<()>>,
     mention_scroll: gpui::ScrollHandle,
     mention: FileMentionState,
@@ -4185,22 +4313,182 @@ impl Composer {
         }
     }
 
+    /// Pin this composer to the right pane's second chat. Its key is the
+    /// new-chat canvas until the first send, then that chat alone.
+    pub fn set_side_chat(&mut self, cx: &mut Context<Self>) {
+        self.side = true;
+        self.current_key = String::new();
+        cx.notify();
+    }
+
+    /// The side chat just landed: keep its key so follow-up prompts steer the
+    /// same session, without ever selecting it in the main view.
+    pub fn set_side_chat_id(&mut self, chat_id: String, cx: &mut Context<Self>) {
+        if self.side {
+            self.current_key = chat_id;
+            cx.notify();
+        }
+    }
+
     /// Advance the access chip. In an existing chat the new level is saved to
     /// that chat, so it reopens at this level on every device. On the new-chat
     /// screen it applies to the draft only and leaves the Security default as is.
     fn cycle_access_mode(&mut self, cx: &mut Context<Self>) {
         let next = next_access(self.state.read(cx).access_mode);
-        if self.state.read(cx).selected_chat.is_some() {
+        self.set_access_mode(next, cx);
+    }
+
+    fn set_access_mode(&mut self, level: komet_proto::SandboxLevel, cx: &mut Context<Self>) {
+        if !self.side && self.state.read(cx).selected_chat.is_some() {
             self.pickers
-                .update(cx, |pickers, cx| pickers.set_chat_sandbox(next, cx));
+                .update(cx, |pickers, cx| pickers.set_chat_sandbox(level, cx));
         }
         // Also set it directly: a chat without a saved configuration (unknown
         // harness) cannot be written, but its next message still uses this level.
         self.state.update(cx, |state, cx| {
-            state.set_access_mode(next);
+            state.set_access_mode(level);
             cx.notify();
         });
+        self.access_menu_open = false;
         cx.notify();
+    }
+
+    /// Permission selector shared by the compact and expanded composer bars.
+    fn render_access_mode_control(
+        &mut self,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        use komet_proto::SandboxLevel as Level;
+
+        let level = self.state.read(cx).access_mode;
+        let label = crate::settings::security::level_title(level);
+        let (glyph, color) = match level {
+            Level::ReadOnly => (icons::EYE, theme.accent),
+            Level::WorkspaceWrite => (icons::SHIELD, theme.accent),
+            Level::DangerFullAccess => (icons::DANGER_TRIANGLE, theme.warning),
+        };
+        let chip = div()
+            .id("composer-access-mode")
+            .relative()
+            .flex_none()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(5.0))
+            .text_size(px(12.0))
+            .text_color(color)
+            .cursor_pointer()
+            .hover(|style| style.opacity(0.8))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.access_menu_open = !this.access_menu_open;
+                cx.notify();
+            }))
+            .child(icon(glyph).size(px(13.0)).flex_none().text_color(color))
+            .child(label);
+        let chip = chip.child(
+            icon(icons::ALT_ARROW_DOWN)
+                .size(px(12.0))
+                .flex_none()
+                .text_color(color.opacity(0.75)),
+        );
+
+        if !self.access_menu_open {
+            return chip.into_any_element();
+        }
+
+        let mut menu = crate::popover::popover_card(theme)
+            .w(px(340.0))
+            .flex()
+            .flex_col()
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.access_menu_open = false;
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .px(px(8.0))
+                    .py(px(7.0))
+                    .text_size(px(12.0))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(theme.text_muted)
+                    .child("Choose agent access"),
+            );
+
+        let options = [
+            (Level::ReadOnly, icons::EYE),
+            (Level::WorkspaceWrite, icons::SHIELD),
+            (Level::DangerFullAccess, icons::DANGER_TRIANGLE),
+        ];
+        for (index, (option, glyph)) in options.into_iter().enumerate() {
+            let selected = option == level;
+            let title = crate::settings::security::level_title(option);
+            let description = crate::settings::security::level_description(option);
+            let icon_color = if option == Level::DangerFullAccess {
+                theme.warning
+            } else {
+                theme.text_muted
+            };
+            menu = menu.child(
+                crate::popover::menu_row(
+                    theme,
+                    false,
+                    format!("composer-access-option-{index}"),
+                    cx.entity_id(),
+                )
+                .id(("composer-access-option", index))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.set_access_mode(option, cx);
+                }))
+                .child(icon(glyph).size(px(14.0)).flex_none().text_color(
+                    if selected && option != Level::DangerFullAccess {
+                        theme.accent
+                    } else {
+                        icon_color
+                    },
+                ))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.0))
+                        .child(
+                            div()
+                                .text_size(px(12.0))
+                                .font_weight(if selected {
+                                    gpui::FontWeight::MEDIUM
+                                } else {
+                                    gpui::FontWeight::NORMAL
+                                })
+                                .text_color(if option == Level::DangerFullAccess {
+                                    theme.warning
+                                } else {
+                                    theme.text
+                                })
+                                .child(title),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(10.5))
+                                .text_color(theme.text_muted)
+                                .child(description),
+                        ),
+                )
+                .when(selected, |row| {
+                    row.child(icon(icons::CHECK).size(px(13.0)).text_color(theme.accent))
+                }),
+            );
+        }
+
+        chip.child(crate::popover::anchored_menu_above(
+            "composer-access-menu",
+            menu.into_any_element(),
+            None,
+        ))
+        .into_any_element()
     }
 
     /// The picker entity, for the shell's canvas target selectors.
@@ -4325,6 +4613,7 @@ impl Composer {
             input,
             pickers,
             home_canvas: false,
+            side: false,
             drafts: HashMap::new(),
             last_sent: None,
             attachments: HashMap::new(),
@@ -4334,6 +4623,7 @@ impl Composer {
             preview_focus_pending: false,
             picker_task: None,
             attach_menu_open: false,
+            access_menu_open: false,
             mention_task: None,
             mention_scroll: gpui::ScrollHandle::new(),
             mention: FileMentionState::default(),
@@ -5537,7 +5827,7 @@ impl Composer {
         };
 
         // Draft swap on chat navigation — the input entity itself survives.
-        if key != self.current_key {
+        if key != self.current_key && !self.side {
             let old_text = self.input.read(cx).text().to_string();
             if old_text.is_empty() {
                 self.drafts.remove(&self.current_key);
@@ -6037,11 +6327,29 @@ impl Composer {
             cx.notify();
             return;
         };
-        // Chat id: existing selection, or client-minted for the new-chat canvas
-        // (the chat then appears from the doc host once the doc materializes).
-        let (chat_id, is_new) = match self.state.read(cx).selected_chat.clone() {
-            Some(id) => (id, false),
-            None => (uuid::Uuid::new_v4().to_string(), true),
+        // Chat id: the side composer owns its key (new-chat canvas until its
+        // first send); the main composer follows the global selection.
+        let side_chat = if self.side {
+            self.state
+                .read(cx)
+                .chats
+                .iter()
+                .find(|c| c.id == self.current_key)
+                .cloned()
+        } else {
+            None
+        };
+        let (chat_id, is_new) = if self.side {
+            if self.current_key.is_empty() {
+                (uuid::Uuid::new_v4().to_string(), true)
+            } else {
+                (self.current_key.clone(), false)
+            }
+        } else {
+            match self.state.read(cx).selected_chat.clone() {
+                Some(id) => (id, false),
+                None => (uuid::Uuid::new_v4().to_string(), true),
+            }
         };
         // Where the new session runs (Current checkout / reuse an existing
         // worktree / fresh worktree off the picked base) — resolved NOW so
@@ -6049,11 +6357,19 @@ impl Composer {
         let plan = self.pickers.read(cx).checkout_plan();
         // Fully-resolved model/reasoning/options — concrete values (chat config
         // or defaults), so the engine never has to guess a "default".
-        let resolved = self.pickers.read(cx).resolved(cx);
-        let existing_cwd = self
-            .state
-            .read(cx)
-            .selected_chat_row()
+        let mut resolved = self.pickers.read(cx).resolved(cx);
+        // The side chat keeps its own config: after its first send the global
+        // selection still names the MAIN chat, so pickers would otherwise
+        // silently run this chat with that one's harness and model.
+        if let Some(config) = side_chat.as_ref().and_then(|c| c.config.as_ref()) {
+            resolved.harness = Some(config.harness);
+            resolved.model = config.model.clone();
+            resolved.reasoning = config.reasoning;
+            resolved.model_options = config.model_options.clone();
+        }
+        let existing_cwd = side_chat
+            .as_ref()
+            .or_else(|| self.state.read(cx).selected_chat_row())
             .and_then(|c| c.cwd.clone());
         // The PROJECT fixes the new chat's device + base folder — sessions are
         // minted onto the project's device, not necessarily this one. With no
@@ -6067,9 +6383,9 @@ impl Composer {
                 .clone()
                 .unwrap_or_else(|| "local".to_string())
         } else {
-            self.state
-                .read(cx)
-                .selected_chat_row()
+            side_chat
+                .as_ref()
+                .or_else(|| self.state.read(cx).selected_chat_row())
                 .map(|c| c.device_id.clone())
                 .or_else(|| local_device_id.clone())
                 .unwrap_or_else(|| "local".to_string())
@@ -6081,9 +6397,9 @@ impl Composer {
                 .clone()
                 .filter(|id| local_device_id.as_deref() != Some(id.as_str()))
         } else {
-            self.state
-                .read(cx)
-                .selected_chat_row()
+            side_chat
+                .as_ref()
+                .or_else(|| self.state.read(cx).selected_chat_row())
                 .map(|c| c.device_id.clone())
         };
         let space_id = space.as_ref().map(|s| s.id.clone());
@@ -6171,7 +6487,7 @@ impl Composer {
         // `select_chat` would silently downgrade a Full access first run.
         let sandbox = self.state.read(cx).access_mode;
         self.state.update(cx, |s, cx| {
-            if is_new {
+            if is_new && !self.side {
                 s.select_chat(Some(chat_id.clone()), cx);
             }
             s.push_echo(&chat_id, echo);
@@ -8352,22 +8668,7 @@ impl Render for Composer {
                         .pt(px(4.0))
                         .pb(px(10.0))
                         .child(attach)
-                        .child(
-                            div()
-                                .id("composer-access-mode")
-                                .flex_none()
-                                .text_size(px(12.0))
-                                .text_color(theme.text_muted)
-                                .cursor_pointer()
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.cycle_access_mode(cx);
-                                }))
-                                .child(match self.state.read(cx).access_mode {
-                                    komet_proto::SandboxLevel::DangerFullAccess => "Full access",
-                                    komet_proto::SandboxLevel::ReadOnly => "Read only",
-                                    komet_proto::SandboxLevel::WorkspaceWrite => "Sandboxed",
-                                }),
-                        )
+                        .child(self.render_access_mode_control(&theme, cx))
                         .child(div().flex_1().min_w_0().child(self.pickers.clone()))
                         .child(send_button),
                 )
@@ -8425,26 +8726,7 @@ impl Render for Composer {
                                 .pr(px(morph_cluster_inset(false, morph_t)))
                                 .relative()
                                 .top(px(-cluster_dy))
-                                .child(
-                                    div()
-                                        .id("composer-access-mode")
-                                        .flex_none()
-                                        .text_size(px(12.0))
-                                        .text_color(theme.text_muted)
-                                        .cursor_pointer()
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.cycle_access_mode(cx);
-                                        }))
-                                        .child(match self.state.read(cx).access_mode {
-                                            komet_proto::SandboxLevel::DangerFullAccess => {
-                                                "Full access"
-                                            }
-                                            komet_proto::SandboxLevel::ReadOnly => "Read only",
-                                            komet_proto::SandboxLevel::WorkspaceWrite => {
-                                                "Sandboxed"
-                                            }
-                                        }),
-                                )
+                                .child(self.render_access_mode_control(&theme, cx))
                                 .when(self.home_canvas, |el| el.child(div().flex_1().min_w_0()))
                                 .child(div().flex_none().child(self.pickers.clone()))
                                 .child(send_button),
@@ -8504,6 +8786,22 @@ impl Render for Composer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn context_menu_offer_depends_on_selection_and_text() {
+        // Empty input: only Paste is actionable.
+        assert_eq!(
+            context_menu_availability(0, false),
+            [false, false, true, false]
+        );
+        // Text but no selection: Select All joins Paste.
+        assert_eq!(
+            context_menu_availability(4, false),
+            [false, false, true, true]
+        );
+        // A selection makes Cut and Copy actionable too.
+        assert_eq!(context_menu_availability(4, true), [true, true, true, true]);
+    }
 
     #[test]
     fn element_chip_label_prefers_selector_then_text() {

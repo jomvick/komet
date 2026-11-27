@@ -1,7 +1,9 @@
 //! Lifecycle and optimistic-concurrency state for an open workspace file.
 
+use std::path::Path;
 use std::sync::Arc;
 
+use base64::Engine as _;
 use gpui::{Entity, SharedString, Subscription, Task};
 use gpui_base::input::EditorState;
 use komet_proto::{
@@ -23,10 +25,16 @@ pub(super) enum DocumentPhase {
     Ready,
     Saving,
     SaveFailed(SharedString),
-    ExternallyModified { disk_hash: Option<String> },
-    Conflict { disk_hash: Option<String> },
+    ExternallyModified {
+        disk_hash: Option<String>,
+    },
+    Conflict {
+        disk_hash: Option<String>,
+    },
     DeletedOnDisk,
     ReadOnly(WorkspaceReadOnlyReason),
+    /// A supported raster image is decoded and ready for the read-only view.
+    Image,
     Error(SharedString),
 }
 
@@ -45,6 +53,10 @@ pub(super) struct FileDocument {
     pub generation: u64,
     pub phase: DocumentPhase,
     pub file: Option<WorkspaceFileText>,
+    /// Decoded image for the read-only preview. Kept out of `lines`/editor.
+    pub image: Option<Arc<gpui::Image>>,
+    /// Intrinsic pixel size when the header could be read.
+    pub image_dimensions: Option<(u32, u32)>,
     pub lines: Arc<Vec<SharedString>>,
     pub editor: Option<Entity<EditorState>>,
     pub editor_events: Option<Subscription>,
@@ -74,6 +86,8 @@ impl FileDocument {
             generation: 1,
             phase: DocumentPhase::Loading,
             file: None,
+            image: None,
+            image_dimensions: None,
             lines: Arc::new(Vec::new()),
             editor: None,
             editor_events: None,
@@ -122,17 +136,33 @@ impl FileDocument {
         self.editor_observer = None;
         self.encoding = writable_encoding(file.encoding);
         self.line_ending = writable_line_ending(file.line_ending);
-        self.lines = Arc::new(
-            file.text
-                .as_deref()
-                .unwrap_or_default()
-                .split('\n')
-                .map(|line| SharedString::from(line.to_string()))
-                .collect(),
-        );
-        self.phase = read_only_reason(&file)
-            .map(DocumentPhase::ReadOnly)
-            .unwrap_or(DocumentPhase::Ready);
+        self.image = None;
+        self.image_dimensions = None;
+        self.lines = Arc::new(Vec::new());
+        if file.image.is_some() {
+            match decode_image(&file) {
+                Some((image, dimensions)) => {
+                    self.image = Some(image);
+                    self.image_dimensions = dimensions;
+                    self.phase = DocumentPhase::Image;
+                }
+                None => {
+                    self.phase = DocumentPhase::Error("This image could not be decoded.".into());
+                }
+            }
+        } else {
+            self.lines = Arc::new(
+                file.text
+                    .as_deref()
+                    .unwrap_or_default()
+                    .split('\n')
+                    .map(|line| SharedString::from(line.to_string()))
+                    .collect(),
+            );
+            self.phase = read_only_reason(&file)
+                .map(DocumentPhase::ReadOnly)
+                .unwrap_or(DocumentPhase::Ready);
+        }
         self.loaded_hash = hash.clone();
         self.saved_hash = hash;
         self.revision = 0;
@@ -155,7 +185,10 @@ impl FileDocument {
     pub fn is_editable(&self) -> bool {
         !matches!(
             self.phase,
-            DocumentPhase::Loading | DocumentPhase::ReadOnly(_) | DocumentPhase::Error(_)
+            DocumentPhase::Loading
+                | DocumentPhase::ReadOnly(_)
+                | DocumentPhase::Image
+                | DocumentPhase::Error(_)
         ) && self.file.as_ref().is_some_and(|file| file.text.is_some())
             && self.saved_hash.is_some()
             && self.encoding.is_some()
@@ -251,6 +284,12 @@ impl FileDocument {
     }
 
     pub fn restore_on_disk(&mut self, file: WorkspaceFileText) {
+        if file.image.is_some() {
+            self.set_loaded(file);
+            return;
+        }
+        self.image = None;
+        self.image_dimensions = None;
         let hash = file.content_hash.clone();
         self.encoding = writable_encoding(file.encoding);
         self.line_ending = writable_line_ending(file.line_ending);
@@ -268,6 +307,12 @@ impl FileDocument {
     }
 
     pub fn apply_external_reload(&mut self, file: WorkspaceFileText) {
+        if file.image.is_some() {
+            self.set_loaded(file);
+            return;
+        }
+        self.image = None;
+        self.image_dimensions = None;
         let hash = file.content_hash.clone();
         self.encoding = writable_encoding(file.encoding);
         self.line_ending = writable_line_ending(file.line_ending);
@@ -331,6 +376,11 @@ impl FileDocument {
         } else {
             0
         };
+        let image_bytes = self
+            .file
+            .as_ref()
+            .and_then(|file| file.image.as_ref())
+            .map_or(0, |image| image.bytes_base64.capacity());
 
         std::mem::size_of::<Self>()
             .saturating_add(file_text_bytes)
@@ -338,6 +388,7 @@ impl FileDocument {
             .saturating_add(line_bytes)
             .saturating_add(pending_save_bytes)
             .saturating_add(editor_text_bytes)
+            .saturating_add(image_bytes)
     }
 }
 
@@ -352,11 +403,28 @@ fn read_only_reason(file: &WorkspaceFileText) -> Option<WorkspaceReadOnlyReason>
     })
 }
 
+/// Decoded image plus its dimensions when the header was readable.
+type DecodedImage = (Arc<gpui::Image>, Option<(u32, u32)>);
+
+/// Decode a workspace image through the conversation image path. The payload
+/// is already capped by the engine (8 MiB) `MAX_PREVIEW_FILE_BYTES`.
+fn decode_image(file: &WorkspaceFileText) -> Option<DecodedImage> {
+    let payload = file.image.as_ref()?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(payload.bytes_base64.as_bytes())
+        .ok()?;
+    let format = crate::attachments::format_by_extension(Path::new(&file.path))?;
+    let dimensions = super::image::dimensions(format, &bytes);
+    Some((Arc::new(gpui::Image::from_bytes(format, bytes)), dimensions))
+}
+
 fn writable_encoding(encoding: WorkspaceTextEncoding) -> Option<WorkspaceWritableEncoding> {
     match encoding {
         WorkspaceTextEncoding::Utf8 => Some(WorkspaceWritableEncoding::Utf8),
         WorkspaceTextEncoding::Utf8Bom => Some(WorkspaceWritableEncoding::Utf8Bom),
-        WorkspaceTextEncoding::Binary | WorkspaceTextEncoding::Unsupported => None,
+        WorkspaceTextEncoding::Image
+        | WorkspaceTextEncoding::Binary
+        | WorkspaceTextEncoding::Unsupported => None,
     }
 }
 
@@ -396,7 +464,34 @@ mod tests {
             line_ending: Some(WorkspaceLineEnding::Lf),
             read_only_reason: None,
             truncated: false,
+            image: None,
         }
+    }
+
+    #[test]
+    fn image_load_is_read_only_and_states_dimensions() {
+        let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAFgwJ/lvt0WQAAAABJRU5ErkJggg==";
+        let mut document = FileDocument::loading(key("img/pixel.png"));
+        document.set_loaded(WorkspaceFileText {
+            path: "img/pixel.png".into(),
+            text: None,
+            content_hash: Some("hash-img".into()),
+            size: 68,
+            modified_at: None,
+            encoding: WorkspaceTextEncoding::Image,
+            line_ending: None,
+            read_only_reason: None,
+            truncated: false,
+            image: Some(komet_proto::WorkspaceFileImage {
+                mime: "image/png".into(),
+                bytes_base64: png.into(),
+                size: 68,
+            }),
+        });
+        assert!(matches!(document.phase, DocumentPhase::Image));
+        assert!(!document.is_editable());
+        assert!(document.image.is_some());
+        assert_eq!(document.image_dimensions, Some((1, 1)));
     }
 
     #[test]

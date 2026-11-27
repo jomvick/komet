@@ -20,9 +20,9 @@ use gpui::{
 };
 
 use komet_proto::{
-    AgentLocalUsage, AgentUsageReport, AgentUsageWindow, HarnessId, UsageBreakdown,
-    UsageCostEstimate, UsageCoverage, UsageDetail, UsagePoint, UsageQuotaPoint, UsageReport,
-    UsageTotals,
+    AgentLocalUsage, AgentUsageReport, AgentUsageStatus, AgentUsageWindow, HarnessId,
+    UsageBreakdown, UsageCostEstimate, UsageCoverage, UsageDetail, UsagePoint, UsageQuotaPoint,
+    UsageReport, UsageSampleSource, UsageTotals,
 };
 use komet_rpc::methods;
 
@@ -31,24 +31,6 @@ use crate::settings::providers::{PROVIDERS, harness_display_name, supports_in_ap
 use crate::settings::widgets;
 use crate::state::AppState;
 use crate::theme::Theme;
-
-/// Agents whose providers expose a quota endpoint today (M3 keeps their real
-/// meter shapes; the rest are measured-usage-only).
-const QUOTA_CAPABLE: [HarnessId; 5] = [
-    HarnessId::ClaudeCode,
-    HarnessId::Codex,
-    HarnessId::Cursor,
-    HarnessId::Antigravity,
-    HarnessId::Copilot,
-];
-
-/// Agents whose CLIs keep local token logs the engine can read (issue #53).
-const LOCAL_LOG_AGENTS: [HarnessId; 4] = [
-    HarnessId::Grok,
-    HarnessId::Pi,
-    HarnessId::Opencode,
-    HarnessId::Muse,
-];
 
 /// A stale visible page may refresh itself, but not more often than this.
 const AUTO_REFRESH_AFTER: Duration = Duration::from_secs(5 * 60);
@@ -360,6 +342,45 @@ impl UsagePage {
             .into_any_element()
     }
 
+    /// The always-visible provenance/state line for an agent's usage row.
+    /// Available names the real source and sample time; not-reported and
+    /// retrieval-error are distinct sentences, never a silent zero.
+    fn usage_status_line(
+        &self,
+        status: &AgentUsageStatus,
+        now: DateTime<Utc>,
+        theme: &Theme,
+    ) -> AnyElement {
+        let (text, color) = match status {
+            AgentUsageStatus::Available {
+                source,
+                collected_at,
+            } => {
+                let source = match source {
+                    UsageSampleSource::ProviderQuota => "Provider quota",
+                    UsageSampleSource::LocalLog => "Agent local logs",
+                    UsageSampleSource::MeasuredTurns => "Komet-measured turns",
+                };
+                let when = collected_at
+                    .map(|at| format!(" · collected {}", ago_phrase(now - at)))
+                    .unwrap_or_default();
+                (
+                    format!("Source: {source}{when}"),
+                    theme.text_muted.opacity(0.7),
+                )
+            }
+            AgentUsageStatus::NotReported { message, .. } => (message.clone(), theme.text_muted),
+            AgentUsageStatus::RetrievalError { message, .. } => (
+                format!("{message} · use Refresh to retry"),
+                theme.warning_muted.opacity(0.95),
+            ),
+        };
+        div()
+            .text_size(px(11.5))
+            .text_color(color)
+            .child(SharedString::from(text))
+            .into_any_element()
+    }
     fn agent_card(
         &self,
         harness: HarnessId,
@@ -380,7 +401,17 @@ impl UsagePage {
             .flex_col()
             .gap(px(12.0));
 
-        if windows.is_empty() {
+        if let Some(report) = report {
+            body = body.child(self.usage_status_line(&report.usage_status, now, theme));
+        }
+
+        let status_explains_empty = report.is_some_and(|report| {
+            matches!(
+                &report.usage_status,
+                AgentUsageStatus::NotReported { .. } | AgentUsageStatus::RetrievalError { .. }
+            )
+        });
+        if windows.is_empty() && !status_explains_empty {
             body = body.child(
                 div()
                     .text_size(px(12.5))
@@ -955,12 +986,13 @@ pub fn time_to_exhaustion(
 }
 
 fn capability(harness: HarnessId) -> &'static str {
-    if QUOTA_CAPABLE.contains(&harness) {
-        "Provider quotas + measured usage"
-    } else if LOCAL_LOG_AGENTS.contains(&harness) {
-        "Local logs + measured usage"
-    } else {
-        "Measured usage only"
+    match komet_harness::capabilities::capabilities(harness)
+        .usage
+        .surface
+    {
+        komet_proto::UsageSurface::ProviderQuota => "Provider quotas + measured usage",
+        komet_proto::UsageSurface::LocalLogs => "Local logs + measured usage",
+        komet_proto::UsageSurface::MeasuredOnly => "Measured usage only",
     }
 }
 
@@ -974,6 +1006,13 @@ fn quota_reason_phrase(report: Option<&AgentUsageReport>, account_present: bool)
     let Some(report) = report else {
         return "Provider quota not reported.".to_string();
     };
+    // The engine's typed state wins: it distinguishes a provider that reported
+    // nothing from a fetch that failed, which this UI must not conflate.
+    match &report.usage_status {
+        AgentUsageStatus::NotReported { message, .. }
+        | AgentUsageStatus::RetrievalError { message, .. } => return message.clone(),
+        AgentUsageStatus::Available { .. } => {}
+    }
     match report.local_usage.as_ref() {
         Some(local) => match local.coverage {
             UsageCoverage::Complete => {
@@ -988,7 +1027,7 @@ fn quota_reason_phrase(report: Option<&AgentUsageReport>, account_present: bool)
                 local_reason_phrase(local)
             ),
         },
-        None if QUOTA_CAPABLE.contains(&report.harness) => {
+        None if komet_harness::capabilities::reports_provider_quota(report.harness) => {
             "Provider quota not reported — the provider did not return a quota sample."
                 .to_string()
         }
@@ -1439,6 +1478,10 @@ mod tests {
             week_cost: None,
             month_cost: None,
             local_usage: None,
+            usage_status: komet_proto::AgentUsageStatus::Available {
+                source: komet_proto::UsageSampleSource::ProviderQuota,
+                collected_at: None,
+            },
         }
     }
 
@@ -1553,6 +1596,32 @@ mod tests {
         assert!(phrase.contains("did not return a quota sample"), "{phrase}");
     }
 
+    #[test]
+    fn typed_status_distinguishes_failure_from_absence() {
+        let mut report = report(UsageTotals::default(), Some("a@b.c"));
+        report.usage_status = AgentUsageStatus::RetrievalError {
+            message: "quota refresh timed out".into(),
+            retryable: true,
+        };
+        let phrase = quota_reason_phrase(Some(&report), true);
+        assert_eq!(phrase, "quota refresh timed out");
+
+        report.usage_status = AgentUsageStatus::NotReported {
+            reason: komet_proto::UsageNotReportedReason::NoTokenCounter,
+            message: "this CLI keeps no token counter".into(),
+        };
+        assert_eq!(
+            quota_reason_phrase(Some(&report), true),
+            "this CLI keeps no token counter"
+        );
+    }
+
+    #[test]
+    fn capability_labels_follow_the_harness_matrix() {
+        assert!(capability(HarnessId::ClaudeCode).contains("Provider quotas"));
+        assert!(capability(HarnessId::Grok).contains("Local logs"));
+        assert!(capability(HarnessId::Cline).contains("Measured usage only"));
+    }
     #[test]
     fn breakdown_line_labels_unknown_and_sums_tokens() {
         let theme = Theme::dark();

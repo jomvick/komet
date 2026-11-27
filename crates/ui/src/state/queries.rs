@@ -3,6 +3,55 @@
 use super::*;
 
 impl AppState {
+    /// Every device whose projects can be selected as an import source. Rows
+    /// retain their owning workspace so the import is routed to the right host.
+    pub fn project_source_devices(&self) -> Vec<super::ProjectSourceDevice> {
+        let mut rows = Vec::new();
+        for device in &self.local_devices {
+            rows.push(super::ProjectSourceDevice {
+                workspace_id: komet_engine::environments::LOCAL_ENV_ID.to_string(),
+                workspace_label: self.local_workspace_label(),
+                device: device.clone(),
+                status: super::WorkspaceStatus::Online,
+            });
+        }
+        for workspace in &self.workspaces {
+            if let Some(devices) = self.env_devices.get(&workspace.id) {
+                rows.extend(
+                    devices
+                        .iter()
+                        .cloned()
+                        .map(|device| super::ProjectSourceDevice {
+                            workspace_id: workspace.id.clone(),
+                            workspace_label: workspace.label.clone(),
+                            device,
+                            status: workspace.status,
+                        }),
+                );
+            }
+        }
+        rows.sort_by_key(|row| {
+            (
+                row.workspace_id != self.active_workspace,
+                row.device.name.to_lowercase(),
+                row.device.id.clone(),
+            )
+        });
+        rows
+    }
+
+    /// Projects cached for a workspace, including inactive workspaces. `None`
+    /// means its first watch frame has not arrived yet.
+    pub fn project_picker_spaces(&self, workspace_id: &str) -> Option<Vec<Space>> {
+        if workspace_id == self.active_workspace {
+            Some(self.spaces.clone())
+        } else if workspace_id == komet_engine::environments::LOCAL_ENV_ID {
+            Some(self.local_spaces.clone())
+        } else {
+            self.env_spaces.get(workspace_id).cloned()
+        }
+    }
+
     /// Non-archived chats in sidebar order.
     pub fn visible_chats(&self) -> impl Iterator<Item = &Chat> {
         self.chats.iter().filter(|c| !c.archived)
@@ -264,11 +313,24 @@ impl AppState {
     /// the paired workspace's home device otherwise.
     pub fn workspace_device_for(&self, env_id: &str) -> Option<String> {
         if env_id == komet_engine::environments::LOCAL_ENV_ID {
-            return self.local_device_id.clone().or(self.home_device_id.clone());
+            return self.home_device_id.clone().or(self.local_device_id.clone());
         }
         let devices = self.env_devices.get(env_id)?;
         crate::state::workspace_home_device(devices, self.home_device_id.as_deref())
             .or_else(|| devices.first().map(|d| d.id.clone()))
+    }
+
+    /// RPC surface for a workspace's own machine. A paired environment has
+    /// its own connection; using the active workspace's relay with a device
+    /// id from another environment cannot reach that machine.
+    pub fn workspace_rpc_client(
+        &self,
+        env_id: &str,
+    ) -> Option<std::sync::Arc<komet_rpc::RpcClient>> {
+        if env_id == komet_engine::environments::LOCAL_ENV_ID {
+            return self.engine.as_ref().map(|engine| engine.client_arc());
+        }
+        self.env_clients.get(env_id).cloned()
     }
 
     /// The device owning the ACTIVE workspace (settings pages target it).

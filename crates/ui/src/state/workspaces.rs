@@ -11,9 +11,8 @@ use super::{
     workspace_home_device, workspace_version,
 };
 
-/// Pump the device and session streams of one workspace until either ends.
-/// Device frames rebuild the workspace's rows; session frames only refresh the
-/// switcher's busy count.
+/// Pump the device, project and session streams of one workspace until either
+/// ends. Inactive workspace rows are cached for cross-device project imports.
 async fn discover_streams(
     this: &gpui::WeakEntity<AppState>,
     cx: &mut gpui::AsyncApp,
@@ -21,11 +20,18 @@ async fn discover_streams(
     client: &std::sync::Arc<komet_rpc::RpcClient>,
     devices: &mut tokio::sync::mpsc::Receiver<serde_json::Value>,
     sessions: &mut Option<tokio::sync::mpsc::Receiver<serde_json::Value>>,
+    spaces: &mut Option<tokio::sync::mpsc::Receiver<serde_json::Value>>,
 ) {
     loop {
         let device_value = devices.recv();
         let session_value = async {
             match sessions {
+                Some(rx) => rx.recv().await,
+                None => std::future::pending().await,
+            }
+        };
+        let space_value = async {
+            match spaces {
                 Some(rx) => rx.recv().await,
                 None => std::future::pending().await,
             }
@@ -66,6 +72,18 @@ async fn discover_streams(
                     .count();
                 let alive = this.update(cx, |state, cx| {
                     state.record_workspace_activity(env_id, busy, cx);
+                });
+                if alive.is_err() {
+                    return;
+                }
+            }
+            value = space_value => {
+                let Some(value) = value else { return };
+                let Ok(spaces) = serde_json::from_value::<Vec<komet_proto::Space>>(value) else {
+                    continue;
+                };
+                let alive = this.update(cx, |state, cx| {
+                    state.record_workspace_spaces(env_id, spaces, cx);
                 });
                 if alive.is_err() {
                     return;
@@ -186,6 +204,7 @@ impl AppState {
         self.env_presence.remove(env_id);
         self.env_clients.remove(env_id);
         self.env_devices.remove(env_id);
+        self.env_spaces.remove(env_id);
         self.env_memory.remove(env_id);
         if self.active_workspace == env_id {
             self.stop_workspace_watches();
@@ -200,6 +219,7 @@ impl AppState {
         self.env_presence.clear();
         self.env_clients.clear();
         self.env_devices.clear();
+        self.env_spaces.clear();
         self.env_memory.clear();
         self.env_activity.clear();
         self.workspaces.clear();
@@ -251,6 +271,10 @@ impl AppState {
                     .subscribe(methods::WATCH_SESSIONS, serde_json::json!({}))
                     .await
                     .ok();
+                let spaces = client
+                    .subscribe(methods::WATCH_SPACES, serde_json::json!({}))
+                    .await
+                    .ok();
                 match client
                     .subscribe(methods::WATCH_DEVICES, serde_json::json!({}))
                     .await
@@ -266,7 +290,17 @@ impl AppState {
                     }
                     Ok(mut rx) => {
                         let mut sessions = sessions;
-                        discover_streams(&this, cx, &env_id, &client, &mut rx, &mut sessions).await;
+                        let mut spaces = spaces;
+                        discover_streams(
+                            &this,
+                            cx,
+                            &env_id,
+                            &client,
+                            &mut rx,
+                            &mut sessions,
+                            &mut spaces,
+                        )
+                        .await;
                         if this
                             .update(cx, |state, cx| state.handle_workspace_lost(&env_id, cx))
                             .is_err()
@@ -320,6 +354,17 @@ impl AppState {
             self.local_device_id = home;
             self.attach_workspace_client(env_id, cx);
         }
+        cx.notify();
+    }
+
+    pub(crate) fn record_workspace_spaces(
+        &mut self,
+        env_id: &str,
+        mut spaces: Vec<komet_proto::Space>,
+        cx: &mut Context<Self>,
+    ) {
+        spaces.sort_by_key(|space| (space.display_name().to_lowercase(), space.id.clone()));
+        self.env_spaces.insert(env_id.to_string(), spaces);
         cx.notify();
     }
 

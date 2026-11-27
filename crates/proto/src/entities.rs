@@ -41,6 +41,9 @@ pub struct Space {
     /// User rename; absent ⇒ display = basename(path).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// Optional project mark selected by the user (emoji rendered in the UI).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logo: Option<String>,
     /// Owner-stamped: is `path` inside a git work tree?
     #[serde(default)]
     pub git_detected: bool,
@@ -429,6 +432,23 @@ pub struct WorkspaceFileText {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub read_only_reason: Option<WorkspaceReadOnlyReason>,
     pub truncated: bool,
+    /// Read-only raster payload for a supported image file. Additive: older
+    /// peers ignore it, and text files leave it absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<WorkspaceFileImage>,
+}
+
+/// Raster image bytes for the Files preview. Transfer-only: the UI decodes
+/// them with the same `Image::from_bytes` path as conversation attachments.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceFileImage {
+    /// `image/png`, `image/jpeg`, `image/gif`, `image/webp` or `image/bmp`.
+    pub mime: String,
+    /// Standard base64 of the original bytes.
+    pub bytes_base64: String,
+    /// Decoded byte length (same as the file size).
+    pub size: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -436,6 +456,8 @@ pub struct WorkspaceFileText {
 pub enum WorkspaceTextEncoding {
     Utf8,
     Utf8Bom,
+    /// Supported raster image: `image` carries the bytes, `text` is absent.
+    Image,
     Binary,
     Unsupported,
 }
@@ -454,6 +476,8 @@ pub enum WorkspaceLineEnding {
 pub enum WorkspaceReadOnlyReason {
     Binary,
     UnsupportedEncoding,
+    /// A known image extension whose bytes are not a supported raster format.
+    UnsupportedImage,
     MixedLineEndings,
     Symlink,
     TooLarge,
@@ -585,6 +609,41 @@ pub struct CheckoutDiff {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Explicit repository state for a checkout. The Changes pane uses this
+/// rather than inferring "no diff yet" into "no repository": a read failure,
+/// a non-repository folder and a clean tree are three distinct outcomes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "state",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum GitCheckoutState {
+    /// Git answered and the folder is a work tree.
+    #[serde(rename_all = "camelCase")]
+    Ready {
+        cwd: String,
+        root: String,
+        /// Current branch name; `HEAD` when detached.
+        branch: String,
+        #[serde(default)]
+        detached: bool,
+        #[serde(default)]
+        changed_files: u32,
+        #[serde(default)]
+        insertions: u64,
+        #[serde(default)]
+        deletions: u64,
+        /// Credential-free GitHub URL, when a remote points at GitHub.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        github_url: Option<String>,
+    },
+    /// Git answered that this folder is outside any work tree.
+    NotRepository { cwd: String },
+    /// Git could not be spawned, timed out, or failed for another reason.
+    Error { cwd: String, message: String },
+}
+
 /// Provider-neutral lifecycle state for a code change request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -705,6 +764,52 @@ pub enum AgentAuthKind {
 pub struct AgentAccountsSnapshot {
     pub accounts: Vec<AgentAccount>,
     pub warnings: Vec<AgentAccountWarning>,
+    /// One typed detection state per provider Komet integrates with.
+    /// Additive: an engine predating the field sends none, and the UI then
+    /// falls back to its old account-list reading instead of inventing a state.
+    #[serde(default)]
+    pub statuses: Vec<AgentIdentityReport>,
+}
+
+/// Typed result of reading one agent's active identity.
+///
+/// The point of this type is the distinction old surfaces lost: a detection
+/// FAILURE is not "not connected", and an agent that does not expose an
+/// identity (Pi reports a provider, not an account) is not "logged out".
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(
+    tag = "state",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum AgentIdentityStatus {
+    Detected {
+        account_id: String,
+        /// Email / display name the agent exposes; `None` when only an opaque
+        /// key is readable.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        identity: Option<String>,
+        /// Whether Komet can switch back to this login.
+        switchable: bool,
+    },
+    NotConnected,
+    /// The CLI is signed in but exposes no readable identity.
+    NotExposed {
+        /// What the UI can honestly say instead (e.g. provider label).
+        message: String,
+    },
+    /// Reading the identity failed (permission denied, torn store, SQLITE_BUSY).
+    Error {
+        message: String,
+        retryable: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentIdentityReport {
+    pub harness: HarnessId,
+    pub status: AgentIdentityStatus,
 }
 
 /// A per-harness detection warning (e.g. Keychain denied reading the live login).
@@ -894,6 +999,67 @@ pub struct AgentLocalUsage {
     pub month_cost: Option<UsageCostEstimate>,
 }
 
+/// Best source behind an available usage sample.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum UsageSampleSource {
+    /// Quota endpoint of the active provider account.
+    ProviderQuota,
+    /// The agent's own local log (tokens, never provider billing).
+    LocalLog,
+    /// Turns Komet itself measured.
+    MeasuredTurns,
+}
+
+/// Why no usage figure exists. Never conflated with an error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum UsageNotReportedReason {
+    /// The provider exposes no quota endpoint for this agent.
+    NoProviderEndpoint,
+    /// No active account was detected, so there is nothing to query.
+    NoAccount,
+    /// No sample has been collected yet (page opened offline, probe deferred).
+    NotCollected,
+    /// The agent's protocol exposes no token counter.
+    NoTokenCounter,
+}
+
+/// The three-state answer every agent's usage row must carry.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(
+    tag = "state",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum AgentUsageStatus {
+    /// A figure exists; `source` says where it came from and `collected_at`
+    /// when it was sampled or read from the source.
+    Available {
+        source: UsageSampleSource,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        collected_at: Option<DateTime<Utc>>,
+    },
+    /// The provider genuinely reports nothing (or no account exists). This is
+    /// NOT a failed fetch and must never render as a zero.
+    NotReported {
+        reason: UsageNotReportedReason,
+        message: String,
+    },
+    /// A fetch was attempted and failed; the last known value may still be
+    /// shown, dated, beside this error.
+    RetrievalError { message: String, retryable: bool },
+}
+
+impl Default for AgentUsageStatus {
+    fn default() -> Self {
+        Self::NotReported {
+            reason: UsageNotReportedReason::NotCollected,
+            message: "no usage sample collected yet".into(),
+        }
+    }
+}
+
 /// One agent's row on the Usage page: the active account's provider meters
 /// plus Komet-measured totals.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -932,6 +1098,10 @@ pub struct AgentUsageReport {
     pub series: UsageSeries,
     #[serde(default)]
     pub rate_limits: UsageRateLimits,
+    /// Mandatory three-state answer for this agent's usage row. Additive with
+    /// an explicit default so a report from an older engine still decodes.
+    #[serde(default)]
+    pub usage_status: AgentUsageStatus,
     /// Estimated API-equivalent spend per window (M5); `None` when no model
     /// in the window has a known price — never a fabricated zero.
     #[serde(default, skip_serializing_if = "Option::is_none")]

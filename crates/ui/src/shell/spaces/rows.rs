@@ -150,18 +150,10 @@ impl Shell {
                     crate::theme::wash(0.0),
                     crate::theme::wash(0.14),
                 ))
-                .on_hover(cx.listener(|this, hovered: &bool, window, cx| {
-                    motion::set_hover(
-                        "project-tree-toggle",
-                        cx.entity_id(),
-                        *hovered,
-                        motion::reduced_motion(cx),
-                    );
-                    if *hovered && !this.spaces_menu.is_open() {
-                        this.open_spaces_menu(window, cx);
-                    }
-                    cx.notify();
-                }))
+                .on_hover(motion::hover_listener(
+                    "project-tree-toggle",
+                    cx.entity_id(),
+                ))
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.settings.project_tree_expanded = !this.settings.project_tree_expanded;
                     this.schedule_save(cx);
@@ -203,23 +195,6 @@ impl Shell {
                     .text_color(theme.text_muted.opacity(0.65)),
                 );
 
-            // In the unfiltered state, `project_header` replaces the dropdown
-            // trigger above. Keep the same menu available here so actions such
-            // as Import project do not disappear when “All projects” is active.
-            let project_header = if self.spaces_menu.get().is_some() {
-                let closing = self.spaces_menu.closing_since();
-                let menu = self.render_spaces_menu(theme, cx);
-                project_header
-                    .relative()
-                    .child(popover::anchored_menu_below_unfrosted(
-                        "spaces-filter-menu",
-                        menu,
-                        closing,
-                    ))
-            } else {
-                project_header
-            };
-
             div()
                 .flex_1()
                 .min_w_0()
@@ -233,18 +208,15 @@ impl Shell {
             trigger.into_any_element()
         };
 
-        // NEW SESSION beside the trigger (adding a project lives in the
-        // dropdown's "New project…" row now). While the sidebar is collapsed
-        // this same button fades into the titlebar instead
-        // (`render_session_title_bar`). A plain button — the canvas showing
-        // is not an "active" state worth a selected wash (user feedback).
-        let add = div()
+        let new_project = div()
             .id("sidebar-new-session")
-            .size(px(24.0))
-            .flex_none()
+            .w_full()
+            .h(px(29.0))
             .flex()
             .items_center()
-            .justify_center()
+            .flex_row()
+            .gap(px(Theme::SPACE_SM))
+            .px(px(Theme::SPACE_SM))
             .rounded(px(6.0))
             .cursor_pointer()
             .bg(motion::hover_blend(
@@ -261,19 +233,25 @@ impl Shell {
                 icon(icons::PLUS)
                     .size(px(14.0))
                     .text_color(theme.text_muted.opacity(0.7)),
+            )
+            .child(
+                div()
+                    .text_size(px(13.0))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(theme.text.opacity(0.8))
+                    .child("New session"),
             );
 
         div()
             .flex_none()
             .flex()
-            .flex_row()
-            .items_center()
+            .flex_col()
             .gap(px(4.0))
             .px(px(Theme::SPACE_SM))
             .pt(px(8.0))
             .pb(px(4.0))
+            .child(new_project)
             .child(trigger)
-            .child(add)
             .into_any_element()
     }
 
@@ -300,24 +278,6 @@ impl Shell {
         let mut actions = popover::popover_card(theme).w(px(220.0)).flex().flex_col();
 
         let (worktrees_enabled, settings_enabled) = self.project_menu_action_availability(cx);
-        actions = actions.child(
-            self.project_menu_action_row(
-                "project-menu-switch",
-                icons::FOLDER,
-                "Switch project",
-                true,
-                active == 0,
-                theme,
-            )
-            .on_hover(cx.listener(|this, hovered: &bool, window, cx| {
-                if *hovered {
-                    this.open_project_menu_page(SpacesMenuPage::Projects, window, cx);
-                }
-            }))
-            .on_click(cx.listener(|this, _, window, cx| {
-                this.open_project_menu_page(SpacesMenuPage::Projects, window, cx);
-            })),
-        );
         actions = actions.when(worktrees_enabled, |menu| {
             menu.child(
                 self.project_menu_action_row(
@@ -325,7 +285,7 @@ impl Shell {
                     icons::GIT_BRANCH,
                     "Switch worktree",
                     true,
-                    active == 1,
+                    active == 0,
                     theme,
                 )
                 .on_hover(cx.listener(|this, hovered: &bool, window, cx| {
@@ -345,7 +305,7 @@ impl Shell {
                     icons::SETTINGS_MINIMALISTIC,
                     "Project settings",
                     true,
-                    active == 1 + usize::from(worktrees_enabled),
+                    active == usize::from(worktrees_enabled),
                     theme,
                 )
                 .on_hover(cx.listener(|this, hovered: &bool, window, cx| {
@@ -845,6 +805,12 @@ impl Shell {
         // Right-click on a real project opens its context menu (rename /
         // remove) — the `~` project-less group has no space to manage.
         let menu_space = folder_id.clone();
+        let project_logo = folder_id.as_deref().and_then(|id| {
+            self.state
+                .read(cx)
+                .space_row(id)
+                .and_then(|space| space.logo.clone())
+        });
         div()
             .id(SharedString::from(format!("folder-header-{key}")))
             .flex()
@@ -884,13 +850,23 @@ impl Shell {
                     }),
                 )
             })
-            // Folder icon
-            .child(
+            // User-selected project logo, falling back to the folder mark.
+            .child(if let Some(logo) = project_logo {
+                div()
+                    .size(px(16.0))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(project_logo_element(&logo, px(14.0), theme.text_muted))
+                    .into_any_element()
+            } else {
                 crate::icons::icon(crate::icons::FOLDER)
                     .size(px(14.0))
                     .flex_none()
-                    .text_color(theme.text_muted.opacity(0.7)),
-            )
+                    .text_color(theme.text_muted.opacity(0.7))
+                    .into_any_element()
+            })
             // Project name (truncated)
             .child(
                 div()
@@ -916,21 +892,6 @@ impl Shell {
                         .child(SharedString::from(format!("{session_count}"))),
                 )
             })
-            // Chevron
-            .child(
-                crate::icons::icon(if is_collapsed {
-                    crate::icons::ALT_ARROW_RIGHT
-                } else {
-                    crate::icons::ALT_ARROW_DOWN
-                })
-                .size(px(12.0))
-                .flex_none()
-                .text_color(motion::hover_blend(
-                    &hover_text,
-                    theme.text_muted.opacity(0.5),
-                    theme.text_muted.opacity(0.85),
-                )),
-            )
             // New session in this folder (real folders only; the `~` group has
             // no folder to start in). Kept extreme-right, always laid out so
             // hovering never shifts the rows; it fades in with header hover.

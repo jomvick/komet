@@ -270,6 +270,7 @@ mod tests {
             device_id: "dev".into(),
             path: "/repo/ribo".into(),
             name: Some("Ribo".into()),
+            logo: None,
             git_detected: true,
             git_checked_at: None,
             checkout_id: Some("co-1".into()),

@@ -653,6 +653,7 @@ impl WorkspaceHost {
             device_id: device_id.clone(),
             path: root.unwrap_or_else(|| path.to_string()),
             name: None,
+            logo: None,
             git_detected: false,
             git_checked_at: None,
             checkout_id: None,
@@ -819,6 +820,7 @@ impl WorkspaceHost {
                 device_id: device_id.to_string(),
                 path: path.to_string(),
                 name,
+                logo: None,
                 git_detected,
                 git_checked_at: None,
                 checkout_id: None,
@@ -830,6 +832,10 @@ impl WorkspaceHost {
 
     pub fn rename_space(&self, space_id: &str, name: Option<&str>) -> Result<bool, EngineError> {
         Ok(self.mutate(|doc| doc.rename_space(space_id, name))?)
+    }
+
+    pub fn set_space_logo(&self, space_id: &str, logo: Option<&str>) -> Result<bool, EngineError> {
+        Ok(self.mutate(|doc| doc.set_space_logo(space_id, logo))?)
     }
 
     /// Hard-delete a space and its chats (registry cascade — one atomic batch).

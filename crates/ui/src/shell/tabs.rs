@@ -221,8 +221,9 @@ impl Shell {
         } else {
             content_left
         };
-        // GitHub and project-open controls sit immediately before the
-        // right-pane toggle at the titlebar's trailing edge.
+        // GitHub (PR/worktree/open-in-Cursor) controls sit just to the LEFT
+        // of the right pane while it is open, on the workspace side of its
+        // boundary.
         let github = self.render_github_button(&theme, cx);
         let panel_toggle = header_icon_button(
             "toggle-changes",
@@ -232,11 +233,17 @@ impl Shell {
             cx.listener(|this, _, _, cx| this.toggle_right_pane(cx)),
         );
         let pane_open = self.right_pane_open(cx);
-        // With the pane open, the GitHub controls and the pane toggle live
-        // INSIDE the pane-header zone below (taken out of these Options), so
-        // the zone is one block exactly as wide as the pane.
-        let mut github = github;
-        let mut panel_toggle = Some(panel_toggle);
+        let (left_of_pane_actions, trailing_github, pane_panel_toggle, trailing_panel_toggle) =
+            if pane_open {
+                (
+                    github.map(|button| div().flex_none().child(button).into_any_element()),
+                    None,
+                    Some(panel_toggle),
+                    None,
+                )
+            } else {
+                (None, github, None, Some(panel_toggle))
+            };
         let trailing: Option<gpui::AnyElement> = if pane_open {
             let right_now = self.eval_tween(self.right_tween, self.right_target(cx));
             let pr = titlebar_right_padding(
@@ -247,16 +254,10 @@ impl Shell {
             // The row's own left padding is part of its content box: a strip
             // wider than what's left after it overflows and clips at the right
             // edge (flex_none never shrinks) — cap to the available width. The
-            // row's 8px child gaps sit OUTSIDE the strip's width (one before
-            // the strip in takeover, two with the title row present): without
-            // budgeting them the capped strip overflows by exactly one gap and
-            // the buttons slide right on expand (user report).
-            // The GitHub controls and the pane toggle follow the strip (one
-            // 8px gap each), so its right edge sits `strip_tail` left of
-            // viewport − pr — the band's edge. The width must subtract that
-            // too, or the whole strip (tabs included) overhangs the
-            // conversation by the width of those controls (user report: the
-            // surface tab straddled the pane's left border).
+            // Parent-row gaps sit outside this zone: one in takeover and two
+            // when the session title and GitHub actions are also visible.
+            // Keep the full zone within the viewport so its left edge follows
+            // the pane boundary during the width tween.
             // The pane header is ONE zone anchored to the window's right
             // edge and exactly `right_now` wide, so its left edge IS the
             // pane's left border whatever the buttons' widths are (no more
@@ -264,9 +265,8 @@ impl Shell {
             // space left after the buttons and scroll if there are too many.
             let gap_budget = if takeover { 8.0 } else { 16.0 };
             let avail = self.viewport_width - row_left - gap_budget;
-            // The right pane's SURFACE TABS (t3 RightPanelTabs) — the diff
-            // options that used to live here moved into the pane's own
-            // second row; expand stays in this band.
+            // Surface tabs stay inside the pane header; expand and close
+            // controls sit beside them at the pane's right edge.
             let controls = self.render_right_tab_strip(cx);
             Some(
                 div()
@@ -277,9 +277,8 @@ impl Shell {
                     .items_center()
                     .gap(px(4.0))
                     .overflow_hidden()
-                    // Right edge sits at viewport − pr − strip_tail; this
-                    // width starts the strip exactly at the pane's left
-                    // border — and rides the open/close tween.
+                    // Zone width follows the pane's animated width, keeping
+                    // its left edge aligned with the pane border.
                     .w(px(right_now.min(avail).max(0.0)))
                     // Window-control clearance lives inside the zone now.
                     .pr(px(pr))
@@ -289,14 +288,6 @@ impl Shell {
                     .pl(px(8.0))
                     // Clipped: a long base-ref name must truncate inside the
                     // controls, never paint under the buttons to the right.
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .h_full()
-                            .overflow_hidden()
-                            .child(controls),
-                    )
                     .child(header_icon_button(
                         "expand-changes",
                         icons::EXPAND_ARROWS,
@@ -304,15 +295,18 @@ impl Shell {
                         cx.entity_id(),
                         cx.listener(|this, _, _, cx| this.toggle_right_pane_expand(cx)),
                     ))
-                    .children(
-                        github
-                            .take()
-                            .map(|g| div().flex_none().ml(px(4.0)).child(g)),
-                    )
-                    .children(
-                        panel_toggle
-                            .take()
-                            .map(|t| div().flex_none().ml(px(4.0)).child(t)),
+                    .children(pane_panel_toggle)
+                    // The header's controls stay at the PANE'S LEFT edge. At
+                    // the right edge they land under the window's own
+                    // maximize/close buttons in takeover and stop receiving
+                    // clicks (user report).
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .overflow_hidden()
+                            .child(controls),
                     )
                     .into_any_element(),
             )
@@ -384,9 +378,10 @@ impl Shell {
                 )
             })
             .child(div().flex_1())
+            .children(left_of_pane_actions)
             .children(trailing)
-            .children(github)
-            .children(panel_toggle);
+            .children(trailing_github)
+            .children(trailing_panel_toggle);
 
         // The unified window titlebar: full-width on the glass shell, ABOVE
         // the inset card. No bottom border — the card's own hairline is the

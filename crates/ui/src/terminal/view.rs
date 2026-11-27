@@ -67,16 +67,15 @@ pub fn terminal_bg() -> Hsla {
     terminal_bg_for(current_appearance())
 }
 
-/// The panel fill behind the grid. On glass the opaque tone thins to a
-/// translucent wash so the blurred desktop reads through like the rest of the
-/// chrome (same move as [`Theme::card_glass_bg`]); opaque platforms keep the
-/// true tone. Explicit cell backgrounds (vim colorschemes etc.) still paint
-/// their own opaque quads on top.
+/// The panel fill behind the grid. Use the shared main-panel token so the
+/// terminal drawer sits in the same color system as the right pane. On glass,
+/// thin it to a translucent wash so the desktop still reads through. Explicit
+/// cell backgrounds (vim colorschemes etc.) paint their own quads on top.
 pub fn terminal_panel_bg(theme: &Theme) -> Hsla {
     if theme.is_glass() {
-        terminal_bg_for(theme.appearance).opacity(0.4)
+        theme.bg.opacity(0.4)
     } else {
-        terminal_bg_for(theme.appearance)
+        theme.bg
     }
 }
 

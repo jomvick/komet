@@ -32,7 +32,7 @@ use gpui::{
     SharedString, Subscription, Task, Window, div, font, list, prelude::*, px,
 };
 
-use komet_proto::{Chat, CheckoutDiff, GitHistoryCommit};
+use komet_proto::{Chat, CheckoutDiff, GitCheckoutState, GitHistoryCommit};
 use komet_rpc::methods;
 
 use crate::composer::{ComposerInput, ComposerInputEvent};
@@ -527,9 +527,9 @@ impl DiffScope {
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::WorkingTree => "Changes",
-            Self::Branch => "Branch changes",
-            Self::LatestTurn => "Latest turn",
+            Self::WorkingTree => "Unstaged",
+            Self::Branch => "All branch changes",
+            Self::LatestTurn => "Last turn",
             Self::History => "History",
             Self::Commit => "Commit",
         }
@@ -989,6 +989,13 @@ pub struct Changes {
     /// `device:cwd` the branch list was fetched for.
     branches_for: Option<String>,
     branches_task: Option<Task<()>>,
+    /// Typed repository state for the selected checkout. `None` while the
+    /// first probe runs; `NotRepository`/`Error` are rendered explicitly,
+    /// never as an empty or clean diff.
+    git_state: Option<GitCheckoutState>,
+    /// `device:cwd` the repository probe was issued for.
+    git_state_for: Option<String>,
+    git_state_task: Option<Task<()>>,
     /// One-shot scoped capture (Branch / Latest turn) + its fetch key.
     scoped: Option<CheckoutDiff>,
     scoped_for: Option<String>,
@@ -1040,6 +1047,9 @@ impl Changes {
             branches: Vec::new(),
             branches_for: None,
             branches_task: None,
+            git_state: None,
+            git_state_for: None,
+            git_state_task: None,
             scoped: None,
             scoped_for: None,
             scoped_error: None,
@@ -1079,7 +1089,7 @@ impl Changes {
             }
             return commit.sha.chars().take(7).collect::<String>().into();
         }
-        gpui::SharedString::from(self.scope.label())
+        gpui::SharedString::from("Review")
     }
 
     /// A pane currently showing the working tree (not a pinned commit or
@@ -1240,6 +1250,62 @@ impl Changes {
             diff.checksum,
             self.scope_key()
         )
+    }
+
+    /// Probe the selected checkout's repository exactly once per
+    /// `device:cwd`. This is the pane's explicit "repo detected / not a repo /
+    /// Git error" state: it never infers either from an absent diff.
+    fn ensure_git_state(&mut self, cx: &mut Context<Self>) {
+        let Some(cwd) = self.scoped_cwd(cx) else {
+            if self.git_state_for.take().is_some() {
+                self.git_state = None;
+                self.git_state_task = None;
+            }
+            return;
+        };
+        let target = self.desired_target(cx);
+        let key = format!("{}:{}", target.as_deref().unwrap_or("local"), cwd);
+        if self.git_state_for.as_deref() == Some(key.as_str()) {
+            return;
+        }
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        self.git_state_for = Some(key.clone());
+        self.git_state = None;
+        self.git_state_task = Some(cx.spawn(async move |this, cx| {
+            let mut params = serde_json::Map::new();
+            params.insert("repoPath".into(), serde_json::Value::String(cwd.clone()));
+            if let Some(target) = target {
+                params.insert("targetDeviceId".into(), serde_json::Value::String(target));
+            }
+            let result = engine
+                .client()
+                .call(
+                    methods::GET_GIT_CHECKOUT_STATE,
+                    serde_json::Value::Object(params),
+                )
+                .await;
+            this.update(cx, |changes, cx| {
+                if changes.git_state_for.as_deref() != Some(key.as_str()) {
+                    return; // superseded by a chat/device/cwd switch
+                }
+                changes.git_state =
+                    Some(match result {
+                        Ok(value) => serde_json::from_value::<GitCheckoutState>(value)
+                            .unwrap_or_else(|error| GitCheckoutState::Error {
+                                cwd: cwd.clone(),
+                                message: error.to_string(),
+                            }),
+                        Err(error) => GitCheckoutState::Error {
+                            cwd: cwd.clone(),
+                            message: error.to_string(),
+                        },
+                    });
+                cx.notify();
+            })
+            .ok();
+        }));
     }
 
     /// Fetch the branch list for the selected chat's checkout (idempotent per
@@ -1501,6 +1567,7 @@ impl Changes {
         // The watch follows the selected chat's host device (idempotent when
         // the target is unchanged); a boot-deferred attempt retries here too.
         self.ensure_watch(cx);
+        self.ensure_git_state(cx);
         if self.scope == DiffScope::History {
             self.history_pane(cx)
                 .update(cx, |history, cx| history.ensure_loaded(cx));
@@ -1730,15 +1797,15 @@ impl Changes {
         cx.notify();
     }
 
-    fn close_scope_menu(&mut self, cx: &mut Context<Self>) {
-        if self.scope_menu.begin_close() {
-            popover::reap_popup(cx, |changes: &mut Self| &mut changes.scope_menu);
-        }
-    }
-
     fn close_ref_menu(&mut self, cx: &mut Context<Self>) {
         if self.ref_menu.begin_close() {
             popover::reap_popup(cx, |changes: &mut Self| &mut changes.ref_menu);
+        }
+    }
+
+    fn close_scope_menu(&mut self, cx: &mut Context<Self>) {
+        if self.scope_menu.begin_close() {
+            popover::reap_popup(cx, |changes: &mut Self| &mut changes.scope_menu);
         }
     }
 
@@ -2112,15 +2179,39 @@ impl Changes {
             }))
             .child(chevron)
             .child(
+                crate::icons::icon(crate::icons::DOCUMENT)
+                    .size(px(13.0))
+                    .text_color(theme.warning.opacity(0.9)),
+            )
+            .child({
+                let (directory, name) = file
+                    .path
+                    .rsplit_once('/')
+                    .unwrap_or(("", file.path.as_str()));
                 div()
                     .flex_1()
                     .min_w_0()
-                    .truncate()
-                    .font_family(theme.font_mono.clone())
-                    .text_size(px(12.0))
-                    .text_color(theme.text_dim)
-                    .child(SharedString::from(file.path.clone())),
-            )
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(6.0))
+                    .text_size(px(12.5))
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_color(theme.text)
+                            .child(SharedString::from(name.to_string())),
+                    )
+                    .when(!directory.is_empty(), |el| {
+                        el.child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .text_color(theme.text_faint)
+                                .child(SharedString::from(format!("{directory}/"))),
+                        )
+                    })
+            })
             .when(file.binary, |el| {
                 el.child(
                     div()
@@ -2250,19 +2341,21 @@ impl Changes {
             (scope == DiffScope::History).then(|| self.history_fetch_button(cx));
         let trigger = div()
             .id("changes-scope-trigger")
-            .h(px(24.0))
-            .px(px(8.0))
+            .h(px(30.0))
+            .px(px(10.0))
             .flex_none()
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(6.0))
-            .rounded(px(6.0))
+            .gap(px(8.0))
+            .rounded(px(7.0))
+            .border_1()
+            .border_color(crate::theme::hairline(0.10))
             .cursor_pointer()
             .bg(motion::hover_blend(
                 "changes-scope-trigger",
-                crate::theme::wash(0.05),
-                crate::theme::wash(0.14),
+                crate::theme::wash(0.045),
+                crate::theme::wash(0.11),
             ))
             .on_hover(motion::hover_listener(
                 "changes-scope-trigger",
@@ -2287,14 +2380,14 @@ impl Changes {
             }))
             .child(
                 div()
-                    .text_size(px(12.0))
+                    .text_size(px(12.5))
                     .text_color(theme.text)
                     .child(SharedString::from(scope.label())),
             )
             .child(
                 crate::icons::icon(crate::icons::ALT_ARROW_DOWN)
                     .size(px(12.0))
-                    .text_color(theme.text_muted.opacity(0.7)),
+                    .text_color(theme.text_muted),
             );
         let trigger = if self.scope_menu.get().is_some() {
             let closing = self.scope_menu.closing_since();
@@ -2303,12 +2396,11 @@ impl Changes {
                 "changes-scope-menu",
                 menu,
                 closing,
-                10.0,
+                8.0,
             ))
         } else {
             trigger
         };
-
         let trailing: AnyElement = if scope == DiffScope::History {
             div()
                 .flex_none()
@@ -2332,14 +2424,23 @@ impl Changes {
                 .into_any_element()
         } else {
             Self::header_button(
-                "changes-fold-all",
-                crate::icons::FOLD_VERTICAL,
+                "changes-review-refresh",
+                crate::icons::REFRESH,
                 &theme,
                 cx.entity_id(),
             )
             .on_click(cx.listener(|this, _, _, cx| {
                 cx.stop_propagation();
-                this.toggle_collapse_all(cx);
+                if this.scope == DiffScope::History {
+                    this.history_pane(cx)
+                        .update(cx, |history, cx| history.refresh(cx));
+                } else if this.scope == DiffScope::WorkingTree {
+                    this.ensure_content(cx);
+                } else {
+                    this.scoped_for = None;
+                    this.scoped_inflight = None;
+                    this.ensure_content(cx);
+                }
             }))
             .into_any_element()
         };
@@ -2363,30 +2464,59 @@ impl Changes {
     }
 
     fn render_scope_menu(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let current = self.scope;
+        let selected = self.scope;
         popover::popover_card(theme)
-            .w(px(180.0))
+            .w(px(178.0))
             .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_scope_menu(cx)))
             .child(
-                // The 2px row gap every other menu carries — rows straight on
-                // the card abutted, adjacent washes read as one slab (user
-                // report).
-                div().flex().flex_col().gap(px(2.0)).children(
-                    DiffScope::ALL.into_iter().enumerate().map(|(ix, scope)| {
-                        popover::menu_row(
-                            theme,
-                            scope == current,
-                            format!("changes-scope-row-{ix}"),
-                            cx.entity_id(),
-                        )
-                        .id(("changes-scope-row", ix))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.set_scope(scope, cx);
-                            this.close_scope_menu(cx);
-                        }))
-                        .child(div().flex_1().child(SharedString::from(scope.label())))
-                    }),
-                ),
+                div().flex().flex_col().gap(px(2.0)).children([
+                    popover::menu_row(
+                        theme,
+                        selected == DiffScope::WorkingTree,
+                        "review-unstaged",
+                        cx.entity_id(),
+                    )
+                    .id("review-unstaged-row")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.set_scope(DiffScope::WorkingTree, cx);
+                        this.close_scope_menu(cx);
+                    }))
+                    .child(div().flex_1().child("Unstaged")),
+                    popover::menu_row(theme, false, "review-staged", cx.entity_id())
+                        .id("review-staged-row")
+                        .text_color(theme.text_faint)
+                        .child(div().flex_1().child("Staged"))
+                        .child(
+                            div()
+                                .text_size(px(9.0))
+                                .text_color(theme.text_faint)
+                                .child("Soon"),
+                        ),
+                    popover::menu_row(
+                        theme,
+                        selected == DiffScope::Branch,
+                        "review-branch",
+                        cx.entity_id(),
+                    )
+                    .id("review-branch-row")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.set_scope(DiffScope::Branch, cx);
+                        this.close_scope_menu(cx);
+                    }))
+                    .child(div().flex_1().child("All branch changes")),
+                    popover::menu_row(
+                        theme,
+                        selected == DiffScope::LatestTurn,
+                        "review-turn",
+                        cx.entity_id(),
+                    )
+                    .id("review-turn-row")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.set_scope(DiffScope::LatestTurn, cx);
+                        this.close_scope_menu(cx);
+                    }))
+                    .child(div().flex_1().child("Last turn")),
+                ]),
             )
             .into_any_element()
     }
@@ -2594,6 +2724,186 @@ impl Changes {
             ))
             .child(list)
             .into_any_element()
+    }
+
+    /// Compact repository strip above the diff: repo name, active branch and
+    /// dirty totals when Git answered. Hidden for blocked states, which get
+    /// the content area instead.
+    fn render_git_strip(&self, theme: &Theme) -> Option<AnyElement> {
+        if self.git_state.is_none() {
+            self.git_state_for.as_ref()?;
+            return Some(
+                div()
+                    .flex_none()
+                    .h(px(30.0))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(6.0))
+                    .px(px(Theme::SPACE_LG))
+                    .border_b_1()
+                    .border_color(crate::theme::hairline(0.06))
+                    .text_size(px(11.0))
+                    .text_color(theme.text_faint)
+                    .child(
+                        crate::icons::icon(crate::icons::GIT_BRANCH)
+                            .size(px(11.0))
+                            .text_color(theme.text_faint),
+                    )
+                    .child(SharedString::from("Checking Git repository…"))
+                    .into_any_element(),
+            );
+        }
+        let GitCheckoutState::Ready {
+            root,
+            branch,
+            detached,
+            changed_files,
+            insertions,
+            deletions,
+            ..
+        } = self.git_state.as_ref()?
+        else {
+            return None;
+        };
+        let name = root
+            .trim_end_matches(['/', '\\'])
+            .rsplit(['/', '\\'])
+            .next()
+            .filter(|name| !name.is_empty())
+            .unwrap_or(root);
+        let dirty = if *changed_files == 0 {
+            SharedString::from("clean")
+        } else if *insertions == 0 && *deletions == 0 {
+            SharedString::from(format!("{changed_files} changed"))
+        } else {
+            SharedString::from(format!(
+                "{changed_files} changed  +{insertions}  -{deletions}"
+            ))
+        };
+        Some(
+            div()
+                .flex_none()
+                .h(px(30.0))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(6.0))
+                .px(px(Theme::SPACE_LG))
+                .border_b_1()
+                .border_color(crate::theme::hairline(0.06))
+                .text_size(px(11.0))
+                .text_color(theme.text_muted)
+                .child(
+                    crate::icons::icon(crate::icons::GIT_BRANCH)
+                        .size(px(11.0))
+                        .text_color(theme.text_faint),
+                )
+                .child(
+                    div()
+                        .min_w_0()
+                        .max_w(px(150.0))
+                        .truncate()
+                        .child(SharedString::from(name.to_string())),
+                )
+                .child(div().text_color(theme.text_faint).child("/"))
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .text_color(if *detached { theme.warning } else { theme.text })
+                        .child(if *detached {
+                            SharedString::from("detached HEAD")
+                        } else {
+                            SharedString::from(branch.clone())
+                        }),
+                )
+                .child(div().flex_1())
+                .child(
+                    div()
+                        .flex_none()
+                        .text_color(if *changed_files == 0 {
+                            theme.text_faint
+                        } else {
+                            theme.text_muted
+                        })
+                        .child(dirty),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// The explicit blocked state: not a repository, or Git failed. Both
+    /// replace the diff body so a read failure can never masquerade as a
+    /// clean/empty checkout.
+    fn render_git_blocked(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (title, detail, warning) = match self.git_state.as_ref()? {
+            GitCheckoutState::NotRepository { cwd } => (
+                "Not a Git repository",
+                format!(
+                    "{cwd} is outside a Git work tree. Diff, branch and history views need a repository."
+                ),
+                false,
+            ),
+            GitCheckoutState::Error { cwd, message } => (
+                "Git unavailable",
+                format!("Could not read the repository at {cwd}: {message}"),
+                true,
+            ),
+            GitCheckoutState::Ready { .. } => return None,
+        };
+        Some(
+            div()
+                .flex_1()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap(px(6.0))
+                .px(px(Theme::SPACE_LG))
+                .child(
+                    div()
+                        .text_size(px(12.0))
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(if warning {
+                            theme.warning
+                        } else {
+                            theme.text_muted
+                        })
+                        .child(SharedString::from(title)),
+                )
+                .child(
+                    div()
+                        .max_w(px(340.0))
+                        .text_center()
+                        .text_size(px(11.0))
+                        .text_color(theme.text_faint)
+                        .child(SharedString::from(detail)),
+                )
+                .when(warning, |el| {
+                    el.child(
+                        div()
+                            .id("changes-git-retry")
+                            .mt(px(4.0))
+                            .px(px(8.0))
+                            .py(px(3.0))
+                            .rounded(px(5.0))
+                            .border_1()
+                            .border_color(theme.border)
+                            .text_size(px(11.0))
+                            .text_color(theme.text_muted)
+                            .cursor_pointer()
+                            .hover(|style| style.bg(theme.element_hover))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.git_state_for = None;
+                                this.sync(cx);
+                                cx.notify();
+                            }))
+                            .child(SharedString::from("Retry")),
+                    )
+                })
+                .into_any_element(),
+        )
     }
 
     fn render_header_strip(&self, theme: &Theme) -> Option<AnyElement> {
@@ -2962,7 +3272,10 @@ impl Render for Changes {
                 }
             });
 
-        let content: AnyElement = if let Some((message, warn)) = scoped_notice {
+        let git_strip = self.render_git_strip(&theme);
+        let content: AnyElement = if let Some(blocked) = self.render_git_blocked(&theme, cx) {
+            blocked
+        } else if let Some((message, warn)) = scoped_notice {
             div()
                 .flex_1()
                 .flex()
@@ -3062,6 +3375,7 @@ impl Render for Changes {
                         .child(message),
                 )
             })
+            .when_some(git_strip, |el, strip| el.child(strip))
             .child(content)
             .into_any_element()
     }
@@ -3518,7 +3832,7 @@ rename to new_name.rs
     #[test]
     fn scope_menu_keeps_only_changes_and_history() {
         assert_eq!(DiffScope::ALL, [DiffScope::WorkingTree, DiffScope::History]);
-        assert_eq!(DiffScope::WorkingTree.label(), "Changes");
+        assert_eq!(DiffScope::WorkingTree.label(), "Unstaged");
         assert_eq!(DiffScope::History.label(), "History");
     }
 

@@ -95,6 +95,15 @@ pub struct WorkspaceEntry {
     pub version: Option<String>,
 }
 
+/// A device that can provide a project to the new-session import picker.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProjectSourceDevice {
+    pub workspace_id: String,
+    pub workspace_label: String,
+    pub device: Device,
+    pub status: WorkspaceStatus,
+}
+
 /// Where the user was inside a paired device, restored when they come back.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct WorkspaceMemory {

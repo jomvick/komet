@@ -15,6 +15,7 @@ use super::{ZOOM_DEFAULT, ZOOM_MAX, ZOOM_MIN};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BrowserAction {
     NewTab,
+    CopyLink,
     ZoomIn,
     ZoomOut,
     ResetZoom,
@@ -25,6 +26,7 @@ pub enum BrowserAction {
     ToggleFavorite,
     ClearStorage,
     BrowserSettings,
+    ClearHistory,
     Screenshot,
     ToggleConsole,
 }
@@ -38,6 +40,7 @@ pub fn action_shipped(action: BrowserAction) -> bool {
     matches!(
         action,
         BrowserAction::NewTab
+            | BrowserAction::CopyLink
             | BrowserAction::OpenExternalBrowser
             | BrowserAction::BrowserSettings
             | BrowserAction::History
@@ -52,6 +55,7 @@ pub fn action_shipped(action: BrowserAction) -> bool {
             | BrowserAction::DeviceEmulation
             // PR 8 : dialogue Clear Storage (cookies/cache/site data/history).
             | BrowserAction::ClearStorage
+            | BrowserAction::ClearHistory
     )
 }
 
@@ -61,6 +65,7 @@ pub fn action_shipped(action: BrowserAction) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct MenuStates {
     pub new_tab: bool,
+    pub copy_link: bool,
     pub zoom_in: bool,
     pub zoom_out: bool,
     pub reset_zoom: bool,
@@ -70,6 +75,7 @@ pub struct MenuStates {
     pub history: bool,
     pub toggle_favorite: bool,
     pub clear_storage: bool,
+    pub clear_history: bool,
     pub browser_settings: bool,
 }
 
@@ -78,6 +84,7 @@ const ZOOM_EPS: f32 = 0.001;
 pub fn menu_state(has_page: bool, zoom: f32, _favorite: bool) -> MenuStates {
     MenuStates {
         new_tab: true,
+        copy_link: has_page,
         zoom_in: has_page && zoom < ZOOM_MAX - ZOOM_EPS,
         zoom_out: has_page && zoom > ZOOM_MIN + ZOOM_EPS,
         reset_zoom: has_page && (zoom - ZOOM_DEFAULT).abs() > ZOOM_EPS,
@@ -89,6 +96,7 @@ pub fn menu_state(has_page: bool, zoom: f32, _favorite: bool) -> MenuStates {
         history: true,
         toggle_favorite: has_page,
         clear_storage: true,
+        clear_history: true,
         browser_settings: true,
     }
 }
@@ -114,88 +122,51 @@ fn shortcut_label(key: &str) -> SharedString {
 
 /// Les entrées de la capture, dans l'ordre des groupes. `favorite` ne change
 /// que le libellé (« Remove from Favorites »).
-pub fn all_menu_items(states: &MenuStates, favorite: bool) -> Vec<MenuItem> {
+/// Le menu « … » réduit à six entrées (capture utilisateur) : zoom, copier le
+/// lien, ouvrir dans le navigateur, effacer l'historique. Les autres actions
+/// restent disponibles par raccourci ou dans les réglages.
+pub fn all_menu_items(states: &MenuStates, _favorite: bool) -> Vec<MenuItem> {
     vec![
         MenuItem {
-            label: "New Tab".into(),
-            shortcut: Some(shortcut_label("T")),
-            action: BrowserAction::NewTab,
-            enabled: states.new_tab,
+            label: "Zoom in".into(),
+            shortcut: Some(shortcut_label("+")),
+            action: BrowserAction::ZoomIn,
+            enabled: states.zoom_in,
             separated: false,
         },
         MenuItem {
-            label: "Zoom In".into(),
-            shortcut: Some(shortcut_label("=")),
-            action: BrowserAction::ZoomIn,
-            enabled: states.zoom_in,
-            separated: true,
-        },
-        MenuItem {
-            label: "Zoom Out".into(),
+            label: "Zoom out".into(),
             shortcut: Some(shortcut_label("-")),
             action: BrowserAction::ZoomOut,
             enabled: states.zoom_out,
             separated: false,
         },
         MenuItem {
-            label: "Reset Zoom".into(),
-            shortcut: Some(shortcut_label("0")),
+            label: "Reset zoom".into(),
+            shortcut: None,
             action: BrowserAction::ResetZoom,
             enabled: states.reset_zoom,
             separated: false,
         },
         MenuItem {
-            label: "Find in Page".into(),
-            shortcut: Some(shortcut_label("F")),
-            action: BrowserAction::FindInPage,
-            enabled: states.find_in_page,
+            label: "Copy link".into(),
+            shortcut: None,
+            action: BrowserAction::CopyLink,
+            enabled: states.copy_link,
             separated: true,
         },
         MenuItem {
-            label: "Device Emulation".into(),
-            shortcut: None,
-            action: BrowserAction::DeviceEmulation,
-            enabled: states.device_emulation,
-            separated: false,
-        },
-        MenuItem {
-            label: "Open in External Browser".into(),
+            label: "Open in browser".into(),
             shortcut: None,
             action: BrowserAction::OpenExternalBrowser,
             enabled: states.open_external,
             separated: false,
         },
         MenuItem {
-            label: "History".into(),
-            shortcut: Some(shortcut_label("H")),
-            action: BrowserAction::History,
-            enabled: states.history,
-            separated: true,
-        },
-        MenuItem {
-            label: (if favorite {
-                "Remove from Favorites"
-            } else {
-                "Add to Favorites"
-            })
-            .into(),
-            shortcut: Some(shortcut_label("D")),
-            action: BrowserAction::ToggleFavorite,
-            enabled: states.toggle_favorite,
-            separated: false,
-        },
-        MenuItem {
-            label: "Clear Storage (Global)".into(),
+            label: "Clear history".into(),
             shortcut: None,
-            action: BrowserAction::ClearStorage,
-            enabled: states.clear_storage,
-            separated: false,
-        },
-        MenuItem {
-            label: "Browser Settings".into(),
-            shortcut: None,
-            action: BrowserAction::BrowserSettings,
-            enabled: states.browser_settings,
+            action: BrowserAction::ClearHistory,
+            enabled: states.clear_history,
             separated: true,
         },
     ]
@@ -299,24 +270,19 @@ mod tests {
     }
 
     #[test]
-    fn menu_items_couvrent_les_onze_entrees_dans_l_ordre() {
+    fn menu_items_couvrent_les_six_entrees_dans_l_ordre() {
         let states = menu_state(true, ZOOM_DEFAULT, false);
         let items = all_menu_items(&states, false);
         let labels: Vec<&str> = items.iter().map(|i| i.label.as_ref()).collect();
         assert_eq!(
             labels,
             [
-                "New Tab",
-                "Zoom In",
-                "Zoom Out",
-                "Reset Zoom",
-                "Find in Page",
-                "Device Emulation",
-                "Open in External Browser",
-                "History",
-                "Add to Favorites",
-                "Clear Storage (Global)",
-                "Browser Settings",
+                "Zoom in",
+                "Zoom out",
+                "Reset zoom",
+                "Copy link",
+                "Open in browser",
+                "Clear history",
             ]
         );
         // Un séparateur ouvre chaque groupe à partir du second.
@@ -326,19 +292,7 @@ mod tests {
             .filter(|(_, i)| i.separated)
             .map(|(ix, _)| ix)
             .collect();
-        assert_eq!(separated, [1, 4, 7, 10]);
-    }
-
-    #[test]
-    fn menu_items_favorite_change_le_libelle() {
-        let states = menu_state(true, ZOOM_DEFAULT, true);
-        let items = all_menu_items(&states, true);
-        let fav = items
-            .iter()
-            .find(|i| i.action == BrowserAction::ToggleFavorite)
-            .expect("favorite entry");
-        assert_eq!(fav.label.as_ref(), "Remove from Favorites");
-        assert!(fav.enabled);
+        assert_eq!(separated, [3, 5]);
     }
 
     #[test]

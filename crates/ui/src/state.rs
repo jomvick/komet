@@ -42,8 +42,8 @@ mod runtime;
 mod workspaces;
 
 pub use engine::{
-    EngineBootConfig, EngineHandle, EngineMode, ThreadCompactions, WorkspaceActivity,
-    WorkspaceEntry, WorkspaceStatus, url_host,
+    EngineBootConfig, EngineHandle, EngineMode, ProjectSourceDevice, ThreadCompactions,
+    WorkspaceActivity, WorkspaceEntry, WorkspaceStatus, url_host,
 };
 pub(crate) use engine::{
     WatchOwner, WorkspaceMemory, wait_for_deferred_engine, workspace_home_device, workspace_version,
@@ -138,6 +138,9 @@ pub struct AppState {
     /// Send-in-flight overlay per chat id: a queued doc command the host
     /// hasn't executed yet (see [`Self::begin_pending_send`]).
     pending_sends: HashMap<String, PendingSend>,
+    /// One-shot seed for the import dialog from the canvas project picker:
+    /// (source workspace, folder, source device). Consumed by the shell.
+    pub pending_import: Option<(String, String, String)>,
     /// The in-flight send's attachment upload, when it has one.
     upload_progress: Option<UploadProgress>,
     /// This engine's device id (best-effort `LocalDevice` probe; `None` until
@@ -161,6 +164,8 @@ pub struct AppState {
     /// Device rows of the local workspace, kept while a paired device is
     /// displayed so the switcher's local row keeps its real hostname.
     local_devices: Vec<Device>,
+    /// Projects of the local workspace, kept while viewing a paired workspace.
+    local_spaces: Vec<Space>,
     /// Connection of the workspace being displayed; `None` while a paired device
     /// is being dialed — the local engine is never a fallback for a remote
     /// workspace, or its rows would land under the wrong label.
@@ -174,6 +179,9 @@ pub struct AppState {
     env_presence: HashMap<String, Task<()>>,
     /// Device rows of the paired devices, kept warm for status and switching.
     env_devices: HashMap<String, Vec<Device>>,
+    /// Project rows of paired workspaces, kept warm so the canvas can import
+    /// a project from another device without switching away from its target.
+    env_spaces: HashMap<String, Vec<Space>>,
     /// Live activity per paired workspace (busy session count), for the
     /// switcher's indicator. Never merges rows across workspaces.
     pub env_activity: HashMap<String, WorkspaceActivity>,
@@ -280,6 +288,7 @@ impl AppState {
             active_plan: None,
             echoes: HashMap::new(),
             pending_sends: HashMap::new(),
+            pending_import: None,
             upload_progress: None,
             local_device_id: None,
             home_device_id: None,
@@ -288,11 +297,13 @@ impl AppState {
             paired_envs: Vec::new(),
             env_list_synced: false,
             local_devices: Vec::new(),
+            local_spaces: Vec::new(),
             display_engine: None,
             env_clients: HashMap::new(),
             env_watches: Vec::new(),
             env_presence: HashMap::new(),
             env_devices: HashMap::new(),
+            env_spaces: HashMap::new(),
             env_activity: HashMap::new(),
             env_memory: HashMap::new(),
             workspaces_task: None,
