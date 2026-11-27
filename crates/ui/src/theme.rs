@@ -424,9 +424,9 @@ pub struct Theme {
     pub danger_strong: Hsla,
 
     // ---- paint: code & diff ----
-    /// Inline-code text — violet, per the user's "a nice purple" request.
+    /// Inline-code text, derived from the selected accent with a text-safe tone.
     pub code_text: Hsla,
-    /// Inline-code wash behind [`Self::code_text`].
+    /// Inline-code wash behind [`Self::code_text`], tinted from the same accent.
     pub code_wash: Hsla,
     /// Shared paint-only syntax palette.
     pub syntax: SyntaxPalette,
@@ -789,6 +789,11 @@ impl Theme {
     pub fn install(appearance: Appearance, cx: &mut App) {
         set_current_appearance(appearance);
         let mut theme = Self::for_appearance(appearance);
+        let (preset, accent) = cx
+            .try_global::<crate::appearance::AppearanceState>()
+            .map(|state| (state.theme_preset, state.accent_color))
+            .unwrap_or_default();
+        theme = theme.with_theme_preset(preset).with_accent_color(accent);
         // Only the whole-window scope lets the image show through the shell
         // surfaces; the in-card scopes keep the chrome opaque.
         if crate::settings::wallpaper::is_enabled(cx)
@@ -803,6 +808,106 @@ impl Theme {
             .thumb_hover(|style| style.bg(hover))
             .thumb_active(|style| style.bg(active));
         cx.set_global(theme);
+    }
+
+    /// Build a palette preview using the same token resolution as the app.
+    pub fn preview_for(
+        appearance: Appearance,
+        preset: crate::settings::ThemePreset,
+        accent: crate::settings::AccentColor,
+    ) -> Self {
+        Self::for_appearance(appearance)
+            .with_theme_preset(preset)
+            .with_accent_color(accent)
+    }
+
+    /// Apply a Komet-authored color family while preserving the selected mode.
+    /// The names describe visual direction only; these token values are original
+    /// Komet palettes, not imported theme files or copied upstream tables.
+    fn with_theme_preset(mut self, preset: crate::settings::ThemePreset) -> Self {
+        use crate::settings::ThemePreset;
+
+        // One hue family per palette, with its own depth: a preset has to read
+        // differently from the next in the picker, so background lightness
+        // moves as much as the hue does. Directions, not upstream values.
+        let (hue, chroma, dark_bg, light_bg) = match preset {
+            ThemePreset::Komet => return self,
+            // Deep navy, cool grey-blue in light mode.
+            ThemePreset::TokyoNight => (262.0, 0.042, 0.200, 0.860),
+            // Muted mauve, the Mocha depth.
+            ThemePreset::Catppuccin => (300.0, 0.032, 0.235, 0.955),
+            // Same family, shallower and creamier — the Latte direction.
+            ThemePreset::CatppuccinLight => (300.0, 0.022, 0.320, 0.972),
+            // Violet night with a pink cast.
+            ThemePreset::Dracula => (285.0, 0.028, 0.270, 0.960),
+            // Warm brown in the dark, paper-cream in the light.
+            ThemePreset::Gruvbox => (65.0, 0.045, 0.265, 0.945),
+        };
+
+        let dark = self.appearance == Appearance::Dark;
+        let bg_l = if dark { dark_bg } else { light_bg };
+        let c = if dark { chroma } else { chroma * 0.58 };
+        let tone = |lightness: f32, saturation: f32| oklch(lightness, c * saturation, hue);
+        if dark {
+            self.bg = tone(bg_l, 1.0);
+            self.surface = tone(bg_l + 0.025, 0.92);
+            self.surface_card = tone(bg_l + 0.012, 0.88);
+            self.surface_raised = tone(bg_l + 0.075, 0.78);
+            self.surface_dialog = tone(bg_l + 0.055, 0.86);
+            self.surface_overlay = tone(bg_l + 0.085, 0.76);
+            self.input_bg = tone(bg_l + 0.028, 0.72).opacity(0.82);
+            self.text = tone(0.94, 0.34);
+            self.text_muted = tone(0.72, 0.40);
+            self.text_faint = tone(0.59, 0.42);
+            self.text_dim = tone(0.63, 0.38);
+            self.border = tone(0.62, 0.30).opacity(0.16);
+            self.border_strong = tone(0.70, 0.34).opacity(0.24);
+            self.element_hover = tone(0.96, 0.20).opacity(0.09);
+            self.element_active = tone(0.96, 0.24).opacity(0.14);
+            self.band = tone(bg_l + 0.12, 0.62).opacity(0.48);
+        } else {
+            self.bg = tone(bg_l, 0.62);
+            self.surface = tone(bg_l - 0.035, 0.64);
+            self.surface_raised = tone(bg_l - 0.012, 0.50);
+            self.surface_card = tone(0.995, 0.34);
+            self.surface_dialog = tone(0.992, 0.42);
+            self.surface_overlay = tone(0.992, 0.46);
+            self.input_bg = tone(0.995, 0.24);
+            self.text = tone(0.22, 0.42);
+            self.text_muted = tone(0.43, 0.44);
+            self.text_faint = tone(0.54, 0.38);
+            self.text_dim = tone(0.49, 0.42);
+            self.border = tone(0.54, 0.30).opacity(0.17);
+            self.border_strong = tone(0.48, 0.34).opacity(0.25);
+            self.element_hover = tone(0.20, 0.24).opacity(0.06);
+            self.element_active = tone(0.20, 0.28).opacity(0.10);
+            self.band = tone(0.35, 0.30).opacity(0.06);
+        }
+        self
+    }
+
+    fn with_accent_color(mut self, color: crate::settings::AccentColor) -> Self {
+        let hue = color.hue();
+        let dark = self.appearance == Appearance::Dark;
+        self.accent = hsla(hue, 0.78, if dark { 0.72 } else { 0.48 }, 1.0);
+        self.accent_strong = hsla(hue, 0.82, if dark { 0.57 } else { 0.43 }, 1.0);
+        self.on_accent = rgb8(0xfa, 0xf9, 0xf5);
+        self.selection = self.accent.opacity(if dark { 0.22 } else { 0.15 });
+        // Message markdown and code blocks used to keep a separate fixed
+        // violet/indigo palette, which made the accent picker appear partial.
+        // Keep their contrast steps, but derive their hue from the selected accent.
+        self.code_text = hsla(hue, 0.58, if dark { 0.82 } else { 0.36 }, 1.0);
+        self.code_wash = hsla(
+            hue,
+            0.72,
+            if dark { 0.62 } else { 0.50 },
+            if dark { 0.12 } else { 0.10 },
+        );
+        self.syntax.keyword = self.accent;
+        self.syntax.function = self.accent;
+        self.syntax.markup_link = self.accent;
+        self.syntax.markup_strong = self.accent;
+        self
     }
 
     fn with_wallpaper(mut self) -> Self {

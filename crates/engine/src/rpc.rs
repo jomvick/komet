@@ -590,6 +590,13 @@ enum MutateParams {
         #[serde(default)]
         name: Option<String>,
     },
+    /// Set or clear the emoji mark shown beside a project in the sidebar.
+    #[serde(rename_all = "camelCase")]
+    SetSpaceLogo {
+        space_id: String,
+        #[serde(default)]
+        logo: Option<String>,
+    },
     /// Hard delete: cascades to every chat (and session row) in the space.
     /// Live runs hosted here are interrupted best-effort.
     #[serde(rename_all = "camelCase")]
@@ -973,6 +980,11 @@ impl EngineRpc {
             MutateParams::RenameSpace { space_id, name } => self
                 .workspace
                 .rename_space(&space_id, name.as_deref())
+                .map_err(failed)
+                .map(drop),
+            MutateParams::SetSpaceLogo { space_id, logo } => self
+                .workspace
+                .set_space_logo(&space_id, logo.as_deref())
                 .map_err(failed)
                 .map(drop),
             MutateParams::DeleteSpace { space_id } => {

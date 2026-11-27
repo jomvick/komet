@@ -41,6 +41,9 @@ pub struct Space {
     /// User rename; absent ⇒ display = basename(path).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// Optional project mark selected by the user (emoji rendered in the UI).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logo: Option<String>,
     /// Owner-stamped: is `path` inside a git work tree?
     #[serde(default)]
     pub git_detected: bool,

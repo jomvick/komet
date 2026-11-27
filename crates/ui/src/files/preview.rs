@@ -180,6 +180,10 @@ impl FilePreviewState {
         self.active.is_some()
     }
 
+    pub(super) fn active_path(&self) -> Option<&str> {
+        self.active.as_deref()
+    }
+
     fn touch_document(&mut self, path: &str) {
         self.document_recency.retain(|candidate| candidate != path);
         self.document_recency.push_back(path.to_string());
@@ -1973,6 +1977,44 @@ impl FilesSurface {
                 .into()
             })
             .tooltip_show_delay(Duration::from_millis(350));
+        if self.presentation == super::FilesPresentation::Browser {
+            return div()
+                .h(px(40.0))
+                .flex_none()
+                .px(px(16.0))
+                .border_b_1()
+                .border_color(theme.border)
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .child(crumbs)
+                .child(
+                    div()
+                        .id("files-open-editor")
+                        .h(px(27.0))
+                        .flex_none()
+                        .px(px(10.0))
+                        .rounded(px(6.0))
+                        .flex()
+                        .items_center()
+                        .gap(px(5.0))
+                        .cursor_pointer()
+                        .border_1()
+                        .border_color(theme.border_strong.opacity(0.5))
+                        .hover(|style| style.bg(crate::theme::wash(0.07)))
+                        .role(gpui::Role::Button)
+                        .aria_label("Open file in editor")
+                        .text_size(px(10.5))
+                        .text_color(theme.text)
+                        .child(icon(icons::SIDEBAR_MINIMALISTIC).size(px(12.0)))
+                        .child("Open")
+                        .child(icon(icons::ALT_ARROW_DOWN).size(px(10.0)))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.open_preview_in_editor(cx);
+                        })),
+                )
+                .into_any_element();
+        }
         div()
             .h(px(31.0))
             .flex_none()
@@ -2111,7 +2153,6 @@ impl FilesSurface {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         self.apply_pending_external_reload(path, window, cx);
-        let editor = self.ensure_editor(path, theme, window, cx);
         let Some(document) = self.preview.documents.get(path) else {
             return gpui::Empty.into_any_element();
         };
@@ -2121,6 +2162,73 @@ impl FilesSurface {
         if let DocumentPhase::Error(error) = &document.phase {
             return centered_state(error.clone(), theme.danger_muted);
         }
+        if self.presentation == super::FilesPresentation::Browser
+            && path.rsplit('.').next().is_some_and(|ext| {
+                ext.eq_ignore_ascii_case("md") || ext.eq_ignore_ascii_case("markdown")
+            })
+            && let Some(source) = document.file.as_ref().and_then(|file| file.text.as_deref())
+        {
+            let tree = crate::markdown::parse_full(source);
+            let options = crate::markdown::render::RenderOptions::settled(path.to_string().into());
+            let rendered =
+                crate::markdown::render::render_tree(&tree, &options, theme, window, &|_| None);
+            return div()
+                .id("files-markdown-preview")
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .px(px(20.0))
+                .py(px(18.0))
+                .child(div().w_full().max_w(px(900.0)).mx_auto().child(rendered))
+                .into_any_element();
+        }
+        if self.presentation == super::FilesPresentation::Browser
+            && path.rsplit('.').next().is_some_and(|ext| {
+                ["txt", "rst", "adoc"]
+                    .iter()
+                    .any(|supported| ext.eq_ignore_ascii_case(supported))
+            })
+            && let Some(source) = document.file.as_ref().and_then(|file| file.text.as_deref())
+        {
+            // Plain project documents deserve a reading layout instead of a
+            // code editor's monospace gutter. The existing Open button keeps
+            // the same file one click away in the editor.
+            let lines = source.lines().map(|line| {
+                div()
+                    .w_full()
+                    .min_h(px(24.0))
+                    .text_size(px(14.0))
+                    .line_height(px(23.0))
+                    .text_color(theme.text.opacity(0.93))
+                    .child(SharedString::from(if line.is_empty() {
+                        " "
+                    } else {
+                        line
+                    }))
+            });
+            return div()
+                .id("files-document-reader")
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .px(px(24.0))
+                .py(px(22.0))
+                .child(
+                    div()
+                        .w_full()
+                        .max_w(px(900.0))
+                        .mx_auto()
+                        .flex()
+                        .flex_col()
+                        .font_family(theme.font_sans.clone())
+                        .children(lines),
+                )
+                .into_any_element();
+        }
+        let editor = self.ensure_editor(path, theme, window, cx);
+        let Some(document) = self.preview.documents.get(path) else {
+            return gpui::Empty.into_any_element();
+        };
         if let Some(image) = document.image.clone() {
             let name = path.rsplit('/').next().unwrap_or(path);
             let dimensions = document

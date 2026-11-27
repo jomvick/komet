@@ -513,13 +513,13 @@ pub struct FlatText {
 }
 
 /// Inline-code tint (round 9): the original is neutral (chat-view.tsx mdTheme
-/// `inlineCode: #f0f0f0 on white/8%`), but the user asked for "a nice purple"
-/// — violet-300 text over a violet-400 wash, readable on the #060606 panel.
+/// Inline-code text follows the selected UI accent, with a tone chosen for the
+/// current appearance so it remains readable on the message surface.
 pub fn inline_code_text(theme: &Theme) -> Hsla {
-    theme.code_text // violet-300
+    theme.code_text
 }
 pub fn inline_code_wash(theme: &Theme) -> Hsla {
-    theme.code_wash // violet-400/12
+    theme.code_wash
 }
 /// Rounded-wash geometry: small radius on a slightly inset box (paint-only —
 /// x extends 2px past the glyphs, y insets 2px from the 22px line box).
@@ -571,7 +571,7 @@ fn flatten_runs_weighted(runs: &[InlineRun], theme: &Theme, base_weight: FontWei
         // Links take the accent marker tone with a thin underline — the hue
         // is gone (ivory/slate), so the underline carries the affordance.
         let is_link = run.style.link.is_some();
-        // Inline code reads violet (see `inline_code_text`); links take the
+        // Inline code reads as the selected accent (see `inline_code_text`); links take the
         // accent; everything else stays the monochrome foreground.
         let color = if run.style.code {
             inline_code_text(theme)

@@ -2,7 +2,22 @@
 
 use super::*;
 
+use crate::settings::RIGHT_PANE_MAX;
+
+/// The conversation column never gets squeezed below this when the window
+/// shrinks: the pane gives way instead of the main chat disappearing.
+const MAIN_COLUMN_MIN: f32 = 360.0;
+
 impl Shell {
+    /// Visible pane width for a docked (non-takeover) pane: the 70% cap from
+    /// the drag path, and never enough to squeeze the main chat away.
+    pub(super) fn fitted_pane_width(viewport: f32, sidebar: f32, stored: f32) -> f32 {
+        let max = RIGHT_PANE_MAX
+            .min(viewport * 0.7)
+            .min((viewport - sidebar - MAIN_COLUMN_MIN).max(RIGHT_PANE_MIN));
+        stored.clamp(RIGHT_PANE_MIN, max.max(RIGHT_PANE_MIN))
+    }
+
     /// Whether the right pane shows. NOT gated on git any more: the pane is
     /// a surface HOST now (terminals work in any space), so only the Git
     /// surface rows check `space_git_detected`. Also available on the
@@ -29,33 +44,14 @@ impl Shell {
             let sidebar_now = self.eval_tween(self.sidebar_tween, self.sidebar_target());
             (self.viewport_width - sidebar_now).max(RIGHT_PANE_MIN)
         } else {
-            // The Files+FileEditor split (render_right_pane) spends a fixed
-            // 220px on the tree column; below SPLIT_RIGHT_PANE_MIN total, the
-            // remaining content column is too narrow to read (user report:
-            // truncated/wrapped-to-nothing file preview). Only the split
-            // needs the wider floor — Diff/Terminal/a lone FileEditor stay at
-            // the normal minimum, and a user's wider manual resize always wins
-            // via `.max`.
-            let min = if self.files_split_active(cx) {
-                SPLIT_RIGHT_PANE_MIN
-            } else {
-                RIGHT_PANE_MIN
-            };
-            self.settings.right_pane_width.max(min)
+            // A pane that fit a wide window must give way when it shrinks:
+            // cap it to 70% (same rule as the drag) and leave the main chat
+            // its minimum width. Only the target changes — the user's saved
+            // width is kept for when the window grows back.
+            let viewport = self.viewport_width;
+            let sidebar_now = self.eval_tween(self.sidebar_tween, self.sidebar_target());
+            Self::fitted_pane_width(viewport, sidebar_now, self.settings.right_pane_width)
         }
-    }
-
-    /// Whether `render_right_pane` will draw the tree+content split for the
-    /// panel key ~as `right_target` sees it: a Files surface tab exists
-    /// alongside whichever surface is active, and that active surface isn't
-    /// the tree itself (matches the `files_panel` condition in
-    /// `render_right_pane` by construction, not a duplicated match).
-    pub(super) fn files_split_active(&self, cx: &App) -> bool {
-        !matches!(self.resolved_right_active(cx), RightSurface::Files)
-            && self
-                .right_surface_rows(cx)
-                .iter()
-                .any(|(s, _, _, _)| matches!(s, RightSurface::Files))
     }
 
     pub(super) fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
@@ -127,6 +123,9 @@ impl Shell {
                     .browsers
                     .get(&key)
                     .map(|browser| (*surface, browser.read(cx).tab_title(), false, None)),
+                RightSurface::NewSession => {
+                    Some((*surface, SharedString::from("New session"), false, None))
+                }
                 RightSurface::Files => self.files.get(&key).map(|files| {
                     let files = files.read(cx);
                     (
@@ -352,8 +351,29 @@ impl Shell {
                     panel.update(cx, |panel, cx| panel.ensure_started(cx));
                 }
             }
-            RightSurface::Browser | RightSurface::Picker => {}
+            RightSurface::Browser | RightSurface::NewSession | RightSurface::Picker => {}
         }
+        cx.notify();
+    }
+
+    /// Open the independent new-session canvas as a right-pane tab. The main
+    /// route and its currently selected chat stay untouched.
+    pub(super) fn add_new_session_surface(&mut self, cx: &mut Context<Self>) {
+        // Reopening the card starts a fresh second chat; an existing one is
+        // never allowed to steal the main view's selection.
+        self.right_home_composer
+            .update(cx, |composer, cx| composer.set_side_chat(cx));
+        self.right_home_transcript
+            .update(cx, |transcript, cx| transcript.reset_side_chat(cx));
+        let from = self.right_target(cx);
+        let key = self.panel_key(cx);
+        push_unique_right_surface(
+            self.right_tabs.entry(key.clone()).or_default(),
+            RightSurface::NewSession,
+        );
+        self.panels.update(&key, |panel| panel.changes_open = true);
+        self.set_right_active(RightSurface::NewSession, cx);
+        self.right_tween = Some(WidthTween::new(from, self.right_target(cx)));
         cx.notify();
     }
 
@@ -534,6 +554,7 @@ impl Shell {
                 .and_then(|files| files.read(cx).attachment_path().map(str::to_string))?,
             RightSurface::File(id) => self.file_surface_paths.get(&id).cloned()?,
             RightSurface::Browser
+            | RightSurface::NewSession
             | RightSurface::Diff(_)
             | RightSurface::Picker
             | RightSurface::Terminal(_)
@@ -730,7 +751,7 @@ impl Shell {
                 self.subagent_tabs.remove(&id);
                 self.subagent_subs.remove(&id);
             }
-            RightSurface::Picker => {}
+            RightSurface::Picker | RightSurface::NewSession => {}
         }
         self.panels.update(&key, |p| {
             if p.right_active == surface {
@@ -1030,5 +1051,29 @@ impl Shell {
                 .push(RightSurface::Terminal(tab));
             self.set_right_active(RightSurface::Terminal(tab), cx);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pane_keeps_saved_width_in_a_roomy_window() {
+        assert_eq!(Shell::fitted_pane_width(1400.0, 256.0, 520.0), 520.0);
+    }
+
+    #[test]
+    fn pane_gives_way_when_the_window_shrinks() {
+        // 900 - 256 sidebar - 360 main = 284 → never below RIGHT_PANE_MIN.
+        assert_eq!(
+            Shell::fitted_pane_width(900.0, 256.0, 800.0),
+            RIGHT_PANE_MIN
+        );
+        // Enough room for 70% but not for a 1000px pane: the main column's
+        // minimum is the tighter cap.
+        assert_eq!(Shell::fitted_pane_width(1400.0, 256.0, 1000.0), 784.0);
+        // A collapsed sidebar hands the space back to the pane.
+        assert_eq!(Shell::fitted_pane_width(900.0, 0.0, 420.0), 420.0);
     }
 }

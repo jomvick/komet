@@ -1594,6 +1594,9 @@ impl BrowserSurface {
     ) {
         match action {
             BrowserAction::NewTab => cx.emit(BrowserSurfaceEvent::NewTab),
+            BrowserAction::CopyLink => {
+                cx.write_to_clipboard(ClipboardItem::new_string(self.url.clone()));
+            }
             BrowserAction::OpenExternalBrowser => {
                 if is_web_url(&self.url) {
                     cx.open_url(&self.url);
@@ -1632,6 +1635,16 @@ impl BrowserSurface {
             }
             BrowserAction::ClearStorage => {
                 self.clear_sel = ClearSelection::DEFAULT;
+                self.clear_open = true;
+                cx.notify();
+            }
+            BrowserAction::ClearHistory => {
+                self.clear_sel = ClearSelection {
+                    cookies: false,
+                    cache: false,
+                    site_data: false,
+                    history: true,
+                };
                 self.clear_open = true;
                 cx.notify();
             }
@@ -3224,23 +3237,6 @@ impl Render for BrowserSurface {
         // molette) — les `cx.listener` appellent `this.view_transform()`.
         // `Copy` : capturé par les closures.
         let view = self.view_transform();
-        // État vide : 5 dernières visites + favoris pour la section Recent.
-        let recent_entries = self
-            .history
-            .as_ref()
-            .map(|h| h.recent(5))
-            .unwrap_or_default();
-        let favorite_entries: Vec<(String, String)> = self
-            .history
-            .as_ref()
-            .map(|h| {
-                h.favorites()
-                    .iter()
-                    .take(5)
-                    .map(|f| (f.url.clone(), f.title.clone()))
-                    .collect()
-            })
-            .unwrap_or_default();
 
         let page_view = image
             .map(|image| {
@@ -3261,194 +3257,135 @@ impl Render for BrowserSurface {
                         .child("Loading…")
                         .into_any_element();
                 }
-                // Empty state: fake-field row (click → address bar focused)
-                // + section « Recent » : 5 dernières visites et favoris.
-                let caps: [SharedString; 3] = if cfg!(target_os = "macos") {
+                // Page d'accueil compacte inspirée du navigateur de référence.
+                let address_caps: [SharedString; 3] = if cfg!(target_os = "macos") {
                     ["⌘".into(), "+".into(), "L".into()]
                 } else {
                     ["Ctrl".into(), "+".into(), "L".into()]
                 };
-                let entity_recent = entity_empty.clone();
+                let history_caps: [SharedString; 3] = if cfg!(target_os = "macos") {
+                    ["⌘".into(), "+".into(), "H".into()]
+                } else {
+                    ["Ctrl".into(), "+".into(), "H".into()]
+                };
+                let entity_history = entity_empty.clone();
                 div()
                     .size_full()
                     .flex()
-                    .flex_col()
                     .items_center()
-                    .pt(px(72.0))
+                    .justify_center()
                     .child(
                         div()
-                            .id("browser-empty-address")
-                            .h(px(28.0))
                             .w_full()
                             .max_w(px(320.0))
-                            .px(px(8.0))
                             .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap(px(8.0))
-                            .rounded(px(8.0))
-                            .cursor_pointer()
-                            .when(address_focused, |el| el.shadow(theme.mark_ring()))
-                            .hover(|s| s.bg(crate::theme::ink(0.04)))
-                            .on_click(move |_event, window, cx| {
-                                entity_empty.update(cx, |this, cx| {
-                                    this.focus_address(window, cx);
-                                });
-                            })
-                            .child(
-                                crate::icons::icon(icons::GLOBAL)
-                                    .size(px(14.0))
-                                    .text_color(theme.text_muted),
-                            )
+                            .flex_col()
+                            .gap(px(2.0))
                             .child(
                                 div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .text_size(px(12.5))
-                                    .text_color(theme.text)
-                                    .child("Open Address…"),
-                            )
-                            .children(caps.iter().enumerate().map(|(ix, cap)| {
-                                div()
-                                    .h(px(18.0))
-                                    .min_w(px(18.0))
-                                    .px(px(5.0))
+                                    .id("browser-empty-address")
+                                    .h(px(28.0))
+                                    .w_full()
+                                    .px(px(8.0))
                                     .flex()
                                     .items_center()
-                                    .justify_center()
-                                    .rounded(px(4.0))
-                                    .bg(crate::theme::ink(0.06))
-                                    .text_size(px(11.0))
-                                    .text_color(if ix == 1 {
-                                        theme.text_faint
-                                    } else {
-                                        theme.text_muted
+                                    .gap(px(10.0))
+                                    .rounded(px(6.0))
+                                    .cursor_pointer()
+                                    .when(address_focused, |el| el.shadow(theme.mark_ring()))
+                                    .hover(|s| s.bg(crate::theme::ink(0.04)))
+                                    .on_click(move |_event, window, cx| {
+                                        entity_empty.update(cx, |this, cx| {
+                                            this.focus_address(window, cx);
+                                        });
                                     })
-                                    .child(cap.clone())
-                            })),
-                    )
-                    // Section « Recent » : 5 dernières visites puis les
-                    // favoris — clic = naviguer dans cet onglet.
-                    .when(
-                        !recent_entries.is_empty() || !favorite_entries.is_empty(),
-                        |el| {
-                            el.child(
-                                div()
-                                    .mt(px(28.0))
-                                    .w_full()
-                                    .max_w(px(360.0))
-                                    .flex()
-                                    .flex_col()
+                                    .child(
+                                        crate::icons::icon(icons::GLOBAL)
+                                            .size(px(13.0))
+                                            .text_color(theme.text_muted),
+                                    )
                                     .child(
                                         div()
-                                            .px(px(8.0))
-                                            .pb(px(4.0))
-                                            .text_size(px(11.0))
+                                            .flex_1()
+                                            .text_size(px(12.5))
                                             .text_color(theme.text_muted)
-                                            .child("Recent"),
+                                            .child("Open Address…"),
                                     )
-                                    .children(recent_entries.iter().enumerate().map(
-                                        |(ix, entry)| {
-                                            let url = entry.url.clone();
-                                            let title = if entry.title.trim().is_empty() {
-                                                entry.url.clone()
-                                            } else {
-                                                entry.title.clone()
-                                            };
-                                            let host = history_host(&entry.url).unwrap_or_default();
+                                    .children(address_caps.iter().enumerate().map(|(ix, cap)| {
+                                        if ix == 1 {
                                             div()
-                                                .id(("browser-recent", ix))
-                                                .h(px(28.0))
-                                                .w_full()
-                                                .px(px(8.0))
-                                                .flex()
-                                                .flex_row()
-                                                .items_center()
-                                                .gap(px(8.0))
-                                                .rounded(px(6.0))
-                                                .cursor_pointer()
-                                                .hover(|s| s.bg(crate::theme::ink(0.04)))
-                                                .on_click({
-                                                    let entity = entity_recent.clone();
-                                                    move |_, _, cx| {
-                                                        entity.update(cx, |this, cx| {
-                                                            this.navigate_to(url.clone(), cx);
-                                                        });
-                                                    }
-                                                })
-                                                .child(
-                                                    div()
-                                                        .flex_1()
-                                                        .min_w_0()
-                                                        .overflow_hidden()
-                                                        .text_size(px(12.5))
-                                                        .text_color(theme.text)
-                                                        .child(title),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .flex_none()
-                                                        .text_size(px(11.0))
-                                                        .text_color(theme.text_muted)
-                                                        .child(host),
-                                                )
-                                        },
-                                    ))
-                                    .children(favorite_entries.iter().enumerate().map(
-                                        |(ix, (url, title))| {
-                                            let title = if title.trim().is_empty() {
-                                                url.clone()
-                                            } else {
-                                                title.clone()
-                                            };
-                                            let host = history_host(url).unwrap_or_default();
+                                                .px(px(2.0))
+                                                .text_size(px(11.0))
+                                                .text_color(theme.text_faint)
+                                                .child(cap.clone())
+                                        } else {
                                             div()
-                                                .id(("browser-recent-fav", ix))
-                                                .h(px(28.0))
-                                                .w_full()
-                                                .px(px(8.0))
+                                                .h(px(18.0))
+                                                .min_w(px(18.0))
+                                                .px(px(5.0))
                                                 .flex()
-                                                .flex_row()
                                                 .items_center()
-                                                .gap(px(8.0))
-                                                .rounded(px(6.0))
-                                                .cursor_pointer()
-                                                .hover(|s| s.bg(crate::theme::ink(0.04)))
-                                                .on_click({
-                                                    let entity = entity_recent.clone();
-                                                    let target = url.clone();
-                                                    move |_, _, cx| {
-                                                        entity.update(cx, |this, cx| {
-                                                            this.navigate_to(target.clone(), cx);
-                                                        });
-                                                    }
-                                                })
-                                                .child(
-                                                    crate::icons::icon(icons::STAR_BOLD)
-                                                        .size(px(11.0))
-                                                        .flex_none()
-                                                        .text_color(theme.warning),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .flex_1()
-                                                        .min_w_0()
-                                                        .overflow_hidden()
-                                                        .text_size(px(12.5))
-                                                        .text_color(theme.text)
-                                                        .child(title),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .flex_none()
-                                                        .text_size(px(11.0))
-                                                        .text_color(theme.text_muted)
-                                                        .child(host),
-                                                )
-                                        },
-                                    )),
+                                                .justify_center()
+                                                .rounded(px(4.0))
+                                                .bg(crate::theme::ink(0.06))
+                                                .text_size(px(11.0))
+                                                .text_color(theme.text_muted)
+                                                .child(cap.clone())
+                                        }
+                                    })),
                             )
-                        },
+                            .child(
+                                div()
+                                    .id("browser-empty-history")
+                                    .h(px(28.0))
+                                    .w_full()
+                                    .px(px(8.0))
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(10.0))
+                                    .rounded(px(6.0))
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(crate::theme::ink(0.04)))
+                                    .on_click(move |_, _, cx| {
+                                        entity_history.update(cx, |this, cx| {
+                                            this.toggle_panel(PanelTab::History, cx);
+                                        });
+                                    })
+                                    .child(
+                                        crate::icons::icon(icons::CLOCK)
+                                            .size(px(13.0))
+                                            .text_color(theme.text_muted),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .text_size(px(12.5))
+                                            .text_color(theme.text_muted)
+                                            .child("History"),
+                                    )
+                                    .children(history_caps.iter().enumerate().map(|(ix, cap)| {
+                                        if ix == 1 {
+                                            div()
+                                                .px(px(2.0))
+                                                .text_size(px(11.0))
+                                                .text_color(theme.text_faint)
+                                                .child(cap.clone())
+                                        } else {
+                                            div()
+                                                .h(px(18.0))
+                                                .min_w(px(18.0))
+                                                .px(px(5.0))
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .rounded(px(4.0))
+                                                .bg(crate::theme::ink(0.06))
+                                                .text_size(px(11.0))
+                                                .text_color(theme.text_muted)
+                                                .child(cap.clone())
+                                        }
+                                    })),
+                            ),
                     )
                     .into_any_element()
             });
@@ -3828,7 +3765,6 @@ impl Render for BrowserSurface {
         let entity_select = cx.entity().clone();
         let entity_devtools = cx.entity().clone();
         let entity_clear = cx.entity().clone();
-        let entity_copy = cx.entity().clone();
         let entity_dots = cx.entity().clone();
         let entity_fav = cx.entity().clone();
         let entity_zoom = cx.entity().clone();
@@ -4009,72 +3945,80 @@ impl Render for BrowserSurface {
             .on_drag_move(cx.listener(Self::on_console_drag))
             .child(
                 div()
-                    .h(px(36.0))
+                    .h(px(44.0))
                     .flex_none()
                     .flex()
                     .items_center()
-                    .gap(px(4.0))
+                    .gap(px(8.0))
                     .px(px(8.0))
                     .border_b_1()
                     .border_color(theme.border)
-                    .child(browser_button(
-                        icons::ARROW_LEFT,
-                        theme.text_muted,
-                        can_back,
-                        move || {
-                            back.send(BrowserCommand::Back);
-                        },
-                        hint(
-                            "Back",
-                            Some("Return to the previous page in this tab's history."),
-                            None,
-                        ),
-                    ))
-                    .child(browser_button(
-                        icons::ARROW_RIGHT,
-                        theme.text_muted,
-                        can_forward,
-                        move || {
-                            forward.send(BrowserCommand::Forward);
-                        },
-                        hint(
-                            "Forward",
-                            Some("Go forward to the next page in this tab's history."),
-                            None,
-                        ),
-                    ))
-                    .child(browser_button(
-                        icons::REFRESH,
-                        theme.text_muted,
-                        true,
-                        move || {
-                            reload.send(if retry {
-                                BrowserCommand::Retry
-                            } else {
-                                BrowserCommand::Reload
-                            });
-                        },
-                        hint(
-                            if retry { "Retry" } else { "Reload" },
-                            Some(if retry {
-                                "Try loading the page again after a failure."
-                            } else {
-                                "Reload the current page."
-                            }),
-                            None,
-                        ),
-                    ))
+                    .child(
+                        div()
+                            .id("browser-navigation-group")
+                            .h(px(34.0))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .gap(px(1.0))
+                            .px(px(4.0))
+                            .rounded(px(18.0))
+                            .bg(crate::theme::ink(0.045))
+                            .child(browser_button(
+                                icons::ARROW_LEFT,
+                                theme.text_muted,
+                                can_back,
+                                move || {
+                                    back.send(BrowserCommand::Back);
+                                },
+                                hint(
+                                    "Back",
+                                    None,
+                                    None,
+                                ),
+                            ))
+                            .child(browser_button(
+                                icons::ARROW_RIGHT,
+                                theme.text_muted,
+                                can_forward,
+                                move || {
+                                    forward.send(BrowserCommand::Forward);
+                                },
+                                hint(
+                                    "Forward",
+                                    None,
+                                    None,
+                                ),
+                            ))
+                            .child(browser_button(
+                                icons::REFRESH,
+                                theme.text_muted,
+                                true,
+                                move || {
+                                    reload.send(if retry {
+                                        BrowserCommand::Retry
+                                    } else {
+                                        BrowserCommand::Reload
+                                    });
+                                },
+                                hint(
+                                    if retry { "Retry" } else { "Reload" },
+                                    None,
+                                    None,
+                                ),
+                            )),
+                    )
                     .child(
                         div()
                             .id("browser-address-row")
                             .group("browser-address")
                             .relative()
-                            .h(px(28.0))
+                            .h(px(34.0))
                             .min_w_0()
                             .flex_1()
                             .flex()
                             .items_center()
-                            .rounded(px(8.0))
+                            .rounded(px(18.0))
                             .border_1()
                             .border_color(if address_focused {
                                 theme.border_strong
@@ -4082,8 +4026,8 @@ impl Render for BrowserSurface {
                                 theme.border
                             })
                             .when(address_focused, |el| el.shadow(theme.mark_ring()))
-                            .bg(crate::theme::ink(0.04))
-                            .px(px(6.0))
+                            .bg(theme.input_bg)
+                            .px(px(10.0))
                             .child(div().flex_1().min_w_0().child(self.address.clone()))
                             // Suggestions de la barre d'adresse : jusqu'à 6
                             // lignes + « Search … », sous le champ, largeur
@@ -4114,10 +4058,8 @@ impl Render for BrowserSurface {
                                             } else {
                                                 "Add to favorites"
                                             },
-                                            Some(
-                                                "Save this page to your favorites, or remove it.",
-                                            ),
-                                            Some("Ctrl+D"),
+                                            None,
+                                            None,
                                         ))
                                         .on_click(move |_event, _window, cx| {
                                             entity_fav.update(cx, |this, cx| {
@@ -4161,8 +4103,8 @@ impl Render for BrowserSurface {
                                             .hover(|s| s.bg(crate::theme::ink(0.14)))
                                             .tooltip(hint(
                                             "Reset zoom",
-                                            Some("Return to 100% zoom."),
-                                            Some("Ctrl+0"),
+                                            None,
+                                            None,
                                         ))
                                             .on_click(move |_, _, cx| {
                                                 entity_zoom.update(cx, |this, cx| {
@@ -4173,73 +4115,44 @@ impl Render for BrowserSurface {
                                     )
                                 },
                             )
-                            // Copy the shown address — Enter already submits.
-                            // Visible au survol du champ ou quand il a le focus.
-                            .child(
-                                div()
-                                    .id("browser-copy-url")
-                                    .size(px(20.0))
-                                    .flex_none()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .rounded(px(4.0))
-                                    .cursor_pointer()
-                                    .opacity(0.0)
-                                    .group_hover("browser-address", |s| s.opacity(1.0))
-                                    .when(address_focused, |el| el.opacity(1.0))
-                                    .hover(|s| s.bg(crate::theme::ink(0.08)))
-                                    .tooltip(hint(
-                                            "Copy URL",
-                                            Some("Copy the address shown in the bar to the clipboard."),
-                                            None,
-                                        ))
-                                    .on_click(move |_event, _window, cx| {
-                                        entity_copy.update(cx, |this, cx| {
-                                            let url =
-                                                this.address.read(cx).text().trim().to_owned();
-                                            if !url.is_empty() {
-                                                cx.write_to_clipboard(ClipboardItem::new_string(
-                                                    url.clone(),
-                                                ));
-                                                this.flash_status("URL copied", cx);
-                                            }
-                                        });
-                                    })
-                                    .child(
-                                        crate::icons::icon(crate::icons::COPY)
-                                            .size(px(12.0))
-                                            .text_color(theme.text_muted),
-                                    ),
-                            ),
                     )
-                    // « Add element » : mode sélection (croix, survol sondé,
-                    // clic → pastille dans le composer, Échap pour quitter).
-                    .child(browser_button_toggle(
-                        icons::TARGET,
-                        self.select_mode,
-                        theme.text_muted,
-                        move |_event, _window, cx| {
-                            entity_select.update(cx, |this, cx| {
-                                this.toggle_select_mode(cx);
-                            });
-                        },
-                        hint(
-                            if self.select_mode {
-                                "Cancel selection"
+                    .child({
+                        let active = self.select_mode;
+                        div()
+                            .id("browser-annotate")
+                            .h(px(34.0))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .px(px(12.0))
+                            .rounded(px(18.0))
+                            .cursor_pointer()
+                            .bg(if active {
+                                crate::theme::wash(0.14)
                             } else {
-                                "Add element to chat"
-                            },
-                            if self.select_mode {
-                                None
-                            } else {
-                                Some(
-                                    "Click any element on the page to attach it to your message as context.",
-                                )
-                            },
-                            if self.select_mode { Some("Esc") } else { None },
-                        ),
-                    ))
+                                crate::theme::ink(0.045)
+                            })
+                            .text_size(px(11.5))
+                            .text_color(if active { theme.accent } else { theme.text_muted })
+                            .hover(|style| style.bg(crate::theme::wash(0.1)))
+                            .tooltip(hint(
+                                if active { "Cancel annotation" } else { "Annotate" },
+                                None,
+                                None,
+                            ))
+                            .on_click(move |_event, _window, cx| {
+                                entity_select.update(cx, |this, cx| {
+                                    this.toggle_select_mode(cx);
+                                });
+                            })
+                            .child(
+                                crate::icons::icon(icons::TARGET)
+                                    .size(px(13.0))
+                                    .text_color(if active { theme.accent } else { theme.text_muted }),
+                            )
+                            .child("Annoter")
+                    })
                     // « DevTools » : tiroir console (Capture / filtres / resize).
                     .child(browser_button_toggle(
                         icons::TERMINAL,
@@ -4257,12 +4170,8 @@ impl Render for BrowserSurface {
                             } else {
                                 "Developer tools"
                             },
-                            if self.show_console {
-                                None
-                            } else {
-                                Some("Console, JavaScript and page screenshot.")
-                            },
-                            if self.show_console { None } else { Some("F12") },
+                            None,
+                            None,
                         ),
                     ))
                     // "…" overflow menu — same recipe as the header's `+` menu.
@@ -4279,7 +4188,7 @@ impl Render for BrowserSurface {
                             .hover(|s| s.bg(crate::theme::ink(0.06)))
                             .tooltip(hint(
                                 "More",
-                                Some("New tab, history, zoom, find, device emulation and storage actions."),
+                                None,
                                 None,
                             ))
                             .on_click(move |_event, _window, cx| {

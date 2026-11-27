@@ -53,8 +53,8 @@ use crate::settings::sync::{SyncEvent, SyncPage};
 use crate::settings::usage::{UsageEvent, UsagePage};
 use crate::settings::wallpaper;
 use crate::settings::{
-    RIGHT_PANE_DEFAULT, RIGHT_PANE_MAX, RIGHT_PANE_MIN, RememberedNavigation, SAVE_DEBOUNCE_MS,
-    SIDEBAR_DEFAULT, SIDEBAR_MAX, SIDEBAR_MIN, TERMINAL_DEFAULT_HEIGHT, UiSettings,
+    RIGHT_PANE_DEFAULT, RIGHT_PANE_MIN, RememberedNavigation, SAVE_DEBOUNCE_MS, SIDEBAR_DEFAULT,
+    SIDEBAR_MAX, SIDEBAR_MIN, TERMINAL_DEFAULT_HEIGHT, UiSettings,
 };
 use crate::state::{
     AppState, ConnectionStatus, EngineBootConfig, EngineMode, GatePhase, Indicator,
@@ -71,12 +71,6 @@ use crate::transcript::{
     Transcript, TranscriptEvent,
 };
 
-/// Wider floor for the right pane while it shows the Files+FileEditor split
-/// (tree column + content column side by side) — below this the content
-/// column left after the fixed-width tree is too narrow to read. See
-/// `Shell::right_target`/`files_split_active`.
-const SPLIT_RIGHT_PANE_MIN: f32 = 560.0;
-
 mod github;
 mod spaces;
 mod tabs;
@@ -89,6 +83,7 @@ actions!(
         ToggleSidebar,
         ToggleChanges,
         PickProjectFolder,
+        ImportProject,
         NewSession,
         FocusBrowserAddress
     ]
@@ -242,6 +237,10 @@ pub struct Shell {
     /// corresponding editor surface on this frame.
     pending_workspace_file: Option<(String, Option<u32>)>,
     composer: Entity<Composer>,
+    /// Second chat hosted in the right pane: its own composer and transcript,
+    /// pinned to a chat id that never becomes the main view's selection.
+    right_home_composer: Entity<Composer>,
+    right_home_transcript: Entity<Transcript>,
     /// External file drag hovering the conversation column — shows the
     /// "Drop files or images to attach" veil; a drop stages them in the composer.
     file_drag_active: bool,
@@ -383,6 +382,10 @@ pub struct Shell {
     /// Space-row context menu (dropdown rows): (space id, window position).
     space_menu: popover::Popup<(String, Point<Pixels>)>,
     rename_space_dialog: Option<RenameSpaceDialog>,
+    /// Project whose sidebar logo chooser is open.
+    logo_space_dialog: Option<String>,
+    logo_dialog_error: Option<String>,
+    logo_picker_task: Option<Task<()>>,
     /// "Import project…" dialog: source workspace + folder, destination base,
     /// and the previewed transfer plan.
     import_dialog: Option<ImportDialog>,
@@ -560,6 +563,14 @@ impl Shell {
         });
         let transcript = cx.new(|cx| Transcript::new(state.clone(), cx));
         let composer = cx.new(|cx| Composer::new(state.clone(), cx));
+        let right_home_composer = cx.new(|cx| Composer::new(state.clone(), cx));
+        let right_home_transcript = cx.new(|cx| Transcript::new(state.clone(), cx));
+        right_home_transcript.update(cx, |transcript, cx| {
+            transcript.bind_composer(right_home_composer.downgrade());
+            transcript.pin_side_chat(cx);
+            transcript.set_rail_enabled(false, cx);
+        });
+        right_home_composer.update(cx, |composer, cx| composer.set_side_chat(cx));
         transcript.update(cx, |t, _| t.bind_composer(composer.downgrade()));
         let transcript_events = cx.subscribe(
             &transcript,
@@ -606,6 +617,19 @@ impl Shell {
                 }
             }
         });
+        // The right pane's second chat: pin its own transcript to whatever the
+        // side composer just sent to, without touching the main selection.
+        cx.subscribe(&right_home_composer, {
+            let transcript = right_home_transcript.clone();
+            let composer = right_home_composer.clone();
+            move |this: &mut Shell, _, event: &ComposerEvent, cx| {
+                let ComposerEvent::Sent { chat_id, .. } = event;
+                let echoes = this.state.read(cx).echoes_for(chat_id).to_vec();
+                composer.update(cx, |c, cx| c.set_side_chat_id(chat_id.clone(), cx));
+                transcript.update(cx, |t, cx| t.attach_side_chat(chat_id.clone(), echoes, cx));
+            }
+        })
+        .detach();
         let pickers = composer.read(cx).pickers().clone();
         let pickers_observation = cx.observe(&pickers, |_, _, cx| cx.notify());
         // Working-indicator heartbeat: notify once a second while a session is
@@ -727,6 +751,8 @@ impl Shell {
             transcript,
             pending_workspace_file: None,
             composer,
+            right_home_composer,
+            right_home_transcript,
             file_drag_active: false,
             file_drag_bounds: Bounds::default(),
             drop_confirm: None,
@@ -803,6 +829,9 @@ impl Shell {
             delete_focus_pending: false,
             space_menu: popover::Popup::default(),
             rename_space_dialog: None,
+            logo_space_dialog: None,
+            logo_dialog_error: None,
+            logo_picker_task: None,
             import_dialog: None,
             import_focus_pending: false,
             delete_space_confirm: None,
@@ -1245,9 +1274,10 @@ impl Shell {
     ) {
         let viewport = f32::from(window.viewport_size().width);
         let width = viewport - f32::from(event.event.position.x);
-        // komet caps the pane at 52% of the window on top of the absolute range.
-        let max = RIGHT_PANE_MAX.min(viewport * 0.52);
-        self.settings.right_pane_width = width.clamp(RIGHT_PANE_MIN, max.max(RIGHT_PANE_MIN));
+        // Same cap as the render path: 70%, and never enough to squeeze the
+        // main chat out — the handle and the pane stop at the same width.
+        let sidebar_now = self.eval_tween(self.sidebar_tween, self.sidebar_target());
+        self.settings.right_pane_width = Self::fitted_pane_width(viewport, sidebar_now, width);
         self.right_tween = None;
         self.schedule_save(cx);
         cx.notify();
@@ -1592,6 +1622,9 @@ impl Shell {
             .on_action(cx.listener(|this, _: &PickProjectFolder, _, cx| {
                 this.open_project_folder_picker(cx);
             }))
+            .on_action(cx.listener(|this, _: &ImportProject, _, cx| {
+                this.open_import_dialog(cx);
+            }))
             // Error-chip actions (transcript rows): Auth opens the Providers
             // settings section, Billing/ModelUnavailable opens the model
             // picker, and Réessayer resubmits the last prompt verbatim.
@@ -1774,7 +1807,7 @@ impl Shell {
         // intact for the return trip.
         let on_chat = matches!(self.route, Route::Chat);
         let right: AnyElement = if on_chat {
-            self.render_right_pane(cx)
+            self.render_right_pane(window, cx)
         } else {
             Empty.into_any_element()
         };
@@ -1808,6 +1841,7 @@ impl Shell {
                     workspace_bg,
                     wallpaper::effect(cx),
                     wallpaper::ascii_texture(cx),
+                    wallpaper::panel_opacity(cx),
                 )
             });
         let workspace: AnyElement = div()

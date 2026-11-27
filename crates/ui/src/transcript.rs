@@ -39,9 +39,10 @@ use gpui::{
     actions, canvas, div, img, list, prelude::*, px, quad,
 };
 
-use komet_doc::{MessagePart, MessageRole, MessageStatus, SessionMessageEntry};
+use komet_doc::{MessagePart, MessageRole, MessageStatus, SessionMessageEntry, TranscriptFrame};
 use komet_proto::TodoItem;
 use komet_proto::ToolCall;
+use komet_rpc::methods;
 
 use crate::composer::{ComposerInput, ComposerInputEvent};
 use crate::markdown::parser::{Block, BlockTree, IncrementalParser, parse_full};
@@ -1734,6 +1735,7 @@ pub fn chips_height(count: usize) -> f32 {
 /// counted by [`chips_height`].
 pub fn detail_height(detail: &ToolDetail) -> f32 {
     let body = match detail {
+        ToolDetail::Output { .. } if let Some(height) = structured_output_height(detail) => height,
         ToolDetail::Output {
             lines,
             truncated_by,
@@ -1760,8 +1762,222 @@ fn detail_section_height(detail: &ToolDetail) -> f32 {
     DETAIL_PANEL_GAP + DETAIL_PANEL_BORDER + DETAIL_LABEL_H + detail_height(detail)
 }
 
+enum StructuredOutput {
+    Json(serde_json::Value),
+    Csv(Vec<Vec<String>>),
+    Checklist(Vec<(char, String)>),
+    Tests(Vec<(bool, String)>),
+}
+
+fn structured_output(detail: &ToolDetail) -> Option<StructuredOutput> {
+    let ToolDetail::Output {
+        lines,
+        truncated_by,
+    } = detail
+    else {
+        return None;
+    };
+    if *truncated_by > 0 {
+        return None;
+    }
+    let text = lines
+        .iter()
+        .map(|line| line.as_ref())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let trimmed = text.trim();
+    if (trimmed.starts_with('{') || trimmed.starts_with('['))
+        && let Ok(value) = serde_json::from_str::<serde_json::Value>(&text)
+    {
+        return Some(StructuredOutput::Json(value));
+    }
+    let checklist = lines
+        .iter()
+        .map(|line| {
+            let line = line.trim();
+            let (mark, text) = line.split_once(' ')?;
+            let mark = match mark {
+                "[x]" | "✓" => '✓',
+                "[ ]" | "+" => '+',
+                "○" => '○',
+                "−" => '−',
+                _ => return None,
+            };
+            Some((mark, text.trim().to_string()))
+        })
+        .collect::<Option<Vec<_>>>();
+    if let Some(checklist) = checklist.filter(|items| !items.is_empty()) {
+        return Some(StructuredOutput::Checklist(checklist));
+    }
+    let test_rows = lines
+        .iter()
+        .filter_map(|line| {
+            let line = line.trim();
+            let lower = line.to_ascii_lowercase();
+            if lower.starts_with("test result:")
+                || lower.starts_with("tests:")
+                || lower.contains(" passed")
+                || lower.contains(" failed")
+                || lower.starts_with("[pass]")
+                || lower.starts_with("[fail]")
+                || lower.starts_with("✓ ")
+                || lower.starts_with("✕ ")
+                || (lower.starts_with("test ")
+                    && (lower.ends_with(" ... ok") || lower.ends_with(" ... FAILED")))
+            {
+                let passed = !lower.contains("fail")
+                    && !lower.starts_with("✕ ")
+                    && !lower.starts_with("[fail]");
+                Some((passed, line.to_string()))
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    if !test_rows.is_empty() {
+        return Some(StructuredOutput::Tests(test_rows));
+    }
+    let rows = lines
+        .iter()
+        .map(|line| split_csv_row(line))
+        .collect::<Option<Vec<_>>>()?;
+    let columns = rows.first()?.len();
+    (rows.len() >= 2 && columns >= 2 && rows.iter().all(|row| row.len() == columns))
+        .then_some(StructuredOutput::Csv(rows))
+}
+
+fn split_csv_row(line: &str) -> Option<Vec<String>> {
+    let mut cells = Vec::new();
+    let mut cell = String::new();
+    let mut chars = line.chars().peekable();
+    let mut quoted = false;
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' if quoted && chars.peek() == Some(&'"') => {
+                chars.next();
+                cell.push('"');
+            }
+            '"' => quoted = !quoted,
+            ',' if !quoted => cells.push(std::mem::take(&mut cell)),
+            _ => cell.push(ch),
+        }
+    }
+    if quoted {
+        return None;
+    }
+    cells.push(cell);
+    Some(cells)
+}
+
+#[derive(Clone, Copy)]
+enum JsonTint {
+    Neutral,
+    String,
+    Number,
+    Boolean,
+}
+
+fn json_tree_rows(
+    value: &serde_json::Value,
+    depth: usize,
+    rows: &mut Vec<(usize, String, String, JsonTint)>,
+) {
+    if rows.len() >= 80 {
+        return;
+    }
+    match value {
+        serde_json::Value::Object(object) => {
+            for (key, value) in object {
+                let preview = match value {
+                    serde_json::Value::Object(child) => format!("{{}} · {} fields", child.len()),
+                    serde_json::Value::Array(child) => format!("[] · {} items", child.len()),
+                    serde_json::Value::String(text) => format!("\"{}\"", text),
+                    _ => value.to_string(),
+                };
+                let tint = match value {
+                    serde_json::Value::String(_) => JsonTint::String,
+                    serde_json::Value::Number(_) => JsonTint::Number,
+                    serde_json::Value::Bool(_) | serde_json::Value::Null => JsonTint::Boolean,
+                    _ => JsonTint::Neutral,
+                };
+                rows.push((depth, key.clone(), preview, tint));
+                if matches!(
+                    value,
+                    serde_json::Value::Object(_) | serde_json::Value::Array(_)
+                ) {
+                    json_tree_rows(value, depth + 1, rows);
+                }
+                if rows.len() >= 80 {
+                    break;
+                }
+            }
+        }
+        serde_json::Value::Array(array) => {
+            for (ix, value) in array.iter().enumerate() {
+                let key = format!("[{ix}]");
+                let preview = match value {
+                    serde_json::Value::Object(child) => format!("{{}} · {} fields", child.len()),
+                    serde_json::Value::Array(child) => format!("[] · {} items", child.len()),
+                    serde_json::Value::String(text) => format!("\"{}\"", text),
+                    _ => value.to_string(),
+                };
+                let tint = match value {
+                    serde_json::Value::String(_) => JsonTint::String,
+                    serde_json::Value::Number(_) => JsonTint::Number,
+                    serde_json::Value::Bool(_) | serde_json::Value::Null => JsonTint::Boolean,
+                    _ => JsonTint::Neutral,
+                };
+                rows.push((depth, key, preview, tint));
+                if matches!(
+                    value,
+                    serde_json::Value::Object(_) | serde_json::Value::Array(_)
+                ) {
+                    json_tree_rows(value, depth + 1, rows);
+                }
+                if rows.len() >= 80 {
+                    break;
+                }
+            }
+        }
+        _ => rows.push((
+            depth,
+            "value".to_string(),
+            value.to_string(),
+            JsonTint::Neutral,
+        )),
+    }
+}
+
+fn structured_output_height(detail: &ToolDetail) -> Option<f32> {
+    match structured_output(detail)? {
+        StructuredOutput::Json(value) => {
+            let mut rows = Vec::new();
+            json_tree_rows(&value, 0, &mut rows);
+            Some(rows.len() as f32 * OUTPUT_LINE_HEIGHT + OUTPUT_BODY_PAD)
+        }
+        StructuredOutput::Csv(rows) => {
+            Some(rows.len().min(17) as f32 * OUTPUT_LINE_HEIGHT + OUTPUT_BODY_PAD)
+        }
+        StructuredOutput::Checklist(items) => {
+            Some(items.len() as f32 * OUTPUT_LINE_HEIGHT + OUTPUT_BODY_PAD)
+        }
+        StructuredOutput::Tests(items) => {
+            Some(items.len() as f32 * OUTPUT_LINE_HEIGHT + OUTPUT_BODY_PAD)
+        }
+    }
+}
+
 /// Labeled Input/Output panel attached to an action row.
 pub(crate) fn detail_section(label: &str, body: AnyElement, theme: &Theme) -> AnyElement {
+    detail_section_with_action(label, body, None, theme)
+}
+
+fn detail_section_with_action(
+    label: &str,
+    body: AnyElement,
+    action: Option<AnyElement>,
+    theme: &Theme,
+) -> AnyElement {
     div()
         .mt(px(DETAIL_PANEL_GAP))
         .w_full()
@@ -1784,7 +2000,9 @@ pub(crate) fn detail_section(label: &str, body: AnyElement, theme: &Theme) -> An
                 .text_size(px(10.8))
                 .font_weight(gpui::FontWeight::MEDIUM)
                 .text_color(theme.text_muted)
-                .child(SharedString::from(label.to_owned())),
+                .child(SharedString::from(label.to_owned()))
+                .child(div().flex_1())
+                .children(action),
         )
         .child(
             div()
@@ -1793,6 +2011,28 @@ pub(crate) fn detail_section(label: &str, body: AnyElement, theme: &Theme) -> An
                 .bg(crate::theme::hairline(0.06)),
         )
         .child(body)
+        .into_any_element()
+}
+
+fn copy_detail_button(text: String, id: SharedString, theme: &Theme) -> AnyElement {
+    div()
+        .id(id)
+        .size(px(18.0))
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(4.0))
+        .cursor_pointer()
+        .hover(|style| style.bg(crate::theme::wash(0.09)))
+        .on_click(move |_, _, cx| {
+            cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+        })
+        .child(
+            crate::icons::icon(crate::icons::COPY)
+                .size(px(11.0))
+                .text_color(theme.text_muted),
+        )
         .into_any_element()
 }
 
@@ -2191,6 +2431,11 @@ pub struct Transcript {
     list: ListState,
     rows: Vec<Row>,
     chat_id: Option<String>,
+    /// Side-chat mode: this transcript renders its own pinned chat instead of
+    /// the state's selected chat (the second chat in the right pane).
+    side: bool,
+    side_entries: Vec<SessionMessageEntry>,
+    side_watch: Option<Task<()>>,
     row_cache: HashMap<String, CachedRows>,
     live_parsers: HashMap<String, IncrementalParser>,
     tree_cache: HashMap<String, (usize, Arc<BlockTree>)>,
@@ -2471,6 +2716,9 @@ impl Transcript {
             list,
             rows: Vec::new(),
             chat_id: None,
+            side: false,
+            side_entries: Vec::new(),
+            side_watch: None,
             row_cache: HashMap::new(),
             live_parsers: HashMap::new(),
             tree_cache: HashMap::new(),
@@ -2547,6 +2795,94 @@ impl Transcript {
     /// entities exist; tests leave it unset (Send is then a no-op).
     pub fn bind_composer(&mut self, composer: WeakEntity<crate::composer::Composer>) {
         self.composer = Some(composer);
+    }
+
+    /// Turn this viewer into the right pane's second chat: it follows its own
+    /// pinned chat id, never `state.selected_chat`.
+    pub fn pin_side_chat(&mut self, cx: &mut Context<Self>) {
+        self.side = true;
+        cx.notify();
+    }
+
+    /// True once the right pane's second chat has been created.
+    pub fn has_side_chat(&self) -> bool {
+        self.side && self.chat_id.is_some()
+    }
+
+    /// Drop the side chat and return to the blank canvas (the Chat card was
+    /// clicked again).
+    pub fn reset_side_chat(&mut self, cx: &mut Context<Self>) {
+        self.side_watch = None;
+        self.side_entries.clear();
+        self.chat_id = None;
+        self.rows.clear();
+        self.list.reset(0);
+        self.stop_reasoning();
+        self.stop_activity();
+        self.sync(cx);
+        cx.notify();
+    }
+
+    /// A send from the side composer: pin this viewer to the chat, seed the
+    /// optimistic echo, and start a doc watch independent of the main chat's
+    /// selection. The main transcript and its watch are never touched.
+    pub fn attach_side_chat(
+        &mut self,
+        chat_id: String,
+        echoes: Vec<SessionMessageEntry>,
+        cx: &mut Context<Self>,
+    ) {
+        self.side_watch = None;
+        self.side_entries = echoes;
+        self.chat_id = Some(chat_id.clone());
+        self.rows.clear();
+        self.row_cache.clear();
+        self.live_parsers.clear();
+        self.tree_cache.clear();
+        self.folds.clear();
+        self.veils.clear();
+        self.shell_tails.clear();
+        self.list.reset(0);
+        self.stop_reasoning();
+        self.stop_activity();
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            cx.notify();
+            return;
+        };
+        let weak = cx.weak_entity();
+        self.side_watch = Some(cx.spawn(async move |_, cx| {
+            let params = serde_json::json!({ "chatId": chat_id });
+            let Ok(mut rx) = engine
+                .client()
+                .subscribe(methods::WATCH_DOC_MESSAGES, params)
+                .await
+            else {
+                return;
+            };
+            while let Some(value) = rx.recv().await {
+                let Ok(frame) = serde_json::from_value::<TranscriptFrame>(value) else {
+                    continue;
+                };
+                let alive = weak.update(cx, |this, cx| {
+                    if !this.side || this.chat_id.as_deref() != Some(chat_id.as_str()) {
+                        return;
+                    }
+                    if let Err(err) =
+                        komet_doc::apply_transcript_frame(&mut this.side_entries, frame)
+                    {
+                        tracing::warn!(%chat_id, error = %err, "side chat frame desync");
+                        return;
+                    }
+                    this.sync(cx);
+                    cx.notify();
+                });
+                if alive.is_err() {
+                    return;
+                }
+            }
+        }));
+        self.sync(cx);
+        cx.notify();
     }
 
     fn begin_prompt_edit(
@@ -3290,7 +3626,24 @@ impl Transcript {
         // O(transcript bytes) each time.
         let state = self.state.clone();
         let s = state.read(cx);
-        let selected = s.selected_chat.clone();
+        // The right pane's second chat reads its own pinned copy: taking it out
+        // lets `rows_for` keep its mutable cache borrows without cloning the
+        // transcript on every frame.
+        let side_entries = if self.side {
+            std::mem::take(&mut self.side_entries)
+        } else {
+            Vec::new()
+        };
+        let entries: &[SessionMessageEntry] = if self.side {
+            &side_entries
+        } else {
+            &s.transcript
+        };
+        let selected = if self.side {
+            self.chat_id.clone()
+        } else {
+            s.selected_chat.clone()
+        };
 
         let attached = selected != self.chat_id;
         if attached {
@@ -3337,13 +3690,14 @@ impl Transcript {
         // Todo diffs derive from entry order: restart the cursor so every
         // pass computes the same diffs whether rows came from cache or not.
         self.todo_cursor = None;
-        for entry in &s.transcript {
+        for entry in entries {
             new_rows.extend(self.rows_for(entry, false));
         }
-        for echo in s.pending_echoes() {
+        let echoes: &[SessionMessageEntry] = if self.side { &[] } else { s.pending_echoes() };
+        for echo in echoes {
             new_rows.extend(self.rows_for(echo, true));
         }
-        let has_entries = !s.transcript.is_empty();
+        let has_entries = !entries.is_empty();
 
         // Text already streamed before this (re)attach is the veil BASELINE:
         // its rows' veils seed instead of fading (render creates them from
@@ -3383,6 +3737,9 @@ impl Transcript {
         match diff_rows(&self.rows, &new_rows) {
             None => {
                 self.rows = new_rows;
+                if self.side {
+                    self.side_entries = side_entries;
+                }
                 self.refresh_protected_attachments(cx);
                 return;
             }
@@ -3412,6 +3769,9 @@ impl Transcript {
             }
         }
         self.rows = new_rows;
+        if self.side {
+            self.side_entries = side_entries;
+        }
         // Live output is keyed by tool part id: a tool that resolved (or left
         // the transcript with a segment reset) must not keep its stream alive
         // in the map — the chip that would show it is gone.
@@ -4942,15 +5302,70 @@ impl Transcript {
                 &row.id, message, kind, detail, *retryable, *cause, *exit_code, &theme, cx,
             ),
             RowKind::Interrupted { label } => div()
+                .w_full()
+                .min_h(px(48.0))
+                .px(px(10.0))
+                .py(px(7.0))
+                .rounded(px(9.0))
+                .border_1()
+                .border_color(theme.warning.opacity(0.16))
+                .bg(theme.warning.opacity(0.05))
                 .flex()
                 .flex_row()
                 .items_center()
-                .gap(px(6.0))
-                .px(px(10.0))
-                .py(px(4.0))
-                .text_size(px(12.0))
-                .text_color(theme.text_muted)
-                .child(label.clone())
+                .gap(px(9.0))
+                .child(
+                    div()
+                        .size(px(22.0))
+                        .rounded(px(6.0))
+                        .bg(theme.warning.opacity(0.11))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            crate::icons::icon(crate::icons::STOP)
+                                .size(px(12.0))
+                                .text_color(theme.warning_muted),
+                        ),
+                )
+                .child(
+                    div()
+                        .min_w_0()
+                        .flex_1()
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.0))
+                        .child(
+                            div()
+                                .text_size(px(12.0))
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_color(theme.warning_muted)
+                                .child(label.clone()),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(10.5))
+                                .text_color(theme.text_muted)
+                                .child("Resend the last prompt to continue."),
+                        ),
+                )
+                .child(
+                    div()
+                        .id("interrupted-retry")
+                        .flex_none()
+                        .px(px(8.0))
+                        .py(px(5.0))
+                        .rounded(px(6.0))
+                        .bg(crate::theme::wash(0.07))
+                        .cursor_pointer()
+                        .hover(|style| style.bg(crate::theme::wash(0.13)))
+                        .text_size(px(11.0))
+                        .text_color(theme.text)
+                        .on_click(|_, window: &mut Window, cx: &mut App| {
+                            window.dispatch_action(Box::new(ErrorRetryTurn), cx);
+                        })
+                        .child("Retry last prompt"),
+                )
                 .into_any_element(),
             RowKind::AgentSwitch { switch } => Self::switch_line(switch, &theme),
             RowKind::ModelSwitch {
@@ -5726,7 +6141,6 @@ impl Transcript {
                             tool.subagent_status,
                             self.subagent_live.get(&tool.part_id),
                             tool.subagent_duration_ms,
-                            tool.subagent_tool_count,
                             theme,
                         )
                         .map(|badge| {
@@ -5806,27 +6220,88 @@ impl Transcript {
                     if let Some(invocation) = invocation.as_deref()
                         && !(detail.is_none() && journal_ready)
                     {
-                        action = action.child(detail_section(
+                        let copy = match invocation {
+                            ToolDetail::Output {
+                                lines,
+                                truncated_by,
+                            } => Some(copy_detail_button(
+                                format!(
+                                    "{}{}",
+                                    lines
+                                        .iter()
+                                        .map(|line| line.as_ref())
+                                        .collect::<Vec<_>>()
+                                        .join("\n"),
+                                    if *truncated_by > 0 {
+                                        format!("\n… {truncated_by} earlier lines omitted")
+                                    } else {
+                                        String::new()
+                                    }
+                                ),
+                                SharedString::from(format!("{key}-input-copy")),
+                                theme,
+                            )),
+                            _ => None,
+                        };
+                        action = action.child(detail_section_with_action(
                             "Input",
                             detail_body(invocation, None, theme),
+                            copy,
                             theme,
                         ));
                     }
                     if let Some(detail) = detail.as_deref() {
-                        action = action.child(detail_section(
+                        let copy = match detail {
+                            ToolDetail::Output {
+                                lines,
+                                truncated_by,
+                            } => Some(copy_detail_button(
+                                format!(
+                                    "{}{}",
+                                    lines
+                                        .iter()
+                                        .map(|line| line.as_ref())
+                                        .collect::<Vec<_>>()
+                                        .join("\n"),
+                                    if *truncated_by > 0 {
+                                        format!("\n… {truncated_by} later lines omitted")
+                                    } else {
+                                        String::new()
+                                    }
+                                ),
+                                SharedString::from(format!("{key}-output-copy")),
+                                theme,
+                            )),
+                            _ => None,
+                        };
+                        action = action.child(detail_section_with_action(
                             if tool.is_error {
                                 "Error output"
                             } else {
                                 "Output"
                             },
                             detail_body(detail, detail_highlights[ix].clone(), theme),
+                            copy,
                             theme,
                         ));
                     }
                     if let Some(live) = live.as_deref() {
-                        action = action.child(detail_section(
+                        let copy = match live {
+                            ToolDetail::Output { lines, .. } => Some(copy_detail_button(
+                                lines
+                                    .iter()
+                                    .map(|line| line.as_ref())
+                                    .collect::<Vec<_>>()
+                                    .join("\n"),
+                                SharedString::from(format!("{key}-live-copy")),
+                                theme,
+                            )),
+                            _ => None,
+                        };
+                        action = action.child(detail_section_with_action(
                             "Live output",
                             detail_body(live, None, theme),
+                            copy,
                             theme,
                         ));
                     }
@@ -5948,7 +6423,7 @@ impl Transcript {
 
 /// A sent message's text with its file-mention chips. The same recipe as the
 /// markdown renderer's inline code (`flat_text_element`): chip ranges shape in
-/// the mono font at `code_text` violet, [`StyledText`] supplies wrapped glyph
+/// the mono font at accent-derived `code_text`, [`StyledText`] supplies wrapped glyph
 /// geometry through its layout handle, and a canvas paints the rounded
 /// `code_wash` *beneath* the glyphs — so chips wrap, clip, and scroll exactly
 /// like the text they decorate.
@@ -6772,34 +7247,125 @@ pub(crate) fn detail_body(
         ToolDetail::Output {
             lines,
             truncated_by,
-        } => body
-            .py(px(6.0))
-            .font_family(theme.font_mono.clone())
-            .text_size(px(11.5))
-            .children(lines.iter().map(|line| {
-                div()
-                    .h(px(OUTPUT_LINE_HEIGHT))
-                    .w_full()
-                    .min_w_0()
-                    .px(px(12.0))
-                    .flex()
-                    .items_center()
-                    .text_color(theme.text.opacity(0.85))
-                    .child(div().w_full().min_w_0().truncate().child(line.clone()))
-            }))
-            .when(*truncated_by > 0, |block| {
-                block.child(
-                    div()
-                        .h(px(OUTPUT_LINE_HEIGHT))
-                        .px(px(12.0))
-                        .flex()
-                        .items_center()
-                        .text_size(px(10.5))
-                        .text_color(theme.text_faint)
-                        .child(SharedString::from(format!("… {truncated_by} more lines"))),
-                )
-            })
-            .into_any_element(),
+        } => {
+            if let Some(structured) = structured_output(detail) {
+                let rows: Vec<(String, String, _)> = match structured {
+                    StructuredOutput::Json(value) => {
+                        let mut tree = Vec::new();
+                        json_tree_rows(&value, 0, &mut tree);
+                        tree.into_iter()
+                            .map(|(depth, key, value, tint)| {
+                                let color = match tint {
+                                    JsonTint::Neutral => theme.text_muted,
+                                    JsonTint::String => theme.success,
+                                    JsonTint::Number => theme.accent,
+                                    JsonTint::Boolean => theme.warning_muted,
+                                };
+                                (format!("{}{}", "  ".repeat(depth), key), value, color)
+                            })
+                            .collect()
+                    }
+                    StructuredOutput::Csv(rows) => {
+                        let rows = rows.into_iter().take(17).enumerate();
+                        rows.map(|(row_ix, row)| {
+                            let is_header = row_ix == 0;
+                            (
+                                row.join("  │  "),
+                                String::new(),
+                                if is_header {
+                                    theme.accent
+                                } else {
+                                    theme.text.opacity(0.82)
+                                },
+                            )
+                        })
+                        .collect()
+                    }
+                    StructuredOutput::Checklist(items) => items
+                        .into_iter()
+                        .map(|(mark, text)| {
+                            let tint = match mark {
+                                '✓' => theme.success,
+                                '+' => theme.accent,
+                                '−' => theme.danger,
+                                _ => theme.text_muted,
+                            };
+                            (format!("{mark}  {text}"), String::new(), tint)
+                        })
+                        .collect(),
+                    StructuredOutput::Tests(items) => items
+                        .into_iter()
+                        .map(|(passed, text)| {
+                            (
+                                if passed { "✓" } else { "✕" }.to_string(),
+                                text,
+                                if passed { theme.success } else { theme.danger },
+                            )
+                        })
+                        .collect(),
+                };
+                body.py(px(6.0))
+                    .font_family(theme.font_mono.clone())
+                    .text_size(px(11.5))
+                    .children(rows.into_iter().map(|(label, value, tint)| {
+                        div()
+                            .h(px(OUTPUT_LINE_HEIGHT))
+                            .w_full()
+                            .min_w_0()
+                            .px(px(12.0))
+                            .flex()
+                            .items_center()
+                            .gap(px(8.0))
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .flex_1()
+                                    .truncate()
+                                    .text_color(tint)
+                                    .child(SharedString::from(label)),
+                            )
+                            .when(!value.is_empty(), |row| {
+                                row.child(
+                                    div()
+                                        .min_w_0()
+                                        .flex_1()
+                                        .truncate()
+                                        .text_color(theme.text.opacity(0.82))
+                                        .child(SharedString::from(value)),
+                                )
+                            })
+                    }))
+                    .into_any_element()
+            } else {
+                body.py(px(6.0))
+                    .font_family(theme.font_mono.clone())
+                    .text_size(px(11.5))
+                    .children(lines.iter().map(|line| {
+                        div()
+                            .h(px(OUTPUT_LINE_HEIGHT))
+                            .w_full()
+                            .min_w_0()
+                            .px(px(12.0))
+                            .flex()
+                            .items_center()
+                            .text_color(theme.text.opacity(0.85))
+                            .child(div().w_full().min_w_0().truncate().child(line.clone()))
+                    }))
+                    .when(*truncated_by > 0, |block| {
+                        block.child(
+                            div()
+                                .h(px(OUTPUT_LINE_HEIGHT))
+                                .px(px(12.0))
+                                .flex()
+                                .items_center()
+                                .text_size(px(10.5))
+                                .text_color(theme.text_faint)
+                                .child(SharedString::from(format!("… {truncated_by} more lines"))),
+                        )
+                    })
+                    .into_any_element()
+            }
+        }
     }
 }
 

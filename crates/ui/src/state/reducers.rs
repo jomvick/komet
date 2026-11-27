@@ -107,6 +107,9 @@ impl AppState {
 
     pub fn apply_spaces(&mut self, mut spaces: Vec<Space>) {
         sort_spaces(&mut spaces);
+        if self.is_local_workspace() {
+            self.local_spaces = spaces.clone();
+        }
         self.spaces = spaces;
         self.spaces_synced = true;
         // Heal a vanished selection (project deleted elsewhere): fall back to
@@ -430,6 +433,12 @@ impl AppState {
             .and_then(|id| self.echoes.get(id))
             .map(|v| v.as_slice())
             .unwrap_or(&[])
+    }
+
+    /// Unconfirmed echoes for any chat by id — the right pane's second chat
+    /// needs its own echo while the main selection stays elsewhere.
+    pub fn echoes_for(&self, chat_id: &str) -> &[SessionMessageEntry] {
+        self.echoes.get(chat_id).map(Vec::as_slice).unwrap_or(&[])
     }
 
     // ---- offline outbox (transparency plan Task 10) ----

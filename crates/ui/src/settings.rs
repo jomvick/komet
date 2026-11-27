@@ -64,7 +64,7 @@ pub const SIDEBAR_DEFAULT: f32 = 256.0;
 
 /// Right ("Changes") pane drag-resize bounds (px).
 pub const RIGHT_PANE_MIN: f32 = 360.0;
-pub const RIGHT_PANE_MAX: f32 = 760.0;
+pub const RIGHT_PANE_MAX: f32 = 1000.0;
 pub const RIGHT_PANE_DEFAULT: f32 = 520.0;
 
 /// Terminal panel height bounds: 160px … 55% of the viewport (§1.10). The
@@ -96,6 +96,125 @@ const FILE_NAME: &str = "ui-settings.json";
 /// A hand-edited or newer-build `backgroundEffect` must not reset every other
 /// preference (widths, keymap): an unreadable effect falls back to `None`.
 fn lenient_effect<'de, D>(deserializer: D) -> Result<wallpaper::BackgroundEffect, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).unwrap_or_default())
+}
+
+/// Accent color used by the installed UI palette. Indigo is the shipped default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AccentColor {
+    #[default]
+    Indigo,
+    Blue,
+    Violet,
+    Teal,
+    Green,
+    Orange,
+    Rose,
+}
+
+impl AccentColor {
+    pub const ALL: [Self; 7] = [
+        Self::Indigo,
+        Self::Blue,
+        Self::Violet,
+        Self::Teal,
+        Self::Green,
+        Self::Orange,
+        Self::Rose,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Indigo => "Indigo",
+            Self::Blue => "Blue",
+            Self::Violet => "Violet",
+            Self::Teal => "Teal",
+            Self::Green => "Green",
+            Self::Orange => "Orange",
+            Self::Rose => "Rose",
+        }
+    }
+
+    pub fn hue(self) -> f32 {
+        match self {
+            Self::Indigo => 0.68,
+            Self::Blue => 0.59,
+            Self::Violet => 0.78,
+            Self::Teal => 0.48,
+            Self::Green => 0.38,
+            Self::Orange => 0.08,
+            Self::Rose => 0.96,
+        }
+    }
+}
+
+/// Original Komet palettes organized around familiar editor-theme moods.
+/// Labels are references for discovery; every Komet palette is authored here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ThemePreset {
+    #[default]
+    Komet,
+    TokyoNight,
+    Catppuccin,
+    CatppuccinLight,
+    Dracula,
+    Gruvbox,
+}
+
+impl ThemePreset {
+    pub const ALL: [Self; 6] = [
+        Self::Komet,
+        Self::TokyoNight,
+        Self::Catppuccin,
+        Self::CatppuccinLight,
+        Self::Dracula,
+        Self::Gruvbox,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Komet => "Komet",
+            Self::TokyoNight => "Tokyo Night",
+            Self::Catppuccin => "Catppuccin",
+            Self::CatppuccinLight => "Catppuccin Light",
+            Self::Dracula => "Dracula",
+            Self::Gruvbox => "Gruvbox",
+        }
+    }
+}
+
+/// A look the user saved from the current accent, palette family and wallpaper,
+/// shown next to the built-in presets.
+///
+/// The image is copied under `{data_dir}/themes/` and this theme owns that copy,
+/// so replacing or removing the live wallpaper never blanks a saved theme.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomTheme {
+    pub name: String,
+    pub accent_color: AccentColor,
+    pub preset: ThemePreset,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wallpaper_path: Option<String>,
+    #[serde(default)]
+    pub wallpaper_scope: wallpaper::WallpaperScope,
+}
+
+fn lenient_accent<'de, D>(deserializer: D) -> Result<AccentColor, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).unwrap_or_default())
+}
+
+fn lenient_theme_preset<'de, D>(deserializer: D) -> Result<ThemePreset, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -186,11 +305,25 @@ pub struct UiSettings {
     /// Light/dark preference. Defaults to following the OS.
     #[serde(deserialize_with = "deserialize_appearance")]
     pub appearance: crate::appearance::AppearanceMode,
+    /// User-selected interface accent; defaults to the familiar indigo.
+    #[serde(deserialize_with = "lenient_accent")]
+    pub accent_color: AccentColor,
+    /// Curated color-family preset, independent from light/dark mode.
+    #[serde(deserialize_with = "lenient_theme_preset")]
+    pub theme_preset: ThemePreset,
+    /// Looks saved from the current accent, palette family and wallpaper.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub custom_themes: Vec<CustomTheme>,
+    /// Name of the saved theme currently applied, for the picker's selection.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_custom_theme: Option<String>,
     /// Local image painted behind translucent app surfaces.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wallpaper_path: Option<String>,
     /// Where the wallpaper is painted: whole window or main panel.
     pub wallpaper_scope: wallpaper::WallpaperScope,
+    /// Opacity of the tint laid over a wallpaper in the main panel.
+    pub wallpaper_panel_opacity: f32,
     /// What is painted over the wallpaper: the image itself or an ASCII pass.
     #[serde(default, deserialize_with = "lenient_effect")]
     pub background_effect: wallpaper::BackgroundEffect,
@@ -329,8 +462,13 @@ impl Default for UiSettings {
             terminal_scrollback_lines: TERMINAL_SCROLLBACK_DEFAULT,
             keymap: KeymapConfig::default(),
             appearance: crate::appearance::AppearanceMode::default(),
+            accent_color: AccentColor::default(),
+            theme_preset: ThemePreset::default(),
+            custom_themes: Vec::new(),
+            active_custom_theme: None,
             wallpaper_path: None,
             wallpaper_scope: wallpaper::WallpaperScope::default(),
+            wallpaper_panel_opacity: wallpaper::DEFAULT_PANEL_SCRIM_ALPHA,
             background_effect: wallpaper::BackgroundEffect::default(),
             files_autosave_delay_ms: FILES_AUTOSAVE_DELAY_DEFAULT_MS,
             files_word_wrap: false,
@@ -573,6 +711,12 @@ impl UiSettings {
             .terminal_scrollback_lines
             .clamp(TERMINAL_SCROLLBACK_MIN, TERMINAL_SCROLLBACK_MAX);
         self.background_effect = self.background_effect.clamped();
+        self.wallpaper_panel_opacity = clamp_or(
+            self.wallpaper_panel_opacity,
+            wallpaper::MIN_PANEL_SCRIM_ALPHA,
+            wallpaper::MAX_PANEL_SCRIM_ALPHA,
+            wallpaper::DEFAULT_PANEL_SCRIM_ALPHA,
+        );
         self.files_autosave_delay_ms = self
             .files_autosave_delay_ms
             .clamp(FILES_AUTOSAVE_DELAY_MIN_MS, FILES_AUTOSAVE_DELAY_MAX_MS);
@@ -699,8 +843,19 @@ mod tests {
                 ..KeymapConfig::default()
             },
             appearance: crate::appearance::AppearanceMode::Light,
+            accent_color: AccentColor::Indigo,
+            theme_preset: ThemePreset::TokyoNight,
+            custom_themes: vec![CustomTheme {
+                name: "My theme".into(),
+                accent_color: AccentColor::Rose,
+                preset: ThemePreset::Dracula,
+                wallpaper_path: Some("/themes/aurora.webp".into()),
+                wallpaper_scope: wallpaper::WallpaperScope::Window,
+            }],
+            active_custom_theme: Some("My theme".into()),
             wallpaper_path: Some("/wallpapers/aurora.webp".into()),
             wallpaper_scope: wallpaper::WallpaperScope::Panel,
+            wallpaper_panel_opacity: wallpaper::DEFAULT_PANEL_SCRIM_ALPHA,
             background_effect: wallpaper::BackgroundEffect::Ascii(wallpaper::AsciiParams::default()),
             files_autosave_delay_ms: 1000,
             files_word_wrap: true,

@@ -527,9 +527,9 @@ impl DiffScope {
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::WorkingTree => "Changes",
-            Self::Branch => "Branch changes",
-            Self::LatestTurn => "Latest turn",
+            Self::WorkingTree => "Unstaged",
+            Self::Branch => "All branch changes",
+            Self::LatestTurn => "Last turn",
             Self::History => "History",
             Self::Commit => "Commit",
         }
@@ -1089,7 +1089,7 @@ impl Changes {
             }
             return commit.sha.chars().take(7).collect::<String>().into();
         }
-        gpui::SharedString::from(self.scope.label())
+        gpui::SharedString::from("Review")
     }
 
     /// A pane currently showing the working tree (not a pinned commit or
@@ -1797,15 +1797,15 @@ impl Changes {
         cx.notify();
     }
 
-    fn close_scope_menu(&mut self, cx: &mut Context<Self>) {
-        if self.scope_menu.begin_close() {
-            popover::reap_popup(cx, |changes: &mut Self| &mut changes.scope_menu);
-        }
-    }
-
     fn close_ref_menu(&mut self, cx: &mut Context<Self>) {
         if self.ref_menu.begin_close() {
             popover::reap_popup(cx, |changes: &mut Self| &mut changes.ref_menu);
+        }
+    }
+
+    fn close_scope_menu(&mut self, cx: &mut Context<Self>) {
+        if self.scope_menu.begin_close() {
+            popover::reap_popup(cx, |changes: &mut Self| &mut changes.scope_menu);
         }
     }
 
@@ -2179,15 +2179,39 @@ impl Changes {
             }))
             .child(chevron)
             .child(
+                crate::icons::icon(crate::icons::DOCUMENT)
+                    .size(px(13.0))
+                    .text_color(theme.warning.opacity(0.9)),
+            )
+            .child({
+                let (directory, name) = file
+                    .path
+                    .rsplit_once('/')
+                    .unwrap_or(("", file.path.as_str()));
                 div()
                     .flex_1()
                     .min_w_0()
-                    .truncate()
-                    .font_family(theme.font_mono.clone())
-                    .text_size(px(12.0))
-                    .text_color(theme.text_dim)
-                    .child(SharedString::from(file.path.clone())),
-            )
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(6.0))
+                    .text_size(px(12.5))
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_color(theme.text)
+                            .child(SharedString::from(name.to_string())),
+                    )
+                    .when(!directory.is_empty(), |el| {
+                        el.child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .text_color(theme.text_faint)
+                                .child(SharedString::from(format!("{directory}/"))),
+                        )
+                    })
+            })
             .when(file.binary, |el| {
                 el.child(
                     div()
@@ -2317,19 +2341,21 @@ impl Changes {
             (scope == DiffScope::History).then(|| self.history_fetch_button(cx));
         let trigger = div()
             .id("changes-scope-trigger")
-            .h(px(24.0))
-            .px(px(8.0))
+            .h(px(30.0))
+            .px(px(10.0))
             .flex_none()
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(6.0))
-            .rounded(px(6.0))
+            .gap(px(8.0))
+            .rounded(px(7.0))
+            .border_1()
+            .border_color(crate::theme::hairline(0.10))
             .cursor_pointer()
             .bg(motion::hover_blend(
                 "changes-scope-trigger",
-                crate::theme::wash(0.05),
-                crate::theme::wash(0.14),
+                crate::theme::wash(0.045),
+                crate::theme::wash(0.11),
             ))
             .on_hover(motion::hover_listener(
                 "changes-scope-trigger",
@@ -2354,14 +2380,14 @@ impl Changes {
             }))
             .child(
                 div()
-                    .text_size(px(12.0))
+                    .text_size(px(12.5))
                     .text_color(theme.text)
                     .child(SharedString::from(scope.label())),
             )
             .child(
                 crate::icons::icon(crate::icons::ALT_ARROW_DOWN)
                     .size(px(12.0))
-                    .text_color(theme.text_muted.opacity(0.7)),
+                    .text_color(theme.text_muted),
             );
         let trigger = if self.scope_menu.get().is_some() {
             let closing = self.scope_menu.closing_since();
@@ -2370,12 +2396,11 @@ impl Changes {
                 "changes-scope-menu",
                 menu,
                 closing,
-                10.0,
+                8.0,
             ))
         } else {
             trigger
         };
-
         let trailing: AnyElement = if scope == DiffScope::History {
             div()
                 .flex_none()
@@ -2399,14 +2424,23 @@ impl Changes {
                 .into_any_element()
         } else {
             Self::header_button(
-                "changes-fold-all",
-                crate::icons::FOLD_VERTICAL,
+                "changes-review-refresh",
+                crate::icons::REFRESH,
                 &theme,
                 cx.entity_id(),
             )
             .on_click(cx.listener(|this, _, _, cx| {
                 cx.stop_propagation();
-                this.toggle_collapse_all(cx);
+                if this.scope == DiffScope::History {
+                    this.history_pane(cx)
+                        .update(cx, |history, cx| history.refresh(cx));
+                } else if this.scope == DiffScope::WorkingTree {
+                    this.ensure_content(cx);
+                } else {
+                    this.scoped_for = None;
+                    this.scoped_inflight = None;
+                    this.ensure_content(cx);
+                }
             }))
             .into_any_element()
         };
@@ -2430,30 +2464,59 @@ impl Changes {
     }
 
     fn render_scope_menu(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let current = self.scope;
+        let selected = self.scope;
         popover::popover_card(theme)
-            .w(px(180.0))
+            .w(px(178.0))
             .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_scope_menu(cx)))
             .child(
-                // The 2px row gap every other menu carries — rows straight on
-                // the card abutted, adjacent washes read as one slab (user
-                // report).
-                div().flex().flex_col().gap(px(2.0)).children(
-                    DiffScope::ALL.into_iter().enumerate().map(|(ix, scope)| {
-                        popover::menu_row(
-                            theme,
-                            scope == current,
-                            format!("changes-scope-row-{ix}"),
-                            cx.entity_id(),
-                        )
-                        .id(("changes-scope-row", ix))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.set_scope(scope, cx);
-                            this.close_scope_menu(cx);
-                        }))
-                        .child(div().flex_1().child(SharedString::from(scope.label())))
-                    }),
-                ),
+                div().flex().flex_col().gap(px(2.0)).children([
+                    popover::menu_row(
+                        theme,
+                        selected == DiffScope::WorkingTree,
+                        "review-unstaged",
+                        cx.entity_id(),
+                    )
+                    .id("review-unstaged-row")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.set_scope(DiffScope::WorkingTree, cx);
+                        this.close_scope_menu(cx);
+                    }))
+                    .child(div().flex_1().child("Unstaged")),
+                    popover::menu_row(theme, false, "review-staged", cx.entity_id())
+                        .id("review-staged-row")
+                        .text_color(theme.text_faint)
+                        .child(div().flex_1().child("Staged"))
+                        .child(
+                            div()
+                                .text_size(px(9.0))
+                                .text_color(theme.text_faint)
+                                .child("Soon"),
+                        ),
+                    popover::menu_row(
+                        theme,
+                        selected == DiffScope::Branch,
+                        "review-branch",
+                        cx.entity_id(),
+                    )
+                    .id("review-branch-row")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.set_scope(DiffScope::Branch, cx);
+                        this.close_scope_menu(cx);
+                    }))
+                    .child(div().flex_1().child("All branch changes")),
+                    popover::menu_row(
+                        theme,
+                        selected == DiffScope::LatestTurn,
+                        "review-turn",
+                        cx.entity_id(),
+                    )
+                    .id("review-turn-row")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.set_scope(DiffScope::LatestTurn, cx);
+                        this.close_scope_menu(cx);
+                    }))
+                    .child(div().flex_1().child("Last turn")),
+                ]),
             )
             .into_any_element()
     }
@@ -3769,7 +3832,7 @@ rename to new_name.rs
     #[test]
     fn scope_menu_keeps_only_changes_and_history() {
         assert_eq!(DiffScope::ALL, [DiffScope::WorkingTree, DiffScope::History]);
-        assert_eq!(DiffScope::WorkingTree.label(), "Changes");
+        assert_eq!(DiffScope::WorkingTree.label(), "Unstaged");
         assert_eq!(DiffScope::History.label(), "History");
     }
 

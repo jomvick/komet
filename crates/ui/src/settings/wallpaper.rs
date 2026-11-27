@@ -20,8 +20,18 @@ fn wallpapers_dir(data_dir: &Path) -> PathBuf {
 /// Copy `src` under `{data_dir}/wallpapers/`, keyed by content hash so picking
 /// the same image twice reuses one file. No-op when `src` is already there.
 fn import_copy(data_dir: &Path, src: &Path) -> io::Result<PathBuf> {
-    let dir = wallpapers_dir(data_dir);
-    let canonical_dir = dir.canonicalize().unwrap_or_else(|_| dir.clone());
+    import_into(&wallpapers_dir(data_dir), src)
+}
+
+/// Copy `src` under `{data_dir}/themes/`. A saved theme owns this copy, so
+/// replacing or removing the live wallpaper never touches it.
+pub fn import_theme_image(data_dir: &Path, src: &Path) -> io::Result<PathBuf> {
+    import_into(&data_dir.join("themes"), src)
+}
+
+/// Copy `src` into `dir` under its content hash. No-op when it is already there.
+fn import_into(dir: &Path, src: &Path) -> io::Result<PathBuf> {
+    let canonical_dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
     let canonical_src = src.canonicalize()?;
     if canonical_src.starts_with(&canonical_dir) {
         return Ok(canonical_src);
@@ -39,7 +49,7 @@ fn import_copy(data_dir: &Path, src: &Path) -> io::Result<PathBuf> {
         .and_then(|ext| ext.to_str())
         .unwrap_or("img")
         .to_ascii_lowercase();
-    std::fs::create_dir_all(&dir)?;
+    std::fs::create_dir_all(dir)?;
     let stored = dir.join(format!("{stem}.{ext}"));
     if !stored.exists() {
         std::fs::write(&stored, &bytes)?;
@@ -103,9 +113,10 @@ impl WallpaperScope {
     }
 }
 
-/// Opacity of the card-tone veil laid over the image in [`WallpaperScope::Panel`],
-/// so text stays readable. Lower = more visible image.
-pub const CARD_SCRIM_ALPHA: f32 = 0.82;
+/// Default opacity of the panel tint; older settings files inherit this value.
+pub const DEFAULT_PANEL_SCRIM_ALPHA: f32 = 0.86;
+pub const MIN_PANEL_SCRIM_ALPHA: f32 = 0.50;
+pub const MAX_PANEL_SCRIM_ALPHA: f32 = 0.98;
 
 // ---------------------------------------------------------------------------
 // Background effect
@@ -269,11 +280,11 @@ fn veiled_image(source: AnyElement, tone: Hsla, scrim_alpha: f32, radius: f32) -
 /// carries its own black backing, so the veil is only dropped once such a
 /// texture is actually painted — while the raw image is shown (or when it
 /// cannot be decoded), the veil keeps the panel text readable.
-pub fn scrim_alpha(effect: BackgroundEffect, has_texture: bool) -> f32 {
+pub fn scrim_alpha(effect: BackgroundEffect, has_texture: bool, panel_opacity: f32) -> f32 {
     if effect.is_ascii() && has_texture {
         0.0
     } else {
-        CARD_SCRIM_ALPHA
+        panel_opacity.clamp(MIN_PANEL_SCRIM_ALPHA, MAX_PANEL_SCRIM_ALPHA)
     }
 }
 
@@ -286,13 +297,14 @@ pub fn card_layer(
     tone: Hsla,
     effect: BackgroundEffect,
     texture: Option<Arc<RenderImage>>,
+    panel_opacity: f32,
 ) -> Option<AnyElement> {
     match scope {
         WallpaperScope::Window => None,
         WallpaperScope::Panel => {
             // The ASCII texture carries its own black backing, so the veil
             // would only wash the glyphs out; the effect's opacity is the scrim.
-            let scrim = scrim_alpha(effect, texture.is_some());
+            let scrim = scrim_alpha(effect, texture.is_some(), panel_opacity);
             Some(
                 div()
                     .absolute()
@@ -316,6 +328,7 @@ pub struct WallpaperState {
     pub path: Option<PathBuf>,
     pub scope: WallpaperScope,
     pub effect: BackgroundEffect,
+    pub panel_opacity: f32,
     /// The rasterised ASCII texture, once a job has completed.
     ascii: Option<Arc<RenderImage>>,
     /// Cache key of `ascii` — one texture per (image, params, size bucket).
@@ -328,11 +341,13 @@ pub struct WallpaperState {
 impl Global for WallpaperState {}
 
 pub fn init(path: Option<String>, effect: BackgroundEffect, data_dir: PathBuf, cx: &mut App) {
-    let scope = UiSettings::load(&data_dir).wallpaper_scope;
+    let settings = UiSettings::load(&data_dir);
+    let scope = settings.wallpaper_scope;
     cx.set_global(WallpaperState {
         path: path.map(PathBuf::from),
         scope,
         effect,
+        panel_opacity: settings.wallpaper_panel_opacity,
         ascii: None,
         ascii_key: None,
         pending: None,
@@ -359,6 +374,36 @@ pub fn effect(cx: &App) -> BackgroundEffect {
     cx.try_global::<WallpaperState>()
         .map(|state| state.effect)
         .unwrap_or_default()
+}
+
+pub fn panel_opacity(cx: &App) -> f32 {
+    cx.try_global::<WallpaperState>()
+        .map(|state| state.panel_opacity)
+        .unwrap_or(DEFAULT_PANEL_SCRIM_ALPHA)
+}
+
+/// Update the main-panel tint live; persist only when the slider is released.
+pub fn set_panel_opacity(opacity: f32, persist: bool, cx: &mut App) -> io::Result<()> {
+    let opacity = if opacity.is_finite() {
+        opacity.clamp(MIN_PANEL_SCRIM_ALPHA, MAX_PANEL_SCRIM_ALPHA)
+    } else {
+        DEFAULT_PANEL_SCRIM_ALPHA
+    };
+    let Some(state) = cx.try_global::<WallpaperState>() else {
+        return Err(io::Error::other("wallpaper settings are not initialized"));
+    };
+    let data_dir = state.data_dir.clone();
+    if persist {
+        let mut settings = UiSettings::load(&data_dir);
+        settings.wallpaper_panel_opacity = opacity;
+        settings.save(&data_dir)?;
+    }
+    let state = cx.global_mut::<WallpaperState>();
+    if (state.panel_opacity - opacity).abs() > f32::EPSILON {
+        state.panel_opacity = opacity;
+        cx.refresh_windows();
+    }
+    Ok(())
 }
 
 pub fn ascii_texture(cx: &App) -> Option<Arc<RenderImage>> {
@@ -570,15 +615,29 @@ mod tests {
         // dropped once a texture exists. While the image is still the raw
         // wallpaper — or when it cannot be decoded — the veil keeps the panel
         // text readable.
-        assert_eq!(scrim_alpha(BackgroundEffect::None, true), CARD_SCRIM_ALPHA);
-        assert_eq!(scrim_alpha(BackgroundEffect::None, false), CARD_SCRIM_ALPHA);
         assert_eq!(
-            scrim_alpha(BackgroundEffect::Ascii(Default::default()), true),
+            scrim_alpha(BackgroundEffect::None, true, DEFAULT_PANEL_SCRIM_ALPHA,),
+            DEFAULT_PANEL_SCRIM_ALPHA
+        );
+        assert_eq!(
+            scrim_alpha(BackgroundEffect::None, false, DEFAULT_PANEL_SCRIM_ALPHA,),
+            DEFAULT_PANEL_SCRIM_ALPHA
+        );
+        assert_eq!(
+            scrim_alpha(
+                BackgroundEffect::Ascii(Default::default()),
+                true,
+                DEFAULT_PANEL_SCRIM_ALPHA,
+            ),
             0.0
         );
         assert_eq!(
-            scrim_alpha(BackgroundEffect::Ascii(Default::default()), false),
-            CARD_SCRIM_ALPHA
+            scrim_alpha(
+                BackgroundEffect::Ascii(Default::default()),
+                false,
+                DEFAULT_PANEL_SCRIM_ALPHA,
+            ),
+            DEFAULT_PANEL_SCRIM_ALPHA
         );
     }
 
@@ -618,6 +677,21 @@ mod tests {
         assert!(
             second.exists(),
             "re-picking the stored wallpaper deleted it"
+        );
+    }
+
+    #[test]
+    fn a_saved_theme_keeps_its_image_when_the_wallpaper_is_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = fixture(dir.path(), "a.png", b"aaa");
+        let live = persist_path(dir.path(), Some(&a)).unwrap().unwrap();
+        let saved = import_theme_image(dir.path(), &live).unwrap();
+        assert!(saved.starts_with(dir.path().join("themes")));
+
+        persist_path(dir.path(), None).unwrap();
+        assert!(
+            saved.exists(),
+            "removing the wallpaper must not delete a saved theme's copy"
         );
     }
 

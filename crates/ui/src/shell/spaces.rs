@@ -95,9 +95,90 @@ pub(super) struct RemoteFolderBrowser {
     focus: FocusHandle,
     focus_pending: bool,
     list_scroll: gpui::ScrollHandle,
+    import_destination: bool,
 }
 
 pub(super) use import::ImportDialog;
+
+/// Built-in project marks are embedded vector assets so they render on systems
+/// without an emoji font. Custom marks use a data URL stored with the project.
+pub(super) fn project_logo_icon_id(logo: &str) -> Option<&'static str> {
+    let logo = if let Some(logo) = logo.strip_prefix("builtin:") {
+        logo
+    } else {
+        // Keep logos chosen with the previous emoji picker visible; the
+        // platform font may not include those glyphs, so render their native
+        // icon equivalents instead.
+        match logo {
+            "📁" => "folder",
+            "💻" => "computer",
+            "🚀" => "branch",
+            "⭐" => "star",
+            "🌐" => "web",
+            "🎨" => "image",
+            "📦" => "drive",
+            "🔧" => "settings",
+            "🧪" => "checklist",
+            "📝" => "document",
+            "🎮" => "terminal",
+            "🧠" => "chat",
+            _ => return None,
+        }
+    };
+    match logo {
+        "folder" => Some(crate::icons::FOLDER),
+        "computer" => Some(crate::icons::MONITOR),
+        "star" => Some(crate::icons::STAR),
+        "web" => Some(crate::icons::GLOBAL),
+        "terminal" => Some(crate::icons::TERMINAL),
+        "image" => Some(crate::icons::IMAGE),
+        "chat" => Some(crate::icons::CHAT_ROUND_LINE),
+        "drive" => Some(crate::icons::HARD_DRIVE),
+        "document" => Some(crate::icons::DOCUMENT),
+        "branch" => Some(crate::icons::GIT_BRANCH),
+        "settings" => Some(crate::icons::SETTINGS_MINIMALISTIC),
+        "checklist" => Some(crate::icons::CHECKLIST),
+        _ => None,
+    }
+}
+
+pub(super) fn project_logo_image(logo: &str) -> Option<std::sync::Arc<gpui::Image>> {
+    use base64::Engine as _;
+    let (mime, encoded) = logo.strip_prefix("data:image/")?.split_once(";base64,")?;
+    let format = match mime {
+        "png" => gpui::ImageFormat::Png,
+        "jpeg" => gpui::ImageFormat::Jpeg,
+        "gif" => gpui::ImageFormat::Gif,
+        "webp" => gpui::ImageFormat::Webp,
+        "bmp" => gpui::ImageFormat::Bmp,
+        "tiff" => gpui::ImageFormat::Tiff,
+        _ => return None,
+    };
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .ok()?;
+    Some(std::sync::Arc::new(gpui::Image::from_bytes(format, bytes)))
+}
+
+pub(super) fn project_logo_element(
+    logo: &str,
+    size: gpui::Pixels,
+    color: gpui::Hsla,
+) -> gpui::AnyElement {
+    if let Some(image) = project_logo_image(logo) {
+        gpui::img(image).size(size).into_any_element()
+    } else if let Some(icon) = project_logo_icon_id(logo) {
+        crate::icons::icon(icon)
+            .size(size)
+            .text_color(color)
+            .into_any_element()
+    } else {
+        div()
+            .text_size(size)
+            .child(logo.to_string())
+            .into_any_element()
+    }
+}
 
 mod add;
 mod browse;

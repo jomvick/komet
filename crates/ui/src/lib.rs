@@ -208,7 +208,7 @@ pub fn run_app(config: UiConfig) {
 }
 
 /// Open the 1320×880 main window (min 900×600) with [`shell::Shell`] as the
-/// root view. Called at boot and again from `on_reopen` if the dock icon is
+/// root view. Called at boot, again from `on_reopen` if the dock icon is
 /// clicked after ⌘W closed the window.
 fn open_main_window(state: gpui::Entity<state::AppState>, boot: EngineBootConfig, cx: &mut App) {
     // komet window geometry: 1320×880, min 900×600 (feature-inventory §1.1).

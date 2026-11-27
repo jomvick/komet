@@ -787,6 +787,7 @@ impl RegistryDoc {
             ("deviceId", json!(space.device_id)),
             ("path", json!(space.path)),
             ("name", opt_str(space.name.as_deref())),
+            ("logo", opt_str(space.logo.as_deref())),
             ("gitDetected", json!(space.git_detected)),
             ("gitCheckedAt", opt_ms(space.git_checked_at)),
             ("checkoutId", opt_str(space.checkout_id.as_deref())),
@@ -824,6 +825,19 @@ impl RegistryDoc {
             space_id,
             OpKind::Update,
             fields([("name", opt_str(name))]),
+        );
+        Ok(true)
+    }
+
+    pub fn set_space_logo(&mut self, space_id: &str, logo: Option<&str>) -> Result<bool, DocError> {
+        if !self.row_exists(KIND_SPACES, space_id) {
+            return Ok(false);
+        }
+        self.write(
+            KIND_SPACES,
+            space_id,
+            OpKind::Update,
+            fields([("logo", opt_str(logo))]),
         );
         Ok(true)
     }

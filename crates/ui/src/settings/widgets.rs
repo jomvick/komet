@@ -134,9 +134,12 @@ pub fn option_card(
                 .p(px(RING_GAP))
                 .border_2()
                 .border_color(if selected {
-                    theme.accent
+                    theme.text
                 } else {
                     gpui::transparent_black()
+                })
+                .when(!selected, |el| {
+                    el.hover(|style| style.border_color(theme.border_strong))
                 })
                 .child(frame),
         )

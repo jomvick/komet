@@ -99,20 +99,20 @@ impl SubagentLive {
     }
 }
 
-/// The spawn chip's status line: the lifecycle word, then the counters. The
-/// doc's chip is the authority for the lifecycle — the live frame never
-/// overrides it, because a frame is a moment that stops being refreshed while the
-/// doc write is the run's last word: a chip left saying "running" by the last
-/// frame before `Done` would say it forever. The doc has no lifecycle only for a
-/// chat written before subagents were tracked, and there the live frame carries
-/// it. Neither source backfills the other's numbers — a number that was never
-/// measured stays unmentioned rather than reading as a zero. `None` means say
-/// nothing: no lifecycle, no badge.
+/// The spawn chip's status line: the lifecycle word, what the child is doing
+/// right now, then how long it has run. The doc's chip is the authority for
+/// the lifecycle — the live frame never overrides it, because a frame is a
+/// moment that stops being refreshed while the doc write is the run's last
+/// word: a chip left saying "running" by the last frame before `Done` would
+/// say it forever. The doc has no lifecycle only for a chat written before
+/// subagents were tracked, and there the live frame carries it. Neither source
+/// backfills the other's activity — a tool that was never reported stays
+/// unmentioned rather than reading as a count. `None` means say nothing: no
+/// lifecycle, no badge.
 pub fn subagent_status_label(
     status: Option<SubagentStatus>,
     live: Option<&SubagentLive>,
     duration_ms: Option<u64>,
-    tool_count: Option<u64>,
 ) -> Option<String> {
     let effective = status.or(live.map(|l| l.status))?;
     let word = match effective {
@@ -122,25 +122,18 @@ pub fn subagent_status_label(
     };
     let mut segments = vec![word.to_string()];
     let running = effective == SubagentStatus::Running;
-    let (count, elapsed_ms, last_tool) = match live.filter(|_| running) {
-        Some(live) => (
-            Some(live.tool_count),
-            Some(live.elapsed_ms),
-            live.last_tool.clone(),
-        ),
-        None => (tool_count, duration_ms, None),
+    let (elapsed_ms, last_tool) = match live.filter(|_| running) {
+        Some(live) => (Some(live.elapsed_ms), live.last_tool.clone()),
+        None => (duration_ms, None),
     };
-    if let Some(count) = count {
-        segments.push(format!(
-            "{count} {}",
-            if count == 1 { "tool" } else { "tools" }
-        ));
+    // The activity before the clock: what the child is on answers the reader's
+    // first question, and the label is the only activity the host exposes
+    // (arguments can carry secrets and never ride the live frame).
+    if let Some(tool) = last_tool {
+        segments.push(tool.to_string());
     }
     if let Some(ms) = elapsed_ms {
         segments.push(transcript::format_elapsed(ms_to_secs(ms)));
-    }
-    if let Some(tool) = last_tool {
-        segments.push(tool.to_string());
     }
     Some(segments.join(" · "))
 }
@@ -159,10 +152,9 @@ pub fn subagent_badge(
     status: Option<SubagentStatus>,
     live: Option<&SubagentLive>,
     duration_ms: Option<u64>,
-    tool_count: Option<u64>,
     theme: &Theme,
 ) -> Option<gpui::Div> {
-    let label = subagent_status_label(status, live, duration_ms, tool_count)?;
+    let label = subagent_status_label(status, live, duration_ms)?;
     let tint = match status.or(live.map(|l| l.status))? {
         SubagentStatus::Running => theme.busy,
         SubagentStatus::Done => theme.success,
@@ -531,12 +523,7 @@ impl SubagentPanel {
     /// or the host's live frames are the only sources.
     fn render_header(&self, theme: &Theme) -> AnyElement {
         let spawn = &self.open.spawn;
-        let status = subagent_status_label(
-            spawn.status,
-            self.live.as_ref(),
-            spawn.duration_ms,
-            spawn.tool_count,
-        );
+        let status = subagent_status_label(spawn.status, self.live.as_ref(), spawn.duration_ms);
         // Tinted by the same lifecycle the word reports (doc first, live frame
         // only where the doc says nothing), so a header never reads "failed" in
         // the done green.
@@ -674,20 +661,14 @@ impl SubagentPanel {
                     tool_count: tool.subagent_tool_count,
                 },
             };
-            subagent_badge(
-                tool.subagent_status,
-                None,
-                tool.subagent_duration_ms,
-                tool.subagent_tool_count,
-                theme,
-            )
-            .expect("a chip with a status has a badge")
-            .id(SharedString::from(format!("{key}-open")))
-            .cursor_pointer()
-            .on_click(cx.listener(move |_this: &mut Self, _, _, cx| {
-                cx.stop_propagation();
-                cx.emit(SubagentEvent::OpenNested(Box::new(nested.clone())));
-            }))
+            subagent_badge(tool.subagent_status, None, tool.subagent_duration_ms, theme)
+                .expect("a chip with a status has a badge")
+                .id(SharedString::from(format!("{key}-open")))
+                .cursor_pointer()
+                .on_click(cx.listener(move |_this: &mut Self, _, _, cx| {
+                    cx.stop_propagation();
+                    cx.emit(SubagentEvent::OpenNested(Box::new(nested.clone())));
+                }))
         });
         let mut row = chip_header_row(tool, theme, open, badge)
             .id(SharedString::from(key.clone()))
@@ -943,33 +924,31 @@ mod tests {
         }
     }
 
-    /// While the child works, the numbers on the chip are the host's: its own
-    /// counter, its own clock, the tool it is on right now.
+    /// While the child works, the label says what it is on right now and for
+    /// how long — the host's own clock, never a tool count.
     #[test]
-    fn status_label_reports_the_hosts_live_counters() {
+    fn status_label_reports_the_hosts_live_activity() {
         let label = subagent_status_label(
             Some(SubagentStatus::Running),
             Some(&live(SubagentStatus::Running, 3, 12_400, Some("Read"))),
             None,
-            None,
         )
         .expect("a running feed always says something");
-        assert_eq!(label, "agent running · 3 tools · 12s · Read");
+        assert_eq!(label, "agent running · Read · 12s");
     }
 
     /// Once the child settled, the doc's single terminal write is the authority
     /// — and a live frame that arrived just before `Done` (still saying
-    /// `running`, still mid-count) must not keep counting on a settled chip.
+    /// `running`) must not keep a stale activity on a settled chip.
     #[test]
     fn status_label_switches_to_the_docs_terminal_write_when_settled() {
         let label = subagent_status_label(
             Some(SubagentStatus::Done),
             Some(&live(SubagentStatus::Running, 2, 9_000, Some("Run"))),
             Some(41_000),
-            Some(3),
         )
         .expect("a settled chip with terminal numbers says them");
-        assert_eq!(label, "agent done · 3 tools · 41s");
+        assert_eq!(label, "agent done · 41s");
         // The other direction: a chat written before subagents were tracked has
         // no lifecycle on its chip, and there the live frame is what says the
         // child is working at all.
@@ -977,33 +956,30 @@ mod tests {
             None,
             Some(&live(SubagentStatus::Running, 1, 1_200, Some("Search"))),
             None,
-            None,
         )
         .expect("the live frame carries the lifecycle when the doc has none");
-        assert_eq!(unlabeled, "agent running · 1 tool · 1s · Search");
+        assert_eq!(unlabeled, "agent running · Search · 1s");
     }
 
-    /// A number the host never measured stays unmentioned. Rendering it as a
-    /// zero would tell the user the child ran no tools, in a chat where it ran
-    /// nine.
+    /// An activity the host never reported stays unmentioned — inventing one
+    /// would tell the user what the child is doing in a chat where nothing
+    /// measured it.
     #[test]
-    fn status_label_leaves_an_unmeasured_number_out_instead_of_zeroing_it() {
+    fn status_label_leaves_unreported_activity_out() {
         let label =
-            subagent_status_label(Some(SubagentStatus::Running), None, None, None).expect("status");
+            subagent_status_label(Some(SubagentStatus::Running), None, None).expect("status");
         assert_eq!(label, "agent running");
         // No lifecycle at all (a chip from before this was tracked): say
         // nothing rather than guess.
-        assert_eq!(
-            subagent_status_label(None, None, Some(41_000), Some(3)),
-            None
-        );
+        assert_eq!(subagent_status_label(None, None, Some(41_000)), None);
     }
 
     #[test]
-    fn status_label_declines_one_tool_in_the_singular() {
+    fn status_label_has_no_tool_count() {
         let label =
-            subagent_status_label(Some(SubagentStatus::Done), None, None, Some(1)).expect("count");
-        assert_eq!(label, "agent done · 1 tool");
+            subagent_status_label(Some(SubagentStatus::Done), None, Some(3_000)).expect("status");
+        assert_eq!(label, "agent done · 3s");
+        assert!(!label.contains("tool"));
     }
 
     /// Rounded seconds: a 900 ms cycle must not read "0s" and a 41.6 s one must
@@ -1014,10 +990,9 @@ mod tests {
             Some(SubagentStatus::Running),
             Some(&live(SubagentStatus::Running, 1, 900, None)),
             None,
-            None,
         )
         .expect("live");
-        assert_eq!(label, "agent running · 1 tool · 1s");
+        assert_eq!(label, "agent running · 1s");
     }
 
     /// The `subagentStatus` frame belongs to one feed. Reading another kind's

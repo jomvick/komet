@@ -148,25 +148,19 @@ pub fn chip_content(kind: WidgetKind, input: &StripInput) -> ChipContent {
                 ],
             )
         }
-        WidgetKind::Subagents => {
-            let count = input.subagent_rows.len();
-            let word = if count == 1 { "agent" } else { "agents" };
-            (
-                input.subagents_allowed && count > 0,
-                crate::icons::WIDGET,
-                format!("{count} {word}"),
-                Vec::new(),
-            )
-        }
+        WidgetKind::Subagents => (
+            input.subagents_allowed && !input.subagent_rows.is_empty(),
+            crate::icons::WIDGET,
+            "Agents".to_string(),
+            Vec::new(),
+        ),
         WidgetKind::Processes => {
             // Only commands still running count: a finished (or failed) one
             // is history, not a live process — the transcript keeps it.
-            let count = running_process_count(&input.process_entries);
-            let word = if count == 1 { "process" } else { "processes" };
             (
-                input.processes_allowed && count > 0,
+                input.processes_allowed && running_process_count(&input.process_entries) > 0,
                 crate::icons::TERMINAL,
-                format!("{count} {word}"),
+                "Processes".to_string(),
                 Vec::new(),
             )
         }
@@ -597,18 +591,18 @@ mod tests {
     }
 
     #[test]
-    fn subagent_and_process_chips_count_rows() {
+    fn subagent_and_process_chips_hide_their_counts() {
         let mut input = strip_input();
         input.subagent_rows = vec![subagent_row("a")];
         let chip = chip_content(WidgetKind::Subagents, &input);
         assert!(chip.visible);
-        assert_eq!(chip.label.as_ref(), "1 agent");
+        assert_eq!(chip.label.as_ref(), "Agents");
 
         input.subagent_rows.push(subagent_row("b"));
         input.subagent_rows.push(subagent_row("c"));
         assert_eq!(
             chip_content(WidgetKind::Subagents, &input).label.as_ref(),
-            "3 agents"
+            "Agents"
         );
 
         let mut input = strip_input();
@@ -618,7 +612,7 @@ mod tests {
         )];
         assert_eq!(
             chip_content(WidgetKind::Processes, &input).label.as_ref(),
-            "1 process"
+            "Processes"
         );
         input.process_entries.push(process_entry(
             crate::transcript::AgentShellStatus::Running,
@@ -626,7 +620,7 @@ mod tests {
         ));
         assert_eq!(
             chip_content(WidgetKind::Processes, &input).label.as_ref(),
-            "2 processes"
+            "Processes"
         );
 
         // Finished and failed commands are history, not live processes:
@@ -641,7 +635,7 @@ mod tests {
         ));
         assert_eq!(
             chip_content(WidgetKind::Processes, &input).label.as_ref(),
-            "2 processes"
+            "Processes"
         );
     }
 

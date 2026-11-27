@@ -269,7 +269,6 @@ impl Shell {
             row.spawn.status,
             row.live.as_ref(),
             row.spawn.duration_ms,
-            row.spawn.tool_count,
         )
         .unwrap_or_default();
         let title = row.spawn.title.clone();
@@ -378,6 +377,87 @@ impl Shell {
             .into_any_element()
     }
 
+    /// The useful part of the home page: destination/checkout selectors, the
+    /// widget strip and the prompt. Shared by the main column and the right
+    /// pane's second chat so both start from the same canvas.
+    fn render_home_canvas(
+        &mut self,
+        composer: &Entity<Composer>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        narrow: bool,
+    ) -> AnyElement {
+        let theme_owned = Theme::of(cx).clone();
+        let theme = &theme_owned;
+        let pickers = composer.read(cx).pickers().clone();
+        let sidebar_width = self.settings.sidebar_width;
+        let (target_selectors, checkout_selectors) = pickers.update(cx, |p, cx| {
+            (
+                p.render_target_selectors(window, sidebar_width, cx),
+                p.render_footer(window, cx),
+            )
+        });
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .child(motion::fade_in(
+                "new-chat-canvas",
+                div()
+                    .w_full()
+                    .max_w(px(768.0))
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .child(
+                        div()
+                            .mb(px(if narrow { 18.0 } else { 28.0 }))
+                            .relative()
+                            .top(px(-16.0))
+                            .text_size(px(if narrow { 17.0 } else { 20.0 }))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(theme.text)
+                            .child("What are we building?"),
+                    )
+                    .child(
+                        div()
+                            .w_full()
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .w_full()
+                                    .px(px(Theme::SPACE_LG))
+                                    .flex()
+                                    // Narrow columns stack the destination and
+                                    // checkout rows instead of clipping them.
+                                    .when(narrow, |el| el.flex_col().gap(px(8.0)))
+                                    .when(!narrow, |el| {
+                                        el.flex_row().items_center().gap(px(Theme::SPACE_MD))
+                                    })
+                                    .child(
+                                        div()
+                                            .when(!narrow, |el| el.flex_none())
+                                            .child(target_selectors),
+                                    )
+                                    .when_some(checkout_selectors, |el, controls| {
+                                        el.child(
+                                            div()
+                                                .when(!narrow, |el| el.flex_1().min_w_0())
+                                                .child(controls),
+                                        )
+                                    }),
+                            )
+                            .child(div().h(px(12.0)).flex_none())
+                            .child(self.render_widget_strip(cx))
+                            .child(composer.clone()),
+                    ),
+            ))
+            .into_any_element()
+    }
+
     pub(super) fn render_main(
         &mut self,
         window: &mut Window,
@@ -483,58 +563,14 @@ impl Shell {
                 ))
                 .into_any_element()
         } else {
-            // Keep destination and checkout selectors in one row; agent/model
-            // selection stays in the composer's action bar.
-            let pickers = self.composer.read(cx).pickers().clone();
-            let (target_selectors, checkout_selectors) = pickers.update(cx, |p, cx| {
-                (p.render_target_selectors(cx), p.render_footer(window, cx))
-            });
-            div()
-                .size_full()
-                .flex()
-                .flex_col()
-                .items_center()
-                .justify_center()
-                .child(motion::fade_in(
-                    "new-chat-canvas",
-                    div()
-                        .w_full()
-                        .max_w(px(768.0))
-                        .flex()
-                        .flex_col()
-                        .items_center()
-                        .child(
-                            div()
-                                .mb(px(28.0))
-                                .text_size(px(20.0))
-                                .font_weight(gpui::FontWeight::SEMIBOLD)
-                                .text_color(theme.text)
-                                .child("What are we building?"),
-                        )
-                        .child(
-                            div()
-                                .w_full()
-                                .flex()
-                                .flex_col()
-                                .child(
-                                    div()
-                                        .w_full()
-                                        .px(px(Theme::SPACE_LG))
-                                        .flex()
-                                        .flex_row()
-                                        .items_center()
-                                        .gap(px(Theme::SPACE_MD))
-                                        .child(div().flex_none().child(target_selectors))
-                                        .when_some(checkout_selectors, |el, controls| {
-                                            el.child(div().flex_1().min_w_0().child(controls))
-                                        }),
-                                )
-                                .child(div().h(px(12.0)).flex_none())
-                                .child(self.render_widget_strip(cx))
-                                .child(self.composer.clone()),
-                        ),
-                ))
-                .into_any_element()
+            // Same home canvas as the main column, with this pane's composer.
+            let composer = self.composer.clone();
+            let main_width = (f32::from(window.viewport_size().width)
+                - self.sidebar_target()
+                - self.right_target(cx)
+                - 10.0)
+                .max(0.0);
+            self.render_home_canvas(&composer, window, cx, main_width < 520.0)
         };
         let status = self.render_status_strip(window, cx);
         // File dropzone over the ENTIRE conversation column (transcript +
@@ -1089,7 +1125,11 @@ impl Shell {
     /// default, drag-resizable. Content is the ACTIVE surface — the Diff
     /// page (its options row + the lazy [`Changes`] viewer), an embedded
     /// terminal, or the "Open a surface" picker when no tabs exist.
-    pub(super) fn render_right_pane(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_right_pane(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         // Park/unpark des sessions CDP selon l'affichage réel : seule la
         // surface browser ACTIVE du pane OUVERT tourne ; les autres (autres
         // panneaux, autres onglets, pane fermé) garent leur Chrome (zéro CPU).
@@ -1112,6 +1152,34 @@ impl Shell {
                         browser.into_any_element()
                     } else {
                         self.render_surface_picker(cx)
+                    }
+                }
+                RightSurface::NewSession => {
+                    let composer = self.right_home_composer.clone();
+                    let has_chat = self.right_home_transcript.read(cx).has_side_chat();
+                    composer.update(cx, |composer, cx| composer.set_home_canvas(!has_chat, cx));
+                    // Before the first send it IS the home page (the useful
+                    // part of it); afterwards the agents' conversation fills
+                    // the pane, with the same strip + prompt stack below.
+                    if has_chat {
+                        div()
+                            .size_full()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div().flex_1().min_h_0().child(
+                                    self.right_home_transcript
+                                        .clone()
+                                        .cached(StyleRefinement::default().size_full()),
+                                ),
+                            )
+                            .child(self.render_widget_strip(cx))
+                            .child(composer)
+                            .into_any_element()
+                    } else {
+                        let pane_width = self.eval_tween(self.right_tween, self.right_target(cx));
+                        self.render_home_canvas(&composer, window, cx, pane_width < 520.0)
                     }
                 }
                 RightSurface::Files => {
@@ -1186,62 +1254,7 @@ impl Shell {
                 }
                 _ => self.render_surface_picker(cx),
             };
-            // Files browser companion: shown alongside File editor tabs
-            // and any other surface that isn't Files itself, matching
-            // VS Code's explorer-stays-put behaviour.
-            let files_panel = if active == RightSurface::Files {
-                None
-            } else {
-                let key = self.panel_key(cx);
-                self.right_tabs.get(&key).and_then(|tabs| {
-                    if tabs.contains(&RightSurface::Files) {
-                        self.files.get(&key).cloned()
-                    } else {
-                        None
-                    }
-                })
-            };
-            match files_panel {
-                Some(files) => {
-                    // Two independent-looking panels (own bg/border/rounded
-                    // corners each, separated by a gap) rather than one
-                    // merged block split by a hairline — user request: the
-                    // file editor should read as its own container, not as
-                    // fused into the explorer's box.
-                    div()
-                        .flex()
-                        .flex_row()
-                        .size_full()
-                        .gap(px(8.0))
-                        .p(px(8.0))
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .h_full()
-                                .rounded(px(8.0))
-                                .overflow_hidden()
-                                .border_1()
-                                .border_color(theme.border)
-                                .bg(theme.bg)
-                                .child(main),
-                        )
-                        .child(
-                            div()
-                                .w(px(240.0))
-                                .flex_none()
-                                .h_full()
-                                .rounded(px(8.0))
-                                .overflow_hidden()
-                                .border_1()
-                                .border_color(theme.border)
-                                .bg(theme.glass())
-                                .child(files),
-                        )
-                        .into_any_element()
-                }
-                None => main,
-            }
+            main
         } else {
             gpui::Empty.into_any_element()
         };
@@ -1386,15 +1399,21 @@ impl Shell {
                                     }),
                                 ),
                             )
-                            // Git only where there IS git — the pane itself
+                            .child(
+                                row("surface-card-chat", icons::CHAT_ROUND_LINE, "Chat").on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        this.add_new_session_surface(cx);
+                                    }),
+                                ),
+                            )
+                            // Review only where there IS git — the pane itself
                             // no longer gates on it (terminals work anywhere).
                             .when(self.space_git_detected(cx), |el| {
                                 el.child(
-                                    row("surface-card-git", icons::GIT_BRANCH, "Git").on_click(
-                                        cx.listener(|this, _, _, cx| {
+                                    row("surface-card-review", icons::GIT_BRANCH, "Review")
+                                        .on_click(cx.listener(|this, _, _, cx| {
                                             this.add_diff_surface(cx);
-                                        }),
-                                    ),
+                                        })),
                                 )
                             }),
                     ),
@@ -1487,6 +1506,7 @@ impl Shell {
             let is_active = surface == active;
             let icon_path = match surface {
                 RightSurface::Browser => icons::GLOBAL,
+                RightSurface::NewSession => icons::CHAT_ROUND_LINE,
                 RightSurface::Files => icons::FOLDER_WITH_FILES,
                 RightSurface::File(_) => icons::DOCUMENT,
                 RightSurface::Diff(_) => icons::GIT_BRANCH,
@@ -1748,10 +1768,10 @@ impl Shell {
                                         .size(px(13.0))
                                         .text_color(theme.text_muted),
                                 )
-                                // "Git", not "Git diff" — the surface hosts
+                                // "Review", not "Git diff" — the surface hosts
                                 // history and per-commit views too (user
                                 // request; matches the picker card).
-                                .child(SharedString::from("Git")),
+                                .child(SharedString::from("Review")),
                         ),
                 )
                 .into_any_element();
