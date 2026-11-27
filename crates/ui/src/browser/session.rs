@@ -301,6 +301,16 @@ pub(crate) fn navigate_error_message(error_text: &str, url: &str) -> String {
     }
 }
 
+/// A superseded navigation answers `net::ERR_ABORTED` — Chrome cancelling the
+/// OLD request because a newer one replaced it. That is not a failure of the
+/// page the user is waiting for, so it must never reach the status bar.
+pub(crate) fn reportable_navigation_error(error_text: &str, url: &str) -> Option<String> {
+    if error_text.contains("ERR_ABORTED") {
+        return None;
+    }
+    Some(navigate_error_message(error_text, url))
+}
+
 pub(crate) fn run_client(
     commands: Receiver<BrowserCommand>,
     events: mpsc::SyncSender<BrowserEvent>,
@@ -440,12 +450,14 @@ fn run_session(
     // ainsi la page dès son premier paint. (Naviguer avant = la page finit
     // de peindre avant l'attachement et Chrome n'émet plus aucun frame.)
     // Sans URL (surface ouverte à vide) on reste sur about:blank.
-    let mut navigate_request_ids = std::collections::HashSet::new();
+    // id → URL demandée : la réponse d'une navigation annulée doit être
+    // attribuée à SA cible, pas à la dernière URL tapée.
+    let mut navigate_request_ids: HashMap<u64, String> = HashMap::new();
     if !current_url.trim().is_empty() {
         socket
             .send(Message::Text(cdp::page_navigate(next_id, current_url)))
             .map_err(|e| e.to_string())?;
-        navigate_request_ids.insert(next_id);
+        navigate_request_ids.insert(next_id, current_url.clone());
         next_id += 1;
     }
 
@@ -546,7 +558,7 @@ fn run_session(
                     socket
                         .send(Message::Text(cdp::page_navigate(next_id, &url)))
                         .map_err(|e| e.to_string())?;
-                    navigate_request_ids.insert(next_id);
+                    navigate_request_ids.insert(next_id, url.clone());
                     next_id += 1;
                     *current_url = url;
                 }
@@ -979,7 +991,7 @@ fn run_session(
                                     socket
                                         .send(Message::Text(cdp::page_navigate(next_id, url)))
                                         .map_err(|e| e.to_string())?;
-                                    navigate_request_ids.insert(next_id);
+                                    navigate_request_ids.insert(next_id, url.to_owned());
                                     next_id += 1;
                                 }
                             }
@@ -1174,21 +1186,16 @@ fn run_session(
 
                 // Check responses to requests
                 if let Some(resp_id) = val.get("id").and_then(Value::as_u64) {
-                    if navigate_request_ids.remove(&resp_id) {
+                    if let Some(requested_url) = navigate_request_ids.remove(&resp_id) {
                         if let Some(error_text) = val
                             .get("result")
                             .and_then(|r| r.get("errorText"))
                             .and_then(Value::as_str)
                             && !error_text.is_empty()
+                            && let Some(message) =
+                                reportable_navigation_error(error_text, &requested_url)
                         {
-                            push_event(
-                                events,
-                                wake,
-                                BrowserEvent::Failed(navigate_error_message(
-                                    error_text,
-                                    current_url,
-                                )),
-                            );
+                            push_event(events, wake, BrowserEvent::Failed(message));
                         }
                     } else if dialog_request_id == Some(resp_id) {
                         dialog_request_id = None;
@@ -1428,4 +1435,27 @@ fn send_screencast_restart(
         .map_err(|e| e.to_string())?;
     *next_id += 1;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn superseded_navigation_is_not_a_failure() {
+        // Chrome aborts the OLD navigation when a newer URL replaces it.
+        assert_eq!(
+            reportable_navigation_error("net::ERR_ABORTED", "https://www.google.com/search?q=xal"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_real_failure_names_its_own_url() {
+        let message =
+            reportable_navigation_error("net::ERR_CONNECTION_REFUSED", "http://localhost:3000/")
+                .expect("a real navigation error is reported");
+        assert!(message.contains("http://localhost:3000/"));
+        assert!(message.contains("lance ton serveur"));
+    }
 }

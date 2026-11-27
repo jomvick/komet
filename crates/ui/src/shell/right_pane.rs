@@ -217,14 +217,11 @@ impl Shell {
             let profile_key = key.clone();
             let data_dir = self.state.read(cx).data_dir.clone();
             let prefs = self.settings.browser.clone();
-            // URL initiale : page d'accueil (Settings → Browser) si choisie,
-            // sinon la dernière page visitée (persistance d'onglets), sinon
-            // l'état « Open Address… ».
-            let initial_url = prefs
-                .home_url
-                .clone()
-                .or_else(|| self.settings.browser_urls.first().cloned())
-                .unwrap_or_default();
+            // Ouvre sur une page vide par défaut : restaurer la dernière URL
+            // ramenait un serveur de dev éteint (localhost:3000) et une page
+            // blanche. Seule une page d'accueil CHOISIE dans les réglages est
+            // chargée automatiquement.
+            let initial_url = prefs.home_url.clone().unwrap_or_default();
             let browser = cx.new(|cx| {
                 crate::browser::BrowserSurface::new(initial_url, profile_key, data_dir, prefs, cx)
             });
