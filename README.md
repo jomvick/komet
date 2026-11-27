@@ -1,7 +1,7 @@
 # Komet — native control plane for coding agents
 
 <p align="center">
-  <img src="dist/logo.png" alt="Komet logo" width="200">
+  <img src="docs/media/komet-logo.png" alt="Komet logo" width="200">
 </p>
 
 > **Komet is the native control plane for coding agents.** One Rust binary drives Claude Code, Codex, Cursor, Devin, GitHub Copilot, Cline, Grok, Hermes, Muse Code, OpenCode, Pi, Antigravity and Qoder — 100% local by default, with optional self-hosted sync across your devices.
